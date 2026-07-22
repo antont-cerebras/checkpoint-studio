@@ -45,19 +45,37 @@
     raw: kind === 'values' && base !== 'dec' ? 1 : undefined,
   };
   $: load(tensor, params);
+  // Only the latest request may write `data` — rapid panning fires overlapping
+  // requests, and without this guard an earlier one resolving late would desync
+  // the view from the current offset.
+  let reqSeq = 0;
   async function load(t: string, p: typeof params) {
+    const seq = ++reqSeq;
     loading = true;
     err = '';
     try {
-      data = await cachedSample(t, p);
+      const d = await cachedSample(t, p);
+      if (seq !== reqSeq) return; // superseded
+      data = d;
     } catch (e) {
+      if (seq !== reqSeq) return;
       err = e instanceof Error ? e.message : String(e);
       data = null;
     }
-    loading = false;
+    if (seq === reqSeq) loading = false;
   }
 
   $: nSlices = data?.slices ?? 1;
+  // Furthest valid top-left of the window, so offsets/seek/pan can't run past the
+  // end (the server already clamps; this keeps the client in sync with it).
+  $: maxRow = data ? Math.max(0, data.total_rows - rows) : 0;
+  $: maxCol = data ? Math.max(0, data.total_cols - cols) : 0;
+  $: if (data && mode === 'window') {
+    const r = Math.min(Math.max(0, rowOff), maxRow);
+    const c = Math.min(Math.max(0, colOff), maxCol);
+    if (r !== rowOff) rowOff = r;
+    if (c !== colOff) colOff = c;
+  }
 
   // ---- heatmap ----
   $: if (kind === 'heatmap' && data && canvas && wrapW && wrapH) draw(data);
@@ -109,10 +127,34 @@
   }
 
   function pan(dr: number, dc: number) {
-    rowOff = Math.max(0, rowOff + dr * rows);
-    colOff = Math.max(0, colOff + dc * cols);
+    rowOff = Math.min(maxRow, Math.max(0, rowOff + dr * rows));
+    colOff = Math.min(maxCol, Math.max(0, colOff + dc * cols));
+  }
+
+  // Keyboard panning in window mode — mirrors the TUI's data view (arrows pan by a
+  // window, Home/End = col start/end, PageUp/PageDown = row start/end). Ignored when
+  // typing into a control so sliders/inputs keep their own arrow behavior.
+  function onKey(e: KeyboardEvent) {
+    if (mode !== 'window' || e.ctrlKey || e.metaKey || e.altKey) return;
+    const tag = (e.target as HTMLElement)?.tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+    switch (e.key) {
+      case 'ArrowUp': pan(-1, 0); break;
+      case 'ArrowDown': pan(1, 0); break;
+      case 'ArrowLeft': pan(0, -1); break;
+      case 'ArrowRight': pan(0, 1); break;
+      case 'PageUp': rowOff = 0; break;
+      case 'PageDown': rowOff = maxRow; break;
+      case 'Home': colOff = 0; break;
+      case 'End': colOff = maxCol; break;
+      default: return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
   }
 </script>
+
+<svelte:window on:keydown={onKey} />
 
 <div class="dv">
   <div class="controls">
@@ -133,11 +175,17 @@
 
     {#if mode === 'window'}
       <div class="grp pan">
-        <button on:click={() => pan(-1, 0)} title="up">↑</button>
-        <button on:click={() => pan(1, 0)} title="down">↓</button>
-        <button on:click={() => pan(0, -1)} title="left">←</button>
-        <button on:click={() => pan(0, 1)} title="right">→</button>
+        <button on:click={() => pan(-1, 0)} disabled={rowOff <= 0} title="up (↑ · PageUp = top)">↑</button>
+        <button on:click={() => pan(1, 0)} disabled={rowOff >= maxRow} title="down (↓ · PageDown = bottom)">↓</button>
+        <button on:click={() => pan(0, -1)} disabled={colOff <= 0} title="left (← · Home = start)">←</button>
+        <button on:click={() => pan(0, 1)} disabled={colOff >= maxCol} title="right (→ · End = end)">→</button>
       </div>
+      <label class="res">row
+        <input type="number" min="0" max={maxRow} step={rows} bind:value={rowOff} />
+      </label>
+      <label class="res">col
+        <input type="number" min="0" max={maxCol} step={cols} bind:value={colOff} />
+      </label>
     {/if}
 
     {#if nSlices > 1}
@@ -177,6 +225,11 @@
     <div class="meta dim">
       {data.values.length}×{data.values[0]?.length ?? 0} of {data.total_rows}×{data.total_cols}
       · view {data.view}{data.mode !== 'grid' ? ` · ${data.mode}` : ''}
+      {#if mode === 'window' && data.rows.length && data.cols.length}
+        · <span class="mono">rows {data.rows[0]}–{data.rows[data.rows.length - 1]} · cols {data.cols[0]}–{data.cols[data.cols.length - 1]}</span>
+      {:else if mode === 'overview'}
+        · <span class="pill" title="Overview is a strided subsample — a lone outlier between sampled indices may not appear. Use window mode for exact 1:1 inspection.">subsample</span>
+      {/if}
       <span class="hover mono">{hover}</span>
     </div>
 
@@ -231,6 +284,20 @@
   .pan button {
     width: 26px;
     padding: 2px 0;
+  }
+  .pan button:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .pill {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border-radius: 4px;
+    padding: 0 5px;
+    cursor: help;
   }
   label {
     display: inline-flex;
