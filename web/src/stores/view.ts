@@ -120,19 +120,53 @@ filterQuery.subscribe((q) => {
 /** Command palette (Space / `:`) open state. */
 export const paletteOpen = writable<boolean>(false);
 
+/** Sorting for the flat (filter / search) tensor list. `none` keeps the natural
+ * order (fuzzy-score for search, tree order for a filter); the tree view is never
+ * reordered. */
+export type SortKey = 'none' | 'name' | 'size' | 'params' | 'dtype' | 'rank';
+export const sortKey = writable<SortKey>('none');
+export const sortDir = writable<'asc' | 'desc'>('asc');
+
 /** The flattened rows — fold-aware, or a flat list while filtering / searching.
  * Shared by TreeView (render) and the key handler (cursor movement). A filter
- * (server-matched) takes precedence over an in-progress fuzzy search. */
+ * (server-matched) takes precedence over an in-progress fuzzy search; a flat list
+ * is optionally sorted. */
 export const visibleRows = derived(
-  [treeData, expanded, search, searching, filterMatches],
-  ([$t, $exp, $q, $searching, $matches]) => {
+  [treeData, expanded, search, searching, filterMatches, sortKey, sortDir],
+  ([$t, $exp, $q, $searching, $matches, $sk, $sd]) => {
     if (!$t) return [] as Row[];
     // An in-progress fuzzy search wins; otherwise a set filter; otherwise the tree.
-    if ($searching && $q.trim()) return searchRows($t.tree, $q.trim());
-    if ($matches) return matchRows($t.tree, $matches);
-    return flatten($t.tree, $exp);
+    let rows: Row[];
+    if ($searching && $q.trim()) rows = searchRows($t.tree, $q.trim());
+    else if ($matches) rows = matchRows($t.tree, $matches);
+    else return flatten($t.tree, $exp); // hierarchical view is never reordered
+    return $sk === 'none' ? rows : sortRows(rows, $sk, $sd);
   },
 );
+
+/** Sort a flat tensor-row list by a facet, ascending or descending. */
+function sortRows(rows: Row[], key: Exclude<SortKey, 'none'>, dir: 'asc' | 'desc'): Row[] {
+  const info = (r: Row) => (r.node.kind === 'tensor' ? r.node.info : null);
+  const cmp = (a: Row, b: Row): number => {
+    const ia = info(a);
+    const ib = info(b);
+    if (!ia || !ib) return 0;
+    switch (key) {
+      case 'name':
+        return ia.name.localeCompare(ib.name, undefined, { numeric: true });
+      case 'size':
+        return ia.size_bytes - ib.size_bytes;
+      case 'params':
+        return ia.num_elements - ib.num_elements;
+      case 'rank':
+        return ia.shape.length - ib.shape.length;
+      case 'dtype':
+        return ia.dtype.localeCompare(ib.dtype);
+    }
+  };
+  const sorted = [...rows].sort(cmp);
+  return dir === 'asc' ? sorted : sorted.reverse();
+}
 
 /** Flat list of the tensor rows whose names the server said pass the filter. */
 function matchRows(nodes: TreeNode[], matches: Set<string>): Row[] {
@@ -149,15 +183,21 @@ function matchRows(nodes: TreeNode[], matches: Set<string>): Row[] {
   return out;
 }
 
-/** Append a filter term (from a badge click), space-joined and deduped. */
-export function addFilterTerm(term: string): void {
+/** Append one or more filter terms (badge click / builder), space-joined + deduped. */
+export function addFilterTerms(terms: string[]): void {
+  const add = terms.map((t) => t.trim()).filter(Boolean);
+  if (!add.length) return;
   filterQuery.update((q) => {
-    const cur = q.trim();
-    return ` ${cur} `.includes(` ${term} `) ? cur : cur ? `${cur} ${term}` : term;
+    let cur = q.trim();
+    for (const t of add) if (!` ${cur} `.includes(` ${t} `)) cur = cur ? `${cur} ${t}` : t;
+    return cur;
   });
   searching.set(false);
   search.set('');
   navigate({ kind: 'tree' });
+}
+export function addFilterTerm(term: string): void {
+  addFilterTerms([term]);
 }
 export function filterByDtype(value: string): void {
   addFilterTerm(`dtype:${value}`);

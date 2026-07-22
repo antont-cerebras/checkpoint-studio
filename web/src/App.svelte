@@ -24,6 +24,8 @@
     filterError,
     filterMatches,
     clearFilter,
+    sortKey,
+    sortDir,
     paletteOpen,
   } from './stores/view';
   import TreeView from './components/TreeView.svelte';
@@ -37,9 +39,12 @@
   import Footer from './components/Footer.svelte';
   import Spinner from './components/Spinner.svelte';
   import Palette from './components/Palette.svelte';
+  import FilterBuilder from './components/FilterBuilder.svelte';
   import { theme } from './stores/theme';
   import { copyText } from './lib/clipboard';
   import type { Screen } from './stores/view';
+
+  let builderOpen = false;
 
   onMount(ensureTree);
 
@@ -283,6 +288,12 @@
   </header>
 
   <div class="filterbar" class:err={$filterError}>
+    <button
+      class="bld"
+      class:on={builderOpen}
+      title="Filter builder — pick facets with the mouse"
+      aria-label="Toggle filter builder"
+      on:click={() => (builderOpen = !builderOpen)}>▤</button>
     <span
       class="flabel"
       title="dtype:F16,BF16  shape:(6,_,42)  dim:4096  rank:>=3  size:1MiB..1GiB  params:>1M  name:re:^model\.  shard:00001  ·  space = AND, ! = not, comma = OR"
@@ -300,10 +311,30 @@
     {:else if $filterMatches}
       <span class="dim">{$visibleRows.length} match{$visibleRows.length === 1 ? '' : 'es'}</span>
     {/if}
+    {#if $filterMatches !== null || $searching}
+      <span class="sort" title="Sort the tensor list">
+        sort
+        <select bind:value={$sortKey} aria-label="Sort by">
+          <option value="none">—</option>
+          <option value="name">name</option>
+          <option value="size">size</option>
+          <option value="params">params</option>
+          <option value="rank">rank</option>
+          <option value="dtype">dtype</option>
+        </select>
+        <button
+          class="dir"
+          disabled={$sortKey === 'none'}
+          title={$sortDir === 'asc' ? 'Ascending (click for descending)' : 'Descending (click for ascending)'}
+          on:click={() => sortDir.update((d) => (d === 'asc' ? 'desc' : 'asc'))}
+        >{$sortDir === 'asc' ? '↑' : '↓'}</button>
+      </span>
+    {/if}
     {#if $filterQuery}
       <button class="clear" on:click={clearFilter}>clear</button>
     {/if}
   </div>
+  {#if builderOpen}<FilterBuilder />{/if}
 
   <main>
     {#if $treeError}
@@ -400,6 +431,22 @@
   .filterbar.err {
     background: color-mix(in srgb, var(--danger) 10%, var(--bg-panel));
   }
+  .bld {
+    flex: 0 0 auto;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--fg-dim);
+    cursor: pointer;
+    font: inherit;
+    padding: 0 6px;
+    line-height: 18px;
+  }
+  .bld.on,
+  .bld:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
   .flabel {
     flex: 0 0 auto;
     color: var(--fg-dim);
@@ -434,6 +481,35 @@
   .clear:hover {
     color: var(--fg);
     border-color: var(--accent);
+  }
+  .sort {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--fg-dim);
+  }
+  .sort select {
+    font-size: 12px;
+    padding: 1px 2px;
+  }
+  .dir {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--fg-dim);
+    cursor: pointer;
+    font: inherit;
+    padding: 0 5px;
+    line-height: 16px;
+  }
+  .dir:hover:not(:disabled) {
+    color: var(--fg);
+    border-color: var(--accent);
+  }
+  .dir:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
   .theme {
     margin-left: auto;

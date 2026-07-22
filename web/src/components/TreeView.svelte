@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { visibleRows, selectedId, expanded, searching, toggle, openDetail, navigate } from '../stores/view';
+  import { visibleRows, selectedId, expanded, searching, filterMatches, toggle, openDetail, navigate } from '../stores/view';
   import type { Row } from '../lib/flatten';
   import { humanCount, humanSize, pyShape } from '../lib/format';
   import { copyText } from '../lib/clipboard';
@@ -94,13 +94,14 @@
     }
   }
 
-  // While searching, results are a flat list, so show the FULL tensor name (the
-  // compacted last-segment label is only meaningful within the indented tree).
-  function label(row: Row, isSearching: boolean): string {
+  // In a flat view (search results OR an active filter) show the FULL tensor name;
+  // the compacted last-segment label is only meaningful within the indented tree.
+  $: flat = $searching || $filterMatches !== null;
+  function label(row: Row, flatView: boolean): string {
     const n = row.node;
     if (n.kind === 'group') return n.name;
     if (n.kind === 'tensor') {
-      return isSearching ? n.info.name : (n.label ?? n.info.name.split('.').pop() ?? n.info.name);
+      return flatView ? n.info.name : (n.label ?? n.info.name.split('.').pop() ?? n.info.name);
     }
     return n.info.name;
   }
@@ -132,7 +133,7 @@
         on:mouseleave={leaveRow}
       >
         <span class="caret">{row.hasChildren ? ($expanded.has(row.id) ? '▾' : '▸') : ''}</span>
-        <span class="lbl">{label(row, $searching)}</span>
+        <span class="lbl">{label(row, flat)}</span>
         {#if row.node.kind === 'tensor'}
           <span class="tmeta">
             <Dtype dtype={row.node.info.dtype} bubble={false} />
