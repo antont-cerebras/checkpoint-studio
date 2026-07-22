@@ -65,6 +65,27 @@ pub fn files(s: &WebState) -> Reply {
     ok(&s.file_tree)
 }
 
+/// Rich tensor filtering: parse the `?q=` text query (see [`crate::tensorfilter`])
+/// with the shared matcher and return the names of the tensors that pass, so the
+/// client masks its tree to them. `active:false` for an empty query (show all); a
+/// malformed query is a `400` whose message the filter bar shows inline.
+pub fn filter(s: &WebState, q: &Query) -> Reply {
+    let query = q.get("q").map(String::as_str).unwrap_or("");
+    match crate::tensorfilter::TensorFilter::parse(query) {
+        Ok(f) if !f.is_active() => ok(json!({ "active": false })),
+        Ok(f) => {
+            let names: Vec<&str> = s
+                .tensors
+                .iter()
+                .filter(|t| f.matches(t))
+                .map(|t| t.name.as_str())
+                .collect();
+            ok(json!({ "active": true, "names": names }))
+        }
+        Err(e) => err(400, e.to_string()),
+    }
+}
+
 pub fn stats(s: &WebState) -> Reply {
     ok(&s.stats)
 }

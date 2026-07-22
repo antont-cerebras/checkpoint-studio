@@ -208,6 +208,7 @@ fn route_api(s: &WebState, path: &str, q: &Query) -> Reply {
     match path {
         "tree" => handlers::tree(s),
         "files" => handlers::files(s),
+        "filter" => handlers::filter(s, q),
         "stats" => handlers::stats(s),
         "health" => handlers::health(s),
         "check" => handlers::check(s),
