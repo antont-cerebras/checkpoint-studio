@@ -7,6 +7,7 @@
   import { filterQuery } from '../stores/view';
   import { humanCount, humanSize, pyShape } from '../lib/format';
   import Dtype from './Dtype.svelte';
+  import Ref from './Ref.svelte';
 
   interface Family {
     name: string;
@@ -53,7 +54,7 @@
       {#each families as f}
         <div class="frow">
           <span class="c mono">{f.count}</span>
-          <span class="n" title={f.name}>{f.name}</span>
+          <span class="n" title={f.name}><Ref name={f.name} /></span>
           <span class="d">
             {#if f.dtype}<Dtype dtype={f.dtype} bubble={false} />{:else}<span class="dim">varies</span>{/if}
           </span>

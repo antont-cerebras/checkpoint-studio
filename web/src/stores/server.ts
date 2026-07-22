@@ -1,12 +1,38 @@
 // Fetched server DATA: loaded once and cached. The tree backs the main screen;
 // per-tensor data-view results are memoized so re-selecting doesn't refetch.
 
-import { writable } from 'svelte/store';
+import { derived, writable } from 'svelte/store';
 import { api } from '../lib/api';
-import type { HistogramDto, SampleDto, StatsDto, TreeResponse } from '../lib/types';
+import type { HistogramDto, SampleDto, StatsDto, TreeNode, TreeResponse } from '../lib/types';
 
 export const tree = writable<TreeResponse | null>(null);
 export const treeError = writable<string | null>(null);
+
+/** Every tensor name, and every shard basename, in the checkpoint. These back the
+ * universal `<Ref>` link resolver: a name found here is turned into a link to the
+ * tensor-detail or byte-layout screen; anything else stays plain text. */
+export const tensorNames = derived(tree, ($t) => collectNames($t, 'tensor'));
+export const shardNames = derived(tree, ($t) => collectNames($t, 'shard'));
+
+function collectNames(t: TreeResponse | null, want: 'tensor' | 'shard'): Set<string> {
+  const set = new Set<string>();
+  if (!t) return set;
+  const walk = (ns: TreeNode[]) => {
+    for (const n of ns) {
+      if (n.kind === 'tensor') {
+        if (want === 'tensor') set.add(n.info.name);
+        else {
+          const p = n.info.source_path;
+          set.add(p.split('/').pop() || p);
+        }
+      } else if (n.kind === 'group') {
+        walk(n.children);
+      }
+    }
+  };
+  walk(t.tree);
+  return set;
+}
 
 let treeStarted = false;
 export async function ensureTree(): Promise<void> {

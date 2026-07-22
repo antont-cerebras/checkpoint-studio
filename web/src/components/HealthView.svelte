@@ -3,6 +3,7 @@
   import { api } from '../lib/api';
   import { humanCount } from '../lib/format';
   import Spinner from './Spinner.svelte';
+  import Ref from './Ref.svelte';
 
   interface Finding {
     severity: string;
@@ -99,7 +100,7 @@
                 {#each c.findings as f}
                   <li>
                     <span class="badge sm {SEV[f.severity] ?? 'na'}">{(STATUS[SEV[f.severity]] ?? STATUS.na).icon}</span>
-                    <span class="subject">{f.subject}</span>
+                    <Ref name={f.subject} />
                     <span class="fmsg dim">{f.message}</span>
                   </li>
                 {/each}
@@ -120,17 +121,17 @@
       {:else}
         {#each health as h}
           {@const lists = [
-            ['Missing files', h.missing_files, 'fail'],
-            ['Extra files (on disk, not in index)', h.extra_files, 'warn'],
-            ['Missing tensors', h.missing_tensors, 'fail'],
-            ['Extra tensors', h.extra_tensors, 'warn'],
+            ['Missing files', h.missing_files, 'fail', 'file'],
+            ['Extra files (on disk, not in index)', h.extra_files, 'warn', 'file'],
+            ['Missing tensors', h.missing_tensors, 'fail', 'tensor'],
+            ['Extra tensors', h.extra_tensors, 'warn', 'tensor'],
           ]}
-          {#each lists as [heading, items, cls]}
+          {#each lists as [heading, items, cls, refKind]}
             {#if items.length}
               <div class="idxgroup">
                 <div class="idxhead"><span class="badge sm {cls}">{cls === 'fail' ? '✗' : '⚠'}</span> {heading} <span class="dim">({items.length})</span></div>
                 <ul class="idxlist">
-                  {#each items as it}<li class="mono">{it}</li>{/each}
+                  {#each items as it}<li class="mono"><Ref name={it} kind={refKind === 'file' ? 'file' : 'tensor'} /></li>{/each}
                 </ul>
               </div>
             {/if}
@@ -257,9 +258,6 @@
     align-items: baseline;
     gap: 8px;
     padding: 2px 0;
-  }
-  .subject {
-    color: var(--warn);
   }
   .fmsg {
     font-size: 12px;

@@ -4,6 +4,7 @@
   import { humanCount, humanSize } from '../lib/format';
   import Spinner from './Spinner.svelte';
   import Dtype from './Dtype.svelte';
+  import Ref from './Ref.svelte';
 
   interface DtypeStat {
     dtype: string;
@@ -88,8 +89,8 @@
 
     {#if s.largest || s.smallest}
       <section class="extremes">
-        {#if s.largest}<div><span class="dim">Largest tensor</span> <span class="mono">{s.largest.name}</span> <span class="dim">· {humanSize(s.largest.bytes)}</span></div>{/if}
-        {#if s.smallest}<div><span class="dim">Smallest tensor</span> <span class="mono">{s.smallest.name}</span> <span class="dim">· {humanSize(s.smallest.bytes)}</span></div>{/if}
+        {#if s.largest}<div><span class="dim">Largest tensor</span> <Ref name={s.largest.name} kind="tensor" class="mono" /> <span class="dim">· {humanSize(s.largest.bytes)}</span></div>{/if}
+        {#if s.smallest}<div><span class="dim">Smallest tensor</span> <Ref name={s.smallest.name} kind="tensor" class="mono" /> <span class="dim">· {humanSize(s.smallest.bytes)}</span></div>{/if}
       </section>
     {/if}
 
@@ -139,7 +140,7 @@
           <thead><tr><th>shard</th><th>apparent</th><th>allocated</th></tr></thead>
           <tbody>
             {#each shards as sh}
-              <tr><td class="mono">{sh.name}</td><td class="mono">{humanSize(sh.apparent)}</td><td class="mono">{humanSize(sh.allocated)}</td></tr>
+              <tr><td class="mono"><Ref name={sh.name} kind="file" /></td><td class="mono">{humanSize(sh.apparent)}</td><td class="mono">{humanSize(sh.allocated)}</td></tr>
             {/each}
           </tbody>
         </table>
