@@ -25,6 +25,10 @@
   let canvas: HTMLCanvasElement;
   let cell = 4;
   let hover = '';
+  // Live size of the canvas's container, so the heatmap fills the pane (fit-to-box,
+  // square cells, centered) and re-renders on window resize / tab switch.
+  let wrapW = 0;
+  let wrapH = 0;
 
   const MODES: Mode[] = ['overview', 'window', 'edges'];
   const DTYPES = ['', 'f16', 'bf16', 'f32', 'f64', 'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'u4', 'i4'];
@@ -56,12 +60,17 @@
   $: nSlices = data?.slices ?? 1;
 
   // ---- heatmap ----
-  $: if (kind === 'heatmap' && data && canvas) draw(data);
+  $: if (kind === 'heatmap' && data && canvas && wrapW && wrapH) draw(data);
   function draw(d: SampleDto) {
     const r = d.values.length;
     const c = r ? d.values[0].length : 0;
     if (!r || !c) return;
-    cell = Math.max(1, Math.min(24, Math.floor(820 / Math.max(r, c))));
+    // Largest square cell that fits the sampled grid into the container (minus the
+    // 1px border each side), capped so a tiny grid doesn't balloon. The canvas is
+    // centered by its flex wrapper, so it fills the pane's limiting dimension.
+    const availW = Math.max(32, wrapW - 2);
+    const availH = Math.max(32, wrapH - 2);
+    cell = Math.max(1, Math.min(48, Math.floor(Math.min(availW / c, availH / r))));
     canvas.width = c * cell;
     canvas.height = r * cell;
     const ctx = canvas.getContext('2d');
@@ -172,7 +181,9 @@
     </div>
 
     {#if kind === 'heatmap'}
-      <canvas bind:this={canvas} on:mousemove={onMove} on:mouseleave={() => (hover = '')}></canvas>
+      <div class="canvaswrap" bind:clientWidth={wrapW} bind:clientHeight={wrapH}>
+        <canvas bind:this={canvas} on:mousemove={onMove} on:mouseleave={() => (hover = '')}></canvas>
+      </div>
       <div class="scale">
         <span class="mono">{num(data.min)}</span>
         <span class="ramp"></span>
@@ -199,12 +210,19 @@
 </div>
 
 <style>
+  .dv {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
   .controls {
     display: flex;
     align-items: center;
     gap: 12px 16px;
     flex-wrap: wrap;
     margin-bottom: 10px;
+    flex: 0 0 auto;
   }
   .grp {
     display: flex;
@@ -238,10 +256,19 @@
     color: var(--accent);
     margin-left: auto;
   }
+  .canvaswrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
   canvas {
     image-rendering: pixelated;
     border: 1px solid var(--border);
     max-width: 100%;
+    max-height: 100%;
   }
   .scale {
     display: flex;
@@ -249,6 +276,7 @@
     gap: 8px;
     margin-top: 6px;
     font-size: 11px;
+    flex: 0 0 auto;
   }
   .ramp {
     width: 160px;
@@ -257,6 +285,8 @@
     background: linear-gradient(to right, rgb(68, 1, 84), rgb(59, 82, 139), rgb(33, 145, 140), rgb(94, 201, 98), rgb(253, 231, 37));
   }
   .tablewrap {
+    flex: 1 1 auto;
+    min-height: 0;
     overflow: auto;
     max-width: 100%;
     border: 1px solid var(--border);

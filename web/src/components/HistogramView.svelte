@@ -15,6 +15,9 @@
   let err = '';
   let loading = false;
   let hover = '';
+  // Live container size, so the chart fills the pane and re-renders on resize.
+  let wrapW = 0;
+  let wrapH = 0;
 
   $: load(name, bins);
   async function load(n: string, b: number) {
@@ -29,12 +32,14 @@
     loading = false;
   }
 
-  const W = 660;
-  const H = 240;
   const PAD = 28;
 
-  $: if (data && canvas && $theme) draw(data);
+  $: if (data && canvas && $theme && wrapW && wrapH) draw(data);
   function draw(d: HistogramDto) {
+    // Fill the width; grow the height with the pane but cap it so the chart stays a
+    // wide banner rather than an over-tall column (minus the 1px border each side).
+    const W = Math.max(240, Math.floor(wrapW) - 2);
+    const H = Math.max(180, Math.min(480, Math.floor(wrapH) - 2));
     canvas.width = W;
     canvas.height = H;
     const ctx = canvas.getContext('2d');
@@ -64,7 +69,7 @@
   function onMove(e: MouseEvent) {
     if (!data) return;
     const n = data.counts.length || 1;
-    const bw = (W - 2 * PAD) / n;
+    const bw = (canvas.width - 2 * PAD) / n;
     const i = Math.floor((e.offsetX - PAD) / bw);
     if (i < 0 || i >= data.counts.length) {
       hover = '';
@@ -90,7 +95,9 @@
   {:else if err}
     <p class="err">{err}</p>
   {:else if data}
-    <canvas bind:this={canvas} on:mousemove={onMove} on:mouseleave={() => (hover = '')}></canvas>
+    <div class="canvaswrap" bind:clientWidth={wrapW} bind:clientHeight={wrapH}>
+      <canvas bind:this={canvas} on:mousemove={onMove} on:mouseleave={() => (hover = '')}></canvas>
+    </div>
     <div class="axis mono">
       <span>{num(span(data)[0])}</span>
       <span class="dim">{dtype}</span>
@@ -100,12 +107,19 @@
 </div>
 
 <style>
+  .hist {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
   .controls {
     display: flex;
     gap: 14px;
     align-items: center;
     margin-bottom: 8px;
     flex-wrap: wrap;
+    flex: 0 0 auto;
   }
   .controls label {
     display: inline-flex;
@@ -124,17 +138,25 @@
     margin-left: auto;
     color: var(--accent);
   }
+  .canvaswrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    align-items: flex-start; /* don't stretch (distort) the canvas buffer */
+    justify-content: flex-start;
+    overflow: hidden;
+  }
   canvas {
     border: 1px solid var(--border);
-    max-width: 100%;
+    display: block;
   }
   .axis {
     display: flex;
     justify-content: space-between;
-    width: 660px;
-    max-width: 100%;
+    width: 100%;
     font-size: 11px;
     margin-top: 4px;
+    flex: 0 0 auto;
   }
   .err {
     color: var(--danger);
