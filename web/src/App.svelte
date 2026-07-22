@@ -55,7 +55,7 @@
       case 'layout':
         return `› Layout${s.file ? `: ${s.file}` : ''}`;
       case 'stats':
-        return '› Statistics';
+        return '› Stats';
       case 'health':
         return '› Health';
       case 'preview':
@@ -74,6 +74,14 @@
     copyText(text);
   }
 
+  // Focus the search input every time it mounts — not just the first time (the box
+  // is unmounted on non-tree screens and remounted on return, where `autofocus`
+  // wouldn't re-fire), so returning from a result lands the cursor back in the query.
+  function focusOnMount(node: HTMLInputElement) {
+    node.focus();
+    node.select();
+  }
+
   function onKeydown(e: KeyboardEvent) {
     // Let real browser/system chords through.
     if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -89,7 +97,11 @@
     }
 
     // --- search mode: the input is focused; only steal a few keys ---
-    if (get(searching)) {
+    // Only while the tree is showing: once a result opens a detail (or any other
+    // screen), that screen's shortcuts (i/m/v/h …) must win, not type into the
+    // still-live query. The query is preserved, so Backspace lands back on the
+    // filtered tree.
+    if (get(searching) && s.kind === 'tree') {
       if (e.key === 'Escape') {
         e.preventDefault();
         exitSearch();
@@ -167,9 +179,13 @@
         e.preventDefault();
         navigate({ kind: 'files' });
         break;
+      // Accept lower- and upper-case: the footer shows plain `e`/`c`/`l`, so a
+      // Shift requirement would just read as "the feature is broken".
+      case 'e':
       case 'E':
         setAllExpanded(true);
         break;
+      case 'c':
       case 'C':
         setAllExpanded(false);
         break;
@@ -183,6 +199,7 @@
       case 'h':
         navigate({ kind: 'health' });
         break;
+      case 'l':
       case 'L':
       case 'y': // no CLI-command copy in the browser; reuse for layout
         navigate({ kind: 'layout' });
@@ -236,12 +253,11 @@
       <span class="crumb dim">{crumb($screen)}</span>
     {/if}
     <span class="root" title={$tree?.root ?? ''}>{$tree?.root ?? '…'}</span>
-    {#if $searching}
+    {#if $searching && $screen.kind === 'tree'}
       <span class="search">
         /
-        <!-- svelte-ignore a11y-autofocus -->
         <input
-          autofocus
+          use:focusOnMount
           spellcheck="false"
           placeholder="fuzzy filter tensors…"
           bind:value={$search}

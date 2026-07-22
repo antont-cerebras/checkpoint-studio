@@ -17,6 +17,18 @@ export async function ensureTree(): Promise<void> {
   } catch (e) {
     treeError.set(e instanceof Error ? e.message : String(e));
   }
+  // Warm the whole-checkpoint stats in the background (~8 KB, precomputed
+  // server-side) so opening the Stats screen is instant rather than showing a
+  // spinner on first visit. Fire-and-forget: failures surface when StatsView awaits.
+  void cachedCheckpointStats().catch(() => {});
+}
+
+// Whole-checkpoint stats (`/api/stats`): fetched once and reused, so the Stats
+// screen renders immediately on every visit after the first.
+let checkpointStats: Promise<Record<string, unknown>> | null = null;
+export function cachedCheckpointStats(): Promise<Record<string, unknown>> {
+  if (!checkpointStats) checkpointStats = api.stats();
+  return checkpointStats;
 }
 
 // --- per-tensor data-view memo caches (keyed by request) ---

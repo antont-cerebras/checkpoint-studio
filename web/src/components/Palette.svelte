@@ -22,7 +22,7 @@
     { group: 'Go', label: 'Tensor tree', run: () => navigate({ kind: 'tree' }) },
     { group: 'Go', label: 'File browser', run: () => navigate({ kind: 'files' }) },
     { group: 'Go', label: 'Byte layout map', run: () => navigate({ kind: 'layout' }) },
-    { group: 'Go', label: 'Statistics', run: () => navigate({ kind: 'stats' }) },
+    { group: 'Go', label: 'Stats', run: () => navigate({ kind: 'stats' }) },
     { group: 'Go', label: 'Health check', run: () => navigate({ kind: 'health' }) },
     { group: 'Tree', label: 'Expand all groups', run: () => setAllExpanded(true) },
     { group: 'Tree', label: 'Collapse all groups', run: () => setAllExpanded(false) },

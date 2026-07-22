@@ -26,11 +26,11 @@
     { keys: 'Enter', label: 'open', act: activateSelection },
     { keys: 'Tab', label: 'files', act: () => navigate({ kind: 'files' }) },
     { keys: 'Space/:', label: 'commands', act: () => paletteOpen.set(true) },
-    { keys: 'E/C', label: 'expand all', act: () => setAllExpanded(true) },
+    { keys: 'e/c', label: 'expand/collapse all', act: () => setAllExpanded(true) },
     { keys: '/', label: 'search', act: startSearch },
     { keys: 'h', label: 'health', act: () => navigate({ kind: 'health' }) },
     { keys: 's', label: 'stats', act: () => navigate({ kind: 'stats' }) },
-    { keys: 'L', label: 'layout', act: () => navigate({ kind: 'layout' }) },
+    { keys: 'l', label: 'layout', act: () => navigate({ kind: 'layout' }) },
   ];
 
   const detailHints: Hint[] = [

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api } from '../lib/api';
+  import { cachedCheckpointStats } from '../stores/server';
   import { humanCount, humanSize } from '../lib/format';
   import Spinner from './Spinner.svelte';
   import Dtype from './Dtype.svelte';
@@ -43,7 +43,7 @@
 
   onMount(async () => {
     try {
-      s = (await api.stats()) as unknown as Stats;
+      s = (await cachedCheckpointStats()) as unknown as Stats;
     } catch (e) {
       err = e instanceof Error ? e.message : String(e);
     }
@@ -59,7 +59,7 @@
   {#if err}
     <p class="err">{err}</p>
   {:else if !s}
-    <Spinner label="computing stats…" />
+    <Spinner label="loading stats…" />
   {:else}
     <div class="cards">
       <div class="card"><span class="k">Parameters</span><span class="v">{humanCount(s.params)}</span></div>
