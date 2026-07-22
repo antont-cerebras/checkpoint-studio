@@ -434,6 +434,13 @@ struct ExploreArgs {
     name: Vec<String>,
 
     #[arg(
+        long = "filter",
+        value_name = "QUERY",
+        help = "Filter --print-tree / --print-tensors by a rich query: facets AND, `!` negates, commas OR. e.g. 'dtype:F16,BF16 shape:(_,4096) size:>1MiB rank:>=3 name:re:^model\\.layers name:q_proj shard:00001'"
+    )]
+    filter: Option<String>,
+
+    #[arg(
         long = "ssh-read",
         value_name = "[USER@]HOST",
         help = "Read a remote checkpoint's structure over SSH on [USER@]HOST (which has the access): an s3:// checkpoint, or a path to a safetensors directory/file on that host. Only the tensor metadata (names/dtypes/shapes) leaves the host — data/secrets stay remote. Metadata-only"
@@ -2044,6 +2051,9 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
     if let Some(host) = args.ssh_read {
         let venv = args.ssh_venv.unwrap_or_else(|| "~/venv".to_string());
         explorer.set_remote_read(host, venv);
+    }
+    if let Some(query) = args.filter.as_deref() {
+        explorer.set_tensor_filter(tensorfilter::TensorFilter::parse(query)?);
     }
     // One-shot exports: print the tree / tensor list and exit (honour --format,
     // -v, and the --name filter), before any interactive or --plain rendering.

@@ -527,6 +527,16 @@ impl Session {
         self.stats = None;
     }
 
+    /// Keep only the tensors passing `keep` — a whole-[`TensorInfo`] predicate, for
+    /// the rich tensor filter ([`crate::tensorfilter`]). Metadata is dropped (the
+    /// filter is tensor-focused, matching the web filter's tensor-only results).
+    pub fn retain_tensors<F: FnMut(&TensorInfo) -> bool>(&mut self, mut keep: F) {
+        self.tensors.retain(|t| keep(t));
+        self.metadata.clear();
+        self.total_parameters = self.tensors.iter().map(|t| t.num_elements).sum();
+        self.stats = None;
+    }
+
     /// The serializable model (local reads only), for serialization / reports.
     pub fn model(&self) -> Option<&Checkpoint> {
         self.model.as_ref()

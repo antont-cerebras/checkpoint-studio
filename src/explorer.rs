@@ -3883,6 +3883,9 @@ pub struct Explorer {
     /// scroll, search) — owned by the kernel; the interactive tree screen drives
     /// and renders from it.
     tree_state: crate::kernel::TreeState,
+    /// A rich tensor filter (`--filter`), applied once at load to narrow the
+    /// session to matching tensors (currently for the `--print-*` exports).
+    tensor_filter: Option<crate::tensorfilter::TensorFilter>,
     /// Transient "✓ Copied …" confirmation shown after a copy shortcut
     /// (`c`/`f`/`n`) as a bottom-line overlay — leaving the path/name in the
     /// status bar intact — paired with the time it was set so it clears on its
@@ -4002,6 +4005,7 @@ impl Explorer {
             remote: None,
             full_loaded: false,
             tree_state: crate::kernel::TreeState::default(),
+            tensor_filter: None,
             copied_flash: None,
             terminal: None,
             clickable: RefCell::new(Vec::new()),
@@ -5772,6 +5776,7 @@ impl Explorer {
     ) -> Result<()> {
         self.load_quiet()?;
         self.apply_name_filter(filter);
+        self.apply_tensor_filter();
         let out = match format {
             TreeFormat::Text => self.tree_text(detail),
             TreeFormat::Json => self.tree_json(detail),
@@ -5789,6 +5794,7 @@ impl Explorer {
     ) -> Result<()> {
         self.load_quiet()?;
         self.apply_name_filter(filter);
+        self.apply_tensor_filter();
         let out = match format {
             TreeFormat::Text => self.tensors_text(detail),
             TreeFormat::Json => self.tensors_json(detail),
@@ -5804,6 +5810,7 @@ impl Explorer {
     pub fn print_view(&mut self, filter: &crate::filter::NameFilter) -> Result<()> {
         self.load_quiet()?;
         self.apply_name_filter(filter);
+        self.apply_tensor_filter();
         let vm = crate::kernel::ViewModel::from_tree(&self.root_label(), &self.tree_state);
         emit_stdout(&serde_json::to_string_pretty(&vm)?)
     }
@@ -5817,6 +5824,27 @@ impl Explorer {
         }
         if let Some(session) = self.session.as_mut() {
             session.retain_named(|name| filter.matches(name));
+        }
+        self.build_tree();
+    }
+
+    /// Set the rich tensor filter (`--filter`), applied by [`Self::apply_tensor_filter`].
+    pub fn set_tensor_filter(&mut self, filter: crate::tensorfilter::TensorFilter) {
+        self.tensor_filter = Some(filter);
+    }
+
+    /// Narrow the session to the tensors passing the `--filter` query, then rebuild
+    /// the tree — the tensor-facet analogue of [`Self::apply_name_filter`], composing
+    /// with it. A no-op when no (active) filter is set.
+    fn apply_tensor_filter(&mut self) {
+        let Some(filter) = self.tensor_filter.clone() else {
+            return;
+        };
+        if !filter.is_active() {
+            return;
+        }
+        if let Some(session) = self.session.as_mut() {
+            session.retain_tensors(|t| filter.matches(t));
         }
         self.build_tree();
     }
