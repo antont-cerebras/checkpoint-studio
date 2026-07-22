@@ -44,6 +44,7 @@ function qs(params: Record<string, string | number | undefined>): string {
 export const api = {
   tree: () => getJson<TreeResponse>('/api/tree'),
   files: () => getJson<FileNode>('/api/files'),
+  filter: (q: string) => getJson<{ active: boolean; names?: string[] }>(`/api/filter?q=${enc(q)}`),
   stats: () => getJson<Record<string, unknown>>('/api/stats'),
   health: () => getJson<unknown[]>('/api/health'),
   check: () => getJson<Record<string, unknown> | null>('/api/check'),

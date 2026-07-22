@@ -20,10 +20,10 @@
     startSearch,
     exitSearch,
     setTab,
-    filters,
-    filterLabel,
+    filterQuery,
+    filterError,
+    filterMatches,
     clearFilter,
-    removeFilter,
     paletteOpen,
   } from './stores/view';
   import TreeView from './components/TreeView.svelte';
@@ -79,6 +79,13 @@
   function focusOnMount(node: HTMLInputElement) {
     node.focus();
     node.select();
+  }
+
+  // While typing a filter query, keep keystrokes out of the global tree shortcuts
+  // (so `h`/`s`/`/`/`e` type into the box instead of navigating). Escape blurs.
+  function filterKeydown(e: KeyboardEvent) {
+    e.stopPropagation();
+    if (e.key === 'Escape') (e.currentTarget as HTMLInputElement).blur();
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -275,19 +282,28 @@
     </select>
   </header>
 
-  {#if $filters.length}
-    <div class="filterbar">
-      <span class="flabel">Filters</span>
-      {#each $filters as f, i}
-        <span class="fchip">
-          {filterLabel(f)}
-          <button class="x" title="Remove" aria-label="Remove filter" on:click={() => removeFilter(i)}>×</button>
-        </span>
-      {/each}
-      <span class="dim">· {$visibleRows.length} tensors</span>
-      <button class="clear" on:click={clearFilter}>clear all</button>
-    </div>
-  {/if}
+  <div class="filterbar" class:err={$filterError}>
+    <span
+      class="flabel"
+      title="dtype:F16,BF16  shape:(6,_,42)  dim:4096  rank:>=3  size:1MiB..1GiB  params:>1M  name:re:^model\.  shard:00001  ·  space = AND, ! = not, comma = OR"
+    >⌕ filter</span>
+    <input
+      class="fq"
+      spellcheck="false"
+      autocomplete="off"
+      placeholder="dtype:F16  shape:(_,4096)  size:>1MiB  name:re:…   (space = AND, ! = not)"
+      bind:value={$filterQuery}
+      on:keydown={filterKeydown}
+    />
+    {#if $filterError}
+      <span class="ferr" title={$filterError}>⚠ {$filterError}</span>
+    {:else if $filterMatches}
+      <span class="dim">{$visibleRows.length} match{$visibleRows.length === 1 ? '' : 'es'}</span>
+    {/if}
+    {#if $filterQuery}
+      <button class="clear" on:click={clearFilter}>clear</button>
+    {/if}
+  </div>
 
   <main>
     {#if $treeError}
@@ -377,38 +393,36 @@
     align-items: center;
     gap: 10px;
     padding: 5px 14px;
-    background: color-mix(in srgb, var(--accent) 12%, var(--bg-panel));
+    background: var(--bg-panel);
     border-bottom: 1px solid var(--border);
     font-size: 12px;
   }
+  .filterbar.err {
+    background: color-mix(in srgb, var(--danger) 10%, var(--bg-panel));
+  }
   .flabel {
+    flex: 0 0 auto;
     color: var(--fg-dim);
     text-transform: uppercase;
     letter-spacing: 0.05em;
     font-size: 11px;
+    cursor: help;
   }
-  .fchip {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    color: var(--accent);
+  .fq {
+    flex: 1 1 auto;
+    min-width: 0;
     font-family: ui-monospace, monospace;
-    background: color-mix(in srgb, var(--accent) 16%, transparent);
-    border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
-    border-radius: 4px;
-    padding: 0 4px 0 8px;
+    font-size: 12px;
   }
-  .fchip .x {
-    background: none;
-    border: none;
-    color: inherit;
-    cursor: pointer;
-    font-size: 14px;
-    line-height: 1;
-    padding: 0 2px;
+  .ferr {
+    flex: 0 1 auto;
+    color: var(--danger);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .clear {
-    margin-left: auto;
+    flex: 0 0 auto;
     background: none;
     border: 1px solid var(--border);
     border-radius: 4px;

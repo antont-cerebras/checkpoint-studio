@@ -4,6 +4,7 @@
 // live here so the global key handler (App.svelte) and the views share them.
 
 import { derived, get, writable } from 'svelte/store';
+import { api } from '../lib/api';
 import { flatten, nodeId, type Row } from '../lib/flatten';
 import { searchRows } from '../lib/search';
 import type { TreeNode } from '../lib/types';
@@ -82,57 +83,65 @@ export const selectedId = writable<string | null>(null);
 export const searching = writable<boolean>(false);
 export const search = writable<string>('');
 
-/** Active tensor facet filters (from clicking dtype / shape / dimension badges).
- * They stack — a tensor must match ALL of them (AND). */
-export type Filter =
-  | { kind: 'dtype'; value: string }
-  | { kind: 'shape'; dims: number[] }
-  | { kind: 'dim'; value: number };
-export const filters = writable<Filter[]>([]);
+/** The tensor filter as a text query (the `tensorfilter` grammar), matched
+ * server-side by the one shared matcher — so web and TUI filter identically.
+ * `filterMatches` is the set of matching tensor names (null = inactive → show
+ * all); `filterError` holds a parse error to show inline. */
+export const filterQuery = writable<string>('');
+export const filterMatches = writable<Set<string> | null>(null);
+export const filterError = writable<string | null>(null);
 
-function matchesFilter(shape: number[], dtype: string, f: Filter): boolean {
-  if (f.kind === 'dtype') return dtype === f.value;
-  if (f.kind === 'dim') return shape.includes(f.value);
-  return shape.length === f.dims.length && shape.every((d, i) => d === f.dims[i]);
-}
-
-function sameFilter(a: Filter, b: Filter): boolean {
-  if (a.kind === 'dtype' && b.kind === 'dtype') return a.value === b.value;
-  if (a.kind === 'dim' && b.kind === 'dim') return a.value === b.value;
-  if (a.kind === 'shape' && b.kind === 'shape')
-    return a.dims.length === b.dims.length && a.dims.every((d, i) => d === b.dims[i]);
-  return false;
-}
-
-export function filterLabel(f: Filter): string {
-  if (f.kind === 'dtype') return `dtype ${f.value}`;
-  if (f.kind === 'dim') return `dim ${f.value}`;
-  return `shape ${f.dims.join('×') || 'scalar'}`;
-}
+// Debounced fetch: whenever the query changes, ask the server which tensors pass.
+// A sequence guard drops stale responses so fast typing can't desync the view.
+let filterTimer: ReturnType<typeof setTimeout> | undefined;
+let filterSeq = 0;
+filterQuery.subscribe((q) => {
+  clearTimeout(filterTimer);
+  const query = q.trim();
+  if (!query) {
+    filterMatches.set(null);
+    filterError.set(null);
+    return;
+  }
+  filterTimer = setTimeout(async () => {
+    const seq = ++filterSeq;
+    try {
+      const res = await api.filter(query);
+      if (seq !== filterSeq) return; // superseded by a newer query
+      filterMatches.set(res.active ? new Set(res.names ?? []) : null);
+      filterError.set(null);
+    } catch (e) {
+      if (seq !== filterSeq) return;
+      filterError.set(e instanceof Error ? e.message : String(e));
+    }
+  }, 200);
+});
 
 /** Command palette (Space / `:`) open state. */
 export const paletteOpen = writable<boolean>(false);
 
-/** The flattened rows — fold-aware, or a flat list while searching / dtype-filtering.
- * Shared by TreeView (render) and the key handler (cursor movement). */
+/** The flattened rows — fold-aware, or a flat list while filtering / searching.
+ * Shared by TreeView (render) and the key handler (cursor movement). A filter
+ * (server-matched) takes precedence over an in-progress fuzzy search. */
 export const visibleRows = derived(
-  [treeData, expanded, search, searching, filters],
-  ([$t, $exp, $q, $searching, $f]) => {
+  [treeData, expanded, search, searching, filterMatches],
+  ([$t, $exp, $q, $searching, $matches]) => {
     if (!$t) return [] as Row[];
+    // An in-progress fuzzy search wins; otherwise a set filter; otherwise the tree.
     if ($searching && $q.trim()) return searchRows($t.tree, $q.trim());
-    if ($f.length) return filterRows($t.tree, $f);
+    if ($matches) return matchRows($t.tree, $matches);
     return flatten($t.tree, $exp);
   },
 );
 
-/** Flat list of tensor rows matching ALL active facet filters. */
-function filterRows(nodes: TreeNode[], fs: Filter[]): Row[] {
+/** Flat list of the tensor rows whose names the server said pass the filter. */
+function matchRows(nodes: TreeNode[], matches: Set<string>): Row[] {
   const out: Row[] = [];
   const walk = (ns: TreeNode[], parentId: string) => {
     for (const n of ns) {
       const id = nodeId(n, parentId);
       if (n.kind === 'group') walk(n.children, id);
-      else if (n.kind === 'tensor' && fs.every((f) => matchesFilter(n.info.shape, n.info.dtype, f)))
+      else if (n.kind === 'tensor' && matches.has(n.info.name))
         out.push({ id, node: n, depth: 0, hasChildren: false });
     }
   };
@@ -140,27 +149,27 @@ function filterRows(nodes: TreeNode[], fs: Filter[]): Row[] {
   return out;
 }
 
-/** Add a filter to the active set (deduped, AND-ed with the rest). */
-function addFilter(f: Filter): void {
-  filters.update((cur) => (cur.some((x) => sameFilter(x, f)) ? cur : [...cur, f]));
+/** Append a filter term (from a badge click), space-joined and deduped. */
+export function addFilterTerm(term: string): void {
+  filterQuery.update((q) => {
+    const cur = q.trim();
+    return ` ${cur} `.includes(` ${term} `) ? cur : cur ? `${cur} ${term}` : term;
+  });
   searching.set(false);
   search.set('');
   navigate({ kind: 'tree' });
 }
 export function filterByDtype(value: string): void {
-  addFilter({ kind: 'dtype', value });
+  addFilterTerm(`dtype:${value}`);
 }
 export function filterByShape(dims: number[]): void {
-  addFilter({ kind: 'shape', dims });
+  addFilterTerm(`shape:(${dims.join(',')})`);
 }
 export function filterByDim(value: number): void {
-  addFilter({ kind: 'dim', value });
-}
-export function removeFilter(index: number): void {
-  filters.update((cur) => cur.filter((_, i) => i !== index));
+  addFilterTerm(`dim:${value}`);
 }
 export function clearFilter(): void {
-  filters.set([]);
+  filterQuery.set('');
 }
 
 // Expand the synthetic root node once the tree first loads, so its children show.
