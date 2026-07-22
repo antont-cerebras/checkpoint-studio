@@ -45,6 +45,7 @@
   import { theme } from './stores/theme';
   import { copyText } from './lib/clipboard';
   import type { Screen } from './stores/view';
+  import type { TreeNode } from './lib/types';
 
   let builderOpen = false;
 
@@ -80,6 +81,34 @@
     copyText(text);
   }
 
+  // Cmd/Ctrl-A on the tensor list copies the (possibly filtered) tensor names — the
+  // list is virtualized, so a text selection would only cover the rendered slice;
+  // copying the full visible set is the useful equivalent. A brief toast confirms.
+  let listFlash = '';
+  let listFlashTimer: ReturnType<typeof setTimeout>;
+  function copyTensorList() {
+    const names: string[] = [];
+    if (get(searching) || get(filterMatches) !== null) {
+      // Flat view: exactly the matched/searched tensors (the "filtered list").
+      for (const r of get(visibleRows)) if (r.node.kind === 'tensor') names.push(r.node.info.name);
+    } else {
+      // Plain tree: every tensor, regardless of which groups are expanded.
+      const t = get(tree);
+      const walk = (nodes: TreeNode[]) => {
+        for (const n of nodes) {
+          if (n.kind === 'tensor') names.push(n.info.name);
+          else if (n.kind === 'group') walk(n.children);
+        }
+      };
+      if (t) walk(t.tree);
+    }
+    if (!names.length) return;
+    copyText(names.join('\n'));
+    listFlash = `Copied ${names.length} tensor name${names.length === 1 ? '' : 's'}`;
+    clearTimeout(listFlashTimer);
+    listFlashTimer = setTimeout(() => (listFlash = ''), 1600);
+  }
+
   // Focus the search input every time it mounts — not just the first time (the box
   // is unmounted on non-tree screens and remounted on return, where `autofocus`
   // wouldn't re-fire), so returning from a result lands the cursor back in the query.
@@ -96,6 +125,18 @@
   }
 
   function onKeydown(e: KeyboardEvent) {
+    // Cmd/Ctrl-A on the tensor list → copy the (filtered) tensor names, not the
+    // whole page's text. Elsewhere (or while typing) leave the browser default.
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === 'a' || e.key === 'A')) {
+      const tgt = e.target as HTMLElement | null;
+      const typing =
+        !!tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'SELECT' || tgt.tagName === 'TEXTAREA');
+      if (get(screen).kind === 'tree' && !typing) {
+        e.preventDefault();
+        copyTensorList();
+      }
+      return;
+    }
     // Let real browser/system chords through.
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     // The palette owns the keyboard while open (its input handles keys).
@@ -369,6 +410,7 @@
   <StatusBar />
   <Footer />
   {#if $paletteOpen}<Palette />{/if}
+  {#if listFlash}<div class="listflash">✓ {listFlash}</div>{/if}
 </div>
 
 <style>
@@ -536,5 +578,19 @@
   }
   .loading {
     padding: 24px;
+  }
+  .listflash {
+    position: fixed;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 40;
+    background: var(--bg-elev);
+    color: var(--fg);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 13px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
   }
 </style>
