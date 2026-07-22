@@ -36,7 +36,6 @@
   import StatusBar from './components/StatusBar.svelte';
   import Footer from './components/Footer.svelte';
   import Spinner from './components/Spinner.svelte';
-  import VaultBoy from './components/VaultBoy.svelte';
   import Palette from './components/Palette.svelte';
   import { theme } from './stores/theme';
   import { copyText } from './lib/clipboard';
@@ -314,7 +313,6 @@
 
   <StatusBar />
   <Footer />
-  {#if $theme === 'fallout'}<VaultBoy />{/if}
   {#if $paletteOpen}<Palette />{/if}
 </div>
 
