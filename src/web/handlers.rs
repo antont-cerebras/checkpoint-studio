@@ -25,6 +25,20 @@ pub fn err(status: u16, msg: impl Into<String>) -> Reply {
     (status, json!({ "error": msg.into() }))
 }
 
+/// Data-value views need the tensor bytes locally; a remote (`--ssh-read`) source
+/// only carries its structure. Returns a friendly 400 for a remote tensor (so the
+/// UI shows a clear note instead of a cryptic open-file failure), else `None`.
+fn require_local(t: &TensorInfo) -> Option<Reply> {
+    crate::remote::is_remote_source(&t.source_path).then(|| {
+        err(
+            400,
+            "This checkpoint was read remotely (--ssh-read): only its structure is available. \
+             Data views (heatmap, values, histogram, statistics) need the file locally — copy \
+             the checkpoint down to preview its values.",
+        )
+    })
+}
+
 // ---- metadata / derived-view routes (served from precomputed state) ----
 
 pub fn tree(s: &WebState) -> Reply {
@@ -130,6 +144,9 @@ pub fn tensor_stats(s: &WebState, q: &Query) -> Reply {
         Ok(t) => t,
         Err(e) => return e,
     };
+    if let Some(e) = require_local(t) {
+        return e;
+    }
     let view = match view_of(q) {
         Ok(v) => v,
         Err(e) => return e,
@@ -145,6 +162,9 @@ pub fn tensor_sample(s: &WebState, q: &Query) -> Reply {
         Ok(t) => t,
         Err(e) => return e,
     };
+    if let Some(e) = require_local(t) {
+        return e;
+    }
     let view = match view_of(q) {
         Ok(v) => v,
         Err(e) => return e,
@@ -177,6 +197,9 @@ pub fn tensor_histogram(s: &WebState, q: &Query) -> Reply {
         Ok(t) => t,
         Err(e) => return e,
     };
+    if let Some(e) = require_local(t) {
+        return e;
+    }
     let view = match view_of(q) {
         Ok(v) => v,
         Err(e) => return e,

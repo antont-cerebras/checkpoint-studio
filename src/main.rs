@@ -674,7 +674,7 @@ enum Command {
     /// it from another machine's browser with no tunnel. Local checkpoints only.
     Web {
         /// The checkpoint to serve — a file, directory, or glob (shards merge into
-        /// one checkpoint).
+        /// one checkpoint). With --ssh-read, an `s3://…` URI or a remote path.
         #[arg(value_name = "PATH", required = true)]
         paths: Vec<PathBuf>,
         /// Recursively search directories for checkpoint files.
@@ -690,6 +690,15 @@ enum Command {
         /// Skip parsing model.safetensors.index.json for the health check.
         #[arg(long = "no-health-check")]
         no_health_check: bool,
+        /// Serve a remote checkpoint: read its structure over SSH on HOST (metadata
+        /// only — data-value views need the file locally). PATH is then an `s3://…`
+        /// URI or a remote path.
+        #[arg(long = "ssh-read", value_name = "[USER@]HOST")]
+        ssh_read: Option<String>,
+        /// The Python venv on the SSH host that has `cerebras.pytorch` (for reading
+        /// s3:// cstorch checkpoints). Defaults to ~/venv.
+        #[arg(long = "ssh-venv", value_name = "PATH")]
+        ssh_venv: Option<String>,
     },
 }
 
@@ -878,7 +887,17 @@ fn main() -> Result<()> {
             port,
             host,
             no_health_check,
-        }) => run_web(&paths, recursive, no_health_check, host, port),
+            ssh_read,
+            ssh_venv,
+        }) => run_web(
+            &paths,
+            recursive,
+            no_health_check,
+            host,
+            port,
+            ssh_read,
+            ssh_venv,
+        ),
         None => run_explore(cli.explore),
     }
 }
@@ -1763,13 +1782,33 @@ fn split_scp(s: &str) -> Option<(String, String)> {
 /// `web` subcommand: read a local checkpoint once and serve the web UI + JSON API,
 /// blocking until Ctrl-C. The server supplies the data; the browser owns the view
 /// state (see `crate::web`).
+#[allow(clippy::too_many_arguments)] // a CLI entry point; each arg is a distinct flag
 fn run_web(
     paths: &[PathBuf],
     recursive: bool,
     no_health_check: bool,
     host: std::net::IpAddr,
     port: u16,
+    ssh_read: Option<String>,
+    ssh_venv: Option<String>,
 ) -> Result<()> {
+    // Remote: read the structure over SSH (metadata only) into the same model a
+    // local read produces, then serve it. No local files/index, so the on-disk
+    // stats and data-value views (heatmap/values/histogram/scan) are unavailable —
+    // the tree, per-tensor info, stats, and layout are.
+    if let Some(rhost) = ssh_read {
+        let src = match paths {
+            [one] => one.to_string_lossy().into_owned(),
+            _ => anyhow::bail!(
+                "web --ssh-read serves a single remote checkpoint; give one s3://… URI or remote path"
+            ),
+        };
+        let venv = ssh_venv.unwrap_or_else(|| "~/venv".to_string());
+        let remote = crate::remote::RemoteRead::new(rhost, venv);
+        let model = remote.read_checkpoint(&src)?;
+        let state = std::sync::Arc::new(web::WebState::build(model, &[], &[]));
+        return web::serve(state, host, port);
+    }
     let (files, index_specs) = collect_safetensors_files(paths, recursive, no_health_check)?;
     if files.is_empty() {
         anyhow::bail!("No checkpoint files found in the specified paths.");
@@ -1982,12 +2021,16 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
     // — a CLI frontend reading the kernel's model directly (the "serializable into
     // JSON" contract). Local only for now; the remote reader fills the model next.
     if args.print_model {
-        if args.ssh_read.is_some() {
-            anyhow::bail!(
-                "--print-model is local-only for now (remote --ssh-read model dump is pending)"
-            );
-        }
-        let model = readers::read_local(&files)?;
+        let model = if let Some(host) = args.ssh_read.as_ref() {
+            let venv = args
+                .ssh_venv
+                .clone()
+                .unwrap_or_else(|| "~/venv".to_string());
+            crate::remote::RemoteRead::new(host.clone(), venv)
+                .read_checkpoint(&files[0].to_string_lossy())?
+        } else {
+            readers::read_local(&files)?
+        };
         println!("{}", serde_json::to_string_pretty(&model)?);
         return Ok(());
     }

@@ -157,6 +157,21 @@ impl RemoteRead {
         Ok((rc.tensors, rc.metadata, config, rc.disk, rc.health))
     }
 
+    /// Read a remote checkpoint's structure into the central [`Checkpoint`] model —
+    /// the same model [`crate::readers::read_local`] produces — so the web server
+    /// and `--print-model` can serve a remote source too. Metadata-only: tensors,
+    /// `__metadata__`, and `config.json` come over SSH; there are no local files,
+    /// index, or byte data (so on-disk stats, the file browser, and data-value
+    /// views are unavailable — the structure, tree, layout, and per-tensor info are).
+    /// Tensors are grouped by their stamped shard path: one shard for an `s3://`
+    /// cstorch checkpoint, one per file for a remote safetensors directory.
+    pub fn read_checkpoint(&self, src: &str) -> Result<crate::model::Checkpoint> {
+        let (tensors, metadata, config, _disk, _health) = self.fetch_with_config(src)?;
+        Ok(assemble_remote_checkpoint(
+            &self.host, src, tensors, metadata, config,
+        ))
+    }
+
     /// Fetch + parse the remote `config.json` for `src` over an already-open
     /// session. `None` for `s3://` (no HF config) or on any read/parse failure —
     /// the config check then reports `n/a` rather than erroring the whole load.
@@ -866,6 +881,65 @@ fn parse_s3_meta(v: &serde_json::Value) -> S3Meta {
     S3Meta { objects, warnings }
 }
 
+/// Assemble a remote read's tensors/metadata/config into the central
+/// [`Checkpoint`](crate::model::Checkpoint) model. Pure (no I/O) so it's unit-tested
+/// without a live SSH host: groups tensors by their stamped `source_path` into one
+/// [`ShardHeader`](crate::model::ShardHeader) each (one shard for an `s3://`
+/// checkpoint, one per file for a remote safetensors dir), first-seen order;
+/// `__metadata__` (unstamped) rides on the first shard. No local files/index/bytes.
+fn assemble_remote_checkpoint(
+    host: &str,
+    src: &str,
+    tensors: Vec<TensorInfo>,
+    mut metadata: Vec<MetadataInfo>,
+    config: Option<crate::config::ModelConfig>,
+) -> crate::model::Checkpoint {
+    use crate::model::{Checkpoint, ShardHeader, Source};
+    let source = if src.starts_with("s3://") {
+        Source::S3 {
+            uri: src.to_string(),
+        }
+    } else {
+        Source::Sftp {
+            host: host.to_string(),
+            root: src.to_string(),
+        }
+    };
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<TensorInfo>> = HashMap::new();
+    for t in tensors {
+        let p = t.source_path.clone();
+        if !groups.contains_key(&p) {
+            order.push(p.clone());
+        }
+        groups.entry(p).or_default().push(t);
+    }
+    let shards: Vec<ShardHeader> = order
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| ShardHeader {
+            tensors: groups.remove(&p).unwrap_or_default(),
+            metadata: if i == 0 {
+                std::mem::take(&mut metadata)
+            } else {
+                Vec::new()
+            },
+            path: p,
+            total_len: 0,
+            header_len: 0,
+        })
+        .collect();
+    Checkpoint {
+        source,
+        root: src.to_string(),
+        files: Vec::new(),
+        shards,
+        config,
+        index: Vec::new(),
+        s3: None,
+    }
+}
+
 /// Map a torch dtype string (`torch.float16`) to the display name used elsewhere
 /// (`F16`); unknown types pass through uppercased.
 fn map_dtype(torch: &str) -> String {
@@ -1096,6 +1170,50 @@ mod tests {
         assert_eq!(t[0].size_bytes, 48);
         assert_eq!(t[0].source_path, "s3://bucket/ckpt");
         assert_eq!(t[1].dtype, "I32");
+    }
+
+    #[test]
+    fn assembles_s3_checkpoint_into_one_shard() {
+        let ts = vec![tensor("a"), tensor("b")]; // both carry source_path "h:/p"
+        let ck = assemble_remote_checkpoint(
+            "lab@host",
+            "s3://bucket/ckpt",
+            ts,
+            vec![meta("format")],
+            None,
+        );
+        assert!(matches!(ck.source, crate::model::Source::S3 { .. }));
+        assert_eq!(ck.root, "s3://bucket/ckpt");
+        assert!(ck.files.is_empty() && ck.index.is_empty() && ck.s3.is_none());
+        // All tensors share one source_path → a single shard, carrying the metadata.
+        assert_eq!(ck.shards.len(), 1);
+        assert_eq!(ck.shards[0].tensors.len(), 2);
+        assert_eq!(ck.shards[0].metadata.len(), 1);
+        assert_eq!(ck.tensors().count(), 2);
+    }
+
+    #[test]
+    fn assembles_sftp_dir_into_one_shard_per_file() {
+        let mk = |name: &str, path: &str| {
+            let mut t = tensor(name);
+            t.source_path = path.to_string();
+            t
+        };
+        // Two shard files, tensors interleaved — grouping is by source_path, and
+        // metadata rides on the first shard only.
+        let ts = vec![
+            mk("a", "host:/ckpt/shard-0.safetensors"),
+            mk("b", "host:/ckpt/shard-1.safetensors"),
+            mk("c", "host:/ckpt/shard-0.safetensors"),
+        ];
+        let ck = assemble_remote_checkpoint("host", "/ckpt", ts, vec![meta("format")], None);
+        assert!(matches!(ck.source, crate::model::Source::Sftp { .. }));
+        assert_eq!(ck.shards.len(), 2);
+        assert_eq!(ck.shards[0].path, "host:/ckpt/shard-0.safetensors");
+        assert_eq!(ck.shards[0].tensors.len(), 2); // a, c
+        assert_eq!(ck.shards[1].tensors.len(), 1); // b
+        assert_eq!(ck.shards[0].metadata.len(), 1);
+        assert!(ck.shards[1].metadata.is_empty());
     }
 
     #[test]
