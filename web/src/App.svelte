@@ -114,6 +114,10 @@
       } else if (e.key === 'Enter') {
         e.preventDefault();
         activateSelection();
+      } else if (e.key === '/') {
+        // Already searching — swallow `/` instead of inserting a literal slash
+        // into the query (matches the TUI, which ignores it).
+        e.preventDefault();
       }
       return; // everything else types into the search box
     }

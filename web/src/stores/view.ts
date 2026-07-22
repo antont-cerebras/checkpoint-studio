@@ -175,10 +175,17 @@ treeData.subscribe((t) => {
 
 // ---- navigation (URL hash = source of truth; browser back/forward just work) ----
 
-export function navigate(s: Screen): void {
+export function navigate(s: Screen, replace = false): void {
   const h = `#${screenToHash(s)}`;
-  if (location.hash !== h) location.hash = h; // pushes a history entry
-  screen.set(s); // optimistic (hashchange will confirm)
+  if (replace) {
+    // Replace the current entry (no new history) — for view-state changes within a
+    // screen, like switching detail tabs, so Back/Esc leaves the screen in one step
+    // instead of walking tab history. replaceState doesn't fire hashchange.
+    history.replaceState(history.state, '', h);
+  } else if (location.hash !== h) {
+    location.hash = h; // pushes a history entry (hashchange also confirms the store)
+  }
+  screen.set(s); // optimistic; the hashchange listener confirms on the push path
 }
 export function back(): void {
   history.back();
@@ -199,7 +206,9 @@ export function openFile(path: string, name: string, fileKind: string): void {
 }
 export function setTab(tab: DataTab): void {
   const s = get(screen);
-  if (s.kind === 'detail') navigate({ ...s, tab });
+  // A tab is view state within the detail, not a navigation step: replace the URL
+  // so Esc / Back leaves the detail in one press from any tab (still deep-linkable).
+  if (s.kind === 'detail') navigate({ ...s, tab }, true);
 }
 
 // ---- tree cursor movement (mirrors kernel::TreeState nav) ----
