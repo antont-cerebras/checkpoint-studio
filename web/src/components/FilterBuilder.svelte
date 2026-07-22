@@ -203,6 +203,11 @@
     fields = fields;
     commit();
   }
+  function toggleNeg(key: keyof Neg) {
+    fields.neg[key] = !fields.neg[key];
+    fields = fields;
+    commit();
+  }
 
   // Move keyboard focus into the builder on open, and keep its keystrokes from
   // triggering the tree's global shortcuts.
@@ -214,7 +219,7 @@
 <!-- svelte-ignore a11y-no-static-element-interactions -->
 <div class="builder" on:keydown={(e) => e.stopPropagation()}>
   <div class="row">
-    <label class="not"><input type="checkbox" bind:checked={fields.neg.dtype} on:change={commit} title="negate" /></label>
+    <button type="button" class="neg" class:on={fields.neg.dtype} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('dtype')}>not</button>
     <span class="k">dtype</span>
     <div class="chips">
       {#each present as d}
@@ -226,7 +231,7 @@
   </div>
 
   <div class="row">
-    <label class="not"><input type="checkbox" bind:checked={fields.neg.name} on:change={commit} title="negate" /></label>
+    <button type="button" class="neg" class:on={fields.neg.name} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('name')}>not</button>
     <span class="k">name</span>
     <select bind:value={fields.nameMode} on:change={commit} aria-label="name match mode">
       <option value="contains">contains</option>
@@ -237,27 +242,27 @@
   </div>
 
   <div class="row">
-    <label class="not"><input type="checkbox" bind:checked={fields.neg.shape} on:change={commit} title="negate" /></label>
+    <button type="button" class="neg" class:on={fields.neg.shape} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('shape')}>not</button>
     <span class="k">shape</span>
     <input class="v" spellcheck="false" placeholder="6,_,42   (_ = any dim, .. = any run)" bind:value={fields.shape} on:input={commit} />
   </div>
 
   <div class="row">
-    <label class="not"><input type="checkbox" bind:checked={fields.neg.dim} on:change={commit} title="negate" /></label>
+    <button type="button" class="neg" class:on={fields.neg.dim} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('dim')}>not</button>
     <span class="k">dim</span>
     <input class="v short" spellcheck="false" placeholder="4096  /  >1000" bind:value={fields.dim} on:input={commit} />
-    <label class="not"><input type="checkbox" bind:checked={fields.neg.rank} on:change={commit} title="negate" /></label>
+    <button type="button" class="neg" class:on={fields.neg.rank} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('rank')}>not</button>
     <span class="k">rank</span>
     <input class="v short" spellcheck="false" placeholder="2  /  >=3" bind:value={fields.rank} on:input={commit} />
   </div>
 
   <div class="row">
-    <label class="not"><input type="checkbox" bind:checked={fields.neg.size} on:change={commit} title="negate" /></label>
+    <button type="button" class="neg" class:on={fields.neg.size} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('size')}>not</button>
     <span class="k">size</span>
     <input class="v short" spellcheck="false" placeholder="1MiB" bind:value={fields.sizeMin} on:input={commit} />
     <span class="to">…</span>
     <input class="v short" spellcheck="false" placeholder="1GiB" bind:value={fields.sizeMax} on:input={commit} />
-    <label class="not"><input type="checkbox" bind:checked={fields.neg.params} on:change={commit} title="negate" /></label>
+    <button type="button" class="neg" class:on={fields.neg.params} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('params')}>not</button>
     <span class="k">params</span>
     <input class="v short" spellcheck="false" placeholder="1M" bind:value={fields.paramsMin} on:input={commit} />
     <span class="to">…</span>
@@ -265,7 +270,7 @@
   </div>
 
   <div class="row">
-    <label class="not"><input type="checkbox" bind:checked={fields.neg.shard} on:change={commit} title="negate" /></label>
+    <button type="button" class="neg" class:on={fields.neg.shard} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('shard')}>not</button>
     <span class="k">shard</span>
     <input class="v" spellcheck="false" placeholder="00001  /  model-00001" bind:value={fields.shard} on:input={commit} />
   </div>
@@ -295,13 +300,32 @@
     letter-spacing: 0.04em;
     min-width: 40px;
   }
-  .not {
-    display: inline-flex;
-    align-items: center;
-  }
-  .not input {
-    margin: 0;
+  .neg {
+    flex: 0 0 auto;
+    min-width: 34px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: none;
+    color: var(--fg-dim);
     cursor: pointer;
+    font: inherit;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 1px 6px;
+    opacity: 0.65;
+  }
+  .neg:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+    opacity: 1;
+  }
+  .neg.on {
+    background: color-mix(in srgb, var(--danger) 22%, transparent);
+    border-color: var(--danger);
+    color: var(--danger);
+    font-weight: 700;
+    opacity: 1;
   }
   .chips {
     display: flex;
