@@ -6,7 +6,7 @@
   import { tree } from '../stores/server';
   import { filterQuery } from '../stores/view';
   import type { TreeNode } from '../lib/types';
-  import Dtype from './Dtype.svelte';
+  import { dtypeInfo } from '../lib/dtype';
 
   function distinctDtypes(nodes: TreeNode[]): string[] {
     const set = new Set<string>();
@@ -223,9 +223,12 @@
     <span class="k">dtype</span>
     <div class="chips">
       {#each present as d}
-        <button class="chip" class:on={fields.dtypes.has(d)} on:click={() => toggleDtype(d)}>
-          <Dtype dtype={d} bubble={false} />
-        </button>
+        <button
+          type="button"
+          class="chip"
+          class:on={fields.dtypes.has(d)}
+          title={dtypeInfo(d)}
+          on:click={() => toggleDtype(d)}>{d}</button>
       {/each}
     </div>
   </div>
@@ -333,15 +336,23 @@
     gap: 4px;
   }
   .chip {
-    background: none;
-    border: 1px solid transparent;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--dtype);
+    background: color-mix(in srgb, var(--dtype) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--dtype) 28%, transparent);
     border-radius: 4px;
-    padding: 0;
+    padding: 1px 6px;
     cursor: pointer;
-    opacity: 0.55;
+    opacity: 0.6;
+  }
+  .chip:hover {
+    opacity: 0.85;
   }
   .chip.on {
     opacity: 1;
+    color: var(--fg);
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
     border-color: var(--accent);
   }
   .v {
