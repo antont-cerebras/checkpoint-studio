@@ -74,8 +74,11 @@ function parseHash(): Screen {
   return { kind: 'tree' };
 }
 
-// Keep the store in sync with the URL (covers the browser back/forward buttons).
-window.addEventListener('hashchange', () => screen.set(parseHash()));
+// Keep the stores in sync with the URL (covers browser back/forward + shared links).
+window.addEventListener('hashchange', () => {
+  screen.set(parseHash());
+  restoreGlobals();
+});
 
 // Persistent tree state (survives screen changes, like the TUI).
 export const expanded = writable<Set<string>>(new Set());
@@ -126,6 +129,9 @@ export const paletteOpen = writable<boolean>(false);
 export type SortKey = 'none' | 'name' | 'size' | 'params' | 'dtype' | 'rank';
 export const sortKey = writable<SortKey>('none');
 export const sortDir = writable<'asc' | 'desc'>('asc');
+
+/** Compact per-family view toggle (the `≡` button) — a view mode, so it's in the URL. */
+export const compact = writable<boolean>(false);
 
 /** The flattened rows — fold-aware, or a flat list while filtering / searching.
  * Shared by TreeView (render) and the key handler (cursor movement). A filter
@@ -222,20 +228,82 @@ treeData.subscribe((t) => {
   }
 });
 
-// ---- navigation (URL hash = source of truth; browser back/forward just work) ----
+// ---- navigation + URL state (the hash is the single source of truth; a shared
+// link and browser back/forward both restore the full view state) ----
+
+/** The screen-independent view state carried in every hash: filter query, sort,
+ * the compact toggle, and search. So any state is reproducible from the URL. */
+function globalQuery(): string {
+  const p = new URLSearchParams();
+  const f = get(filterQuery).trim();
+  if (f) p.set('filter', f);
+  const sk = get(sortKey);
+  if (sk !== 'none') p.set('sort', `${sk}.${get(sortDir)}`);
+  if (get(compact)) p.set('compact', '1');
+  if (get(searching)) p.set('q', get(search)); // presence ⇒ search mode (empty ok)
+  return p.toString();
+}
+
+/** A screen's own hash plus the global state. */
+function hashFor(s: Screen): string {
+  const base = screenToHash(s);
+  const g = globalQuery();
+  if (!g) return base;
+  return base.includes('?') ? `${base}&${g}` : `${base}?${g}`;
+}
+
+let restoring = false;
+
+/** Restore the global stores from the current hash (initial load + back/forward). */
+function restoreGlobals(): void {
+  restoring = true;
+  const q = new URLSearchParams(location.hash.replace(/^#/, '').split('?')[1] ?? '');
+  filterQuery.set(q.get('filter') ?? '');
+  const sort = q.get('sort');
+  if (sort) {
+    const [k, d] = sort.split('.');
+    sortKey.set((['name', 'size', 'params', 'dtype', 'rank'].includes(k) ? k : 'none') as SortKey);
+    sortDir.set(d === 'desc' ? 'desc' : 'asc');
+  } else {
+    sortKey.set('none');
+  }
+  compact.set(q.get('compact') === '1');
+  const qs = q.get('q');
+  searching.set(qs !== null);
+  search.set(qs ?? '');
+  restoring = false;
+}
+
+/** Mirror the current screen + global state into the hash without a new history
+ * entry (replaceState doesn't fire hashchange, so this can't loop). */
+function syncHash(): void {
+  if (restoring) return;
+  const h = `#${hashFor(get(screen))}`;
+  if (location.hash !== h) history.replaceState(history.state, '', h);
+}
 
 export function navigate(s: Screen, replace = false): void {
-  const h = `#${screenToHash(s)}`;
+  const h = `#${hashFor(s)}`;
   if (replace) {
     // Replace the current entry (no new history) — for view-state changes within a
-    // screen, like switching detail tabs, so Back/Esc leaves the screen in one step
-    // instead of walking tab history. replaceState doesn't fire hashchange.
+    // screen (e.g. a detail tab) so Back/Esc leaves the screen in one step.
     history.replaceState(history.state, '', h);
   } else if (location.hash !== h) {
     location.hash = h; // pushes a history entry (hashchange also confirms the store)
   }
   screen.set(s); // optimistic; the hashchange listener confirms on the push path
 }
+
+// Restore any global state from the initial URL, THEN mirror later edits into the
+// hash. Order matters: restore first so the subscriptions' initial fire doesn't
+// stomp the link's params before they're read.
+restoreGlobals();
+filterQuery.subscribe(syncHash);
+sortKey.subscribe(syncHash);
+sortDir.subscribe(syncHash);
+compact.subscribe(syncHash);
+search.subscribe(syncHash);
+searching.subscribe(syncHash);
 export function back(): void {
   history.back();
 }

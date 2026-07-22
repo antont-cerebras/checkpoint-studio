@@ -26,6 +26,7 @@
     clearFilter,
     sortKey,
     sortDir,
+    compact,
     paletteOpen,
   } from './stores/view';
   import TreeView from './components/TreeView.svelte';
@@ -46,7 +47,6 @@
   import type { Screen } from './stores/view';
 
   let builderOpen = false;
-  let compactOpen = false;
 
   onMount(ensureTree);
 
@@ -298,10 +298,10 @@
       on:click={() => (builderOpen = !builderOpen)}>▤</button>
     <button
       class="bld"
-      class:on={compactOpen}
+      class:on={$compact}
       title="Compact view — collapse per-layer / per-expert families"
       aria-label="Toggle compact family view"
-      on:click={() => (compactOpen = !compactOpen)}>≡</button>
+      on:click={() => compact.update((v) => !v)}>≡</button>
     <span
       class="flabel"
       title="dtype:F16,BF16  shape:(6,_,42)  dim:4096  rank:>=3  size:1MiB..1GiB  params:>1M  name:re:^model\.  shard:00001  ·  space = AND, ! = not, comma = OR"
@@ -350,7 +350,7 @@
     {:else if !$tree}
       <div class="loading"><Spinner label="reading checkpoint…" /></div>
     {:else if $screen.kind === 'tree'}
-      {#if compactOpen}<CompactView />{:else}<TreeView />{/if}
+      {#if $compact}<CompactView />{:else}<TreeView />{/if}
     {:else if $screen.kind === 'detail'}
       <Detail tensor={$screen.tensor} tab={$screen.tab} />
     {:else if $screen.kind === 'files'}
