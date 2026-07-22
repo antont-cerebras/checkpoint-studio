@@ -1,0 +1,45 @@
+---
+source: tests/cli.rs
+assertion_line: 289
+expression: "plain(&[\"--filter\", \"name:mlp\"])"
+---
+Checkpoint Explorer - [FIXTURE] (1/1)  ·  filter: name:mlp (1 match)                           [×]
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+· model.layers.0.mlp.down_proj.weight [U16, (3, 4, 5), 120 B]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · PgUp/PgDn page · Enter open · Tab files · Space/: commands
+e/c expand/collapse all · / search · l legend · h health · s stats · t copy tree · f copy file · n copy name
+y copy command · ⌫/\ back/fwd · R rename · q quit
+ ▪ model.layers.0.mlp.down_proj.weight
+   [FIXTURE]  editable

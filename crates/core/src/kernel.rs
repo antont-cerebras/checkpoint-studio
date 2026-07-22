@@ -83,6 +83,20 @@ pub struct TreeState {
     /// so there's no `search_mode` bool that can disagree with a stale query /
     /// filtered list.
     pub search: Option<SearchState>,
+    /// A persistent structured filter (`--filter` / the palette), `Some` while
+    /// active. Its flat result rows are shown instead of the folded tree (but an
+    /// in-progress `search` takes precedence). Populated by the frontend from the
+    /// full tensor list, so it can be edited/cleared live without a destructive
+    /// prune.
+    pub filter: Option<FilterState>,
+}
+
+/// The tree screen's persistent structured filter: the query text and the flat
+/// result rows it produced (the tensors passing [`crate::tensorfilter`]).
+#[derive(Default)]
+pub struct FilterState {
+    pub query: String,
+    pub filtered: Vec<(TreeNode, usize)>,
 }
 
 /// The tree screen's live search: the query being typed, its caret, and the
@@ -133,13 +147,42 @@ impl TreeState {
         }
     }
 
-    /// The currently visible rows: the search results while searching, else the
-    /// fold-aware flattened tree. The one selector every navigation op reads.
+    /// The currently visible rows: an in-progress search wins, then a persistent
+    /// structured filter, else the fold-aware flattened tree. The one selector
+    /// every navigation op reads.
     pub fn visible(&self) -> &[(TreeNode, usize)] {
-        match &self.search {
-            Some(s) => &s.filtered,
-            None => &self.flattened,
+        if let Some(s) = &self.search {
+            return &s.filtered;
         }
+        if let Some(f) = &self.filter {
+            return &f.filtered;
+        }
+        &self.flattened
+    }
+
+    /// Whether a persistent structured filter is active.
+    pub fn filter_active(&self) -> bool {
+        self.filter.is_some()
+    }
+
+    /// The active filter query, or `""` when none.
+    pub fn filter_query(&self) -> &str {
+        self.filter.as_ref().map_or("", |f| f.query.as_str())
+    }
+
+    /// Set (or replace) the persistent filter with its precomputed flat rows, and
+    /// reset the cursor/scroll since the visible set changes wholesale.
+    pub fn set_filter(&mut self, query: String, filtered: Vec<(TreeNode, usize)>) {
+        self.filter = Some(FilterState { query, filtered });
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Drop the persistent filter (back to the folded tree).
+    pub fn clear_filter(&mut self) {
+        self.filter = None;
+        self.selected = 0;
+        self.scroll = 0;
     }
 
     /// Rebuild the flattened rows from the (possibly re-folded) tree. The pure

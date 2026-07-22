@@ -282,6 +282,20 @@ fn plain_tree() {
     settings().bind(|| insta::assert_snapshot!(plain(&[])));
 }
 
+/// The rich `--filter` applied to the interactive tree: the title shows the query
+/// + match count and only matching tensors remain (flat list).
+#[test]
+fn plain_tree_filtered() {
+    settings().bind(|| insta::assert_snapshot!(plain(&["--filter", "name:mlp"])));
+}
+
+/// `--print-tensors --filter` — the print export narrowed by the rich filter.
+#[test]
+fn print_tensors_filter() {
+    settings()
+        .bind(|| insta::assert_snapshot!(export(&["--print-tensors", "--filter", "name:mlp"])));
+}
+
 /// The `s` view: the full-screen checkpoint-stats report.
 #[test]
 fn stats_popup() {

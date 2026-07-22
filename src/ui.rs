@@ -345,6 +345,9 @@ pub struct DrawConfig<'a> {
     pub search_query: &'a str,
     /// Caret position within `search_query`, as a character index in `0..=len`.
     pub search_cursor: usize,
+    /// The active persistent filter query (`--filter` / palette), or `""` when
+    /// none — surfaced in the title so a narrowed tree reads as filtered, not tiny.
+    pub filter_query: &'a str,
     /// Leading glyph for the status bar (e.g. `▪`, `▸`, `†`).
     pub status_icon: &'a str,
     /// Bottom status line: a tensor's full name, or a group's source
@@ -925,12 +928,24 @@ impl UI {
 
         // Title. (A health-check warning is surfaced on the status bar instead —
         // see the `⚠ health` alert beside the read-only badge below.)
-        let title = vec![Span::raw(format!(
+        let mut title = vec![Span::raw(format!(
             "Checkpoint Explorer - {} ({}/{})",
             config.current_file,
             config.file_idx + 1,
             config.total_files
         ))];
+        if !config.filter_query.is_empty() {
+            let n = config.tree.len();
+            title.push(Span::styled(
+                format!(
+                    "  ·  filter: {} ({} match{})",
+                    config.filter_query,
+                    n,
+                    if n == 1 { "" } else { "es" }
+                ),
+                Style::default().fg(palette::ACCENT),
+            ));
+        }
         lines.push(Line::from(title));
 
         // The search bar rides the header while searching; the key hints are a
@@ -7789,6 +7804,7 @@ mod tests {
                 search_mode: false,
                 search_query: "",
                 search_cursor: 0,
+                filter_query: "",
                 status_icon: "▪",
                 status_bar: "",
                 status_secondary: "",
@@ -7968,6 +7984,7 @@ mod tests {
             search_mode: false,
             search_query: "",
             search_cursor: 0,
+            filter_query: "",
             status_icon: "▪",
             status_bar: "model.safetensors",
             status_secondary: "",

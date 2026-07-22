@@ -3323,6 +3323,7 @@ impl Mode for DataMode {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Cmd {
     Search,
+    Filter,
     ExpandAll,
     CollapseAll,
     ViewFiles,
@@ -3435,6 +3436,14 @@ enum DataCmd {
 /// drift.
 const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
     (Cmd::Search, "Tree", "Search by name", '/'),
+    // Palette-only (blank-label sentinel → no footer chip / hotkey); opens a prompt
+    // for the rich filter query.
+    (
+        Cmd::Filter,
+        "Tree",
+        "Filter tensors… (dtype/shape/size/name/…)",
+        '\u{0}',
+    ),
     (Cmd::ExpandAll, "Tree", "Expand all groups", 'e'),
     (Cmd::CollapseAll, "Tree", "Collapse all groups", 'c'),
     (Cmd::ViewFiles, "View", "File browser", '\t'),
@@ -4668,6 +4677,9 @@ impl Explorer {
         let schemas = crate::sample::parse_packing_schemas(self.tensors(), self.metadata());
         self.packing_schemas = schemas;
         self.build_tree();
+        // Apply a `--filter` to the live tree (non-destructive view filter); a no-op
+        // when none is set. Print paths override this with a destructive prune.
+        self.refresh_filter();
         self.full_loaded = true;
     }
 
@@ -5727,6 +5739,7 @@ impl Explorer {
             search_mode: self.tree_state.search_mode(),
             search_query: self.tree_state.search_query(),
             search_cursor: self.tree_state.search_cursor(),
+            filter_query: self.tree_state.filter_query(),
             status_icon,
             status_bar: &status_bar,
             status_secondary: &status_secondary,
@@ -5835,7 +5848,8 @@ impl Explorer {
 
     /// Narrow the session to the tensors passing the `--filter` query, then rebuild
     /// the tree — the tensor-facet analogue of [`Self::apply_name_filter`], composing
-    /// with it. A no-op when no (active) filter is set.
+    /// with it. A no-op when no (active) filter is set. Destructive (drops the other
+    /// tensors) — for the one-shot `--print-*` exports.
     fn apply_tensor_filter(&mut self) {
         let Some(filter) = self.tensor_filter.clone() else {
             return;
@@ -5847,6 +5861,37 @@ impl Explorer {
             session.retain_tensors(|t| filter.matches(t));
         }
         self.build_tree();
+        // The prune already narrowed the tree; drop the (now redundant) view filter
+        // `refresh_filter` set at load, so the print output reads the plain tree.
+        self.tree_state.clear_filter();
+    }
+
+    /// Refresh the interactive tree's persistent filter view from the current
+    /// `tensor_filter` — **non-destructive**: computes a flat list of the matching
+    /// tensors from the full session (so the filter can be edited/cleared live) and
+    /// hands it to the kernel, or clears the filter when none is active.
+    fn refresh_filter(&mut self) {
+        let active = self.tensor_filter.as_ref().is_some_and(|f| f.is_active());
+        if !active {
+            self.tree_state.clear_filter();
+            return;
+        }
+        let filter = self.tensor_filter.clone().expect("active implies Some");
+        let rows: Vec<(TreeNode, usize)> = self
+            .tensors()
+            .iter()
+            .filter(|t| filter.matches(t))
+            .map(|t| {
+                (
+                    TreeNode::Tensor {
+                        info: t.clone(),
+                        label: None,
+                    },
+                    0,
+                )
+            })
+            .collect();
+        self.tree_state.set_filter(filter.query().to_string(), rows);
     }
 
     /// The whole tree as text — every group and tensor in the browser's row
@@ -6828,6 +6873,7 @@ impl Explorer {
     fn run_command(&mut self, cmd: Cmd, term: &mut crate::tui::LiveTerminal) -> Option<Nav> {
         match cmd {
             Cmd::Search => self.enter_search_mode(),
+            Cmd::Filter => self.run_filter_prompt(term),
             Cmd::ExpandAll => self.tree_state.set_all_expanded(true),
             Cmd::CollapseAll => self.tree_state.set_all_expanded(false),
             Cmd::ViewFiles => {
@@ -9417,6 +9463,71 @@ impl Explorer {
 
     /// Prompt for the repack output path, pre-filled with `default`, rejecting an
     /// empty name or an existing file. Returns `None` if cancelled.
+    /// Open the filter prompt and apply the result: an empty query clears the
+    /// filter, else it's parsed (already validated in the prompt) and applied
+    /// non-destructively; either way the tree view refreshes.
+    fn run_filter_prompt(&mut self, term: &mut crate::tui::LiveTerminal) {
+        let Some(query) = self.prompt_filter(term) else {
+            return; // cancelled (Esc)
+        };
+        self.tensor_filter = if query.trim().is_empty() {
+            None
+        } else {
+            crate::tensorfilter::TensorFilter::parse(&query).ok()
+        };
+        self.refresh_filter();
+    }
+
+    /// Prompt for a rich filter query, pre-filled with the active one, validating
+    /// each Enter with [`crate::tensorfilter::TensorFilter::parse`] and showing any
+    /// error inline. Empty is allowed (clears). `None` on Esc (cancel).
+    fn prompt_filter(&self, term: &mut crate::tui::LiveTerminal) -> Option<String> {
+        let mut input = self.tree_state.filter_query().to_string();
+        let mut error: Option<String> = None;
+        loop {
+            if term
+                .draw(|f| {
+                    UI::render_text_prompt(
+                        f,
+                        "Filter tensors (e.g. dtype:F16 shape:(_,4096) size:>1MiB — empty clears)",
+                        &input,
+                        error.as_deref(),
+                    )
+                })
+                .is_err()
+            {
+                return None;
+            }
+            match event::read() {
+                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                Ok(Event::Key(KeyEvent { code, .. })) => match code {
+                    KeyCode::Enter => {
+                        let trimmed = input.trim();
+                        if trimmed.is_empty() {
+                            return Some(String::new()); // clear
+                        }
+                        match crate::tensorfilter::TensorFilter::parse(trimmed) {
+                            Ok(_) => return Some(trimmed.to_string()),
+                            Err(e) => error = Some(e.to_string()),
+                        }
+                    }
+                    KeyCode::Esc => return None,
+                    KeyCode::Backspace => {
+                        input.pop();
+                        error = None;
+                    }
+                    KeyCode::Char(c) => {
+                        input.push(c);
+                        error = None;
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
     fn prompt_output_path(
         &self,
         term: &mut crate::tui::LiveTerminal,

@@ -1,0 +1,6 @@
+---
+source: tests/cli.rs
+assertion_line: 296
+expression: "export(&[\"--print-tensors\", \"--filter\", \"name:mlp\"])"
+---
+model.layers.0.mlp.down_proj.weight [U16, (3, 4, 5), 120 B]
