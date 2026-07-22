@@ -161,6 +161,7 @@ pub fn tensor_sample(s: &WebState, q: &Query) -> Reply {
             row_tail: fnum(q, "row_tail", 0.5),
             col_tail: fnum(q, "col_tail", 0.5),
         },
+        Some("max") => SampleMode::GridMax,
         _ => SampleMode::Grid,
     };
     let schema = s.schemas.get(name_of(q));

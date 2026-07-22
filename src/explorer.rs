@@ -3514,7 +3514,7 @@ const DATA_COMMANDS: &[(DataCmd, &str, &str, char)] = &[
     (
         DataCmd::Layout,
         "View",
-        "Cycle layout (overview / edges / window)",
+        "Cycle layout (overview / abs-max / edges / window)",
         'e',
     ),
     (DataCmd::Zebra, "View", "Cycle zebra striping", 'z'),
@@ -5351,6 +5351,7 @@ impl Explorer {
                 col_tail: self.data_view.data_view_col_tail.get(),
             },
             DataLayout::Overview => SampleMode::Grid,
+            DataLayout::OverviewMax => SampleMode::GridMax,
             DataLayout::Window => SampleMode::Window {
                 row_off: self.data_view.data_view_win_row.get(),
                 col_off: self.data_view.data_view_win_col.get(),
@@ -6298,6 +6299,7 @@ impl Explorer {
                 col_tail: self.data_view.data_view_col_tail.get(),
             },
             DataLayout::Overview => SampleMode::Grid,
+            DataLayout::OverviewMax => SampleMode::GridMax,
             DataLayout::Window => SampleMode::Window {
                 row_off: self.data_view.data_view_win_row.get(),
                 col_off: self.data_view.data_view_win_col.get(),
@@ -10083,6 +10085,7 @@ impl Explorer {
         // emitted at the default position to keep the command tidy.
         parts.push(match self.data_view.data_view_layout.get() {
             DataLayout::Overview => "--overview".to_string(),
+            DataLayout::OverviewMax => "--abs-max".to_string(),
             DataLayout::Edges => {
                 let (rt, ct) = (
                     self.data_view.data_view_row_tail.get(),
@@ -11264,7 +11267,11 @@ mod tests {
         assert_eq!(tree_command_for_key('c'), Some(Cmd::CollapseAll));
         assert_eq!(tree_command_for_key('C'), Some(Cmd::CollapseAll));
         // Copy-screen stays reachable via the palette even without a hotkey.
-        assert!(TREE_COMMANDS.iter().any(|&(cmd, ..)| cmd == Cmd::CopyScreen));
+        assert!(
+            TREE_COMMANDS
+                .iter()
+                .any(|&(cmd, ..)| cmd == Cmd::CopyScreen)
+        );
 
         // With no files there's nothing to repack (needs an HDF5 source) or rename
         // (needs a local safetensors checkpoint), so the palette omits both but

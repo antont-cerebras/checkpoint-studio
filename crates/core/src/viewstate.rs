@@ -6,21 +6,25 @@
 use crate::sample::ViewDtype;
 
 /// The numeric grid / heatmap layout: a downsampled **overview** of the whole
-/// tensor, the **edges** (corners) at full resolution, or a scrollable **window**
-/// (for inspecting padding). Cycled with `e`.
+/// tensor, the same overview reduced by **abs-max** (each cell = max |value| over
+/// its block, so no element is sampled away), the **edges** (corners) at full
+/// resolution, or a scrollable **window** (for inspecting padding). Cycled with `e`.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub enum DataLayout {
     Overview,
+    OverviewMax,
     #[default]
     Edges,
     Window,
 }
 
 impl DataLayout {
-    /// The next layout in the `e` cycle: Overview → Edges → Window → Overview.
+    /// The next layout in the `e` cycle: Overview → OverviewMax → Edges → Window →
+    /// Overview.
     pub fn next(self) -> Self {
         match self {
-            DataLayout::Overview => DataLayout::Edges,
+            DataLayout::Overview => DataLayout::OverviewMax,
+            DataLayout::OverviewMax => DataLayout::Edges,
             DataLayout::Edges => DataLayout::Window,
             DataLayout::Window => DataLayout::Overview,
         }
@@ -141,7 +145,8 @@ mod tests {
         assert!(parse_stripe_mode("nope").is_err());
         assert_eq!(parse_num_base("hex").unwrap(), NumBase::Hex);
         assert_eq!(NumBase::Decimal.next().next(), NumBase::Octal);
-        assert_eq!(DataLayout::Overview.next(), DataLayout::Edges);
+        assert_eq!(DataLayout::Overview.next(), DataLayout::OverviewMax);
+        assert_eq!(DataLayout::OverviewMax.next(), DataLayout::Edges);
         assert_eq!(NumBase::Binary.label(), "bin");
     }
 }

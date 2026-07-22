@@ -24,7 +24,7 @@ async function getJson<T>(url: string): Promise<T> {
 const enc = encodeURIComponent;
 
 export interface SampleParams {
-  mode?: 'grid' | 'window' | 'edges';
+  mode?: 'grid' | 'max' | 'window' | 'edges';
   rows?: number;
   cols?: number;
   slice?: number;

@@ -205,6 +205,7 @@ pub fn view_label(v: ViewDtype) -> String {
 fn mode_label(m: &SampleMode) -> String {
     match m {
         SampleMode::Grid => "grid",
+        SampleMode::GridMax => "abs-max",
         SampleMode::Edges { .. } => "edges",
         SampleMode::Window { .. } => "window",
     }

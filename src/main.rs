@@ -227,6 +227,13 @@ struct ExploreArgs {
     overview: bool,
 
     #[arg(
+        long = "abs-max",
+        conflicts_with_all = ["edge", "overview", "window"],
+        help = "Show the abs-max overview submode: each cell is the max |value| over its block (full scan; nothing sampled away)"
+    )]
+    abs_max: bool,
+
+    #[arg(
         long,
         num_args = 0..=1,
         require_equals = true,
@@ -1877,6 +1884,8 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         Some(DataLayout::Window)
     } else if args.edge.is_some() {
         Some(DataLayout::Edges)
+    } else if args.abs_max {
+        Some(DataLayout::OverviewMax)
     } else if args.overview {
         Some(DataLayout::Overview)
     } else {

@@ -8,7 +8,7 @@
   export let tensor: string;
   export let kind: 'heatmap' | 'values';
 
-  type Mode = 'overview' | 'window' | 'edges';
+  type Mode = 'overview' | 'absmax' | 'window' | 'edges';
   let mode: Mode = 'overview';
   let dtype = ''; // '' = stored
   let slice = 0;
@@ -30,9 +30,15 @@
   let wrapW = 0;
   let wrapH = 0;
 
-  const MODES: Mode[] = ['overview', 'window', 'edges'];
+  // abs-max (a full-scan magnitude map, nothing sampled away) only makes sense for
+  // the heatmap; the numeric grid shows real values, not magnitudes.
+  $: modes = (kind === 'heatmap'
+    ? ['overview', 'absmax', 'window', 'edges']
+    : ['overview', 'window', 'edges']) as Mode[];
   const DTYPES = ['', 'f16', 'bf16', 'f32', 'f64', 'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'u4', 'i4'];
-  const serverMode = (m: Mode): 'grid' | 'window' | 'edges' => (m === 'overview' ? 'grid' : m);
+  const serverMode = (m: Mode): 'grid' | 'max' | 'window' | 'edges' =>
+    m === 'overview' ? 'grid' : m === 'absmax' ? 'max' : m;
+  const modeLabel = (m: Mode): string => (m === 'absmax' ? 'abs-max' : m);
 
   $: params = {
     mode: serverMode(mode),
@@ -114,6 +120,20 @@
     hover = `[${data.rows[i]}, ${data.cols[j]}] = ${num(row[j])}`;
   }
 
+  // Click an overview / abs-max cell to drop a window there — a discoverable seek
+  // into the exact region (the window is centered on the clicked block).
+  function onClick(e: MouseEvent) {
+    if (!data || (mode !== 'overview' && mode !== 'absmax')) return;
+    const j = Math.floor(e.offsetX / cell);
+    const i = Math.floor(e.offsetY / cell);
+    const r = data.rows[i];
+    const c = data.cols[j];
+    if (r == null || c == null) return;
+    rowOff = Math.max(0, r - Math.floor(rows / 2));
+    colOff = Math.max(0, c - Math.floor(cols / 2));
+    mode = 'window';
+  }
+
   // ---- values ----
   function cellText(i: number, j: number): string {
     if (!data) return '';
@@ -159,8 +179,8 @@
 <div class="dv">
   <div class="controls">
     <div class="grp">
-      {#each MODES as m}
-        <button class:active={mode === m} on:click={() => (mode = m)}>{m}</button>
+      {#each modes as m}
+        <button class:active={mode === m} on:click={() => (mode = m)}>{modeLabel(m)}</button>
       {/each}
     </div>
 
@@ -180,7 +200,7 @@
         <button on:click={() => pan(0, -1)} disabled={colOff <= 0} title="left (← · Home = start)">←</button>
         <button on:click={() => pan(0, 1)} disabled={colOff >= maxCol} title="right (→ · End = end)">→</button>
       </div>
-      <label class="res">row
+      <label class="res">go&nbsp;to&nbsp;row
         <input type="number" min="0" max={maxRow} step={rows} bind:value={rowOff} />
       </label>
       <label class="res">col
@@ -235,7 +255,15 @@
 
     {#if kind === 'heatmap'}
       <div class="canvaswrap" bind:clientWidth={wrapW} bind:clientHeight={wrapH}>
-        <canvas bind:this={canvas} on:mousemove={onMove} on:mouseleave={() => (hover = '')}></canvas>
+        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+        <canvas
+          bind:this={canvas}
+          class:clickable={mode === 'overview' || mode === 'absmax'}
+          title={mode === 'overview' || mode === 'absmax' ? 'Click a cell to open a window there' : ''}
+          on:mousemove={onMove}
+          on:mouseleave={() => (hover = '')}
+          on:click={onClick}
+        ></canvas>
       </div>
       <div class="scale">
         <span class="mono">{num(data.min)}</span>
@@ -336,6 +364,9 @@
     border: 1px solid var(--border);
     max-width: 100%;
     max-height: 100%;
+  }
+  canvas.clickable {
+    cursor: crosshair;
   }
   .scale {
     display: flex;

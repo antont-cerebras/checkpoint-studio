@@ -196,7 +196,7 @@ pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
         (Detail | Data, Char('r' | 'R')) => "Reshape the tensor's dimensions (row-major).",
         // Data view.
         (Data, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
-        (Data, Char('e' | 'E')) => "Cycle the layout: overview → edges → window.",
+        (Data, Char('e' | 'E')) => "Cycle the layout: overview → abs-max → edges → window.",
         (Data, Char('z' | 'Z')) => "Cycle zebra striping: rows → columns → off.",
         (Data, Char('b' | 'B')) => "Cycle the numeral base: dec → hex → oct → bin.",
         (Data, Char(']') | Char('[')) => "Step to the next / previous slice.",
@@ -2296,6 +2296,7 @@ impl UI {
             SampleMode::Edges { .. } => "edges",
             SampleMode::Window { .. } => "window",
             SampleMode::Grid => "sampled",
+            SampleMode::GridMax => "abs-max",
         };
         let mut dtype_line = view_dtype_spans(
             &tensor.dtype,
@@ -2461,6 +2462,13 @@ impl UI {
                 sample.rows.len(),
                 sample.total_rows,
                 sample.cols.len(),
+                sample.total_cols
+            ),
+            SampleMode::GridMax => format!(
+                " → abs-max: {} × {} blocks over {} × {} (every element scanned)",
+                sample.rows.len(),
+                sample.cols.len(),
+                sample.total_rows,
                 sample.total_cols
             ),
         }));
@@ -5141,12 +5149,13 @@ fn view_footer_items(
         items.push((vec![Seg::Key("d", hint_key('d'))], "dtype"));
         items.push((vec![Seg::Key("r", hint_key('r'))], "reshape"));
     }
-    // Cycle the layout overview → edges → window → overview; the label names the
-    // layout `e` switches to next.
+    // Cycle the layout overview → abs-max → edges → window → overview; the label
+    // names the layout `e` switches to next.
     items.push((
         vec![Seg::Key("e", hint_key('e'))],
         match mode {
-            SampleMode::Grid => "edges",
+            SampleMode::Grid => "abs-max",
+            SampleMode::GridMax => "edges",
             SampleMode::Edges { .. } => "window",
             SampleMode::Window { .. } => "overview",
         },

@@ -546,6 +546,12 @@ pub enum SampleMode {
     /// Evenly-spaced indices across the whole matrix (the default overview).
     #[default]
     Grid,
+    /// Like [`Grid`](SampleMode::Grid) but each output cell is the **maximum
+    /// absolute value** over the whole block of source elements it represents,
+    /// rather than a single sampled element. A full scan (reads every element),
+    /// so nothing is sampled away — a lone outlier still shows. The cells are
+    /// magnitudes (≥ 0) with no single stored element, so `raw` is empty.
+    GridMax,
     /// The first and last rows and columns, contiguously — to inspect edge
     /// padding (e.g. is a tensor zero-padded, or padded with something else).
     /// `row_tail` / `col_tail` bias the fixed budget toward the tail: `0.0`
@@ -681,6 +687,41 @@ pub fn sample_tensor_with(
     // Logical elements to skip to reach the chosen stored slice (0 for 1D/2D).
     let base = stored_slice * total_rows * total_cols;
 
+    // Abs-max overview: aggregate whole blocks instead of point-sampling, so no
+    // element is skipped (a full scan). Handled here because it doesn't reduce to a
+    // set of sampled indices like the other modes.
+    if mode == SampleMode::GridMax {
+        return grid_absmax(
+            reader,
+            t,
+            total_cols,
+            base,
+            total_rows,
+            max_rows.max(1),
+            max_cols.max(1),
+            view,
+            unpack,
+            field,
+        )
+        .map(|(rows, cols, values, min, max)| Sample {
+            rows,
+            cols,
+            values,
+            raw: Vec::new(), // an aggregated cell has no single stored element
+            min,
+            max,
+            total_rows,
+            total_cols,
+            slices,
+            slice,
+            view,
+            overridable,
+            mode,
+            display_shape: view.logical_shape_with(shape, &t.dtype, unpack),
+            unpacked,
+        });
+    }
+
     let (rows, cols) = match mode {
         SampleMode::Grid => (
             sample_indices(total_rows, max_rows.max(1)),
@@ -694,6 +735,7 @@ pub fn sample_tensor_with(
             window_indices(total_rows, max_rows.max(1), row_off),
             window_indices(total_cols, max_cols.max(1), col_off),
         ),
+        SampleMode::GridMax => unreachable!("handled above"),
     };
 
     let (values, raw) = read_sampled(
@@ -744,6 +786,97 @@ fn window_indices(n: usize, k: usize, off: usize) -> Vec<usize> {
     }
     let start = off.min(n - k);
     (start..start + k).collect()
+}
+
+/// The abs-max overview result: `(row block-start indices, col block-start
+/// indices, magnitude grid, min, max)`.
+type AbsMaxGrid = (Vec<usize>, Vec<usize>, Vec<Vec<f64>>, f64, f64);
+
+/// Overview aggregation for [`SampleMode::GridMax`]: partition the matrix into a
+/// `grid_rows x grid_cols` block grid and reduce each block to `max |v|` over every
+/// finite element it covers — so nothing is sampled away. Streams the matrix in
+/// **fixed-size row chunks** (reusing [`read_sampled`], so packed / unpacked /
+/// 3D-slice decoding is identical to the other modes), folding each element into
+/// its block, so memory stays bounded to one chunk however coarse the grid is (a
+/// 4-row overview of a huge tensor must not pull a quarter of it into memory).
+/// Returns the representative block-start indices, the magnitude grid, and its
+/// `(min, max)` — `min` is pinned to `0` so the colour ramp runs from zero
+/// magnitude to the largest, making outliers pop.
+#[allow(clippy::too_many_arguments)]
+fn grid_absmax(
+    reader: &dyn TensorReader,
+    t: &TensorInfo,
+    total_cols: usize,
+    base: usize,
+    total_rows: usize,
+    max_rows: usize,
+    max_cols: usize,
+    view: ViewDtype,
+    unpack: Option<&PackingSchema>,
+    field: usize,
+) -> Result<AbsMaxGrid, String> {
+    let grid_rows = max_rows.min(total_rows).max(1);
+    let grid_cols = max_cols.min(total_cols).max(1);
+    // Contiguous block boundary `b` of `g` over `n` — covers `0..n` exactly.
+    let bound = |b: usize, n: usize, g: usize| b * n / g;
+    let all_cols: Vec<usize> = (0..total_cols).collect();
+    let rows_idx: Vec<usize> = (0..grid_rows)
+        .map(|i| bound(i, total_rows, grid_rows))
+        .collect();
+    let cols_idx: Vec<usize> = (0..grid_cols)
+        .map(|j| bound(j, total_cols, grid_cols))
+        .collect();
+    // Each source column's output block, precomputed so the hot loop skips a divide.
+    let col_gj: Vec<usize> = (0..total_cols)
+        .map(|c| (c * grid_cols / total_cols).min(grid_cols - 1))
+        .collect();
+
+    // NEG_INFINITY marks an untouched cell; any finite `|v|` (≥ 0) beats it.
+    let mut values = vec![vec![f64::NEG_INFINITY; grid_cols]; grid_rows];
+    let mut gmax = 0.0f64;
+    const CHUNK_ROWS: usize = 512;
+    let mut r0 = 0;
+    while r0 < total_rows {
+        let r1 = (r0 + CHUNK_ROWS).min(total_rows);
+        let chunk_rows: Vec<usize> = (r0..r1).collect();
+        let (chunk, _raw) = read_sampled(
+            reader,
+            t,
+            total_cols,
+            base,
+            &chunk_rows,
+            &all_cols,
+            view,
+            unpack,
+            field,
+        )?;
+        for (bi, vrow) in chunk.iter().enumerate() {
+            let gi = ((r0 + bi) * grid_rows / total_rows).min(grid_rows - 1);
+            let out = &mut values[gi];
+            for (c, &v) in vrow.iter().enumerate() {
+                if v.is_finite() {
+                    let a = v.abs();
+                    let cell = &mut out[col_gj[c]];
+                    if a > *cell {
+                        *cell = a;
+                    }
+                    if a > gmax {
+                        gmax = a;
+                    }
+                }
+            }
+        }
+        r0 = r1;
+    }
+    // Blocks with no finite element → NaN (drawn as a gap, not zero magnitude).
+    for row in &mut values {
+        for cell in row.iter_mut() {
+            if *cell == f64::NEG_INFINITY {
+                *cell = f64::NAN;
+            }
+        }
+    }
+    Ok((rows_idx, cols_idx, values, 0.0, gmax))
 }
 
 /// Up to `k` evenly-spaced indices in `0..n`, always including `0` and `n-1`.
@@ -2699,6 +2832,45 @@ mod tests {
                 assert_eq!(s.values[i][j], (r * 5 + c) as f64);
             }
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn grid_max_aggregates_blocks_and_catches_off_grid_outliers() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_gridmax");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // 8x8 f32, all 1.0 except a -100.0 outlier at (3,3) — deliberately off the
+        // strided sample grid so the plain overview can't see it.
+        let header = br#"{"w":{"dtype":"F32","shape":[8,8],"data_offsets":[0,256]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for r in 0..8u32 {
+            for c in 0..8u32 {
+                let v: f32 = if (r, c) == (3, 3) { -100.0 } else { 1.0 };
+                f.write_all(&v.to_le_bytes()).unwrap();
+            }
+        }
+        drop(f);
+        let t = fixture(&path, "w", &[8, 8], (0, 256));
+
+        // Strided 2x2 overview samples rows/cols {0,7} → misses the (3,3) outlier.
+        let g = sample_tensor(&t, 2, 2, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        assert_eq!(g.max, 1.0, "subsample misses the off-grid outlier");
+
+        // Abs-max 2x2 reduces each 4x4 block by max|v| → the top-left block catches it.
+        let m = sample_tensor(&t, 2, 2, 0, ViewDtype::Stored, SampleMode::GridMax, None).unwrap();
+        assert_eq!((m.total_rows, m.total_cols), (8, 8));
+        assert_eq!(m.values, vec![vec![100.0, 1.0], vec![1.0, 1.0]]);
+        assert_eq!((m.min, m.max), (0.0, 100.0));
+        assert!(
+            m.raw.is_empty(),
+            "aggregated cells have no single stored element"
+        );
+        assert_eq!(m.rows, vec![0, 4]); // representative block-start indices
+        assert_eq!(m.cols, vec![0, 4]);
         let _ = std::fs::remove_file(&path);
     }
 
