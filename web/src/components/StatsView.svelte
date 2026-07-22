@@ -56,6 +56,7 @@
 </script>
 
 <div class="stats">
+  <div class="inner">
   {#if err}
     <p class="err">{err}</p>
   {:else if !s}
@@ -145,14 +146,18 @@
       </section>
     {/if}
   {/if}
+  </div>
 </div>
 
 <style>
   .stats {
     height: 100%;
     overflow: auto;
-    padding: 18px 22px;
+  }
+  .inner {
     max-width: 960px;
+    margin: 0 auto;
+    padding: 18px 22px;
   }
   .cards {
     display: flex;

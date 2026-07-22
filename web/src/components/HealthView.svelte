@@ -63,6 +63,7 @@
 </script>
 
 <div class="health">
+  <div class="inner">
   {#if loading}
     <Spinner label="running checks…" />
   {:else if err}
@@ -138,14 +139,18 @@
       {/if}
     </section>
   {/if}
+  </div>
 </div>
 
 <style>
   .health {
     height: 100%;
     overflow: auto;
-    padding: 18px 22px;
+  }
+  .inner {
     max-width: 900px;
+    margin: 0 auto;
+    padding: 18px 22px;
   }
   .banner {
     display: flex;
