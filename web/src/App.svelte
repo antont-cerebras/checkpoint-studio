@@ -40,11 +40,13 @@
   import Spinner from './components/Spinner.svelte';
   import Palette from './components/Palette.svelte';
   import FilterBuilder from './components/FilterBuilder.svelte';
+  import CompactView from './components/CompactView.svelte';
   import { theme } from './stores/theme';
   import { copyText } from './lib/clipboard';
   import type { Screen } from './stores/view';
 
   let builderOpen = false;
+  let compactOpen = false;
 
   onMount(ensureTree);
 
@@ -294,6 +296,12 @@
       title="Filter builder — pick facets with the mouse"
       aria-label="Toggle filter builder"
       on:click={() => (builderOpen = !builderOpen)}>▤</button>
+    <button
+      class="bld"
+      class:on={compactOpen}
+      title="Compact view — collapse per-layer / per-expert families"
+      aria-label="Toggle compact family view"
+      on:click={() => (compactOpen = !compactOpen)}>≡</button>
     <span
       class="flabel"
       title="dtype:F16,BF16  shape:(6,_,42)  dim:4096  rank:>=3  size:1MiB..1GiB  params:>1M  name:re:^model\.  shard:00001  ·  space = AND, ! = not, comma = OR"
@@ -342,7 +350,7 @@
     {:else if !$tree}
       <div class="loading"><Spinner label="reading checkpoint…" /></div>
     {:else if $screen.kind === 'tree'}
-      <TreeView />
+      {#if compactOpen}<CompactView />{:else}<TreeView />{/if}
     {:else if $screen.kind === 'detail'}
       <Detail tensor={$screen.tensor} tab={$screen.tab} />
     {:else if $screen.kind === 'files'}

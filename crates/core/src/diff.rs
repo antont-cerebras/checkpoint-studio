@@ -245,6 +245,86 @@ pub fn name_schema(names: &[&str]) -> Vec<(String, usize)> {
         .collect()
 }
 
+/// A family of tensors sharing an index template (layer / expert numbers → range
+/// placeholders; see [`name_schema`]), with rolled-up stats — for a compact
+/// per-layer / per-expert listing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TensorFamily {
+    /// Templated display name, e.g. `model.layers.{0-47}.…experts.{0-3}.down_proj.weight`.
+    pub name: String,
+    /// How many tensors collapsed into this family.
+    pub count: usize,
+    /// The dtype, when uniform across the family (else `None` — "varies").
+    pub dtype: Option<String>,
+    /// The shape, when uniform across the family (else `None`).
+    pub shape: Option<Vec<usize>>,
+    /// Total parameters across the family.
+    pub params: usize,
+    /// Total logical bytes across the family.
+    pub size_bytes: usize,
+}
+
+/// Collapse `tensors` into families by index template (each digit run — a layer
+/// number, an expert id — becomes a range), rolling up the member count, total
+/// params / bytes, and the dtype + shape when uniform. First-appearance order
+/// (alphabetical when the input is sorted). A compact "what's in here, per layer /
+/// per expert" summary, mirroring how `diff` collapses its entries.
+pub fn tensor_families(tensors: &[crate::tree::TensorInfo]) -> Vec<TensorFamily> {
+    use std::collections::HashMap;
+    struct Agg {
+        template: String,
+        indices: Vec<Vec<String>>,
+        count: usize,
+        params: usize,
+        size: usize,
+        dtype: Option<String>,
+        shape: Option<Vec<usize>>,
+    }
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut aggs: Vec<Agg> = Vec::new();
+    for t in tensors {
+        let (template, idx) = templatize(&t.name);
+        let np = idx.len();
+        let gi = *index.entry(template.clone()).or_insert_with(|| {
+            aggs.push(Agg {
+                template,
+                indices: vec![Vec::new(); np],
+                count: 0,
+                params: 0,
+                size: 0,
+                dtype: Some(t.dtype.clone()),
+                shape: Some(t.shape.clone()),
+            });
+            aggs.len() - 1
+        });
+        let a = &mut aggs[gi];
+        a.count += 1;
+        a.params += t.num_elements;
+        a.size += t.size_bytes;
+        for (p, v) in idx.into_iter().enumerate() {
+            if let Some(slot) = a.indices.get_mut(p) {
+                slot.push(v);
+            }
+        }
+        if a.dtype.as_deref() != Some(t.dtype.as_str()) {
+            a.dtype = None;
+        }
+        if a.shape.as_deref() != Some(t.shape.as_slice()) {
+            a.shape = None;
+        }
+    }
+    aggs.into_iter()
+        .map(|a| TensorFamily {
+            name: display_name(&a.template, &a.indices),
+            count: a.count,
+            dtype: a.dtype,
+            shape: a.shape,
+            params: a.params,
+            size_bytes: a.size,
+        })
+        .collect()
+}
+
 /// Render each entry as its own group (no collapsing) — for `--full`. Each
 /// placeholder gets its single value back, so the displayed name is the original.
 fn singletons<K: Clone>(items: &[(String, K)]) -> Vec<Group<K>> {
@@ -2078,6 +2158,45 @@ mod tests {
         // A pattern that matches nothing counts zero.
         let miss = NameMap::from_pairs([("^nope$".to_string(), "x".to_string())]).unwrap();
         assert_eq!(miss.match_count(names), 0);
+    }
+
+    #[test]
+    fn tensor_families_collapse_layers_and_experts() {
+        use crate::tree::{Layout, Storage, TensorInfo};
+        let mk = |name: &str, shape: &[usize]| TensorInfo {
+            name: name.into(),
+            dtype: "F16".into(),
+            shape: shape.to_vec(),
+            size_bytes: shape.iter().product::<usize>() * 2,
+            num_elements: shape.iter().product(),
+            storage: Storage::Unknown,
+            source_path: "s".into(),
+            layout: Layout::None,
+        };
+        let mut tensors = Vec::new();
+        for l in 0..3 {
+            for e in 0..2 {
+                tensors.push(mk(
+                    &format!("model.layers.{l}.mlp.experts.{e}.down_proj.weight"),
+                    &[8, 6],
+                ));
+            }
+        }
+        tensors.push(mk("model.embed_tokens.weight", &[32, 8]));
+
+        let fams = tensor_families(&tensors);
+        assert_eq!(fams.len(), 2); // the 6 expert weights collapse; embed is its own
+        let moe = fams.iter().find(|f| f.name.contains("experts")).unwrap();
+        assert_eq!(
+            moe.name,
+            "model.layers.{0-2}.mlp.experts.{0-1}.down_proj.weight"
+        );
+        assert_eq!(moe.count, 6);
+        assert_eq!(moe.dtype.as_deref(), Some("F16"));
+        assert_eq!(moe.shape, Some(vec![8, 6]));
+        assert_eq!(moe.params, 6 * 48);
+        let embed = fams.iter().find(|f| f.name.contains("embed")).unwrap();
+        assert_eq!(embed.count, 1);
     }
 
     fn s3obj(

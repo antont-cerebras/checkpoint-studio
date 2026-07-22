@@ -86,6 +86,26 @@ pub fn filter(s: &WebState, q: &Query) -> Reply {
     }
 }
 
+/// Compact per-family listing: collapse the (optionally `?q=`-filtered) tensors into
+/// index-templated families (`model.layers.{0-47}.…experts.{0-3}.down_proj.weight`)
+/// with per-family count + uniform dtype/shape + total params/bytes — a "what's in
+/// here, per layer / per expert" summary (same collapsing as `diff`).
+pub fn schema(s: &WebState, q: &Query) -> Reply {
+    let query = q.get("q").map(String::as_str).unwrap_or("");
+    let filter = match crate::tensorfilter::TensorFilter::parse(query) {
+        Ok(f) => f,
+        Err(e) => return err(400, e.to_string()),
+    };
+    let families = if filter.is_active() {
+        let matched: Vec<crate::tree::TensorInfo> =
+            s.tensors.iter().filter(|t| filter.matches(t)).cloned().collect();
+        crate::diff::tensor_families(&matched)
+    } else {
+        crate::diff::tensor_families(&s.tensors)
+    };
+    ok(json!({ "families": families }))
+}
+
 pub fn stats(s: &WebState) -> Reply {
     ok(&s.stats)
 }

@@ -45,6 +45,17 @@ export const api = {
   tree: () => getJson<TreeResponse>('/api/tree'),
   files: () => getJson<FileNode>('/api/files'),
   filter: (q: string) => getJson<{ active: boolean; names?: string[] }>(`/api/filter?q=${enc(q)}`),
+  schema: (q: string) =>
+    getJson<{
+      families: {
+        name: string;
+        count: number;
+        dtype: string | null;
+        shape: number[] | null;
+        params: number;
+        size_bytes: number;
+      }[];
+    }>(`/api/schema?q=${enc(q)}`),
   stats: () => getJson<Record<string, unknown>>('/api/stats'),
   health: () => getJson<unknown[]>('/api/health'),
   check: () => getJson<Record<string, unknown> | null>('/api/check'),
