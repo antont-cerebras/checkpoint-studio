@@ -3435,13 +3435,16 @@ enum DataCmd {
 /// drift.
 const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
     (Cmd::Search, "Tree", "Search by name", '/'),
-    (Cmd::ExpandAll, "Tree", "Expand all groups", 'E'),
-    (Cmd::CollapseAll, "Tree", "Collapse all groups", 'C'),
+    (Cmd::ExpandAll, "Tree", "Expand all groups", 'e'),
+    (Cmd::CollapseAll, "Tree", "Collapse all groups", 'c'),
     (Cmd::ViewFiles, "View", "File browser", '\t'),
     (Cmd::Stats, "View", "Checkpoint stats", 's'),
     (Cmd::Health, "View", "Health report", 'h'),
     (Cmd::Legend, "View", "Legend", 'l'),
-    (Cmd::CopyScreen, "Copy", "Screen text", 'c'),
+    // `c` now expands/collapses (mirrors the web); copy-screen keeps the palette
+    // (and the tree's purpose-built `t` copy) but gives up its tree hotkey. The
+    // blank sentinel makes it palette-only (no footer chip; see `key_label`).
+    (Cmd::CopyScreen, "Copy", "Screen text", '\u{0}'),
     (Cmd::CopyTree, "Copy", "Tree / tensor list…", 't'),
     (Cmd::CopyPath, "Copy", "File path", 'f'),
     (Cmd::CopyName, "Copy", "Tensor name", 'n'),
@@ -3610,6 +3613,7 @@ type RenameCmdEntry = PaletteRow<RenameCmd>;
 /// sentinels for its palette-only commands.
 fn key_label(c: char) -> String {
     match c {
+        '\u{0}' => String::new(), // palette-only sentinel: no footer chip / hotkey
         '\t' => "Tab".to_string(),
         '\r' => "Enter".to_string(),
         '\u{12}' => "^R".to_string(),
@@ -3628,6 +3632,13 @@ fn key_label(c: char) -> String {
 /// The tree command bound to key `c`, if any — so the key handler and the palette
 /// share one key→command mapping (the registry table).
 fn tree_command_for_key(c: char) -> Option<Cmd> {
+    // Expand/collapse-all accept either case: bare `e`/`c` (mirroring the web UI)
+    // plus the historical Shift+E/Shift+C, so no muscle memory regresses.
+    let c = match c {
+        'E' => 'e',
+        'C' => 'c',
+        other => other,
+    };
     TREE_COMMANDS
         .iter()
         .find(|(_, _, _, key)| *key == c)
@@ -11246,6 +11257,14 @@ mod tests {
         assert_eq!(tree_command_for_key('/'), Some(Cmd::Search));
         assert_eq!(tree_command_for_key('q'), Some(Cmd::Quit));
         assert_eq!(tree_command_for_key('z'), None); // unbound
+        // Expand/collapse-all take either case (mirrors the web); `c` no longer
+        // triggers copy-screen on the tree (it's palette-only now).
+        assert_eq!(tree_command_for_key('e'), Some(Cmd::ExpandAll));
+        assert_eq!(tree_command_for_key('E'), Some(Cmd::ExpandAll));
+        assert_eq!(tree_command_for_key('c'), Some(Cmd::CollapseAll));
+        assert_eq!(tree_command_for_key('C'), Some(Cmd::CollapseAll));
+        // Copy-screen stays reachable via the palette even without a hotkey.
+        assert!(TREE_COMMANDS.iter().any(|&(cmd, ..)| cmd == Cmd::CopyScreen));
 
         // With no files there's nothing to repack (needs an HDF5 source) or rename
         // (needs a local safetensors checkpoint), so the palette omits both but
@@ -11337,6 +11356,9 @@ mod tests {
         for &(cmd, _, _, c) in TREE_COMMANDS {
             if !e.available_commands().iter().any(|&(a, ..)| a == cmd) {
                 continue; // gated off in this context (e.g. Repack needs HDF5)
+            }
+            if key_label(c).is_empty() {
+                continue; // palette-only (e.g. copy-screen since `c` now collapses)
             }
             let want = if c == '\t' {
                 KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)

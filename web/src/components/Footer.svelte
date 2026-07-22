@@ -30,7 +30,7 @@
     { keys: '/', label: 'search', act: startSearch },
     { keys: 'h', label: 'health', act: () => navigate({ kind: 'health' }) },
     { keys: 's', label: 'stats', act: () => navigate({ kind: 'stats' }) },
-    { keys: 'l', label: 'layout', act: () => navigate({ kind: 'layout' }) },
+    { keys: '⇧L', label: 'layout', act: () => navigate({ kind: 'layout' }) },
   ];
 
   const detailHints: Hint[] = [

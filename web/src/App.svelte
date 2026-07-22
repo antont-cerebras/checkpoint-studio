@@ -199,8 +199,7 @@
       case 'h':
         navigate({ kind: 'health' });
         break;
-      case 'l':
-      case 'L':
+      case 'L': // Shift+L: `l` alone is "legend" in the TUI, so don't shadow it
       case 'y': // no CLI-command copy in the browser; reuse for layout
         navigate({ kind: 'layout' });
         break;
