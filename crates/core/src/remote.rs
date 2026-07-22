@@ -452,6 +452,43 @@ def prog(done, total, unit=None):
     tail = ("/" + unit) if unit else ""
     sys.stdout.write("%s%d/%d%s\n" % (P, done, total, tail))
     sys.stdout.flush()
+def probe_s3(src):
+    # Best-effort, LIST-ONLY diagnosis of a load failure: enumerate the objects
+    # under the prefix and report how many are empty (0 bytes) plus whether the
+    # cstorch metadata object itself is empty, so the caller can explain *why*
+    # cstorch.load failed (empty checkpoint / missing metadata / wrong prefix)
+    # instead of surfacing only the raw dill traceback. Read-only; never mutates.
+    if not src.startswith("s3://"):
+        return {}
+    try:
+        import boto3
+        from urllib.parse import urlparse
+        u = urlparse(src)
+        bucket, prefix = u.netloc, u.path.lstrip("/")
+        cli = boto3.client("s3")
+        total = empty = nbytes = 0
+        meta_key = None; meta_empty = False; sample = []; tok = None
+        while True:
+            kw = {"Bucket": bucket, "Prefix": prefix}
+            if tok: kw["ContinuationToken"] = tok
+            resp = cli.list_objects_v2(**kw)
+            for it in resp.get("Contents", []):
+                k = it["Key"]; sz = int(it.get("Size", 0))
+                rel = k[len(prefix):].lstrip("/") if k.startswith(prefix) else k
+                if not rel:
+                    continue
+                total += 1; nbytes += sz
+                if sz == 0: empty += 1
+                if rel.rsplit("/", 1)[-1] == "__METADATA__":
+                    meta_key = rel; meta_empty = (sz == 0)
+                if len(sample) < 12: sample.append([rel, sz])
+            if resp.get("IsTruncated"): tok = resp.get("NextContinuationToken")
+            else: break
+        return {"s3_probe": {"prefix": prefix, "total": total, "empty": empty,
+                             "bytes": nbytes, "metadata_key": meta_key,
+                             "metadata_empty": meta_empty, "sample": sample}}
+    except Exception as e:
+        return {"s3_probe_error": "%r" % (e,)}
 try:
     import cerebras.pytorch as cstorch
 except Exception as e:
@@ -459,7 +496,7 @@ except Exception as e:
 try:
     sd = cstorch.load(SRC, map_location=None)   # lazy: metadata only, no data
 except Exception as e:
-    emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
+    emit(dict({"error": "cstorch.load failed: %r" % (e,)}, **probe_s3(SRC))); sys.exit(0)
 keys = list(sd.keys())
 total = len(keys)
 prog(0, total)                                  # total known → bar goes determinate
@@ -618,8 +655,8 @@ fn parse_dump(
 ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>, S3Meta)> {
     let v: serde_json::Value =
         serde_json::from_str(json).context("parsing the remote metadata JSON")?;
-    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
-        bail!("remote: {err}");
+    if v.get("error").is_some() {
+        bail!("remote: {}", diagnose_remote_error(&v));
     }
     let mut tensors = Vec::new();
     if let Some(arr) = v.get("tensors").and_then(|t| t.as_array()) {
@@ -685,6 +722,83 @@ fn parse_dump(
         .unwrap_or_default();
     let s3 = parse_s3_meta(&v);
     Ok((tensors, metadata, s3))
+}
+
+/// Turn the remote script's `error` — optionally accompanied by a best-effort,
+/// list-only `s3_probe` of the objects under the prefix — into a message that
+/// explains *why* a `cstorch.load` failed (empty checkpoint, missing/empty
+/// metadata object, wrong prefix) rather than surfacing only the raw
+/// cstorch/dill traceback tail (`EOFError('Ran out of input')`), which on its own
+/// tells a user nothing actionable.
+fn diagnose_remote_error(v: &serde_json::Value) -> String {
+    let err = v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("remote read failed");
+    if let Some(probe) = v.get("s3_probe") {
+        return format!("{}\n\ncstorch: {err}", diagnose_s3_probe(probe));
+    }
+    if let Some(pe) = v.get("s3_probe_error").and_then(|e| e.as_str()) {
+        return format!("{err}\n(couldn't list the S3 objects to diagnose: {pe})");
+    }
+    err.to_string()
+}
+
+/// Human-readable verdict from the list-only S3 probe (object counts + how many
+/// are 0 bytes + whether the cstorch `__METADATA__` object is empty). Ordered
+/// most-diagnostic-first: no objects → wrong path; all empty → empty checkpoint;
+/// empty metadata → interrupted save; some empty → partial; otherwise the data
+/// looks intact so it's a format/version issue rather than missing bytes.
+fn diagnose_s3_probe(p: &serde_json::Value) -> String {
+    let u64_field = |k: &str| p.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let total = u64_field("total");
+    let empty = u64_field("empty");
+    let bytes = u64_field("bytes");
+    let prefix = p
+        .get("prefix")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let meta_key = p
+        .get("metadata_key")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("__METADATA__");
+    let meta_empty = p
+        .get("metadata_empty")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    if total == 0 {
+        format!(
+            "No objects exist under the S3 prefix `{prefix}` — the path is wrong or the \
+             checkpoint isn't there. Check the prefix / step directory."
+        )
+    } else if empty == total {
+        format!(
+            "The checkpoint is empty: all {total} objects under `{prefix}` are 0 bytes \
+             ({} total). Every key was created but no data was ever written — an incomplete \
+             or failed save/upload. Re-save or re-upload the checkpoint, or point at a \
+             complete one (check for a sibling step under the same prefix).",
+            crate::utils::format_size(bytes as usize)
+        )
+    } else if meta_empty {
+        format!(
+            "The checkpoint's metadata object `{meta_key}` is empty (0 bytes), so cstorch has \
+             nothing to load ({empty} of {total} objects are 0 bytes). The metadata wasn't \
+             written — most likely an interrupted save."
+        )
+    } else if empty > 0 {
+        format!(
+            "The checkpoint looks partially written: {empty} of {total} objects under \
+             `{prefix}` are 0 bytes ({} total). It's incomplete.",
+            crate::utils::format_size(bytes as usize)
+        )
+    } else {
+        format!(
+            "The {total} objects under `{prefix}` look intact ({} total), so this is likely a \
+             format/version cstorch can't load rather than a missing/empty checkpoint.",
+            crate::utils::format_size(bytes as usize)
+        )
+    }
 }
 
 /// Parse the remote script's optional `s3_objects` / `s3_warnings` fields into
@@ -809,6 +923,25 @@ mod tests {
         assert!(s.contains("SRC = \"s3://b/k\""));
         assert!(s.contains("import cerebras.pytorch"));
         assert!(s.contains(SENTINEL));
+    }
+
+    #[test]
+    fn cstorch_script_probes_s3_on_load_failure() {
+        // A load failure lists the objects (read-only) and merges the probe into
+        // the error object so the caller can diagnose an empty/partial checkpoint.
+        let s = dump_script("s3://b/k", false);
+        assert!(s.contains("def probe_s3"), "{s}");
+        assert!(s.contains("**probe_s3(SRC)"), "{s}");
+        assert!(s.contains("\"s3_probe\""));
+        assert!(s.contains("__METADATA__"));
+        // The probe must stay list-only + read-only.
+        assert!(s.contains("list_objects_v2"));
+        for forbidden in ["put_object", "delete_object", "upload", "copy_object"] {
+            assert!(
+                !s.contains(forbidden),
+                "probe must stay read-only: {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -967,8 +1100,67 @@ mod tests {
 
     #[test]
     fn surfaces_remote_error() {
+        // No probe attached → the raw cstorch error passes through unchanged.
         let err = parse_dump(r#"{"error":"cstorch.load failed: boom"}"#, "s3://x/y");
         assert!(err.unwrap_err().to_string().contains("boom"));
+    }
+
+    #[test]
+    fn diagnoses_all_empty_checkpoint() {
+        // The real-world case: every object under the prefix (incl. __METADATA__)
+        // is 0 bytes → cstorch's dill.loads hits EOFError.
+        let json = r#"{"error":"cstorch.load failed: EOFError('Ran out of input')",
+            "s3_probe":{"prefix":"kimi/3bit/260720","total":1642,"empty":1642,"bytes":0,
+                        "metadata_key":"__METADATA__","metadata_empty":true,
+                        "sample":[["__METADATA__",0],["lm_head.weight",0]]}}"#;
+        let msg = parse_dump(json, "s3://b/k").unwrap_err().to_string();
+        assert!(msg.contains("empty"), "{msg}");
+        assert!(msg.contains("all 1642 objects"), "{msg}");
+        assert!(msg.contains("0 bytes"), "{msg}");
+        // The raw cstorch error is still included, but after the diagnosis.
+        assert!(msg.contains("Ran out of input"), "{msg}");
+    }
+
+    #[test]
+    fn diagnoses_empty_metadata_object() {
+        // Data objects have bytes, but the metadata object is empty.
+        let json = r#"{"error":"cstorch.load failed: EOFError('Ran out of input')",
+            "s3_probe":{"prefix":"m/step","total":10,"empty":1,"bytes":4096,
+                        "metadata_key":"__METADATA__","metadata_empty":true,"sample":[]}}"#;
+        let msg = parse_dump(json, "s3://b/k").unwrap_err().to_string();
+        assert!(msg.contains("`__METADATA__` is empty"), "{msg}");
+        assert!(msg.contains("interrupted save"), "{msg}");
+    }
+
+    #[test]
+    fn diagnoses_wrong_prefix() {
+        let json = r#"{"error":"cstorch.load failed: boom",
+            "s3_probe":{"prefix":"typo/here","total":0,"empty":0,"bytes":0,
+                        "metadata_key":null,"metadata_empty":false,"sample":[]}}"#;
+        let msg = parse_dump(json, "s3://b/k").unwrap_err().to_string();
+        assert!(msg.contains("No objects exist"), "{msg}");
+        assert!(msg.contains("typo/here"), "{msg}");
+    }
+
+    #[test]
+    fn diagnoses_intact_objects_as_format_issue() {
+        // Nothing empty → the bytes are there, so it's a format/version problem.
+        let json = r#"{"error":"cstorch.load failed: KeyError('spec')",
+            "s3_probe":{"prefix":"m/s","total":5,"empty":0,"bytes":1048576,
+                        "metadata_key":"__METADATA__","metadata_empty":false,"sample":[]}}"#;
+        let msg = parse_dump(json, "s3://b/k").unwrap_err().to_string();
+        assert!(msg.contains("look intact"), "{msg}");
+        assert!(msg.contains("format/version"), "{msg}");
+    }
+
+    #[test]
+    fn falls_back_when_probe_itself_failed() {
+        let json = r#"{"error":"cstorch.load failed: boom",
+            "s3_probe_error":"NoCredentialsError()"}"#;
+        let msg = parse_dump(json, "s3://b/k").unwrap_err().to_string();
+        assert!(msg.contains("boom"), "{msg}");
+        assert!(msg.contains("couldn't list the S3 objects"), "{msg}");
+        assert!(msg.contains("NoCredentialsError"), "{msg}");
     }
 
     #[test]
