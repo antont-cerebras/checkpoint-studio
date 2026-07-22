@@ -121,17 +121,42 @@ impl WebState {
     }
 }
 
-/// Start the server and block until the process is stopped (Ctrl-C). `host` is the
-/// bind address (default `0.0.0.0` — all interfaces, so it's reachable at this
-/// machine's hostname on the network, matching how VMs serve web apps here).
+/// Reserve the server socket **up front**, before any slow work (e.g. a 5–10 s
+/// remote read), so a port clash is reported in milliseconds rather than after the
+/// wait. `host` is the bind address (default `0.0.0.0`). If a *specific* requested
+/// port is already in use, fall back to an OS-assigned free port so the command
+/// still comes up — and warn where it landed (so a stale server, or a chosen port,
+/// doesn't just fail).
+pub fn bind(host: IpAddr, port: u16) -> Result<tiny_http::Server> {
+    match tiny_http::Server::http(SocketAddr::new(host, port)) {
+        Ok(server) => Ok(server),
+        Err(e) if port != 0 => {
+            let server = tiny_http::Server::http(SocketAddr::new(host, 0))
+                .map_err(|e2| anyhow::anyhow!("failed to start web server on {host}: {e2}"))?;
+            let freed = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
+            eprintln!(
+                "checkpoint-explorer: port {port} is already in use ({e}) — serving on free \
+                 port {freed} instead (use --port to pick another, or free {port} first)."
+            );
+            Ok(server)
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "failed to start web server on {host}:{port}: {e}"
+        )),
+    }
+}
+
+/// Start the server and block until the process is stopped (Ctrl-C). Binds the
+/// port immediately (see [`bind`]); for a remote read, bind first and pass the
+/// server to [`serve_on`] so the port is held while the read runs.
 pub fn serve(state: Arc<WebState>, host: IpAddr, port: u16) -> Result<()> {
-    let server = tiny_http::Server::http(SocketAddr::new(host, port))
-        .map_err(|e| anyhow::anyhow!("failed to start web server on {host}:{port}: {e}"))?;
-    let bound = server
-        .server_addr()
-        .to_ip()
-        .map(|a| a.port())
-        .unwrap_or(port);
+    serve_on(bind(host, port)?, state, host)
+}
+
+/// Serve on an already-[`bind`]-ed socket and block until stopped. `host` is only
+/// used to render a reachable URL (a wildcard bind isn't clickable).
+pub fn serve_on(server: tiny_http::Server, state: Arc<WebState>, host: IpAddr) -> Result<()> {
+    let bound = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
     // Print a URL the browser can actually reach: a wildcard bind (0.0.0.0 / ::)
     // isn't clickable, so show this host's FQDN instead of the bind address.
     let display = if host.is_unspecified() {

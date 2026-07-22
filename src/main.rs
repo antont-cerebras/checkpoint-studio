@@ -1803,11 +1803,15 @@ fn run_web(
                 "web --ssh-read serves a single remote checkpoint; give one s3://… URI or remote path"
             ),
         };
+        // Reserve the port *before* the read (5–10 s over SSH): a clash is reported
+        // immediately, and if the requested port is taken we land on a free one and
+        // hold it while the read runs — so the wait is never wasted.
+        let server = web::bind(host, port)?;
         let venv = ssh_venv.unwrap_or_else(|| "~/venv".to_string());
         let remote = crate::remote::RemoteRead::new(rhost, venv);
         let model = remote.read_checkpoint(&src)?;
         let state = std::sync::Arc::new(web::WebState::build(model, &[], &[]));
-        return web::serve(state, host, port);
+        return web::serve_on(server, state, host);
     }
     let (files, index_specs) = collect_safetensors_files(paths, recursive, no_health_check)?;
     if files.is_empty() {
