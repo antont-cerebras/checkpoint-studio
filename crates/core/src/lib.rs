@@ -27,6 +27,7 @@ pub mod sample;
 pub mod sftp;
 pub mod stats;
 pub mod stheader;
+pub mod tensorfilter;
 pub mod tree;
 pub mod utils;
 pub mod viewstate;
