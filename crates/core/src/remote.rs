@@ -137,6 +137,43 @@ const SENTINEL: &str = "CKPT_EXPLORER_META:";
 /// ahead of the final metadata so the load bar fills for an `s3://` read too.
 const PROGRESS_TAG: &str = "CKPT_EXPLORER_PROG:";
 
+/// Line prefix for the value-diff script's live status events (load phase +
+/// per-tensor start), so the two-line comparison view shows what's happening.
+const STATUS_TAG: &str = "CKPT_EXPLORER_STAT:";
+
+/// A live event streamed from the remote value comparison, driving the two-line
+/// progress view. Borrowed names point into the current output line (copy what you
+/// keep).
+#[derive(Debug)]
+pub enum CompareEvent<'a> {
+    /// A checkpoint is being loaded (`"old"` / `"new"`) — the slow cstorch.load
+    /// step, shown so a long load isn't mistaken for a hang.
+    Loading(&'a str),
+    /// Tensor `done` of `total` has begun comparing.
+    Start {
+        done: usize,
+        total: usize,
+        name: &'a str,
+    },
+    /// A tensor finished comparing, with its outcome and the bytes read for it.
+    Done {
+        name: &'a str,
+        status: CompareStatus,
+        bytes: u64,
+    },
+}
+
+/// The outcome of one tensor's value comparison, for the live view's status mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareStatus {
+    /// Compared and identical.
+    Identical,
+    /// Compared and the values (or distribution) differ.
+    Changed,
+    /// Couldn't be compared (shape mismatch / read error).
+    Error,
+}
+
 /// Upper bound on SSH sessions used to read one safetensors dir's shards in
 /// parallel (work-stealing) — roughly one per shard for a typical sharded model,
 /// so no worker is more than ~1 shard deep. If opening this many trips sshd's
@@ -491,9 +528,13 @@ impl RemoteRead {
     /// loads both checkpoints and, for each `(old_name, new_name)` pair, realises the
     /// two tensors and streams them in row-chunks to compute max/mean `|Δ|` and/or a
     /// shared-range histogram. Only the small per-tensor result JSON crosses the wire
-    /// (never tensor data); `done/total compared` progress streams ahead of it so a
-    /// long run shows a filling bar. Returns a map keyed by the *new* (post-rename)
+    /// (never tensor data); the map returned is keyed by the *new* (post-rename)
     /// tensor name — the same key the diff report is built from.
+    ///
+    /// `on_event` receives live [`CompareEvent`]s (checkpoint loading, each tensor
+    /// starting, each tensor finishing with its outcome + bytes) as the remote
+    /// streams them, so the caller can drive a live view of exactly what's being
+    /// compared — cstorch.load and a slow tensor are then visible, not a frozen bar.
     ///
     /// **Read-only:** loads (lazily) and reads tensor data to compare; it never
     /// writes, saves, or otherwise mutates either checkpoint.
@@ -504,28 +545,69 @@ impl RemoteRead {
         new_uri: &str,
         pairs: &[(String, String)],
         opts: &RemoteValueOpts,
-        progress: Option<&LoadProgress>,
+        mut on_event: impl FnMut(CompareEvent),
     ) -> Result<(HashMap<String, RemoteTensorDiff>, Option<RemoteValueStats>)> {
         let script = value_diff_script(old_uri, new_uri, pairs, opts);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
-        if let Some(p) = progress {
-            p.set_total(pairs.len());
-            p.set_unit(crate::progress::Unit::Compared);
-        }
         let out = session.exec_capture(&command, &script, |line| {
-            if let Some(rest) = line.strip_prefix(PROGRESS_TAG) {
-                let mut parts = rest.splitn(3, '/');
-                if let (Some(d), Some(t)) = (parts.next(), parts.next())
-                    && let (Ok(done), Ok(total)) = (d.trim().parse(), t.trim().parse())
-                    && let Some(p) = progress
+            if let Some(rest) = line.strip_prefix(STATUS_TAG) {
+                // `load\t<old|new>` or `start\t<i>\t<total>\t<name>`.
+                let mut f = rest.split('\t');
+                match f.next() {
+                    Some("load") => {
+                        if let Some(w) = f.next() {
+                            on_event(CompareEvent::Loading(w));
+                        }
+                    }
+                    Some("start") => {
+                        if let (Some(i), Some(t), Some(name)) = (f.next(), f.next(), f.next())
+                            && let (Ok(done), Ok(total)) = (i.parse(), t.parse())
+                        {
+                            on_event(CompareEvent::Start { done, total, name });
+                        }
+                    }
+                    _ => {}
+                }
+            } else if let Some(payload) = line.strip_prefix(SENTINEL) {
+                // Each per-tensor result line is a "done" event (the summary line has
+                // no `name`, so it's skipped here and picked up by parse below).
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload)
+                    && let Some(name) = v.get("name").and_then(|x| x.as_str())
                 {
-                    p.set_total(total);
-                    p.set_done(done);
-                    p.set_unit(crate::progress::Unit::Compared);
+                    on_event(CompareEvent::Done {
+                        name,
+                        status: compare_status(&v),
+                        bytes: v
+                            .get("bytes")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                    });
                 }
             }
         })?;
         parse_value_diff(&out, &self.host)
+    }
+}
+
+/// Classify a per-tensor result line for the live view's status mark.
+fn compare_status(v: &serde_json::Value) -> CompareStatus {
+    if v.get("error").is_some() {
+        return CompareStatus::Error;
+    }
+    let values_changed = v
+        .get("values")
+        .and_then(|x| x.get("differing"))
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|d| d > 0);
+    let hist_changed = v
+        .get("histogram")
+        .and_then(|x| x.get("tvd"))
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|t| t > 0.0);
+    if values_changed || hist_changed {
+        CompareStatus::Changed
+    } else {
+        CompareStatus::Identical
     }
 }
 
@@ -682,9 +764,11 @@ emit({"tensors": tensors, "metadata": [], "s3_objects": s3_objects, "s3_warnings
 /// `DiffAcc` semantics: bit-equal (or both-NaN) slots are unchanged, `max`/`mean`
 /// `|Δ|` are over finite differing pairs, others count as non-finite mismatches —
 /// and (b) a shared-range histogram (both sides binned over their combined finite
-/// range into `n` equal-width bins, like the local `Range` layout). Emits a
-/// sentinel JSON line per tensor plus `PROG:done/total/compared` lines. Both URIs
-/// and the name pairs are embedded as JSON literals (valid Python), so nothing
+/// range into `n` equal-width bins, like the local `Range` layout). Streams status
+/// events for the live view — `STAT:load\t<old|new>` while loading each checkpoint,
+/// `STAT:start\t<i>\t<total>\t<name>` as each tensor begins — plus one sentinel
+/// JSON result line per tensor (carrying its `bytes`) and a final `summary`. Both
+/// URIs and the name pairs are embedded as JSON literals (valid Python), so nothing
 /// needs shell quoting.
 ///
 /// **Read-only:** it only `cstorch.load`s (lazily) and reads tensor data to
@@ -715,11 +799,11 @@ FULL_HIST = __FULL_HIST__
 BINS = __BINS__
 CHUNK = 4000000
 S = "__SENTINEL__"
-P = "__PROGRESS__"
+ST = "__STATUS__"
 def emit(o):
     sys.stdout.write(S + json.dumps(o) + "\n"); sys.stdout.flush()
-def prog(done, total):
-    sys.stdout.write("%s%d/%d/compared\n" % (P, done, total)); sys.stdout.flush()
+def stat(s):
+    sys.stdout.write(ST + s + "\n"); sys.stdout.flush()
 try:
     import cerebras.pytorch as cstorch
 except Exception as e:
@@ -730,7 +814,9 @@ try:
 except Exception as e:
     emit({"error": "import numpy/torch failed (needed to compare values): %r" % (e,)}); sys.exit(0)
 try:
+    stat("load\told")
     old_sd = cstorch.load(OLD, map_location=None)
+    stat("load\tnew")
     new_sd = cstorch.load(NEW, map_location=None)
 except Exception as e:
     emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
@@ -738,22 +824,24 @@ def to_f64(rt, i, j):
     sl = rt if i is None else rt[i:j]
     return sl.to(torch.float64).numpy().reshape(-1)
 total = len(PAIRS)
-prog(0, total)
 t0 = time.time()
 read_bytes = 0
 compared = 0
 for idx in range(total):
     oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
+    stat("start\t%d\t%d\t%s" % (idx + 1, total, nname))
     res = {"name": nname}
     try:
         a = old_sd[oname]; b = new_sd[nname]
         ashape = [int(d) for d in a.shape]; bshape = [int(d) for d in b.shape]
         if ashape != bshape:
-            res["error"] = "shapes differ"; emit(res); prog(idx + 1, total); continue
+            res["error"] = "shapes differ"; emit(res); continue
         # Realise each side to CPU once (one read of its stored bytes from S3); the
         # per-chunk float64 conversions below then work off the in-memory copy.
         ra = a.to("cpu"); rb = b.to("cpu")
-        read_bytes += ra.element_size() * ra.nelement() + rb.element_size() * rb.nelement()
+        tb = ra.element_size() * ra.nelement() + rb.element_size() * rb.nelement()
+        res["bytes"] = int(tb)
+        read_bytes += tb
         compared += 1
         scalar = (len(ashape) == 0)
         d0 = 0 if scalar else ashape[0]
@@ -824,7 +912,7 @@ for idx in range(total):
             res["histogram"] = h
     except Exception as e:
         res["error"] = "%r" % (e,)
-    emit(res); prog(idx + 1, total)
+    emit(res)
 emit({"summary": {"tensors": total, "compared": compared, "bytes": int(read_bytes), "elapsed_s": time.time() - t0}})
 "#;
     TEMPLATE
@@ -836,7 +924,7 @@ emit({"summary": {"tensors": total, "compared": compared, "bytes": int(read_byte
         .replace("__FULL_HIST__", b(opts.full_hist))
         .replace("__BINS__", &bins_lit)
         .replace("__SENTINEL__", SENTINEL)
-        .replace("__PROGRESS__", PROGRESS_TAG)
+        .replace("__STATUS__", STATUS_TAG)
 }
 
 /// The boto3 object-listing script for an `s3://…` checkpoint: a single paginated
@@ -1469,6 +1557,11 @@ mod tests {
         assert!(s.contains("import cerebras.pytorch"));
         assert!(s.contains("np.histogram"));
         assert!(s.contains(SENTINEL));
+        // Streams live status events (load phase + per-tensor start) for the view.
+        assert!(s.contains(STATUS_TAG), "{s}");
+        assert!(s.contains("stat(\"load\\told\")"), "{s}");
+        assert!(s.contains("stat(\"start\\t"), "{s}");
+        assert!(s.contains("res[\"bytes\"]"), "{s}");
         // Read-only: it loads + reads to compare, never saves/writes/uploads/deletes.
         for forbidden in [
             "cstorch.save",
@@ -1536,6 +1629,32 @@ mod tests {
         let (_m, none) =
             parse_value_diff(&format!("{SENTINEL}{{\"name\":\"z\"}}\n"), "host").unwrap();
         assert!(none.is_none());
+    }
+
+    #[test]
+    fn compare_status_classifies_results() {
+        let v = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert_eq!(
+            compare_status(&v(r#"{"name":"a","error":"shapes differ"}"#)),
+            CompareStatus::Error
+        );
+        assert_eq!(
+            compare_status(&v(r#"{"name":"a","values":{"differing":0}}"#)),
+            CompareStatus::Identical
+        );
+        assert_eq!(
+            compare_status(&v(r#"{"name":"a","values":{"differing":5}}"#)),
+            CompareStatus::Changed
+        );
+        // A distribution shift alone counts as changed.
+        assert_eq!(
+            compare_status(&v(r#"{"name":"a","histogram":{"tvd":0.3,"n":40}}"#)),
+            CompareStatus::Changed
+        );
+        assert_eq!(
+            compare_status(&v(r#"{"name":"a","histogram":{"tvd":0.0,"n":40}}"#)),
+            CompareStatus::Identical
+        );
     }
 
     #[test]

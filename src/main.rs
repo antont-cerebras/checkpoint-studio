@@ -1317,6 +1317,179 @@ fn erase_block(prev_lines: usize) {
     }
 }
 
+/// Shared state for the remote value-comparison's live two-line view (below).
+struct RemoteCompareState {
+    inner: std::sync::Mutex<RemoteCompareInner>,
+    done: std::sync::atomic::AtomicUsize,
+    done_bytes: std::sync::atomic::AtomicU64,
+    total: usize,
+    total_bytes: u64,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct RemoteCompareInner {
+    /// `Some("old"/"new")` while a checkpoint is loading (before comparison starts).
+    loading: Option<String>,
+    /// The tensor being compared right now.
+    current: Option<String>,
+    /// The most recently finished tensor and its outcome.
+    last: Option<(String, crate::remote::CompareStatus)>,
+}
+
+/// Live view of the remote value comparison: **two lines** on stderr — the tensor
+/// last compared (with a ✓/≠/✗ status mark + running count and bytes), and the one
+/// in progress (spinner) — so the slow `cstorch.load` and each tensor are visible
+/// rather than a frozen counter. Erased when done, leaving the diff report clean.
+/// A no-op off a TTY. Fed by [`crate::remote::CompareEvent`]s.
+struct RemoteCompareView {
+    state: Option<std::sync::Arc<RemoteCompareState>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RemoteCompareView {
+    fn start(total: usize, total_bytes: u64) -> Self {
+        use std::io::IsTerminal;
+        if !std::io::stderr().is_terminal() {
+            return Self {
+                state: None,
+                handle: None,
+            };
+        }
+        let state = std::sync::Arc::new(RemoteCompareState {
+            inner: std::sync::Mutex::new(RemoteCompareInner::default()),
+            done: std::sync::atomic::AtomicUsize::new(0),
+            done_bytes: std::sync::atomic::AtomicU64::new(0),
+            total,
+            total_bytes,
+            stop: std::sync::atomic::AtomicBool::new(false),
+        });
+        let worker = std::sync::Arc::clone(&state);
+        let handle = std::thread::spawn(move || remote_compare_loop(worker));
+        Self {
+            state: Some(state),
+            handle: Some(handle),
+        }
+    }
+
+    /// Apply one streamed event to the shared state.
+    fn on(&self, ev: crate::remote::CompareEvent) {
+        use crate::remote::CompareEvent;
+        use std::sync::atomic::Ordering;
+        let Some(st) = &self.state else { return };
+        match ev {
+            CompareEvent::Loading(what) => {
+                if let Ok(mut i) = st.inner.lock() {
+                    i.loading = Some(what.to_string());
+                    i.current = None;
+                }
+            }
+            CompareEvent::Start { name, .. } => {
+                if let Ok(mut i) = st.inner.lock() {
+                    i.loading = None;
+                    i.current = Some(name.to_string());
+                }
+            }
+            CompareEvent::Done {
+                name,
+                status,
+                bytes,
+            } => {
+                st.done.fetch_add(1, Ordering::Relaxed);
+                st.done_bytes.fetch_add(bytes, Ordering::Relaxed);
+                if let Ok(mut i) = st.inner.lock() {
+                    i.last = Some((name.to_string(), status));
+                    i.current = None;
+                }
+            }
+        }
+    }
+
+    fn finish(mut self) {
+        use std::sync::atomic::Ordering;
+        if let Some(st) = &self.state {
+            st.stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// The two-line view's render thread: redraw ~10×/s until stopped, then erase.
+fn remote_compare_loop(st: std::sync::Arc<RemoteCompareState>) {
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    let width = match crossterm::terminal::size() {
+        Ok((c, _)) if c > 0 => c as usize,
+        _ => 100,
+    };
+    let mut prev_lines = 0usize;
+    let mut frame = 0usize;
+    while !st.stop.load(Ordering::Relaxed) {
+        draw_block(&remote_compare_block(frame, &st, width), &mut prev_lines);
+        frame += 1;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    erase_block(prev_lines);
+    let _ = std::io::stderr().flush();
+}
+
+/// Build the two lines: last-compared (status mark + count + bytes) and in-progress.
+fn remote_compare_block(frame: usize, st: &RemoteCompareState, width: usize) -> Vec<String> {
+    use std::sync::atomic::Ordering;
+    const GREEN: &str = "\x1b[1;32m";
+    const YELLOW: &str = "\x1b[1;33m";
+    const RED: &str = "\x1b[1;31m";
+    const CYAN: &str = "\x1b[1;36m";
+    const DIM: &str = "\x1b[2m";
+    const RESET: &str = "\x1b[0m";
+    let spin = DIFF_SPINNER[frame % DIFF_SPINNER.len()];
+    let done = st.done.load(Ordering::Relaxed);
+    let done_b = st.done_bytes.load(Ordering::Relaxed);
+    let counts = format!(
+        "{done}/{} · {}/{}",
+        st.total,
+        utils::format_size(done_b as usize),
+        utils::format_size(st.total_bytes as usize),
+    );
+    let (loading, current, last) = st
+        .inner
+        .lock()
+        .map(|i| (i.loading.clone(), i.current.clone(), i.last.clone()))
+        .unwrap_or_default();
+
+    // Line 1 — the tensor last compared, with its outcome.
+    let name_budget = width.saturating_sub(counts.chars().count() + 6).max(12);
+    let line1 = if let Some((name, status)) = last {
+        use crate::remote::CompareStatus::*;
+        let (color, mark) = match status {
+            Identical => (GREEN, '✓'),
+            Changed => (YELLOW, '≠'),
+            Error => (RED, '✗'),
+        };
+        format!(
+            "{color}{mark}{RESET} {DIM}{}{RESET}  {DIM}{counts}{RESET}",
+            truncate_tail(&name, name_budget)
+        )
+    } else {
+        format!("{DIM}(reading…)  {counts}{RESET}")
+    };
+
+    // Line 2 — what's happening right now.
+    let line2 = if let Some(what) = loading {
+        format!("{CYAN}{spin}{RESET} {DIM}loading {what} checkpoint …{RESET}")
+    } else if let Some(name) = current {
+        format!(
+            "{CYAN}{spin}{RESET} {}",
+            truncate_tail(&name, width.saturating_sub(3).max(12))
+        )
+    } else {
+        format!("{CYAN}{spin}{RESET} {DIM}…{RESET}")
+    };
+    vec![line1, line2]
+}
+
 /// Human-readable elapsed time: `850ms`, `12.3s`, or `2m3s`.
 fn format_elapsed(d: std::time::Duration) -> String {
     let secs = d.as_secs_f64();
@@ -1393,7 +1566,10 @@ fn run_diff(
             // we're still authenticating and nothing is being read yet).
             let sa = r.open_with(&mut password)?;
             let sb = r.open_with(&mut password)?;
-            eprintln!("checkpoint-explorer diff: reading tensor metadata over ssh …");
+            eprintln!(
+                "checkpoint-explorer diff: reading each checkpoint's tensor list over ssh \
+                 (names/dtypes/shapes only — no tensor data is transferred) …"
+            );
             let bars = progress::Bars::start(vec![old_str.to_string(), new_str.to_string()]);
             let read =
                 |session: &crate::sftp::RemoteSession, src: &str, i: usize| -> Result<SideLoad> {
@@ -1512,6 +1688,7 @@ fn run_diff(
                         &new_str,
                         &[(name.to_string(), name.to_string())],
                         &vopts,
+                        (a.size_bytes + b.size_bytes) as u64,
                     ) {
                         Ok(mut m) => m.remove(name),
                         Err(e) => {
@@ -1606,6 +1783,16 @@ fn run_diff(
                     (a.shape == b.shape).then(|| (a.name.clone(), k.to_string()))
                 })
                 .collect();
+            // Data to read (both sides, stored dtype) — for the view total + intro.
+            let total_bytes: u64 = pairs
+                .iter()
+                .filter_map(|(_, k)| {
+                    Some(
+                        (old_map.get(k.as_str())?.size_bytes + new_map.get(k.as_str())?.size_bytes)
+                            as u64,
+                    )
+                })
+                .sum();
             let vopts = crate::remote::RemoteValueOpts {
                 values: opts.values,
                 histogram: opts.histogram,
@@ -1619,6 +1806,7 @@ fn run_diff(
                 &new_str,
                 &pairs,
                 &vopts,
+                total_bytes,
             ) {
                 Ok(m) => m
                     .into_iter()
@@ -1761,9 +1949,13 @@ fn tensor_histogram(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> Option<di
 }
 
 /// Open a session (reusing the already-entered `password`, so no second prompt) and
-/// run the proxy value comparison for `pairs`, with a progress bar that fills as the
-/// remote reports `done/total compared`. Used for both the bulk `--values`/
-/// `--histogram` run and the single `--tensor` focus.
+/// run the proxy value comparison for `pairs`. The comparison happens **on the
+/// remote** (it holds the S3 access); only the small per-tensor results come back,
+/// never tensor data. A live two-line view ([`RemoteCompareView`]) shows what's
+/// loading / comparing now, and a final line reports the I/O throughput.
+/// `total_bytes` is the data to be read (both sides, stored dtype) — for the view's
+/// total and the intro. Used for both the bulk `--values`/`--histogram` run and the
+/// single `--tensor` focus.
 fn fetch_remote_value_diff(
     r: &crate::remote::RemoteRead,
     password: &mut Option<String>,
@@ -1771,33 +1963,29 @@ fn fetch_remote_value_diff(
     new_uri: &str,
     pairs: &[(String, String)],
     vopts: &crate::remote::RemoteValueOpts,
+    total_bytes: u64,
 ) -> Result<HashMap<String, crate::remote::RemoteTensorDiff>> {
     let session = r.open_with(password)?;
     eprintln!(
-        "checkpoint-explorer diff: comparing {} tensor(s)' values over ssh …",
-        pairs.len()
+        "checkpoint-explorer diff: comparing {} tensor(s) on {} — reading ≈ {} from S3 \
+         (tensor data is processed on the remote, not streamed here) …",
+        pairs.len(),
+        r.host,
+        crate::utils::format_size(total_bytes as usize),
     );
-    let bars = progress::Bars::start(vec![format!("comparing {} tensors", pairs.len())]);
-    let progress = bars.progress(0);
-    let out = r.value_diff(
-        &session,
-        old_uri,
-        new_uri,
-        pairs,
-        vopts,
-        progress.as_deref(),
-    );
-    bars.finish(0, out.is_ok());
-    bars.join();
+    let view = RemoteCompareView::start(pairs.len(), total_bytes);
+    let out = r.value_diff(&session, old_uri, new_uri, pairs, vopts, |ev| view.on(ev));
+    view.finish();
     let (map, stats) = out?;
     // I/O + timing from the proxy: bytes read from S3 and the throughput, so a long
     // comparison's performance is visible (on stderr, keeping stdout's diff clean).
+    // `elapsed_s` is the remote compare time (excludes the ssh handshake).
     if let Some(s) = stats {
         let elapsed = std::time::Duration::from_secs_f64(s.elapsed_s.max(0.0));
         let read = crate::utils::format_size(s.bytes as usize);
         let rate = if s.elapsed_s > 0.0 {
             format!(
-                " ({}/s)",
+                " ({}/s from S3)",
                 crate::utils::format_size((s.bytes as f64 / s.elapsed_s) as usize)
             )
         } else {
