@@ -2352,8 +2352,19 @@ fn render_repack_verdict(
                     format!(" {dim}(first: expert {e}, offset {off}: {o} vs {n}){reset}")
                 })
                 .unwrap_or_default();
+            // If every difference is to an adjacent index (max |Δ| == 1), it's the
+            // signature of an independent re-quantization, not a lossless repack.
+            let delta = if rr.max_delta <= 1 {
+                format!(" {dim}— all by ±1 (same weights, independently re-quantized){reset}")
+            } else {
+                format!(
+                    " {dim}— max |Δ| {}, {} by >1{reset}",
+                    rr.max_delta,
+                    crate::utils::format_parameters(rr.differing_gt1 as usize),
+                )
+            };
             println!(
-                "  {yellow}≠{reset} {name}  {yellow}{} of {} indices differ{reset}{where_}",
+                "  {yellow}≠{reset} {name}  {yellow}{} of {} indices differ{reset}{delta}{where_}",
                 crate::utils::format_parameters(rr.differing as usize),
                 crate::utils::format_parameters(rr.elements as usize),
             );
@@ -2395,33 +2406,35 @@ fn print_repack_sample(rr: &crate::remote::RepackResult, red: &str, dim: &str, r
     let cols = s.old.first().map(|r| r.len()).unwrap_or(0);
     println!(
         "      {dim}decoded index slice — experts {}..{} (rows) × offset {}..{} (cols); \
-         new cells that differ from old are red:{reset}",
+         cells that differ are red in both grids:{reset}",
         s.e0,
         s.e0 + rows as u64,
         s.off0,
         s.off0 + cols as u64,
     );
+    // Both grids highlight the differing cells (red), so the eye lands on the same
+    // positions in old and new.
+    let render = |a: &[Vec<u32>], b: &[Vec<u32>]| {
+        for (i, row) in a.iter().take(rows).enumerate() {
+            let brow = &b[i];
+            let cells: String = row
+                .iter()
+                .enumerate()
+                .map(|(j, v)| {
+                    if brow.get(j) != Some(v) {
+                        format!(" {red}{v}{reset}")
+                    } else {
+                        format!(" {v}")
+                    }
+                })
+                .collect();
+            println!("        {dim}e{:<4}{reset}{cells}", s.e0 + i as u64);
+        }
+    };
     println!("      {dim}old:{reset}");
-    for (i, row) in s.old.iter().take(rows).enumerate() {
-        let cells: String = row.iter().map(|v| format!(" {v}")).collect();
-        println!("        {dim}e{:<4}{reset}{cells}", s.e0 + i as u64);
-    }
+    render(&s.old, &s.new);
     println!("      {dim}new:{reset}");
-    for (i, row) in s.new.iter().take(rows).enumerate() {
-        let orow = &s.old[i];
-        let cells: String = row
-            .iter()
-            .enumerate()
-            .map(|(j, v)| {
-                if orow.get(j) != Some(v) {
-                    format!(" {red}{v}{reset}")
-                } else {
-                    format!(" {v}")
-                }
-            })
-            .collect();
-        println!("        {dim}e{:<4}{reset}{cells}", s.e0 + i as u64);
-    }
+    render(&s.new, &s.old);
 }
 
 /// Detect a fold along dim 0: old `(E, …)` ↔ new `(ceil(E/fold), …)` with the inner

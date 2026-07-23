@@ -144,6 +144,11 @@ pub struct RepackResult {
     pub elements: u64,
     /// Decoded indices that differ between old and new (0 ⇒ equivalent).
     pub differing: u64,
+    /// Largest `|old − new|` over the decoded indices (1 ⇒ every difference is to an
+    /// adjacent index — the signature of an independent re-quantization).
+    pub max_delta: u32,
+    /// Differing indices that differ by more than 1 (0 ⇒ all differences are ±1).
+    pub differing_gt1: u64,
     /// Old words with non-zero bits above `bits` (top-13-zero check; 0 ⇒ ok).
     pub sparse_bad: u64,
     /// New words with a non-zero bit above `fold*bits` (MSB check; 0 ⇒ ok).
@@ -1266,7 +1271,7 @@ def work(idx):
         # must all be zero (else the packing assumption is wrong).
         sparse_bad = int(np.count_nonzero(ao >> np.uint16(BITS)))
         dense_bad = int(np.count_nonzero(bo >> np.uint16(fold * BITS)))
-        differing = 0; first = None
+        differing = 0; first = None; maxdelta = 0; big = 0
         blk = max(1, CMP // max(1, E))
         for n0 in range(0, N, blk):
             n1 = min(n0 + blk, N)
@@ -1275,10 +1280,17 @@ def work(idx):
             ne = o != nd
             cnt = int(np.count_nonzero(ne))
             differing += cnt
+            if cnt:
+                # |Δ| over the decoded indices — max magnitude + how many differ by
+                # more than 1 (all ±1 ⇒ same weights, re-quantized).
+                d = np.abs(o.astype(np.int32) - nd.astype(np.int32))
+                m = int(d.max())
+                if m > maxdelta: maxdelta = m
+                big += int(np.count_nonzero(d > 1))
             if first is None and cnt:
                 p = np.argwhere(ne)[0]; e = int(p[0]); col = n0 + int(p[1])
                 first = [e, col, int(o[p[0], p[1]]), int(nd[p[0], p[1]])]
-        res.update({"elements": E * N, "differing": differing, "sparse_bad": sparse_bad, "dense_bad": dense_bad, "fold": fold, "bytes": tb})
+        res.update({"elements": E * N, "differing": differing, "sparse_bad": sparse_bad, "dense_bad": dense_bad, "fold": fold, "bytes": tb, "maxdelta": maxdelta, "big": big})
         if first is not None:
             res["first"] = first
         # A small decoded window (experts × inner-offset), centred on the first
@@ -1594,6 +1606,8 @@ fn parse_repack_result(v: &serde_json::Value) -> RepackResult {
     RepackResult {
         elements: u("elements"),
         differing: u("differing"),
+        max_delta: u("maxdelta") as u32,
+        differing_gt1: u("big"),
         sparse_bad: u("sparse_bad"),
         dense_bad: u("dense_bad"),
         fold: u("fold") as usize,
