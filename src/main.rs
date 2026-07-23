@@ -2037,7 +2037,8 @@ fn run_repack_verify(
     let other_differs = added || removed || other_changed || old_sum.metadata != new_sum.metadata;
 
     let results = if let Some(r) = remote.filter(|_| s3_pair) {
-        match fetch_remote_repack(r, password, old_uri, new_uri, &pairs, bits, false) {
+        let labels = repack_bar_labels(&pairs, old_t, new_t);
+        match fetch_remote_repack(r, password, old_uri, new_uri, &pairs, &labels, bits, false) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("checkpoint-explorer diff: {e:#}");
@@ -2155,14 +2156,44 @@ fn auto_sparse_families(
     (pairs, bits, handled)
 }
 
+/// The ordered set of tensors that get their own remote download bar: each weight,
+/// then any sibling `.codebook` / `.qscale` present on both sides (the proxy streams
+/// those too, so they shouldn't download invisibly). Labels are the *new* names —
+/// the key the proxy tags every event with.
+fn repack_bar_labels(
+    pairs: &[(String, String)],
+    old_t: &[TensorInfo],
+    new_t: &[TensorInfo],
+) -> Vec<String> {
+    let has = |ts: &[TensorInfo], n: &str| ts.iter().any(|t| t.name == n);
+    let mut labels = Vec::new();
+    for (oname, nname) in pairs {
+        labels.push(nname.clone());
+        let (Some(ostem), Some(nstem)) =
+            (oname.strip_suffix(".weight"), nname.strip_suffix(".weight"))
+        else {
+            continue;
+        };
+        for kind in ["codebook", "qscale"] {
+            let (oaux, naux) = (format!("{ostem}.{kind}"), format!("{nstem}.{kind}"));
+            if has(old_t, &oaux) && has(new_t, &naux) {
+                labels.push(naux);
+            }
+        }
+    }
+    labels
+}
+
 /// Open a session (reusing the password) and run the proxy repack verification with
-/// the live two-line view + a final I/O line (mirrors [`fetch_remote_value_diff`]).
+/// a per-tensor download bar (weights + sibling codebook/qscale) + a final I/O line.
+#[allow(clippy::too_many_arguments)]
 fn fetch_remote_repack(
     r: &crate::remote::RemoteRead,
     password: &mut Option<String>,
     old_uri: &str,
     new_uri: &str,
     pairs: &[(String, String)],
+    bar_labels: &[String],
     bits: usize,
     auto_sparse: bool,
 ) -> Result<HashMap<String, crate::remote::RepackResult>> {
@@ -2183,15 +2214,16 @@ fn fetch_remote_repack(
             pairs.len().clamp(1, 4),
         );
     }
-    // One standard progress bar per tensor (labelled by the *new* name), each
-    // filling over its (old + new) S3 byte size as the proxy streams the two sides.
-    let bars = progress::Bars::start(pairs.iter().map(|(_, n)| n.clone()).collect());
-    let index: std::collections::HashMap<&str, usize> = pairs
+    // One standard progress bar per read tensor (weight + sibling codebook/qscale),
+    // labelled by the *new* name, each filling over its (old + new) S3 byte size as
+    // the proxy streams the two sides.
+    let bars = progress::Bars::start(bar_labels.to_vec());
+    let index: std::collections::HashMap<&str, usize> = bar_labels
         .iter()
         .enumerate()
-        .map(|(i, (_, n))| (n.as_str(), i))
+        .map(|(i, n)| (n.as_str(), i))
         .collect();
-    let finished = std::cell::RefCell::new(vec![false; pairs.len()]);
+    let finished = std::cell::RefCell::new(vec![false; bar_labels.len()]);
     let out = r.verify_repack(&session, old_uri, new_uri, pairs, bits, auto_sparse, |ev| {
         drive_bars(&bars, &index, &finished, ev)
     });
@@ -2354,7 +2386,8 @@ fn run_auto_sparse(
     bits: usize,
 ) -> HashMap<String, crate::remote::RepackResult> {
     if let Some(r) = remote.filter(|_| s3_pair) {
-        match fetch_remote_repack(r, password, old_uri, new_uri, pairs, bits, true) {
+        let labels = repack_bar_labels(pairs, old_t, new_t);
+        match fetch_remote_repack(r, password, old_uri, new_uri, pairs, &labels, bits, true) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("checkpoint-explorer diff: sparse index compare: {e:#}");

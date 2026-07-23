@@ -770,6 +770,16 @@ fn dispatch_stream_line(
                     on_event(RepackEvent::Comparing(name));
                 }
             }
+            // A sibling tensor's own bar finished downloading (codebook / qscale) —
+            // it has no per-tensor verdict of its own, so mark the bar done (✓).
+            Some("done") => {
+                if let Some(name) = f.next() {
+                    on_event(RepackEvent::Done {
+                        name,
+                        status: CompareStatus::Identical,
+                    });
+                }
+            }
             _ => {}
         }
     } else if let Some(payload) = line.strip_prefix(SENTINEL)
@@ -1316,18 +1326,58 @@ def decode_u16(buf, compressed):
     return np.frombuffer(buf, dtype=np.uint16)     # raw 16-bit words, zero-copy
 def to_u16(dt):   # fallback via cstorch (no byte progress)
     return dt.to("cpu").contiguous().view(torch.int16).numpy().view(np.uint16)
-def read_aux(sd, name):   # a small float sibling tensor (codebook / scale), as f64
-    if name not in sd:
+NPF = {"float16": np.float16, "float32": np.float32, "float64": np.float64}
+def aux_meta(loc):
+    # (compressed, numpy_dtype, shape, size) for a numpy-float-stored sibling, else None.
+    client, bucket, key = loc
+    h = client.head_object(Bucket=bucket, Key=key)
+    md = h.get("Metadata") or {}
+    try:
+        meta = json.loads(md.get("metadata") or md.get("Metadata") or "{}")
+    except Exception:
         return None
-    return sd[name].to("cpu").to(torch.float64).numpy()
+    nm = meta.get("__NUMPY__")
+    if not nm or nm.get("dtype") not in NPF:
+        return None
+    return (bool(meta.get("compressed")), NPF[nm["dtype"]], [int(x) for x in nm["shape"]], int(h.get("ContentLength", 0)))
+def stream_aux(sd, name, on_side):
+    # Read a sibling float tensor (codebook / scale) over S3 with byte progress → f64.
+    # Falls back to cstorch materialise (no progress) if it isn't numpy-float-stored.
+    dt = sd[name]
+    loc = resolve(dt)
+    am = aux_meta(loc) if loc is not None else None
+    if loc is None or am is None:
+        on_side(0)
+        return dt.to("cpu").to(torch.float64).numpy(), 0
+    comp, npdt, shape, size = am
+    buf = download_raw(loc, on_side)
+    raw = zstandard.decompress(bytes(buf)) if comp else buf
+    return np.frombuffer(raw, dtype=npdt).reshape(shape).astype(np.float64), size
 def cmp_aux(oname_a, nname_a):
-    # Always returns a dict recording the tensor NAMES tried, so the caller can show
-    # exactly what was compared (and flag when the sibling wasn't found).
-    a = read_aux(old_sd, oname_a); b = read_aux(new_sd, nname_a)
+    # Streams both sides over S3 (its own progress bar, keyed by the new name) and
+    # records the NAMES tried, so the caller shows exactly what was compared.
     out = {"old_name": oname_a, "new_name": nname_a,
-           "old_present": a is not None, "new_present": b is not None}
-    if a is None or b is None:
+           "old_present": oname_a in old_sd, "new_present": nname_a in new_sd}
+    if not out["old_present"] or not out["new_present"]:
         return out
+    osz = 0; nsz = 0
+    olo = resolve(old_sd[oname_a]); nlo = resolve(new_sd[nname_a])
+    oam = aux_meta(olo) if olo is not None else None
+    nam = aux_meta(nlo) if nlo is not None else None
+    if oam: osz = oam[3]
+    if nam: nsz = nam[3]
+    stat("size\t%s\t%d\t%d" % (nname_a, osz, nsz))
+    od = [0]; nd = [0]; last = [0]
+    def bump():
+        s = od[0] + nd[0]
+        if s - last[0] >= EMIT:
+            last[0] = s; stat("bytes\t%s\t%d\t%d" % (nname_a, od[0], nd[0]))
+    a, _ = stream_aux(old_sd, oname_a, lambda x: (od.__setitem__(0, x), bump()))
+    b, _ = stream_aux(new_sd, nname_a, lambda x: (nd.__setitem__(0, x), bump()))
+    stat("bytes\t%s\t%d\t%d" % (nname_a, osz, nsz))
+    stat("done\t%s" % (nname_a,))
+    with agg_lock:
+        read_bytes[0] += osz + nsz
     out["shape_old"] = [int(x) for x in a.shape]; out["shape_new"] = [int(x) for x in b.shape]
     if list(a.shape) != list(b.shape):
         return out
