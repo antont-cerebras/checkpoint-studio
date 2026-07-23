@@ -2354,19 +2354,28 @@ fn render_repack_verdict(
                 .unwrap_or_default();
             // If every difference is to an adjacent index (max |Δ| == 1), it's the
             // signature of an independent re-quantization, not a lossless repack.
-            let delta = if rr.max_delta <= 1 {
-                format!(" {dim}— all by ±1 (same weights, independently re-quantized){reset}")
+            let adj = if rr.max_delta <= 1 {
+                format!("{dim}all by ±1 (same weights, independently re-quantized){reset}")
             } else {
                 format!(
-                    " {dim}— max |Δ| {}, {} by >1{reset}",
+                    "{dim}max |Δ| {}, {} by >1{reset}",
                     rr.max_delta,
                     crate::utils::format_parameters(rr.differing_gt1 as usize),
                 )
             };
             println!(
-                "  {yellow}≠{reset} {name}  {yellow}{} of {} indices differ{reset}{delta}{where_}",
+                "  {yellow}≠{reset} {name}  {yellow}{} of {} indices differ{reset} — {adj}{where_}",
                 crate::utils::format_parameters(rr.differing as usize),
                 crate::utils::format_parameters(rr.elements as usize),
+            );
+            // Aggregate magnitude + whether the average value is preserved.
+            println!(
+                "      {dim}Σ|Δ| {} · mean |Δ|/param {:.4} · mean index {:.4} → {:.4} (Δ {:+.4}){reset}",
+                crate::utils::format_parameters(rr.sum_abs as usize),
+                rr.mean_abs,
+                rr.mean_old,
+                rr.mean_new,
+                rr.mean_new - rr.mean_old,
             );
             print_repack_sample(rr, red, dim, reset);
         } else {

@@ -149,6 +149,14 @@ pub struct RepackResult {
     pub max_delta: u32,
     /// Differing indices that differ by more than 1 (0 ⇒ all differences are ±1).
     pub differing_gt1: u64,
+    /// Total `Σ|old − new|` over all indices.
+    pub sum_abs: u64,
+    /// Mean `|old − new|` per index (per parameter).
+    pub mean_abs: f64,
+    /// Mean decoded index on each side — near-equal means the *average value* is
+    /// preserved even where individual indices moved.
+    pub mean_old: f64,
+    pub mean_new: f64,
     /// Old words with non-zero bits above `bits` (top-13-zero check; 0 ⇒ ok).
     pub sparse_bad: u64,
     /// New words with a non-zero bit above `fold*bits` (MSB check; 0 ⇒ ok).
@@ -1272,25 +1280,34 @@ def work(idx):
         sparse_bad = int(np.count_nonzero(ao >> np.uint16(BITS)))
         dense_bad = int(np.count_nonzero(bo >> np.uint16(fold * BITS)))
         differing = 0; first = None; maxdelta = 0; big = 0
+        sum_abs = 0; sum_old = 0; sum_new = 0
         blk = max(1, CMP // max(1, E))
         for n0 in range(0, N, blk):
             n1 = min(n0 + blk, N)
             o = ao[:, n0:n1] & mask
             nd = (bo[we, n0:n1] >> se[:, None]) & mask
+            # Aggregate |Δ| and per-side sums (for mean |Δ|/parameter + mean index).
+            dd = o.astype(np.int64) - nd.astype(np.int64)
+            ad = np.abs(dd)
+            sum_abs += int(ad.sum())
+            sum_old += int(o.sum(dtype=np.uint64))
+            sum_new += int(nd.sum(dtype=np.uint64))
             ne = o != nd
             cnt = int(np.count_nonzero(ne))
             differing += cnt
             if cnt:
-                # |Δ| over the decoded indices — max magnitude + how many differ by
-                # more than 1 (all ±1 ⇒ same weights, re-quantized).
-                d = np.abs(o.astype(np.int32) - nd.astype(np.int32))
-                m = int(d.max())
+                m = int(ad.max())
                 if m > maxdelta: maxdelta = m
-                big += int(np.count_nonzero(d > 1))
+                big += int(np.count_nonzero(ad > 1))   # differ by more than ±1
             if first is None and cnt:
                 p = np.argwhere(ne)[0]; e = int(p[0]); col = n0 + int(p[1])
                 first = [e, col, int(o[p[0], p[1]]), int(nd[p[0], p[1]])]
-        res.update({"elements": E * N, "differing": differing, "sparse_bad": sparse_bad, "dense_bad": dense_bad, "fold": fold, "bytes": tb, "maxdelta": maxdelta, "big": big})
+        elems = E * N
+        res.update({"elements": elems, "differing": differing, "sparse_bad": sparse_bad, "dense_bad": dense_bad, "fold": fold, "bytes": tb, "maxdelta": maxdelta, "big": big,
+                    "sum_abs": int(sum_abs),
+                    "mean_abs": (sum_abs / elems) if elems else 0.0,
+                    "mean_old": (sum_old / elems) if elems else 0.0,
+                    "mean_new": (sum_new / elems) if elems else 0.0})
         if first is not None:
             res["first"] = first
         # A small decoded window (experts × inner-offset), centred on the first
@@ -1603,11 +1620,16 @@ fn parse_repack_result(v: &serde_json::Value) -> RepackResult {
         old: grid(s.get("old")),
         new: grid(s.get("new")),
     });
+    let f = |k: &str| v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
     RepackResult {
         elements: u("elements"),
         differing: u("differing"),
         max_delta: u("maxdelta") as u32,
         differing_gt1: u("big"),
+        sum_abs: u("sum_abs"),
+        mean_abs: f("mean_abs"),
+        mean_old: f("mean_old"),
+        mean_new: f("mean_new"),
         sparse_bad: u("sparse_bad"),
         dense_bad: u("dense_bad"),
         fold: u("fold") as usize,
