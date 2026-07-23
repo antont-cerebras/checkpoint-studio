@@ -1310,12 +1310,12 @@ def work(idx):
                     "mean_new": (sum_new / elems) if elems else 0.0})
         if first is not None:
             res["first"] = first
-        # A small decoded window (experts × inner-offset), centred on the first
-        # mismatch (or the top-left corner), so the caller can SHOW old vs new and
-        # see where/how they diverge.
-        se0 = max(0, first[0] - 3) if first else 0
-        so0 = max(0, first[1] - 8) if first else 0
-        se1 = min(E, se0 + 8); so1 = min(N, so0 + 24)
+        # A decoded window (experts × inner-offset), centred on the first mismatch
+        # (or the top-left corner), so the caller can SHOW old vs new and see
+        # where/how they diverge.
+        se0 = max(0, first[0] - 6) if first else 0
+        so0 = max(0, first[1] - 16) if first else 0
+        se1 = min(E, se0 + 16); so1 = min(N, so0 + 48)
         ew = np.arange(se0, se1)
         sold = (ao[se0:se1, so0:so1] & mask).astype(np.uint16).tolist()
         snew = ((bo[ew // fold][:, so0:so1] >> ((ew % fold) * BITS).astype(np.uint16)[:, None]) & mask).astype(np.uint16).tolist()
