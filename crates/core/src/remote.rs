@@ -1037,7 +1037,9 @@ def prep(dt):
     td = NP2T.get(nm.get("dtype")) if nm else None
     if td is None: return None
     return (r.s3_client, r.bucket, key, int(head.get("ContentLength", 0)), bool(meta.get("compressed")), td, [int(x) for x in nm["shape"]])
-def stream_tensor(p, on):
+def stream_raw(p, on):
+    # Just the network read (with byte progress). Decompression + reshape is deferred
+    # (see decode_tensor) so the bar reaches 100% before the slow decode, not during it.
     client, bucket, key, total, comp, td, shape = p
     body = client.get_object(Bucket=bucket, Key=key)["Body"]
     buf = bytearray()
@@ -1045,6 +1047,9 @@ def stream_tensor(p, on):
         c = body.read(DL)
         if not c: break
         buf += c; on(len(buf))
+    return buf
+def decode_tensor(buf, p):
+    client, bucket, key, total, comp, td, shape = p
     raw = zstandard.decompress(bytes(buf)) if comp else buf
     return torch.frombuffer(bytearray(raw), dtype=td).reshape(shape)
 total = len(PAIRS)
@@ -1066,6 +1071,7 @@ def work(idx):
         # compared here — only progress + the small result cross ssh. Fall back to
         # cstorch materialise (no byte progress) for a non-numpy-stored tensor.
         pa = prep(a); pb = prep(b)
+        streamed = None   # (raw_a, raw_b) when read over the network
         if pa is not None and pb is not None:
             osz = pa[3]; nsz = pb[3]
             stat("size\t%s\t%d\t%d" % (nname, osz, nsz))
@@ -1074,15 +1080,20 @@ def work(idx):
                 s = od[0] + nd[0]
                 if s - last[0] >= EMIT:
                     last[0] = s; stat("bytes\t%s\t%d\t%d" % (nname, od[0], nd[0]))
-            ra = stream_tensor(pa, lambda n: (od.__setitem__(0, n), bump()))
-            rb = stream_tensor(pb, lambda n: (nd.__setitem__(0, n), bump()))
+            rawa = stream_raw(pa, lambda n: (od.__setitem__(0, n), bump()))
+            rawb = stream_raw(pb, lambda n: (nd.__setitem__(0, n), bump()))
             stat("bytes\t%s\t%d\t%d" % (nname, osz, nsz))
+            streamed = (rawa, rawb)
             tb = osz + nsz
         else:
             ra = a.to("cpu"); rb = b.to("cpu")
             tb = ra.element_size() * ra.nelement() + rb.element_size() * rb.nelement()
             stat("size\t%s\t%d\t%d" % (nname, int(ra.element_size() * ra.nelement()), int(rb.element_size() * rb.nelement())))
+        # Bytes are all read (bar at 100%); decompress + decode below is the slow part,
+        # so flag "comparing" now — not after it.
         stat("phase\t%s\tcomparing" % (nname,))
+        if streamed is not None:
+            ra = decode_tensor(streamed[0], pa); rb = decode_tensor(streamed[1], pb)
         res["bytes"] = int(tb)
         scalar = (len(ashape) == 0)
         d0 = 0 if scalar else ashape[0]
@@ -1257,7 +1268,9 @@ def head(loc):
     except Exception:
         meta = {}
     return int(h.get("ContentLength", 0)), bool(meta.get("compressed")), ("__NUMPY__" in meta)
-def download(loc, compressed, on):
+def download_raw(loc, on):
+    # Just the network read (with byte progress). Decompression is deferred so the
+    # bar reaches 100% before the slow decode, not during it.
     client, bucket, key = loc
     body = client.get_object(Bucket=bucket, Key=key)["Body"]
     buf = bytearray()
@@ -1267,6 +1280,8 @@ def download(loc, compressed, on):
             break
         buf += c
         on(len(buf))
+    return buf
+def decode_u16(buf, compressed):
     if compressed:
         return np.frombuffer(zstandard.decompress(bytes(buf)), dtype=np.uint16)
     return np.frombuffer(buf, dtype=np.uint16)     # raw 16-bit words, zero-copy
@@ -1319,15 +1334,17 @@ def work(idx):
             if s - last[0] >= EMIT:
                 last[0] = s
                 stat("bytes\t%s\t%d\t%d" % (nname, odone[0], ndone[0]))
+        streamed = None   # (raw_a, comp_a, raw_b, comp_b) when read over the network
         if lo is not None and ln is not None:
             osz, ocomp, onp = head(lo); nsz, ncomp, nnp = head(ln)
             stat("size\t%s\t%d\t%d" % (nname, osz, nsz))
             if onp and nnp:
                 def oon(n): odone[0] = n; bump()
                 def non(n): ndone[0] = n; bump()
-                ao = download(lo, ocomp, oon)
-                bo = download(ln, ncomp, non)
+                ra = download_raw(lo, oon)
+                rb = download_raw(ln, non)
                 stat("bytes\t%s\t%d\t%d" % (nname, osz, nsz))
+                streamed = (ra, ocomp, rb, ncomp)
                 tb = osz + nsz
             else:
                 ao = to_u16(da); bo = to_u16(db)   # not numpy-stored: no byte progress
@@ -1336,7 +1353,11 @@ def work(idx):
             ao = to_u16(da); bo = to_u16(db)
             tb = int(ao.nbytes) + int(bo.nbytes)
             stat("size\t%s\t%d\t%d" % (nname, int(ao.nbytes), int(bo.nbytes)))
+        # Bytes are all read (bar at 100%); the decompress + decode below is the slow
+        # part, so flag "comparing" now — not after it.
         stat("phase\t%s\tcomparing" % (nname,))
+        if streamed is not None:
+            ao = decode_u16(streamed[0], streamed[1]); bo = decode_u16(streamed[2], streamed[3])
         ao = ao.reshape(E, -1); bo = bo.reshape(W, -1)
         N = ao.shape[1]
         we = (np.arange(E) // fold)
