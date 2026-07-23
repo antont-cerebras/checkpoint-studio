@@ -1329,9 +1329,12 @@ def work(idx):
         we = (np.arange(E) // fold)
         se = ((np.arange(E) % fold) * BITS).astype(np.uint16)
         # Format checks: old words' bits above BITS, new words' bits above fold*BITS,
-        # must all be zero (else the packing assumption is wrong).
+        # must all be zero (else the packing assumption is wrong). When fold*BITS==16
+        # (e.g. 4-bit ×4) there are no unused high bits — and shifting a uint16 by 16
+        # is undefined — so skip the dense check.
         sparse_bad = int(np.count_nonzero(ao >> np.uint16(BITS)))
-        dense_bad = int(np.count_nonzero(bo >> np.uint16(fold * BITS)))
+        dshift = fold * BITS
+        dense_bad = 0 if dshift >= 16 else int(np.count_nonzero(bo >> np.uint16(dshift)))
         differing = 0; first = None; maxdelta = 0; big = 0
         sum_abs = 0; sum_old = 0; sum_new = 0
         blk = max(1, CMP // max(1, E))

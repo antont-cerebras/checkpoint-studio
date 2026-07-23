@@ -631,10 +631,11 @@ enum Command {
         /// with --name (this is a full data read, so scope it). Exit 0 = equivalent.
         #[arg(long = "verify-repack")]
         verify_repack: bool,
-        /// Index bit-width for --verify-repack (default 3; the packing fold is derived
-        /// from the shapes, and fold*bits must fit in the 16-bit word).
-        #[arg(long = "repack-bits", value_name = "N", default_value_t = 3)]
-        repack_bits: usize,
+        /// Index bit-width for --verify-repack. Omit to auto-derive from the shape
+        /// fold (fold 5 ⇒ 3-bit, fold 4 ⇒ 4-bit, …; `bits = 16 / fold`); pass N to
+        /// override for a non-max-density packing.
+        #[arg(long = "repack-bits", value_name = "N")]
+        repack_bits: Option<usize>,
     },
 
     /// Run health checks on a checkpoint and report any problems.
@@ -1784,7 +1785,7 @@ fn run_diff(
     jobs: usize,
     remote: Option<&crate::remote::RemoteRead>,
     verify_repack: bool,
-    repack_bits: usize,
+    repack_bits: Option<usize>,
 ) -> i32 {
     let load_local = |path: &Path| -> Result<SideLoad> {
         let (files, _index_specs) =
@@ -2234,7 +2235,7 @@ fn run_repack_verify(
     new_t: &[TensorInfo],
     old_sum: &diff::CheckpointSummary,
     new_sum: &diff::CheckpointSummary,
-    bits: usize,
+    repack_bits: Option<usize>,
 ) -> i32 {
     // A non-s3 remote (safetensors dir over SFTP) can't do this — the data isn't
     // reachable. Local files and s3-vs-s3 both can.
@@ -2246,12 +2247,15 @@ fn run_repack_verify(
         return 2;
     }
     // Candidate pairs: same name on both sides, shape folds along dim 0. Scoped by
-    // `--name` already (old_sum/new_sum are the filtered summaries).
+    // `--name` already (old_sum/new_sum are the filtered summaries). Track the fold
+    // so the bit-width can be auto-derived.
     let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut fold0 = None;
     for (name, osig) in &old_sum.tensors {
         if let Some(nsig) = new_sum.tensors.get(name)
-            && detect_fold(&osig.shape, &nsig.shape, bits).is_some()
+            && let Some(fold) = detect_fold(&osig.shape, &nsig.shape)
         {
+            fold0.get_or_insert(fold);
             pairs.push((name.clone(), name.clone()));
         }
     }
@@ -2262,6 +2266,9 @@ fn run_repack_verify(
         );
         return 2;
     }
+    // Index bit-width: as given, else the max-density packing for the detected fold
+    // (`16 / fold` — fold 5 ⇒ 3-bit, fold 4 ⇒ 4-bit).
+    let bits = repack_bits.unwrap_or_else(|| (16 / fold0.unwrap_or(1)).max(1));
     // Whether anything OTHER than the verified fold-pairs differs structurally — an
     // add/remove, a non-fold-pair sig change, or a metadata change. The fold-pairs
     // themselves always show as "changed" (shape/dtype), so they're excluded: if
@@ -2310,7 +2317,7 @@ fn local_repack(
         let (Some(ow), Some(nw)) = (find(old_t, oname), find(new_t, nname)) else {
             continue;
         };
-        let Some(fold) = detect_fold(&ow.shape, &nw.shape, bits) else {
+        let Some(fold) = detect_fold(&ow.shape, &nw.shape) else {
             continue;
         };
         // Sibling codebook / scale tensor names (weight name minus ".weight").
@@ -2586,9 +2593,9 @@ fn print_repack_aux(
 }
 
 /// Detect a fold along dim 0: old `(E, …)` ↔ new `(ceil(E/fold), …)` with the inner
-/// dims equal, `2 ≤ fold` and `fold*bits ≤ 16`. Returns the fold, or `None` if the
-/// shapes aren't a fold pair.
-fn detect_fold(old: &[usize], new: &[usize], bits: usize) -> Option<usize> {
+/// dims equal and `2 ≤ fold ≤ 16` (so `bits = 16/fold ≥ 1`). Returns the fold, or
+/// `None` if the shapes aren't a fold pair. The bit-width is derived separately.
+fn detect_fold(old: &[usize], new: &[usize]) -> Option<usize> {
     if old.is_empty() || old.len() != new.len() || old[1..] != new[1..] {
         return None;
     }
@@ -2597,7 +2604,7 @@ fn detect_fold(old: &[usize], new: &[usize], bits: usize) -> Option<usize> {
         return None;
     }
     let fold = e.div_ceil(w);
-    if fold < 2 || fold * bits > 16 || w != e.div_ceil(fold) {
+    if !(2..=16).contains(&fold) || w != e.div_ceil(fold) {
         return None;
     }
     Some(fold)

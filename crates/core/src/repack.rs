@@ -307,6 +307,25 @@ mod tests {
     }
 
     #[test]
+    fn four_bit_fold4_has_no_unused_msb() {
+        // 4-bit ×4 uses all 16 bits: fold 4, bits 4, dense_shift == 16 ⇒ no MSB slack,
+        // and the shift-by-16 guard must not panic or false-flag.
+        let idx = vec![
+            vec![1u16, 9, 15, 0, 8],
+            vec![4, 12, 3, 6, 11],
+            vec![7, 0, 13, 3, 1],
+            vec![2, 6, 5, 14, 10], // 4 experts, fold 4 -> w=1, all slots used
+        ];
+        let (sparse, dense, w) = pack(&idx, 4, 4);
+        assert_eq!(w, 1);
+        let c = compare_indices(&sparse, &dense, 4, 5, 4, 4);
+        assert_eq!(c.differing, 0);
+        assert_eq!(c.sparse_bad, 0);
+        assert_eq!(c.dense_bad, 0); // fold*bits == 16 ⇒ check skipped, not a spurious hit
+        assert_eq!(c.sum_old, c.sum_new);
+    }
+
+    #[test]
     fn detects_value_and_format_problems() {
         let idx = vec![vec![1u16, 2, 3, 4], vec![5, 6, 7, 0], vec![2, 2, 2, 2]];
         let (mut sparse, mut dense, _w) = pack(&idx, 5, 3); // 3 experts, fold 5, w=1
