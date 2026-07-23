@@ -117,6 +117,25 @@ fn totals_line(
     format!("{label}: {old_s} → {new_s} ({delta_s})")
 }
 
+/// Format an ISO-8601 timestamp (`2026-06-26T14:32:01+00:00`) as
+/// `2026-06-26 14:32:01 UTC` for display; an unrecognised format passes through.
+fn fmt_timestamp(iso: &str) -> String {
+    let Some((date, rest)) = iso.split_once('T') else {
+        return iso.to_string();
+    };
+    let utc = rest.ends_with('Z') || rest.contains("+00:00") || rest.contains("+0000");
+    // The time is `HH:MM:SS(.fff)?` before the timezone; strip the tz (`+`/`-`/`Z`)
+    // and any fractional seconds.
+    let core = rest
+        .split(['+', '-', 'Z'])
+        .next()
+        .unwrap_or(rest)
+        .split('.')
+        .next()
+        .unwrap_or(rest);
+    format!("{date} {core}{}", if utc { " UTC" } else { "" })
+}
+
 /// Render a changed tensor's `old` and `new` signatures, colouring only what
 /// actually differs — the dtype (if it changed) and the shape dimensions that
 /// changed — old side red, new green, so the eye lands on the change.
@@ -929,6 +948,10 @@ pub struct DiffReport {
     /// The S3 object-metadata diff, set only for an s3-vs-s3 comparison (attached
     /// after [`compare_with`], which has no S3 data). `None` otherwise.
     pub s3: Option<S3Diff>,
+    /// Each side's last-modified timestamp (the newest S3 object under the prefix),
+    /// shown in the size/params summary. `Some` only for an s3-vs-s3 diff.
+    pub old_modified: Option<String>,
+    pub new_modified: Option<String>,
 }
 
 impl DiffReport {
@@ -1008,6 +1031,21 @@ impl DiffReport {
                 format_parameters
             )
         );
+        // For an s3-vs-s3 diff, the checkpoints' last-modified (newest object under
+        // each prefix) — old red, new green, like the size/params values.
+        if let (Some(o), Some(n)) = (&self.old_modified, &self.new_modified) {
+            let (os, ns) = (fmt_timestamp(o), fmt_timestamp(n));
+            let line = if os == ns {
+                format!("modified: {os} (unchanged)")
+            } else {
+                format!(
+                    "modified: {} → {}",
+                    paint(&os, opts.color, RED),
+                    paint(&ns, opts.color, GREEN),
+                )
+            };
+            let _ = writeln!(s, "{line}");
+        }
 
         let _ = writeln!(
             s,
@@ -1666,6 +1704,8 @@ pub fn compare_with(
         old_params: old.total_params,
         new_params: new.total_params,
         s3: None, // attached by the caller for an s3-vs-s3 diff
+        old_modified: None,
+        new_modified: None,
     }
 }
 
@@ -2134,6 +2174,25 @@ fn write_meta_line_diff(s: &mut String, old: &str, new: &str, color: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_is_humanized() {
+        assert_eq!(
+            fmt_timestamp("2026-06-26T14:32:01+00:00"),
+            "2026-06-26 14:32:01 UTC"
+        );
+        assert_eq!(
+            fmt_timestamp("2026-06-26T14:32:01Z"),
+            "2026-06-26 14:32:01 UTC"
+        );
+        // Fractional seconds + a non-UTC offset: seconds kept, tz dropped, no " UTC".
+        assert_eq!(
+            fmt_timestamp("2026-06-26T14:32:01.5-05:00"),
+            "2026-06-26 14:32:01"
+        );
+        // Unrecognised → passthrough.
+        assert_eq!(fmt_timestamp("whenever"), "whenever");
+    }
 
     #[test]
     fn match_count_counts_matches_even_when_the_name_is_unchanged() {

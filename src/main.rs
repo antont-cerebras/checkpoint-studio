@@ -1678,40 +1678,57 @@ fn repack_view_block(frame: usize, i: &RepackDlInner, width: usize) -> Vec<Strin
             "{CYAN}{spin}{RESET} {DIM}loading {w} checkpoint …{RESET}"
         )];
     }
+    const BARW: usize = 18;
     let mut lines = Vec::with_capacity(i.tensors.len());
     for t in &i.tensors {
         let done = t.old_done + t.new_done;
         let total = t.old_total + t.new_total;
-        let (mark, phase) = match t.phase {
-            RepackDlPhase::Downloading => {
-                (format!("{CYAN}{spin}{RESET}"), "downloading".to_string())
-            }
+        let (mark, phase_plain, phase_col): (String, &str, String) = match t.phase {
+            RepackDlPhase::Downloading => (
+                format!("{CYAN}{spin}{RESET}"),
+                "downloading",
+                "downloading".into(),
+            ),
             RepackDlPhase::Comparing => (
                 format!("{CYAN}{spin}{RESET}"),
+                "comparing…",
                 format!("{DIM}comparing…{RESET}"),
             ),
             RepackDlPhase::Done(Identical) => (
                 format!("{GREEN}✓{RESET}"),
+                "equivalent",
                 format!("{GREEN}equivalent{RESET}"),
             ),
             RepackDlPhase::Done(Changed) => (
                 format!("{YELLOW}≠{RESET}"),
+                "differ",
                 format!("{YELLOW}differ{RESET}"),
             ),
-            RepackDlPhase::Done(Error) => (format!("{RED}✗{RESET}"), format!("{RED}error{RESET}")),
+            RepackDlPhase::Done(Error) => (
+                format!("{RED}✗{RESET}"),
+                "error",
+                format!("{RED}error{RESET}"),
+            ),
         };
-        let bar = mini_bar(done, total, 18);
-        let sizes = format!(
-            "{}/{} {DIM}(old {}, new {}){RESET}",
+        let bar = mini_bar(done, total, BARW);
+        let (d, tt) = (
             utils::format_size(done as usize),
             utils::format_size(total as usize),
+        );
+        let (ot, nt) = (
             utils::format_size(t.old_total as usize),
             utils::format_size(t.new_total as usize),
         );
-        // name — trimmed to fit, keeping the informative tail.
-        let name = truncate_tail(&t.name, width.saturating_sub(64).max(16));
+        let sizes_plain = format!("{d}/{tt} (old {ot}, new {nt})");
+        let sizes_col = format!("{d}/{tt} {DIM}(old {ot}, new {nt}){RESET}");
+        // Budget the name so the WHOLE line fits the terminal width (mark + name +
+        // bar + sizes + phase, plus separators) — a wrapped line breaks the in-place
+        // redraw (draw_block counts logical lines), corrupting later output.
+        let overhead =
+            1 + 1 + 2 + BARW + 1 + sizes_plain.chars().count() + 2 + phase_plain.chars().count();
+        let name = truncate_tail(&t.name, width.saturating_sub(overhead + 1).max(8));
         lines.push(format!(
-            "{mark} {name}  {CYAN}{bar}{RESET} {sizes}  {phase}"
+            "{mark} {name}  {CYAN}{bar}{RESET} {sizes_col}  {phase_col}"
         ));
     }
     if lines.is_empty() {
@@ -2161,6 +2178,17 @@ fn run_diff(
         (Some(o), Some(n)) => {
             let count = o.objects.len().max(n.objects.len());
             eprintln!("checkpoint-explorer diff: compared {count} S3 object(s)' metadata");
+            // Each checkpoint's last-modified = the newest object under its prefix
+            // (ISO-8601 UTC strings sort chronologically), shown in the summary.
+            let latest = |m: &crate::remote::S3Meta| {
+                m.objects
+                    .iter()
+                    .map(|x| x.last_modified.clone())
+                    .filter(|s| !s.is_empty())
+                    .max()
+            };
+            report.old_modified = latest(o);
+            report.new_modified = latest(n);
             report.s3 = Some(diff::compare_s3(o, n));
         }
         (Some(_), None) | (None, Some(_)) => eprintln!(
