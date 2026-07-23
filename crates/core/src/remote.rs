@@ -161,8 +161,19 @@ pub struct RepackResult {
     pub sparse_bad: u64,
     /// New words with a non-zero bit above `fold*bits` (MSB check; 0 ⇒ ok).
     pub dense_bad: u64,
-    /// The fold factor used (experts per packed word).
+    /// The fold factor used (experts per packed word). `1` for a sparse↔sparse
+    /// compare (the auto-detected `--values` path on packed expert weights).
     pub fold: usize,
+    /// The index bit-width used to decode + format-check (derived from the codebook's
+    /// centroid count for the auto path, else `16/fold`).
+    pub bits: usize,
+    /// Fraction of decoded indices that are 0 across both sides — the "amount of
+    /// zeroes" that (with a sibling codebook) marks a tensor as sparse-packed.
+    pub zero_frac: f64,
+    /// Set when the top-bits format check failed (the words don't look like packed
+    /// indices), so the tensor was compared as plain stored-dtype *values* instead —
+    /// carries that float comparison so the report can fall back to it.
+    pub fallback: Option<RepackFallback>,
     /// First differing `(expert, inner_offset, old_idx, new_idx)`, for diagnostics.
     pub first_mismatch: Option<(u64, u64, u32, u32)>,
     /// A small decoded window (experts × inner-offset), centred on the first
@@ -216,6 +227,19 @@ pub struct RepackSample {
     pub off0: u64,
     pub old: Vec<Vec<u32>>,
     pub new: Vec<Vec<u32>>,
+}
+
+/// A plain stored-dtype *value* comparison used when the top-bits format check
+/// fails, so a codebooked tensor that turns out **not** to be packed indices is
+/// still meaningfully diffed (the auto `--values` fallback).
+#[derive(Debug, Clone, Default)]
+pub struct RepackFallback {
+    /// The stored dtype the words were reinterpreted as (e.g. `F16`).
+    pub dtype: String,
+    pub elements: u64,
+    pub differing: u64,
+    pub max_abs: f64,
+    pub mean_abs: f64,
 }
 
 impl RepackResult {
@@ -1771,6 +1795,23 @@ fn parse_repack_result(v: &serde_json::Value) -> RepackResult {
         sparse_bad: u("sparse_bad"),
         dense_bad: u("dense_bad"),
         fold: u("fold") as usize,
+        bits: u("bits") as usize,
+        zero_frac: f("zero_frac"),
+        fallback: v.get("fallback").filter(|x| !x.is_null()).map(|fb| {
+            let fu = |k: &str| fb.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let ff = |k: &str| fb.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+            RepackFallback {
+                dtype: fb
+                    .get("dtype")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                elements: fu("elements"),
+                differing: fu("differing"),
+                max_abs: ff("max_abs"),
+                mean_abs: ff("mean_abs"),
+            }
+        }),
         first_mismatch: first,
         sample,
         codebook: aux(v.get("codebook")),

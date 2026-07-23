@@ -12,7 +12,7 @@
 //! tensors' values. Results are the same [`RepackResult`] the remote path produces,
 //! so the reporting is shared.
 
-use crate::remote::{RepackAux, RepackResult, RepackSample};
+use crate::remote::{RepackAux, RepackFallback, RepackResult, RepackSample};
 use crate::tree::TensorInfo;
 
 /// The index-comparison outcome (everything a [`RepackResult`] needs except the
@@ -27,6 +27,9 @@ pub struct IdxCompare {
     pub sum_abs: u64,
     pub sum_old: u64,
     pub sum_new: u64,
+    /// Decoded indices equal to 0, counted across both sides (`2 * elements` total) —
+    /// the "amount of zeroes" that marks a tensor as sparse-packed.
+    pub zeros: u64,
     pub first_mismatch: Option<(u64, u64, u32, u32)>,
     pub sample: Option<RepackSample>,
 }
@@ -55,6 +58,7 @@ pub fn compare_indices(
 
     let (mut differing, mut sum_abs, mut sum_old, mut sum_new) = (0u64, 0u64, 0u64, 0u64);
     let (mut max_delta, mut differing_gt1) = (0u32, 0u64);
+    let mut zeros = 0u64;
     let mut first: Option<(u64, u64, u32, u32)> = None;
     for ei in 0..e {
         let word = ei / fold;
@@ -66,6 +70,7 @@ pub fn compare_indices(
             let nd = ((nrow[n] >> shift) & mask) as i64;
             sum_old += o as u64;
             sum_new += nd as u64;
+            zeros += u64::from(o == 0) + u64::from(nd == 0);
             if o != nd {
                 let d = (o - nd).unsigned_abs();
                 differing += 1;
@@ -93,6 +98,7 @@ pub fn compare_indices(
         sum_abs,
         sum_old,
         sum_new,
+        zeros,
         first_mismatch: first,
         sample,
     }
@@ -186,6 +192,15 @@ pub fn verify_local(
             0.0
         }
     };
+    let zero_frac = if c.elements > 0 {
+        c.zeros as f64 / (2.0 * c.elements as f64)
+    } else {
+        0.0
+    };
+    // The top-bits format check failed ⇒ the words don't look like packed indices;
+    // compare them as plain stored-dtype values instead (the auto `--values`
+    // fallback), so a mis-detected tensor is still meaningfully diffed.
+    let fallback = (c.sparse_bad > 0 || c.dense_bad > 0).then(|| fallback_local(old_w, new_w));
     RepackResult {
         elements: c.elements,
         differing: c.differing,
@@ -198,6 +213,9 @@ pub fn verify_local(
         sparse_bad: c.sparse_bad,
         dense_bad: c.dense_bad,
         fold,
+        bits,
+        zero_frac,
+        fallback,
         first_mismatch: c.first_mismatch,
         sample: c.sample,
         codebook: Some(aux_local(codebook.0, codebook.1, codebook.2, codebook.3)),
@@ -205,6 +223,42 @@ pub fn verify_local(
         bytes,
         error: None,
     }
+}
+
+/// Compare two weight tensors as plain stored-dtype values (decoded to f64) — the
+/// fallback when the sparse format check fails. Returns `elements`/`differing` and
+/// max/mean `|Δ|`, or a zeroed result (dtype only) if either side can't be read.
+fn fallback_local(old_w: &TensorInfo, new_w: &TensorInfo) -> RepackFallback {
+    let mut fb = RepackFallback {
+        dtype: new_w.dtype.clone(),
+        ..Default::default()
+    };
+    let (Ok(oa), Ok(na)) = (
+        crate::sample::read_all_f64(old_w),
+        crate::sample::read_all_f64(new_w),
+    ) else {
+        return fb;
+    };
+    let (mut differing, mut sum_abs, mut max_abs) = (0u64, 0f64, 0f64);
+    for (a, b) in oa.iter().zip(&na) {
+        let d = (a - b).abs();
+        if a != b {
+            differing += 1;
+        }
+        sum_abs += d;
+        if d > max_abs {
+            max_abs = d;
+        }
+    }
+    fb.elements = oa.len() as u64;
+    fb.differing = differing;
+    fb.max_abs = max_abs;
+    fb.mean_abs = if oa.is_empty() {
+        0.0
+    } else {
+        sum_abs / oa.len() as f64
+    };
+    fb
 }
 
 /// Value-diff a sibling float tensor (codebook / scale) locally, recording the names
@@ -323,6 +377,28 @@ mod tests {
         assert_eq!(c.sparse_bad, 0);
         assert_eq!(c.dense_bad, 0); // fold*bits == 16 ⇒ check skipped, not a spurious hit
         assert_eq!(c.sum_old, c.sum_new);
+    }
+
+    #[test]
+    fn fold1_compares_two_sparse_sides_directly() {
+        // Sparse↔sparse (the auto `--values` case): fold 1, one index per word on
+        // both sides, same shape. compare_indices decodes each word directly.
+        let old = vec![0u16, 3, 0, 7, 1, 0]; // 3 experts × 2 inner
+        let mut new = old.clone();
+        new[3] = 6; // one index differs by 1 (7 -> 6)
+        let c = compare_indices(&old, &new, 3, 2, 1, 3);
+        assert_eq!(c.differing, 1);
+        assert_eq!(c.max_delta, 1);
+        assert_eq!(c.differing_gt1, 0);
+        assert_eq!(c.sparse_bad, 0);
+        assert_eq!(c.dense_bad, 0); // fold*bits = 3 < 16 ⇒ new side also checked, clean
+        // Zeros counted across both sides: old has 3 (idx 0), new has 3 ⇒ 6 of 12.
+        assert_eq!(c.zeros, 6);
+        // A high bit above `bits` on either side trips the format check (→ fallback).
+        let mut bad = old.clone();
+        bad[0] |= 1 << 5;
+        assert!(compare_indices(&bad, &new, 3, 2, 1, 3).sparse_bad >= 1);
+        assert!(compare_indices(&old, &bad, 3, 2, 1, 3).dense_bad >= 1);
     }
 
     #[test]
