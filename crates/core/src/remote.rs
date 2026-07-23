@@ -168,10 +168,28 @@ pub struct RepackResult {
     /// A small decoded window (experts × inner-offset), centred on the first
     /// mismatch, so the caller can show where old and new diverge.
     pub sample: Option<RepackSample>,
+    /// Value diff of the sibling `codebook` tensor (the float centroids), when
+    /// present — a codebook difference explains index differences.
+    pub codebook: Option<RepackAux>,
+    /// Value diff of the sibling `qscale` tensor (the per-group scales), when present.
+    pub qscale: Option<RepackAux>,
     /// Bytes read from S3 for this tensor (both sides).
     pub bytes: u64,
     /// Set when the tensor couldn't be verified (bad shapes / read error).
     pub error: Option<String>,
+}
+
+/// The value diff of a sibling float tensor (codebook / scale) between the two
+/// checkpoints — these have the same shape on both sides, so the structural diff
+/// shows them "unchanged" even when their values differ.
+#[derive(Debug, Clone)]
+pub struct RepackAux {
+    /// `Some((old_shape, new_shape))` when the shapes differ (not compared).
+    pub shape_mismatch: Option<(Vec<usize>, Vec<usize>)>,
+    pub elements: u64,
+    pub differing: u64,
+    pub max_abs: f64,
+    pub mean_abs: f64,
 }
 
 /// A decoded 2-D window of indices for both sides — the top-left is
@@ -1225,6 +1243,19 @@ def download(loc, compressed, on):
     return np.frombuffer(buf, dtype=np.uint16)     # raw 16-bit words, zero-copy
 def to_u16(dt):   # fallback via cstorch (no byte progress)
     return dt.to("cpu").contiguous().view(torch.int16).numpy().view(np.uint16)
+def read_aux(sd, name):   # a small float sibling tensor (codebook / scale), as f64
+    if name not in sd:
+        return None
+    return sd[name].to("cpu").to(torch.float64).numpy()
+def cmp_aux(oname_a, nname_a):
+    a = read_aux(old_sd, oname_a); b = read_aux(new_sd, nname_a)
+    if a is None or b is None:
+        return None
+    if list(a.shape) != list(b.shape):
+        return {"shape_old": [int(x) for x in a.shape], "shape_new": [int(x) for x in b.shape]}
+    d = np.abs(a - b)
+    return {"elements": int(a.size), "differing": int(np.count_nonzero(a != b)),
+            "max_abs": float(d.max()) if d.size else 0.0, "mean_abs": float(d.mean()) if d.size else 0.0}
 total = len(PAIRS)
 t0 = time.time()
 agg_lock = threading.Lock()
@@ -1320,6 +1351,16 @@ def work(idx):
         sold = (ao[se0:se1, so0:so1] & mask).astype(np.uint16).tolist()
         snew = ((bo[ew // fold][:, so0:so1] >> ((ew % fold) * BITS).astype(np.uint16)[:, None]) & mask).astype(np.uint16).tolist()
         res["sample"] = {"e0": int(se0), "off0": int(so0), "cols": int(so1 - so0), "old": sold, "new": snew}
+        # Also diff the sibling codebook + scale tensors (float centroids/scales),
+        # since these have the same shape/dtype on both sides and so don't show up in
+        # the structural diff — but a codebook difference explains index differences
+        # (the same weights quantised against a different codebook).
+        if oname.endswith(".weight") and nname.endswith(".weight"):
+            op = oname[:-7]; npx = nname[:-7]
+            cb = cmp_aux(op + ".codebook", npx + ".codebook")
+            if cb is not None: res["codebook"] = cb
+            qs = cmp_aux(op + ".qscale", npx + ".qscale")
+            if qs is not None: res["qscale"] = qs
         with agg_lock:
             read_bytes[0] += tb; compared[0] += 1
     except Exception as e:
@@ -1621,6 +1662,31 @@ fn parse_repack_result(v: &serde_json::Value) -> RepackResult {
         new: grid(s.get("new")),
     });
     let f = |k: &str| v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+    let aux = |val: Option<&serde_json::Value>| -> Option<RepackAux> {
+        let a = val?;
+        let dims = |k: &str| -> Vec<usize> {
+            a.get(k)
+                .and_then(|x| x.as_array())
+                .map(|d| {
+                    d.iter()
+                        .filter_map(|n| n.as_u64().map(|n| n as usize))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let shape_mismatch = a
+            .get("shape_old")
+            .map(|_| (dims("shape_old"), dims("shape_new")));
+        let au = |k: &str| a.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let af = |k: &str| a.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+        Some(RepackAux {
+            shape_mismatch,
+            elements: au("elements"),
+            differing: au("differing"),
+            max_abs: af("max_abs"),
+            mean_abs: af("mean_abs"),
+        })
+    };
     RepackResult {
         elements: u("elements"),
         differing: u("differing"),
@@ -1635,6 +1701,8 @@ fn parse_repack_result(v: &serde_json::Value) -> RepackResult {
         fold: u("fold") as usize,
         first_mismatch: first,
         sample,
+        codebook: aux(v.get("codebook")),
+        qscale: aux(v.get("qscale")),
         bytes: u("bytes"),
         error: v.get("error").and_then(|e| e.as_str()).map(str::to_string),
     }
@@ -2213,6 +2281,11 @@ mod tests {
         assert!(s.contains("stat(\"size"), "{s}");
         assert!(s.contains("stat(\"bytes"), "{s}");
         assert!(s.contains("res[\"sample\"]"), "{s}");
+        // Also diffs the sibling codebook + scale tensors.
+        assert!(
+            s.contains("cmp_aux") && s.contains(".codebook") && s.contains(".qscale"),
+            "{s}"
+        );
         assert!(s.contains(STATUS_TAG) && s.contains(SENTINEL));
         // Read-only: reads objects, never writes/uploads/deletes.
         for forbidden in [
@@ -2232,8 +2305,11 @@ mod tests {
     #[test]
     fn parse_repack_reads_results_and_flags_format() {
         let out = format!(
-            "{s}{{\"name\":\"a\",\"elements\":100,\"differing\":0,\"sparse_bad\":0,\"dense_bad\":0,\"fold\":5}}\n\
-             {s}{{\"name\":\"b\",\"elements\":100,\"differing\":7,\"sparse_bad\":0,\"dense_bad\":0,\"fold\":5,\"first\":[3,12,5,2]}}\n\
+            "{s}{{\"name\":\"a\",\"elements\":100,\"differing\":0,\"sparse_bad\":0,\"dense_bad\":0,\"fold\":5,\
+             \"codebook\":{{\"elements\":64,\"differing\":0,\"max_abs\":0.0,\"mean_abs\":0.0}}}}\n\
+             {s}{{\"name\":\"b\",\"elements\":100,\"differing\":7,\"sparse_bad\":0,\"dense_bad\":0,\"fold\":5,\"first\":[3,12,5,2],\
+             \"codebook\":{{\"elements\":64,\"differing\":9,\"max_abs\":0.03,\"mean_abs\":0.001}},\
+             \"qscale\":{{\"shape_old\":[8,2],\"shape_new\":[8,3]}}}}\n\
              {s}{{\"name\":\"c\",\"elements\":100,\"differing\":0,\"sparse_bad\":9,\"dense_bad\":0,\"fold\":5}}\n\
              {s}{{\"summary\":{{\"tensors\":3,\"compared\":3,\"bytes\":2048,\"elapsed_s\":2.0}}}}\n",
             s = SENTINEL
@@ -2241,9 +2317,19 @@ mod tests {
         let (m, stats) = parse_repack(&out, "host").unwrap();
         assert_eq!(m.len(), 3);
         assert!(m["a"].equivalent(), "a should be equivalent");
+        assert!(m["a"].codebook.as_ref().unwrap().differing == 0);
         assert_eq!(m["b"].differing, 7);
         assert_eq!(m["b"].first_mismatch, Some((3, 12, 5, 2)));
         assert!(!m["b"].equivalent());
+        // The sibling codebook diff is parsed alongside.
+        let cb = m["b"].codebook.as_ref().unwrap();
+        assert_eq!(cb.differing, 9);
+        assert!((cb.max_abs - 0.03).abs() < 1e-9);
+        // A shape mismatch on a sibling is carried too.
+        assert_eq!(
+            m["b"].qscale.as_ref().unwrap().shape_mismatch,
+            Some((vec![8, 2], vec![8, 3]))
+        );
         // A format violation makes it non-equivalent even with 0 differing.
         assert_eq!(m["c"].sparse_bad, 9);
         assert!(!m["c"].equivalent());

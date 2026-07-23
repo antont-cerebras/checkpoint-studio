@@ -2381,6 +2381,10 @@ fn render_repack_verdict(
         } else {
             println!("  {green}✓{reset} {name}  {dim}equivalent ({counts}){reset}");
         }
+        // The sibling codebook / scale value-diff (same shape on both sides, so the
+        // structural diff can't see it). A differing codebook explains index diffs.
+        print_repack_aux("codebook", rr.codebook.as_ref(), green, yellow, dim, reset);
+        print_repack_aux("qscale", rr.qscale.as_ref(), green, yellow, dim, reset);
     }
     let verified = pairs.len();
     if !all_ok {
@@ -2444,6 +2448,33 @@ fn print_repack_sample(rr: &crate::remote::RepackResult, red: &str, dim: &str, r
     render(&s.old, &s.new);
     println!("      {dim}new:{reset}");
     render(&s.new, &s.old);
+}
+
+/// Print the value diff of a sibling `codebook` / `qscale` tensor (which the
+/// structural diff can't flag, being the same shape on both sides). `identical`,
+/// `differs — max/mean |Δ|`, or `shape differs`.
+fn print_repack_aux(
+    label: &str,
+    aux: Option<&crate::remote::RepackAux>,
+    green: &str,
+    yellow: &str,
+    dim: &str,
+    reset: &str,
+) {
+    let Some(a) = aux else { return };
+    if let Some((o, n)) = &a.shape_mismatch {
+        println!("      {label}: {yellow}shape differs{reset} {dim}{o:?} vs {n:?}{reset}");
+    } else if a.differing == 0 {
+        println!("      {label}: {green}identical{reset}");
+    } else {
+        println!(
+            "      {label}: {yellow}differs{reset} {dim}— max |Δ| {:.5}, mean {:.5}, {}/{} entries{reset}",
+            a.max_abs,
+            a.mean_abs,
+            crate::utils::format_parameters(a.differing as usize),
+            crate::utils::format_parameters(a.elements as usize),
+        );
+    }
 }
 
 /// Detect a fold along dim 0: old `(E, …)` ↔ new `(ceil(E/fold), …)` with the inner
