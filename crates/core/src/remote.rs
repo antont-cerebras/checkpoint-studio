@@ -85,6 +85,34 @@ pub struct S3Meta {
     pub warnings: Vec<String>,
 }
 
+/// What a remote value comparison ([`RemoteRead::value_diff`]) computes per tensor.
+#[derive(Clone, Debug)]
+pub struct RemoteValueOpts {
+    /// Compare element values: max/mean `|Δ|`, differing + non-finite-mismatch counts.
+    pub values: bool,
+    /// Compare value distributions: total-variation distance over a shared range.
+    pub histogram: bool,
+    /// Histogram bucket count; `None` uses the same default the local diff does.
+    pub bins: Option<usize>,
+    /// Ship the full per-bin histogram (the single-tensor `--tensor` table needs it);
+    /// the bulk path leaves this off so only the small TVD summary crosses the wire.
+    pub full_hist: bool,
+}
+
+/// One tensor's remote value/distribution comparison. Fields are independently
+/// optional: `values`/`hist_*` appear only when requested and computable; `error`
+/// marks a per-tensor skip (e.g. materialising its data failed) — not a whole-diff
+/// failure, so the other tensors still report.
+#[derive(Debug, Default)]
+pub struct RemoteTensorDiff {
+    pub values: Option<crate::sample::ValueDiff>,
+    /// `(tvd, bins)` summary for the bulk `--histogram` path.
+    pub hist_shift: Option<(f64, usize)>,
+    /// Full per-bin histogram for the single-tensor table (`full_hist`).
+    pub hist_full: Option<crate::sample::HistogramDiff>,
+    pub error: Option<String>,
+}
+
 /// Line prefix the remote script tags its JSON with, so we can pick it out of any
 /// motd / cstorch chatter on the SSH stdout.
 const SENTINEL: &str = "CKPT_EXPLORER_META:";
@@ -441,6 +469,48 @@ impl RemoteRead {
             })?;
         parse_dump(json, &self.source_path(src))
     }
+
+    /// Compare two `s3://` cstorch checkpoints' tensor **values** on the remote proxy
+    /// (which has the S3 access) over an already-open session. A single torch script
+    /// loads both checkpoints and, for each `(old_name, new_name)` pair, realises the
+    /// two tensors and streams them in row-chunks to compute max/mean `|Δ|` and/or a
+    /// shared-range histogram. Only the small per-tensor result JSON crosses the wire
+    /// (never tensor data); `done/total compared` progress streams ahead of it so a
+    /// long run shows a filling bar. Returns a map keyed by the *new* (post-rename)
+    /// tensor name — the same key the diff report is built from.
+    ///
+    /// **Read-only:** loads (lazily) and reads tensor data to compare; it never
+    /// writes, saves, or otherwise mutates either checkpoint.
+    pub fn value_diff(
+        &self,
+        session: &RemoteSession,
+        old_uri: &str,
+        new_uri: &str,
+        pairs: &[(String, String)],
+        opts: &RemoteValueOpts,
+        progress: Option<&LoadProgress>,
+    ) -> Result<HashMap<String, RemoteTensorDiff>> {
+        let script = value_diff_script(old_uri, new_uri, pairs, opts);
+        let command = format!("source {}/bin/activate && python3 -", self.venv);
+        if let Some(p) = progress {
+            p.set_total(pairs.len());
+            p.set_unit(crate::progress::Unit::Compared);
+        }
+        let out = session.exec_capture(&command, &script, |line| {
+            if let Some(rest) = line.strip_prefix(PROGRESS_TAG) {
+                let mut parts = rest.splitn(3, '/');
+                if let (Some(d), Some(t)) = (parts.next(), parts.next())
+                    && let (Ok(done), Ok(total)) = (d.trim().parse(), t.trim().parse())
+                    && let Some(p) = progress
+                {
+                    p.set_total(total);
+                    p.set_done(done);
+                    p.set_unit(crate::progress::Unit::Compared);
+                }
+            }
+        })?;
+        parse_value_diff(&out, &self.host)
+    }
 }
 
 /// The cstorch dump script for an `s3://…` checkpoint: `cstorch.load` (lazy — no
@@ -586,6 +656,161 @@ emit({"tensors": tensors, "metadata": [], "s3_objects": s3_objects, "s3_warnings
     TEMPLATE
         .replace("__URI__", &src_lit)
         .replace("__WANT_S3__", if want_s3 { "True" } else { "False" })
+        .replace("__SENTINEL__", SENTINEL)
+        .replace("__PROGRESS__", PROGRESS_TAG)
+}
+
+/// The value-comparison script for two `s3://` cstorch checkpoints: load both,
+/// then for each `(old_name, new_name)` pair realise the tensors and stream them in
+/// row-chunks to compute (a) element `|Δ|` stats — matching [`crate::sample`]'s
+/// `DiffAcc` semantics: bit-equal (or both-NaN) slots are unchanged, `max`/`mean`
+/// `|Δ|` are over finite differing pairs, others count as non-finite mismatches —
+/// and (b) a shared-range histogram (both sides binned over their combined finite
+/// range into `n` equal-width bins, like the local `Range` layout). Emits a
+/// sentinel JSON line per tensor plus `PROG:done/total/compared` lines. Both URIs
+/// and the name pairs are embedded as JSON literals (valid Python), so nothing
+/// needs shell quoting.
+///
+/// **Read-only:** it only `cstorch.load`s (lazily) and reads tensor data to
+/// compare — it never opens anything for writing, never `save`s, and touches no S3
+/// write API. Neither checkpoint is modified.
+fn value_diff_script(
+    old_uri: &str,
+    new_uri: &str,
+    pairs: &[(String, String)],
+    opts: &RemoteValueOpts,
+) -> String {
+    let old_lit = serde_json::to_string(old_uri).unwrap_or_else(|_| "\"\"".into());
+    let new_lit = serde_json::to_string(new_uri).unwrap_or_else(|_| "\"\"".into());
+    let pairs_lit = serde_json::to_string(pairs).unwrap_or_else(|_| "[]".into());
+    let bins_lit = opts
+        .bins
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "None".into());
+    let b = |x: bool| if x { "True" } else { "False" };
+    const TEMPLATE: &str = r#"
+import sys, json
+OLD = __OLD__
+NEW = __NEW__
+PAIRS = __PAIRS__
+WANT_VALUES = __WANT_VALUES__
+WANT_HIST = __WANT_HIST__
+FULL_HIST = __FULL_HIST__
+BINS = __BINS__
+CHUNK = 4000000
+S = "__SENTINEL__"
+P = "__PROGRESS__"
+def emit(o):
+    sys.stdout.write(S + json.dumps(o) + "\n"); sys.stdout.flush()
+def prog(done, total):
+    sys.stdout.write("%s%d/%d/compared\n" % (P, done, total)); sys.stdout.flush()
+try:
+    import cerebras.pytorch as cstorch
+except Exception as e:
+    emit({"error": "import cerebras.pytorch failed: %r" % (e,)}); sys.exit(0)
+try:
+    import numpy as np
+    import torch
+except Exception as e:
+    emit({"error": "import numpy/torch failed (needed to compare values): %r" % (e,)}); sys.exit(0)
+try:
+    old_sd = cstorch.load(OLD, map_location=None)
+    new_sd = cstorch.load(NEW, map_location=None)
+except Exception as e:
+    emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
+def to_f64(rt, i, j):
+    sl = rt if i is None else rt[i:j]
+    return sl.to(torch.float64).numpy().reshape(-1)
+total = len(PAIRS)
+prog(0, total)
+for idx in range(total):
+    oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
+    res = {"name": nname}
+    try:
+        a = old_sd[oname]; b = new_sd[nname]
+        ashape = [int(d) for d in a.shape]; bshape = [int(d) for d in b.shape]
+        if ashape != bshape:
+            res["error"] = "shapes differ"; emit(res); prog(idx + 1, total); continue
+        ra = a.to("cpu"); rb = b.to("cpu")
+        scalar = (len(ashape) == 0)
+        d0 = 0 if scalar else ashape[0]
+        inner = 1
+        for d in ashape[1:]: inner *= d
+        rows = max(1, CHUNK // max(1, inner))
+        spans = [(None, None)] if scalar else [(i, min(i + rows, d0)) for i in range(0, d0, rows)]
+        if not spans: spans = [(None, None)]
+        elements = 0; differing = 0; nfm = 0; max_abs = 0.0; sum_abs = 0.0
+        omin = omax = nmin = nmax = None
+        for (i, j) in spans:
+            av = to_f64(ra, i, j); bv = to_f64(rb, i, j)
+            if WANT_VALUES:
+                both_nan = np.isnan(av) & np.isnan(bv)
+                dmask = ~((av == bv) | both_nan)
+                elements += int(av.size)
+                differing += int(np.count_nonzero(dmask))
+                bothfin = np.isfinite(av) & np.isfinite(bv)
+                fdm = dmask & bothfin
+                if bool(np.any(fdm)):
+                    dd = np.abs(av[fdm] - bv[fdm])
+                    m = float(dd.max())
+                    if m > max_abs: max_abs = m
+                    sum_abs += float(dd.sum())
+                nfm += int(np.count_nonzero(dmask & ~bothfin))
+            if WANT_HIST:
+                af = av[np.isfinite(av)]; bf = bv[np.isfinite(bv)]
+                if af.size:
+                    lo = float(af.min()); hi = float(af.max())
+                    omin = lo if omin is None else min(omin, lo)
+                    omax = hi if omax is None else max(omax, hi)
+                if bf.size:
+                    lo = float(bf.min()); hi = float(bf.max())
+                    nmin = lo if nmin is None else min(nmin, lo)
+                    nmax = hi if nmax is None else max(nmax, hi)
+        if WANT_VALUES:
+            mean_abs = (sum_abs / elements) if elements > 0 else 0.0
+            res["values"] = {"elements": elements, "differing": differing, "max_abs": max_abs, "mean_abs": mean_abs, "nonfinite_mismatch": nfm}
+        if WANT_HIST:
+            mins = [x for x in (omin, nmin) if x is not None]
+            maxs = [x for x in (omax, nmax) if x is not None]
+            n = BINS if BINS else 40
+            lo_c = min(mins) if mins else 0.0
+            hi_c = max(maxs) if maxs else 0.0
+            if hi_c <= lo_c: n = 1
+            oc = np.zeros(n, dtype=np.int64); nc = np.zeros(n, dtype=np.int64)
+            onf = 0; nnf = 0
+            for (i, j) in spans:
+                av = to_f64(ra, i, j); bv = to_f64(rb, i, j)
+                afin = np.isfinite(av); bfin = np.isfinite(bv)
+                onf += int(av.size) - int(np.count_nonzero(afin))
+                nnf += int(bv.size) - int(np.count_nonzero(bfin))
+                af = av[afin]; bf = bv[bfin]
+                if hi_c <= lo_c:
+                    oc[0] += int(af.size); nc[0] += int(bf.size)
+                else:
+                    hc, _ = np.histogram(af, bins=n, range=(lo_c, hi_c)); oc += hc.astype(np.int64)
+                    hc, _ = np.histogram(bf, bins=n, range=(lo_c, hi_c)); nc += hc.astype(np.int64)
+            ot = int(oc.sum()); nt = int(nc.sum())
+            if ot == 0 and nt == 0: tvd = 0.0
+            elif ot == 0 or nt == 0: tvd = 1.0
+            else: tvd = 0.5 * float(np.abs(oc.astype(np.float64) / ot - nc.astype(np.float64) / nt).sum())
+            h = {"tvd": tvd, "n": int(n)}
+            if FULL_HIST:
+                h["lo"] = lo_c; h["hi"] = hi_c
+                h["old"] = [int(x) for x in oc.tolist()]; h["new"] = [int(x) for x in nc.tolist()]
+                h["old_total"] = ot; h["new_total"] = nt; h["old_nonfinite"] = onf; h["new_nonfinite"] = nnf
+            res["histogram"] = h
+    except Exception as e:
+        res["error"] = "%r" % (e,)
+    emit(res); prog(idx + 1, total)
+"#;
+    TEMPLATE
+        .replace("__OLD__", &old_lit)
+        .replace("__NEW__", &new_lit)
+        .replace("__PAIRS__", &pairs_lit)
+        .replace("__WANT_VALUES__", b(opts.values))
+        .replace("__WANT_HIST__", b(opts.histogram))
+        .replace("__FULL_HIST__", b(opts.full_hist))
+        .replace("__BINS__", &bins_lit)
         .replace("__SENTINEL__", SENTINEL)
         .replace("__PROGRESS__", PROGRESS_TAG)
 }
@@ -737,6 +962,107 @@ fn parse_dump(
         .unwrap_or_default();
     let s3 = parse_s3_meta(&v);
     Ok((tensors, metadata, s3))
+}
+
+/// Parse [`RemoteRead::value_diff`]'s streamed output: one sentinel-tagged JSON line
+/// per tensor (`{name, values?, histogram?, error?}`), collected into a map keyed by
+/// the tensor's (new/post-rename) name. A sentinel line that carries an `error` but
+/// no `name` is a fatal, whole-run failure (import / load) → an `Err`. Non-sentinel
+/// lines (motd, cstorch chatter) are ignored.
+fn parse_value_diff(out: &str, host: &str) -> Result<HashMap<String, RemoteTensorDiff>> {
+    let mut map = HashMap::new();
+    let mut saw = false;
+    for line in out.lines() {
+        let Some(payload) = line.strip_prefix(SENTINEL) else {
+            continue;
+        };
+        saw = true;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        match v.get("name").and_then(|x| x.as_str()) {
+            Some(name) => {
+                map.insert(name.to_string(), parse_tensor_diff(&v));
+            }
+            // A `name`-less line with an `error` is a fatal failure for the whole run.
+            None if v.get("error").is_some() => bail!("remote: {}", diagnose_remote_error(&v)),
+            None => {}
+        }
+    }
+    if !saw {
+        bail!(
+            "no value-comparison output returned from {host} — remote output was:\n{}",
+            out.trim()
+        );
+    }
+    Ok(map)
+}
+
+/// Build one tensor's [`RemoteTensorDiff`] from its result JSON.
+fn parse_tensor_diff(v: &serde_json::Value) -> RemoteTensorDiff {
+    let error = v.get("error").and_then(|e| e.as_str()).map(str::to_string);
+    let values = v.get("values").and_then(parse_value_fields);
+    let (hist_shift, hist_full) = match v.get("histogram") {
+        Some(h) => (parse_hist_shift(h), parse_hist_full(h)),
+        None => (None, None),
+    };
+    RemoteTensorDiff {
+        values,
+        hist_shift,
+        hist_full,
+        error,
+    }
+}
+
+/// A `{elements, differing, max_abs, mean_abs, nonfinite_mismatch}` object into a
+/// [`ValueDiff`](crate::sample::ValueDiff). Requires the two count fields; the rest
+/// default to 0.
+fn parse_value_fields(v: &serde_json::Value) -> Option<crate::sample::ValueDiff> {
+    let u = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+    let f = |k: &str| v.get(k).and_then(serde_json::Value::as_f64);
+    Some(crate::sample::ValueDiff {
+        elements: u("elements")?,
+        differing: u("differing")?,
+        max_abs: f("max_abs").unwrap_or(0.0),
+        mean_abs: f("mean_abs").unwrap_or(0.0),
+        nonfinite_mismatch: u("nonfinite_mismatch").unwrap_or(0),
+    })
+}
+
+/// The `(tvd, bins)` summary always present on a histogram result (bulk path).
+fn parse_hist_shift(h: &serde_json::Value) -> Option<(f64, usize)> {
+    let tvd = h.get("tvd").and_then(serde_json::Value::as_f64)?;
+    let n = h.get("n").and_then(serde_json::Value::as_u64)? as usize;
+    Some((tvd, n))
+}
+
+/// The full per-bin histogram, present only when `full_hist` was requested (the
+/// single-tensor `--tensor` table). `None` when the bin arrays are absent.
+fn parse_hist_full(h: &serde_json::Value) -> Option<crate::sample::HistogramDiff> {
+    let arr_u64 = |val: Option<&serde_json::Value>| -> Option<Vec<u64>> {
+        Some(
+            val?.as_array()?
+                .iter()
+                .map(|x| x.as_u64().unwrap_or(0))
+                .collect(),
+        )
+    };
+    let old = arr_u64(h.get("old"))?;
+    let new = arr_u64(h.get("new"))?;
+    let n = h.get("n").and_then(serde_json::Value::as_u64)? as usize;
+    let lo = h.get("lo").and_then(serde_json::Value::as_f64)?;
+    let hi = h.get("hi").and_then(serde_json::Value::as_f64)?;
+    let u = |k: &str| h.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    Some(crate::sample::HistogramDiff {
+        bins: crate::sample::HistBins::Range { lo, hi },
+        n,
+        old,
+        new,
+        old_total: u("old_total"),
+        new_total: u("new_total"),
+        old_nonfinite: u("old_nonfinite"),
+        new_nonfinite: u("new_nonfinite"),
+    })
 }
 
 /// Turn the remote script's `error` — optionally accompanied by a best-effort,
@@ -1072,6 +1398,112 @@ mod tests {
                 "list script must stay list-only + read-only: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn value_diff_script_embeds_inputs_and_is_read_only() {
+        let pairs = vec![
+            ("old.w".to_string(), "new.w".to_string()),
+            ("x".to_string(), "x".to_string()),
+        ];
+        let opts = RemoteValueOpts {
+            values: true,
+            histogram: true,
+            bins: Some(32),
+            full_hist: false,
+        };
+        let s = value_diff_script("s3://b/old", "s3://b/new", &pairs, &opts);
+        assert!(s.contains(r#"OLD = "s3://b/old""#), "{s}");
+        assert!(s.contains(r#"NEW = "s3://b/new""#));
+        assert!(s.contains(r#"[["old.w","new.w"],["x","x"]]"#), "{s}");
+        assert!(s.contains("WANT_VALUES = True"));
+        assert!(s.contains("WANT_HIST = True"));
+        assert!(s.contains("FULL_HIST = False"));
+        assert!(s.contains("BINS = 32"));
+        assert!(s.contains("import cerebras.pytorch"));
+        assert!(s.contains("np.histogram"));
+        assert!(s.contains(SENTINEL));
+        // Read-only: it loads + reads to compare, never saves/writes/uploads/deletes.
+        for forbidden in [
+            "cstorch.save",
+            "torch.save",
+            ".save(",
+            "put_object",
+            "upload",
+            "delete_object",
+            "copy_object",
+            "open(",
+        ] {
+            assert!(
+                !s.contains(forbidden),
+                "value-diff script must stay read-only: {forbidden}"
+            );
+        }
+        // No histogram wanted → the branch and its bins are dropped from the script.
+        let vonly = value_diff_script(
+            "s3://b/o",
+            "s3://b/n",
+            &pairs,
+            &RemoteValueOpts {
+                values: true,
+                histogram: false,
+                bins: None,
+                full_hist: false,
+            },
+        );
+        assert!(vonly.contains("WANT_HIST = False"), "{vonly}");
+        assert!(vonly.contains("BINS = None"), "{vonly}");
+    }
+
+    #[test]
+    fn parse_value_diff_collects_results_and_flags_fatal() {
+        let out = format!(
+            "{s}{{\"name\":\"a.w\",\"values\":{{\"elements\":10,\"differing\":3,\"max_abs\":0.5,\"mean_abs\":0.1,\"nonfinite_mismatch\":1}}}}\n\
+             motd noise\n\
+             {s}{{\"name\":\"b.w\",\"histogram\":{{\"tvd\":0.25,\"n\":40}}}}\n\
+             {s}{{\"name\":\"c.w\",\"error\":\"shapes differ\"}}\n",
+            s = SENTINEL
+        );
+        let m = parse_value_diff(&out, "host").unwrap();
+        assert_eq!(m.len(), 3);
+        let vd = m["a.w"].values.as_ref().unwrap();
+        assert_eq!(vd.elements, 10);
+        assert_eq!(vd.differing, 3);
+        assert_eq!(vd.max_abs, 0.5);
+        assert_eq!(vd.nonfinite_mismatch, 1);
+        assert_eq!(m["b.w"].hist_shift, Some((0.25, 40)));
+        assert!(m["b.w"].hist_full.is_none()); // summary only (no bin arrays)
+        assert_eq!(m["c.w"].error.as_deref(), Some("shapes differ"));
+
+        // A name-less error line is a fatal whole-run failure.
+        let fatal = format!("{SENTINEL}{{\"error\":\"import numpy/torch failed\"}}\n");
+        assert!(parse_value_diff(&fatal, "host").is_err());
+        // No sentinel output at all is also an error.
+        assert!(parse_value_diff("just motd\n", "host").is_err());
+    }
+
+    #[test]
+    fn parse_value_diff_reads_full_histogram() {
+        let out = format!(
+            "{SENTINEL}{{\"name\":\"w\",\"histogram\":{{\"tvd\":0.5,\"n\":2,\"lo\":-1.0,\"hi\":1.0,\
+             \"old\":[3,1],\"new\":[1,3],\"old_total\":4,\"new_total\":4,\"old_nonfinite\":0,\"new_nonfinite\":0}}}}\n"
+        );
+        let m = parse_value_diff(&out, "h").unwrap();
+        let hf = m["w"].hist_full.as_ref().unwrap();
+        assert_eq!(hf.n, 2);
+        assert_eq!(hf.old, vec![3, 1]);
+        assert_eq!(hf.new, vec![1, 3]);
+        assert_eq!(hf.old_total, 4);
+        assert!((hf.tvd() - 0.5).abs() < 1e-9);
+        match hf.bins {
+            crate::sample::HistBins::Range { lo, hi } => {
+                assert_eq!(lo, -1.0);
+                assert_eq!(hi, 1.0);
+            }
+            _ => panic!("expected Range bins"),
+        }
+        // The summary shift is present alongside the full data.
+        assert_eq!(m["w"].hist_shift, Some((0.5, 2)));
     }
 
     #[test]

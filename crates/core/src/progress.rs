@@ -32,6 +32,9 @@ pub enum Unit {
     Tensors,
     /// S3 objects being HEADed for their metadata (the `diff` s3-vs-s3 phase).
     S3Objects,
+    /// Tensors compared value-by-value (the remote `diff --values`/`--histogram`
+    /// phase, computed on the ssh proxy).
+    Compared,
 }
 
 impl LoadProgress {
@@ -50,6 +53,7 @@ impl LoadProgress {
             Unit::Shards => 1,
             Unit::Tensors => 2,
             Unit::S3Objects => 3,
+            Unit::Compared => 4,
         };
         self.unit.store(code, Ordering::Relaxed);
     }
@@ -60,6 +64,7 @@ impl LoadProgress {
             1 => " shards",
             2 => " tensors",
             3 => " S3 objects",
+            4 => " compared",
             _ => "",
         }
     }

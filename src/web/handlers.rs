@@ -97,8 +97,12 @@ pub fn schema(s: &WebState, q: &Query) -> Reply {
         Err(e) => return err(400, e.to_string()),
     };
     let families = if filter.is_active() {
-        let matched: Vec<crate::tree::TensorInfo> =
-            s.tensors.iter().filter(|t| filter.matches(t)).cloned().collect();
+        let matched: Vec<crate::tree::TensorInfo> = s
+            .tensors
+            .iter()
+            .filter(|t| filter.matches(t))
+            .cloned()
+            .collect();
         crate::diff::tensor_families(&matched)
     } else {
         crate::diff::tensor_families(&s.tensors)

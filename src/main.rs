@@ -514,6 +514,9 @@ enum Command {
     /// S3 objects' metadata is compared too — checksum/ETag, size, tags, and user
     /// metadata (best-effort, using the remote host's own AWS access); timestamps
     /// (last-modified and timestamp-valued tags/metadata) are shown as info only.
+    /// `--values` / `--histogram` / `--tensor` are supported there as well: since the
+    /// s3:// data isn't reachable locally, the element `|Δ|` and distribution stats
+    /// are computed on the remote (only the small per-tensor results cross the wire).
     ///
     /// Exit status follows `diff`: 0 = structurally identical, 1 = differences
     /// found, 2 = trouble (a path couldn't be read).
@@ -595,7 +598,9 @@ enum Command {
         jobs: Option<usize>,
         /// Read each checkpoint's structure over SSH on [USER@]HOST (which holds the
         /// access): an s3:// checkpoint or a remote safetensors directory/file.
-        /// Data/secrets stay remote; structural diff (dtype/shape).
+        /// Data/secrets stay remote. For an s3-vs-s3 pair, --values / --histogram /
+        /// --tensor also work — the value/distribution comparison runs on the remote
+        /// (only the per-tensor results cross the wire, never tensor data).
         #[arg(long = "ssh-read", value_name = "[USER@]HOST")]
         ssh_read: Option<String>,
         /// Path to the cstorch virtualenv on the --ssh-read host (default: ~/venv).
@@ -1376,13 +1381,16 @@ fn run_diff(
     // (ssh2 sessions aren't Sync, so a session per thread). The password is entered
     // once and reused for the second session, so it's still one prompt; agent/key
     // auth needs none. A spinner line animates for each read. Local: sequential.
+    // The SSH password is entered once (on the first session) and reused for every
+    // later session — the two parallel structure reads and, for an s3-vs-s3 value
+    // diff, the comparison session opened afterwards — so the whole run is one prompt.
+    let mut password: Option<String> = None;
     let loaded: Result<(SideLoad, SideLoad)> = match remote {
         Some(r) => (|| -> Result<(SideLoad, SideLoad)> {
             // Open both sessions up front so the one password prompt happens here,
             // before the spinner. Opening is silent, so nothing is printed until
             // we're actually connected — then announce the read (not before, when
             // we're still authenticating and nothing is being read yet).
-            let mut password: Option<String> = None;
             let sa = r.open_with(&mut password)?;
             let sb = r.open_with(&mut password)?;
             eprintln!("checkpoint-explorer diff: reading tensor metadata over ssh …");
@@ -1431,7 +1439,35 @@ fn run_diff(
     // independent of `--only-tensors`, which only hides the metadata *diff*. Only
     // needed when values / distributions are compared.
     let compares_data = opts.values || opts.histogram || tensor.is_some();
-    let (old_schemas, new_schemas) = if compares_data {
+
+    // A remote source's tensor *data* isn't reachable locally, so value/distribution
+    // comparison for `--ssh-read` must run on the proxy. Only an s3-vs-s3 pair is
+    // supported (both cstorch checkpoints the remote can load); for a non-s3 remote
+    // (a safetensors dir) or a mixed pair, fall back to a structural diff and say so.
+    let s3_pair = old_str.starts_with("s3://") && new_str.starts_with("s3://");
+    let remote_values = match remote {
+        Some(_) if compares_data && !s3_pair => {
+            eprintln!(
+                "checkpoint-explorer diff: value/distribution comparison over --ssh-read needs \
+                 both sides to be s3:// cstorch checkpoints — comparing structure only"
+            );
+            false
+        }
+        Some(_) if compares_data => {
+            // cstorch tensors are already the logical values, so the local decode
+            // views (`--dtype u4/unpacked/…`) don't apply on the remote.
+            if !matches!(view, sample::ViewDtype::Stored) {
+                eprintln!(
+                    "checkpoint-explorer diff: --dtype is ignored for s3:// cstorch checkpoints \
+                     (their tensors are already the logical values)"
+                );
+            }
+            true
+        }
+        _ => false,
+    };
+
+    let (old_schemas, new_schemas) = if compares_data && !remote_values {
         (
             sample::parse_packing_schemas(&old_t, &old_m),
             sample::parse_packing_schemas(&new_t, &new_m),
@@ -1456,7 +1492,50 @@ fn run_diff(
         if !name_map.is_empty() {
             eprintln!("checkpoint-explorer diff: --map is ignored with --tensor");
         }
-        return run_diff_tensor(&old_label, &new_label, name, &old_t, &new_t, &ctx, opts);
+        // Remote (s3-vs-s3): compare this one tensor's values/distribution on the
+        // proxy. `full_hist` so the bin-by-bin table can be rendered locally.
+        let remote_diff = if remote_values {
+            let a = old_t.iter().find(|t| t.name == name);
+            let b = new_t.iter().find(|t| t.name == name);
+            match (a, b) {
+                (Some(a), Some(b)) if a.shape == b.shape => {
+                    let vopts = crate::remote::RemoteValueOpts {
+                        values: true,
+                        histogram: opts.histogram,
+                        bins,
+                        full_hist: true,
+                    };
+                    match fetch_remote_value_diff(
+                        remote.expect("remote_values implies a remote"),
+                        &mut password,
+                        &old_str,
+                        &new_str,
+                        &[(name.to_string(), name.to_string())],
+                        &vopts,
+                    ) {
+                        Ok(mut m) => m.remove(name),
+                        Err(e) => {
+                            eprintln!("checkpoint-explorer diff: {e:#}");
+                            return 2;
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        return run_diff_tensor(
+            &old_label,
+            &new_label,
+            name,
+            &old_t,
+            &new_t,
+            &ctx,
+            opts,
+            remote_values,
+            remote_diff.as_ref(),
+        );
     }
 
     // `--only-tensors` / an active filter (opts.metadata == false): drop metadata
@@ -1497,9 +1576,9 @@ fn run_diff(
 
     let mut report = if opts.values || opts.histogram {
         use rayon::prelude::*;
-        // Read each common same-shape tensor and compare values and/or distribution.
         // The old side is keyed by its *post-rename* name (the same names `common`
-        // is drawn from), so a mapped tensor still finds its on-disk data.
+        // is drawn from), so a mapped tensor still finds its data; the value carries
+        // its original (pre-rename) name for the remote lookup.
         let old_map: HashMap<String, &TensorInfo> = old_t
             .iter()
             .map(|t| (name_map.map(&t.name).into_owned(), t))
@@ -1513,38 +1592,79 @@ fn run_diff(
             .filter(|k| new_sum.tensors.contains_key(*k))
             .map(String::as_str)
             .collect();
-        let progress = CompareProgress::start(common.len());
-        let compute = |name: &str| -> diff::TensorExtras {
-            let _tracked = progress.track(name);
-            let (Some(a), Some(b)) = (old_map.get(name), new_map.get(name)) else {
-                return diff::TensorExtras::default();
+
+        // The per-tensor extras, keyed by (post-rename) name — computed either on the
+        // proxy (s3-vs-s3) or locally.
+        let extras: HashMap<String, diff::TensorExtras> = if remote_values {
+            // One proxy script reads both checkpoints and compares each common
+            // same-shape pair; the pair carries (old original name, new/common name).
+            let pairs: Vec<(String, String)> = common
+                .iter()
+                .filter_map(|&k| {
+                    let a = old_map.get(k)?;
+                    let b = new_map.get(k)?;
+                    (a.shape == b.shape).then(|| (a.name.clone(), k.to_string()))
+                })
+                .collect();
+            let vopts = crate::remote::RemoteValueOpts {
+                values: opts.values,
+                histogram: opts.histogram,
+                bins,
+                full_hist: false, // bulk path needs only the TVD summary
             };
-            if a.shape != b.shape {
-                return diff::TensorExtras::default(); // needs matching shapes
+            match fetch_remote_value_diff(
+                remote.expect("remote_values implies a remote"),
+                &mut password,
+                &old_str,
+                &new_str,
+                &pairs,
+                &vopts,
+            ) {
+                Ok(m) => m
+                    .into_iter()
+                    .map(|(k, rd)| (k, extras_from_remote(&rd)))
+                    .collect(),
+                Err(e) => {
+                    eprintln!("checkpoint-explorer diff: {e:#}");
+                    return 2;
+                }
             }
-            diff::TensorExtras {
-                values: opts.values.then(|| tensor_values(a, b, &ctx)).flatten(),
-                histogram: opts
-                    .histogram
-                    .then(|| tensor_histogram(a, b, &ctx))
-                    .flatten(),
-            }
-        };
-        // Reading tensor data is I/O-bound, so compare up to `jobs` tensors at
-        // once (the results are order-independent). `jobs == 1` stays sequential.
-        let pairs: Vec<(&str, diff::TensorExtras)> = if jobs <= 1 {
-            common.iter().map(|&n| (n, compute(n))).collect()
         } else {
-            match rayon::ThreadPoolBuilder::new().num_threads(jobs).build() {
-                Ok(pool) => pool.install(|| common.par_iter().map(|&n| (n, compute(n))).collect()),
-                Err(_) => common.iter().map(|&n| (n, compute(n))).collect(),
-            }
+            let progress = CompareProgress::start(common.len());
+            let compute = |name: &str| -> diff::TensorExtras {
+                let _tracked = progress.track(name);
+                let (Some(a), Some(b)) = (old_map.get(name), new_map.get(name)) else {
+                    return diff::TensorExtras::default();
+                };
+                if a.shape != b.shape {
+                    return diff::TensorExtras::default(); // needs matching shapes
+                }
+                diff::TensorExtras {
+                    values: opts.values.then(|| tensor_values(a, b, &ctx)).flatten(),
+                    histogram: opts
+                        .histogram
+                        .then(|| tensor_histogram(a, b, &ctx))
+                        .flatten(),
+                }
+            };
+            // Reading tensor data is I/O-bound, so compare up to `jobs` tensors at
+            // once (the results are order-independent). `jobs == 1` stays sequential.
+            let pairs: Vec<(&str, diff::TensorExtras)> = if jobs <= 1 {
+                common.iter().map(|&n| (n, compute(n))).collect()
+            } else {
+                match rayon::ThreadPoolBuilder::new().num_threads(jobs).build() {
+                    Ok(pool) => {
+                        pool.install(|| common.par_iter().map(|&n| (n, compute(n))).collect())
+                    }
+                    Err(_) => common.iter().map(|&n| (n, compute(n))).collect(),
+                }
+            };
+            progress.finish();
+            pairs.into_iter().map(|(n, e)| (n.to_string(), e)).collect()
         };
-        progress.finish();
         // Feed the precomputed extras into the (pure) comparison. Each common name
         // is requested exactly once, so `remove` moves the value out (no clone).
-        let extras: std::cell::RefCell<HashMap<&str, diff::TensorExtras>> =
-            std::cell::RefCell::new(pairs.into_iter().collect());
+        let extras = std::cell::RefCell::new(extras);
         diff::compare_with(&old_sum, &new_sum, |name| {
             extras.borrow_mut().remove(name).unwrap_or_default()
         })
@@ -1640,8 +1760,56 @@ fn tensor_histogram(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> Option<di
     })
 }
 
+/// Open a session (reusing the already-entered `password`, so no second prompt) and
+/// run the proxy value comparison for `pairs`, with a progress bar that fills as the
+/// remote reports `done/total compared`. Used for both the bulk `--values`/
+/// `--histogram` run and the single `--tensor` focus.
+fn fetch_remote_value_diff(
+    r: &crate::remote::RemoteRead,
+    password: &mut Option<String>,
+    old_uri: &str,
+    new_uri: &str,
+    pairs: &[(String, String)],
+    vopts: &crate::remote::RemoteValueOpts,
+) -> Result<HashMap<String, crate::remote::RemoteTensorDiff>> {
+    let session = r.open_with(password)?;
+    eprintln!(
+        "checkpoint-explorer diff: comparing {} tensor(s)' values over ssh …",
+        pairs.len()
+    );
+    let bars = progress::Bars::start(vec![format!("comparing {} tensors", pairs.len())]);
+    let progress = bars.progress(0);
+    let out = r.value_diff(
+        &session,
+        old_uri,
+        new_uri,
+        pairs,
+        vopts,
+        progress.as_deref(),
+    );
+    bars.finish(0, out.is_ok());
+    bars.join();
+    out
+}
+
+/// Map a proxy-computed [`RemoteTensorDiff`](crate::remote::RemoteTensorDiff) into the
+/// [`diff::TensorExtras`] the report is built from — the value stats verbatim, the
+/// histogram summarized to its `(tvd, bins)` shift. A per-tensor remote error leaves
+/// both empty (the tensor then shows as a structural-only change).
+fn extras_from_remote(rd: &crate::remote::RemoteTensorDiff) -> diff::TensorExtras {
+    diff::TensorExtras {
+        values: rd.values,
+        histogram: rd
+            .hist_shift
+            .map(|(tvd, bins)| diff::HistShift { tvd, bins }),
+    }
+}
+
 /// The `diff --tensor NAME` path: compare one tensor's signature and, when it's
-/// in both checkpoints, its element values. Exits 2 if the name is in neither.
+/// in both checkpoints, its element values. With `remote`, the values/histogram were
+/// computed on the proxy (`remote_diff`, `None` when that tensor couldn't be
+/// compared). Exits 2 if the name is in neither.
+#[allow(clippy::too_many_arguments)] // one focused CLI path; each arg is distinct
 fn run_diff_tensor(
     old_label: &str,
     new_label: &str,
@@ -1650,6 +1818,8 @@ fn run_diff_tensor(
     new_t: &[TensorInfo],
     ctx: &ValueCtx,
     opts: diff::DiffOpts,
+    remote: bool,
+    remote_diff: Option<&crate::remote::RemoteTensorDiff>,
 ) -> i32 {
     let old_info = old_t.iter().find(|t| t.name == name);
     let new_info = new_t.iter().find(|t| t.name == name);
@@ -1660,8 +1830,10 @@ fn run_diff_tensor(
 
     let old_sig = old_info.map(diff::TensorSig::of);
     let new_sig = new_info.map(diff::TensorSig::of);
-    // Compare values only when the tensor is in both checkpoints.
+    // Compare values only when the tensor is in both checkpoints. Remote (s3): use
+    // the proxy-computed result; local: read the data here.
     let values = match (old_info, new_info) {
+        (Some(a), Some(b)) if remote => Some(value_cmp_remote(a, b, remote_diff)),
         (Some(a), Some(b)) => Some(value_cmp(a, b, ctx)),
         _ => None,
     };
@@ -1686,19 +1858,31 @@ fn run_diff_tensor(
         && let (Some(a), Some(b)) = (old_info, new_info)
         && a.shape == b.shape
     {
-        match sample::histogram_diff(
-            a,
-            ctx.old_schemas.get(&a.name),
-            b,
-            ctx.new_schemas.get(&b.name),
-            ctx.view,
-            ctx.bins,
-        ) {
-            Ok(hd) => {
-                hist_differs = hd.differs();
-                print!("{}", diff::render_histogram_table(name, &hd, opts.color));
+        if remote {
+            match remote_diff.and_then(|rd| rd.hist_full.as_ref()) {
+                Some(hd) => {
+                    hist_differs = hd.differs();
+                    print!("{}", diff::render_histogram_table(name, hd, opts.color));
+                }
+                None => eprintln!(
+                    "checkpoint-explorer diff: histogram: not available for this tensor over ssh"
+                ),
             }
-            Err(e) => eprintln!("checkpoint-explorer diff: histogram: {e}"),
+        } else {
+            match sample::histogram_diff(
+                a,
+                ctx.old_schemas.get(&a.name),
+                b,
+                ctx.new_schemas.get(&b.name),
+                ctx.view,
+                ctx.bins,
+            ) {
+                Ok(hd) => {
+                    hist_differs = hd.differs();
+                    print!("{}", diff::render_histogram_table(name, &hd, opts.color));
+                }
+                Err(e) => eprintln!("checkpoint-explorer diff: histogram: {e}"),
+            }
         }
     }
 
@@ -1724,6 +1908,33 @@ fn value_cmp(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> diff::ValueCmp {
         Ok(vd) if vd.differing == 0 => diff::ValueCmp::Identical,
         Ok(vd) => diff::ValueCmp::Differ(vd),
         Err(e) => diff::ValueCmp::Skipped(e),
+    }
+}
+
+/// Map a proxy-computed [`RemoteTensorDiff`](crate::remote::RemoteTensorDiff) into a
+/// [`diff::ValueCmp`] for the `--tensor` focus. Shapes are checked here (the remote
+/// only compares matching pairs); a per-tensor remote error, or values not having
+/// been computed, is reported as skipped rather than failing the diff.
+fn value_cmp_remote(
+    a: &TensorInfo,
+    b: &TensorInfo,
+    rd: Option<&crate::remote::RemoteTensorDiff>,
+) -> diff::ValueCmp {
+    if a.shape != b.shape {
+        return diff::ValueCmp::Skipped("shapes differ".to_string());
+    }
+    match rd {
+        Some(rd) => {
+            if let Some(e) = &rd.error {
+                return diff::ValueCmp::Skipped(e.clone());
+            }
+            match rd.values {
+                Some(vd) if vd.differing == 0 => diff::ValueCmp::Identical,
+                Some(vd) => diff::ValueCmp::Differ(vd),
+                None => diff::ValueCmp::Skipped("values not compared".to_string()),
+            }
+        }
+        None => diff::ValueCmp::Skipped("remote value comparison unavailable".to_string()),
     }
 }
 

@@ -1531,7 +1531,7 @@ pub fn tensor_stats(
 
 /// Element-wise comparison of two equal-shape tensors, each decoded to `f64`.
 /// Used by `diff --tensor` and the full-checkpoint `diff --values`.
-#[derive(Clone, Copy, serde::Serialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct ValueDiff {
     /// Total elements compared.
     pub elements: u64,
@@ -1711,6 +1711,7 @@ pub fn compare_values(
 /// Two tensors' value histograms over the *same* bin layout (so the bins align),
 /// for `diff --histogram`. `bins`/`n` describe the shared layout; `old`/`new` are
 /// the per-bin counts.
+#[derive(Clone, Debug)]
 pub struct HistogramDiff {
     pub bins: HistBins,
     pub n: usize,
