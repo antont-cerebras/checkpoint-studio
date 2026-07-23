@@ -1789,7 +1789,33 @@ fn fetch_remote_value_diff(
     );
     bars.finish(0, out.is_ok());
     bars.join();
-    out
+    let (map, stats) = out?;
+    // I/O + timing from the proxy: bytes read from S3 and the throughput, so a long
+    // comparison's performance is visible (on stderr, keeping stdout's diff clean).
+    if let Some(s) = stats {
+        let elapsed = std::time::Duration::from_secs_f64(s.elapsed_s.max(0.0));
+        let read = crate::utils::format_size(s.bytes as usize);
+        let rate = if s.elapsed_s > 0.0 {
+            format!(
+                " ({}/s)",
+                crate::utils::format_size((s.bytes as f64 / s.elapsed_s) as usize)
+            )
+        } else {
+            String::new()
+        };
+        let skipped = s.tensors.saturating_sub(s.compared);
+        let skip_note = if skipped > 0 {
+            format!(", {skipped} skipped")
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "checkpoint-explorer diff: compared {} tensor(s){skip_note} on the remote in {} · read {read}{rate}",
+            s.compared,
+            format_elapsed(elapsed),
+        );
+    }
+    Ok(map)
 }
 
 /// Map a proxy-computed [`RemoteTensorDiff`](crate::remote::RemoteTensorDiff) into the

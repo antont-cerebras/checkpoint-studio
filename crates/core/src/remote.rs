@@ -113,6 +113,22 @@ pub struct RemoteTensorDiff {
     pub error: Option<String>,
 }
 
+/// I/O + timing metrics the proxy reports after a [`RemoteRead::value_diff`] run, so
+/// the caller can show how much data was read and how fast. `elapsed_s` is measured
+/// on the remote (compute + S3 read), so it excludes the SSH handshake and the
+/// transfer of the small result JSON.
+#[derive(Debug, Default, Clone)]
+pub struct RemoteValueStats {
+    /// Tensor pairs requested.
+    pub tensors: usize,
+    /// Pairs actually read + compared (excludes shape-mismatch / errored ones).
+    pub compared: usize,
+    /// Total tensor bytes read from S3 (both sides, at their stored dtype).
+    pub bytes: u64,
+    /// Wall-clock seconds on the remote for the whole comparison.
+    pub elapsed_s: f64,
+}
+
 /// Line prefix the remote script tags its JSON with, so we can pick it out of any
 /// motd / cstorch chatter on the SSH stdout.
 const SENTINEL: &str = "CKPT_EXPLORER_META:";
@@ -489,7 +505,7 @@ impl RemoteRead {
         pairs: &[(String, String)],
         opts: &RemoteValueOpts,
         progress: Option<&LoadProgress>,
-    ) -> Result<HashMap<String, RemoteTensorDiff>> {
+    ) -> Result<(HashMap<String, RemoteTensorDiff>, Option<RemoteValueStats>)> {
         let script = value_diff_script(old_uri, new_uri, pairs, opts);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
         if let Some(p) = progress {
@@ -689,7 +705,7 @@ fn value_diff_script(
         .unwrap_or_else(|| "None".into());
     let b = |x: bool| if x { "True" } else { "False" };
     const TEMPLATE: &str = r#"
-import sys, json
+import sys, json, time
 OLD = __OLD__
 NEW = __NEW__
 PAIRS = __PAIRS__
@@ -723,6 +739,9 @@ def to_f64(rt, i, j):
     return sl.to(torch.float64).numpy().reshape(-1)
 total = len(PAIRS)
 prog(0, total)
+t0 = time.time()
+read_bytes = 0
+compared = 0
 for idx in range(total):
     oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
     res = {"name": nname}
@@ -731,7 +750,11 @@ for idx in range(total):
         ashape = [int(d) for d in a.shape]; bshape = [int(d) for d in b.shape]
         if ashape != bshape:
             res["error"] = "shapes differ"; emit(res); prog(idx + 1, total); continue
+        # Realise each side to CPU once (one read of its stored bytes from S3); the
+        # per-chunk float64 conversions below then work off the in-memory copy.
         ra = a.to("cpu"); rb = b.to("cpu")
+        read_bytes += ra.element_size() * ra.nelement() + rb.element_size() * rb.nelement()
+        compared += 1
         scalar = (len(ashape) == 0)
         d0 = 0 if scalar else ashape[0]
         inner = 1
@@ -802,6 +825,7 @@ for idx in range(total):
     except Exception as e:
         res["error"] = "%r" % (e,)
     emit(res); prog(idx + 1, total)
+emit({"summary": {"tensors": total, "compared": compared, "bytes": int(read_bytes), "elapsed_s": time.time() - t0}})
 "#;
     TEMPLATE
         .replace("__OLD__", &old_lit)
@@ -969,8 +993,12 @@ fn parse_dump(
 /// the tensor's (new/post-rename) name. A sentinel line that carries an `error` but
 /// no `name` is a fatal, whole-run failure (import / load) → an `Err`. Non-sentinel
 /// lines (motd, cstorch chatter) are ignored.
-fn parse_value_diff(out: &str, host: &str) -> Result<HashMap<String, RemoteTensorDiff>> {
+fn parse_value_diff(
+    out: &str,
+    host: &str,
+) -> Result<(HashMap<String, RemoteTensorDiff>, Option<RemoteValueStats>)> {
     let mut map = HashMap::new();
+    let mut stats = None;
     let mut saw = false;
     for line in out.lines() {
         let Some(payload) = line.strip_prefix(SENTINEL) else {
@@ -986,7 +1014,11 @@ fn parse_value_diff(out: &str, host: &str) -> Result<HashMap<String, RemoteTenso
             }
             // A `name`-less line with an `error` is a fatal failure for the whole run.
             None if v.get("error").is_some() => bail!("remote: {}", diagnose_remote_error(&v)),
-            None => {}
+            None => {
+                if let Some(s) = v.get("summary") {
+                    stats = parse_value_stats(s);
+                }
+            }
         }
     }
     if !saw {
@@ -995,7 +1027,21 @@ fn parse_value_diff(out: &str, host: &str) -> Result<HashMap<String, RemoteTenso
             out.trim()
         );
     }
-    Ok(map)
+    Ok((map, stats))
+}
+
+/// The final `{"summary": {...}}` line's I/O + timing metrics.
+fn parse_value_stats(s: &serde_json::Value) -> Option<RemoteValueStats> {
+    let u = |k: &str| s.get(k).and_then(serde_json::Value::as_u64);
+    Some(RemoteValueStats {
+        tensors: u("tensors")? as usize,
+        compared: u("compared").unwrap_or(0) as usize,
+        bytes: u("bytes").unwrap_or(0),
+        elapsed_s: s
+            .get("elapsed_s")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0),
+    })
 }
 
 /// Build one tensor's [`RemoteTensorDiff`] from its result JSON.
@@ -1461,11 +1507,17 @@ mod tests {
             "{s}{{\"name\":\"a.w\",\"values\":{{\"elements\":10,\"differing\":3,\"max_abs\":0.5,\"mean_abs\":0.1,\"nonfinite_mismatch\":1}}}}\n\
              motd noise\n\
              {s}{{\"name\":\"b.w\",\"histogram\":{{\"tvd\":0.25,\"n\":40}}}}\n\
-             {s}{{\"name\":\"c.w\",\"error\":\"shapes differ\"}}\n",
+             {s}{{\"name\":\"c.w\",\"error\":\"shapes differ\"}}\n\
+             {s}{{\"summary\":{{\"tensors\":3,\"compared\":2,\"bytes\":4096,\"elapsed_s\":1.5}}}}\n",
             s = SENTINEL
         );
-        let m = parse_value_diff(&out, "host").unwrap();
+        let (m, stats) = parse_value_diff(&out, "host").unwrap();
         assert_eq!(m.len(), 3);
+        let st = stats.expect("summary line parsed");
+        assert_eq!(st.tensors, 3);
+        assert_eq!(st.compared, 2);
+        assert_eq!(st.bytes, 4096);
+        assert!((st.elapsed_s - 1.5).abs() < 1e-9);
         let vd = m["a.w"].values.as_ref().unwrap();
         assert_eq!(vd.elements, 10);
         assert_eq!(vd.differing, 3);
@@ -1480,6 +1532,10 @@ mod tests {
         assert!(parse_value_diff(&fatal, "host").is_err());
         // No sentinel output at all is also an error.
         assert!(parse_value_diff("just motd\n", "host").is_err());
+        // A run with no summary line still parses (stats just absent).
+        let (_m, none) =
+            parse_value_diff(&format!("{SENTINEL}{{\"name\":\"z\"}}\n"), "host").unwrap();
+        assert!(none.is_none());
     }
 
     #[test]
@@ -1488,7 +1544,7 @@ mod tests {
             "{SENTINEL}{{\"name\":\"w\",\"histogram\":{{\"tvd\":0.5,\"n\":2,\"lo\":-1.0,\"hi\":1.0,\
              \"old\":[3,1],\"new\":[1,3],\"old_total\":4,\"new_total\":4,\"old_nonfinite\":0,\"new_nonfinite\":0}}}}\n"
         );
-        let m = parse_value_diff(&out, "h").unwrap();
+        let (m, _stats) = parse_value_diff(&out, "h").unwrap();
         let hf = m["w"].hist_full.as_ref().unwrap();
         assert_eq!(hf.n, 2);
         assert_eq!(hf.old, vec![3, 1]);
