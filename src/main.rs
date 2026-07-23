@@ -621,6 +621,20 @@ enum Command {
         /// blank lines ignored).
         #[arg(long = "map-from", value_name = "FILE")]
         map_from: Option<PathBuf>,
+        /// Verify two s3:// cstorch checkpoints are the SAME weights in different
+        /// packings (s3-vs-s3 over --ssh-read). For each tensor present on both sides
+        /// whose shape folds along dim 0 — old (E, …) sparse: one N-bit index per
+        /// 16-bit word; new (ceil(E/fold), …) dense: `fold` indices per word, expert
+        /// e at word e//fold, shift (e%fold)*bits — it decodes both on the remote and
+        /// checks the indices match, and validates the packing (old words' bits above
+        /// N, new words' bits above fold*N must be zero). Gate to a subset of layers
+        /// with --name (this is a full data read, so scope it). Exit 0 = equivalent.
+        #[arg(long = "verify-repack")]
+        verify_repack: bool,
+        /// Index bit-width for --verify-repack (default 3; the packing fold is derived
+        /// from the shapes, and fold*bits must fit in the 16-bit word).
+        #[arg(long = "repack-bits", value_name = "N", default_value_t = 3)]
+        repack_bits: usize,
     },
 
     /// Run health checks on a checkpoint and report any problems.
@@ -782,6 +796,8 @@ fn main() -> Result<()> {
             ssh_venv,
             map,
             map_from,
+            verify_repack,
+            repack_bits,
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
             // the `Result` convention `main` uses elsewhere, so exit explicitly.
@@ -841,6 +857,8 @@ fn main() -> Result<()> {
                 &name_map,
                 jobs,
                 remote.as_ref(),
+                verify_repack,
+                repack_bits,
             );
             // Report how long it took, by default (on stderr, so a piped diff on
             // stdout stays clean). Skip on trouble (exit 2) — the error already said.
@@ -1536,6 +1554,8 @@ fn run_diff(
     name_map: &diff::NameMap,
     jobs: usize,
     remote: Option<&crate::remote::RemoteRead>,
+    verify_repack: bool,
+    repack_bits: usize,
 ) -> i32 {
     let load_local = |path: &Path| -> Result<SideLoad> {
         let (files, _index_specs) =
@@ -1683,6 +1703,9 @@ fn run_diff(
         }
         if !name_map.is_empty() {
             eprintln!("checkpoint-explorer diff: --map is ignored with --tensor");
+        }
+        if verify_repack {
+            eprintln!("checkpoint-explorer diff: --verify-repack is ignored with --tensor");
         }
         // Remote (s3-vs-s3): compare this one tensor's values/distribution on the
         // proxy. `full_hist` so the bin-by-bin table can be rendered locally.
@@ -1934,7 +1957,232 @@ fn run_diff(
         (None, None) => {}
     }
     print!("{}", report.render(&old_label, &new_label, opts));
+
+    // `--verify-repack`: after the structural diff, confirm the shape-folded expert
+    // tensors encode the same indices in old (sparse) vs new (dense) packing. Runs on
+    // the proxy (s3-vs-s3). Its verdict drives the exit code when requested.
+    if verify_repack {
+        return run_repack_verify(
+            remote,
+            &mut password,
+            &old_str,
+            &new_str,
+            s3_pair,
+            &old_sum,
+            &new_sum,
+            repack_bits,
+        );
+    }
     i32::from(report.has_differences())
+}
+
+/// The `diff --verify-repack` path: find tensors present on both sides whose shapes
+/// fold along dim 0 (already scoped by `--name`, in `old_sum`/`new_sum`), verify
+/// their packed indices match on the proxy, and print a verdict. Returns the exit
+/// code: 0 = every matched tensor is equivalent (and nothing else differs), 1
+/// otherwise, 2 on trouble.
+#[allow(clippy::too_many_arguments)]
+fn run_repack_verify(
+    remote: Option<&crate::remote::RemoteRead>,
+    password: &mut Option<String>,
+    old_uri: &str,
+    new_uri: &str,
+    s3_pair: bool,
+    old_sum: &diff::CheckpointSummary,
+    new_sum: &diff::CheckpointSummary,
+    bits: usize,
+) -> i32 {
+    let Some(r) = remote.filter(|_| s3_pair) else {
+        eprintln!(
+            "checkpoint-explorer diff: --verify-repack needs both sides to be s3:// cstorch \
+             checkpoints over --ssh-read (the data is read on the remote)"
+        );
+        return 2;
+    };
+    // Candidate pairs: same name on both sides, shape folds along dim 0. Scoped by
+    // `--name` already (old_sum/new_sum are the filtered summaries).
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (name, osig) in &old_sum.tensors {
+        if let Some(nsig) = new_sum.tensors.get(name)
+            && detect_fold(&osig.shape, &nsig.shape, bits).is_some()
+        {
+            pairs.push((name.clone(), name.clone()));
+        }
+    }
+    if pairs.is_empty() {
+        eprintln!(
+            "checkpoint-explorer diff: --verify-repack: no fold-pair tensors matched — check \
+             --name and that the shapes fold along dim 0 (old E, new ceil(E/fold))"
+        );
+        return 2;
+    }
+    // Whether anything OTHER than the verified fold-pairs differs structurally — an
+    // add/remove, a non-fold-pair sig change, or a metadata change. The fold-pairs
+    // themselves always show as "changed" (shape/dtype), so they're excluded: if
+    // they verify equivalent and nothing else differs, the checkpoints are the same
+    // modulo packing (exit 0).
+    let verified: std::collections::HashSet<&String> = pairs.iter().map(|(_, n)| n).collect();
+    let added = new_sum
+        .tensors
+        .keys()
+        .any(|k| !old_sum.tensors.contains_key(k));
+    let removed = old_sum
+        .tensors
+        .keys()
+        .any(|k| !new_sum.tensors.contains_key(k));
+    let other_changed = old_sum.tensors.iter().any(|(k, osig)| {
+        new_sum.tensors.get(k).is_some_and(|nsig| nsig != osig) && !verified.contains(k)
+    });
+    let other_differs = added || removed || other_changed || old_sum.metadata != new_sum.metadata;
+
+    let results = match fetch_remote_repack(r, password, old_uri, new_uri, &pairs, bits) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("checkpoint-explorer diff: {e:#}");
+            return 2;
+        }
+    };
+    render_repack_verdict(&pairs, &results, bits, other_differs)
+}
+
+/// Open a session (reusing the password) and run the proxy repack verification with
+/// the live two-line view + a final I/O line (mirrors [`fetch_remote_value_diff`]).
+fn fetch_remote_repack(
+    r: &crate::remote::RemoteRead,
+    password: &mut Option<String>,
+    old_uri: &str,
+    new_uri: &str,
+    pairs: &[(String, String)],
+    bits: usize,
+) -> Result<HashMap<String, crate::remote::RepackResult>> {
+    let session = r.open_with(password)?;
+    eprintln!(
+        "checkpoint-explorer diff: verifying repack of {} tensor(s) on {} \
+         (decoding {bits}-bit indices on the remote; this reads the full tensors) …",
+        pairs.len(),
+        r.host,
+    );
+    let view = RemoteCompareView::start(pairs.len(), 0);
+    let out = r.verify_repack(&session, old_uri, new_uri, pairs, bits, |ev| view.on(ev));
+    view.finish();
+    let (map, stats) = out?;
+    if let Some(s) = stats {
+        let elapsed = std::time::Duration::from_secs_f64(s.elapsed_s.max(0.0));
+        let read = crate::utils::format_size(s.bytes as usize);
+        let rate = if s.elapsed_s > 0.0 {
+            format!(
+                " ({}/s from S3)",
+                crate::utils::format_size((s.bytes as f64 / s.elapsed_s) as usize)
+            )
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "checkpoint-explorer diff: verified {} tensor(s) on the remote in {} · read {read}{rate}",
+            s.compared,
+            format_elapsed(elapsed),
+        );
+    }
+    Ok(map)
+}
+
+/// Print the repack verification section + verdict; return the exit code: 0 =
+/// every matched tensor is equivalent AND nothing else differs (`other_differs`
+/// false), 1 = any mismatch / format violation / other structural change.
+fn render_repack_verdict(
+    pairs: &[(String, String)],
+    results: &HashMap<String, crate::remote::RepackResult>,
+    bits: usize,
+    other_differs: bool,
+) -> i32 {
+    use std::io::IsTerminal;
+    let color = std::io::stdout().is_terminal();
+    let (green, yellow, red, dim, reset) = if color {
+        ("\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "", "", "", "")
+    };
+    println!("\nrepack verification ({bits}-bit expert indices, folded along dim 0):");
+    let mut all_ok = true;
+    // Few lines (gated by --name), so list them plainly, sorted.
+    let mut names: Vec<&String> = pairs.iter().map(|(_, n)| n).collect();
+    names.sort();
+    for name in names {
+        let Some(rr) = results.get(name) else {
+            all_ok = false;
+            println!("  {red}✗{reset} {name}  {dim}(no result returned){reset}");
+            continue;
+        };
+        if let Some(err) = &rr.error {
+            all_ok = false;
+            println!("  {red}✗{reset} {name}  {red}error:{reset} {err}");
+            continue;
+        }
+        let counts = format!(
+            "fold {}, {} indices",
+            rr.fold,
+            crate::utils::format_parameters(rr.elements as usize)
+        );
+        if rr.sparse_bad > 0 || rr.dense_bad > 0 {
+            all_ok = false;
+            println!(
+                "  {red}✗{reset} {name}  {red}format check FAILED{reset}: \
+                 {} sparse word(s) with non-zero top bits, {} dense word(s) with non-zero MSB {dim}({counts}){reset}",
+                rr.sparse_bad, rr.dense_bad,
+            );
+        } else if rr.differing > 0 {
+            all_ok = false;
+            let where_ = rr
+                .first_mismatch
+                .map(|(e, off, o, n)| {
+                    format!(" {dim}(first: expert {e}, offset {off}: {o} vs {n}){reset}")
+                })
+                .unwrap_or_default();
+            println!(
+                "  {yellow}≠{reset} {name}  {yellow}{} of {} indices differ{reset}{where_}",
+                crate::utils::format_parameters(rr.differing as usize),
+                crate::utils::format_parameters(rr.elements as usize),
+            );
+        } else {
+            println!("  {green}✓{reset} {name}  {dim}equivalent ({counts}){reset}");
+        }
+    }
+    let verified = pairs.len();
+    if !all_ok {
+        println!("{red}verdict: NOT equivalent{reset} — see the mismatches above");
+        return 1;
+    }
+    if other_differs {
+        println!(
+            "{yellow}verdict: expert weights equivalent modulo packing{reset} — {verified} tensor(s) verified; \
+             but other tensors/metadata differ (see the diff above)"
+        );
+        1
+    } else {
+        println!(
+            "{green}verdict: equivalent modulo packing{reset} — {verified} tensor(s) verified, all indices match; \
+             no other differences"
+        );
+        0
+    }
+}
+
+/// Detect a fold along dim 0: old `(E, …)` ↔ new `(ceil(E/fold), …)` with the inner
+/// dims equal, `2 ≤ fold` and `fold*bits ≤ 16`. Returns the fold, or `None` if the
+/// shapes aren't a fold pair.
+fn detect_fold(old: &[usize], new: &[usize], bits: usize) -> Option<usize> {
+    if old.is_empty() || old.len() != new.len() || old[1..] != new[1..] {
+        return None;
+    }
+    let (e, w) = (old[0], new[0]);
+    if w == 0 || e <= w {
+        return None;
+    }
+    let fold = e.div_ceil(w);
+    if fold < 2 || fold * bits > 16 || w != e.div_ceil(fold) {
+        return None;
+    }
+    Some(fold)
 }
 
 /// `compare_values` for two same-shape tensors under `ctx`, as an `Option`.

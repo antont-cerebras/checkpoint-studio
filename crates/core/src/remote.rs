@@ -133,6 +133,39 @@ pub struct RemoteValueStats {
     pub elapsed_s: f64,
 }
 
+/// One tensor's repack-equivalence verification ([`RemoteRead::verify_repack`]):
+/// does the old ("sparse", one 3-bit index per 16-bit word) and new ("dense",
+/// `fold` 3-bit indices per word, folded along dim 0) encode the same indices? Plus
+/// format sanity: `sparse_bad` / `dense_bad` count words whose bits above the used
+/// range are non-zero (a non-zero count means the format assumption is wrong).
+#[derive(Debug, Default, Clone)]
+pub struct RepackResult {
+    /// Logical 3-bit indices compared (`E × prod(inner_dims)`).
+    pub elements: u64,
+    /// Decoded indices that differ between old and new (0 ⇒ equivalent).
+    pub differing: u64,
+    /// Old words with non-zero bits above `bits` (top-13-zero check; 0 ⇒ ok).
+    pub sparse_bad: u64,
+    /// New words with a non-zero bit above `fold*bits` (MSB check; 0 ⇒ ok).
+    pub dense_bad: u64,
+    /// The fold factor used (experts per packed word).
+    pub fold: usize,
+    /// First differing `(expert, inner_offset, old_idx, new_idx)`, for diagnostics.
+    pub first_mismatch: Option<(u64, u64, u32, u32)>,
+    /// Bytes read from S3 for this tensor (both sides).
+    pub bytes: u64,
+    /// Set when the tensor couldn't be verified (bad shapes / read error).
+    pub error: Option<String>,
+}
+
+impl RepackResult {
+    /// Whether this tensor verified as equivalent: same indices and both format
+    /// checks clean.
+    pub fn equivalent(&self) -> bool {
+        self.error.is_none() && self.differing == 0 && self.sparse_bad == 0 && self.dense_bad == 0
+    }
+}
+
 /// Line prefix the remote script tags its JSON with, so we can pick it out of any
 /// motd / cstorch chatter on the SSH stdout.
 const SENTINEL: &str = "CKPT_EXPLORER_META:";
@@ -591,9 +624,78 @@ impl RemoteRead {
         })?;
         parse_value_diff(&out, &self.host)
     }
+
+    /// Verify that shape-folded expert tensors in two `s3://` cstorch checkpoints
+    /// encode the *same* 3-bit indices in different packings (old: one index per
+    /// 16-bit word; new: `fold` indices per word, folded along dim 0). Runs on the
+    /// proxy: per pair it reinterprets both tensors' raw 16-bit words, decodes the
+    /// indices, checks equality, and validates the format (old words' top bits and
+    /// new words' MSB must be zero). Streams the same [`CompareEvent`]s as
+    /// [`Self::value_diff`] for the live view. Returns per-tensor [`RepackResult`]s
+    /// keyed by name. **Read-only.**
+    pub fn verify_repack(
+        &self,
+        session: &RemoteSession,
+        old_uri: &str,
+        new_uri: &str,
+        pairs: &[(String, String)],
+        bits: usize,
+        mut on_event: impl FnMut(CompareEvent),
+    ) -> Result<(HashMap<String, RepackResult>, Option<RemoteValueStats>)> {
+        let script = repack_verify_script(old_uri, new_uri, pairs, bits);
+        let command = format!("source {}/bin/activate && python3 -", self.venv);
+        let out = session.exec_capture(&command, &script, |line| {
+            if let Some(rest) = line.strip_prefix(STATUS_TAG) {
+                let mut f = rest.split('\t');
+                match f.next() {
+                    Some("load") => {
+                        if let Some(w) = f.next() {
+                            on_event(CompareEvent::Loading(w));
+                        }
+                    }
+                    Some("start") => {
+                        if let (Some(i), Some(t), Some(name)) = (f.next(), f.next(), f.next())
+                            && let (Ok(done), Ok(total)) = (i.parse(), t.parse())
+                        {
+                            on_event(CompareEvent::Start { done, total, name });
+                        }
+                    }
+                    _ => {}
+                }
+            } else if let Some(payload) = line.strip_prefix(SENTINEL)
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(payload)
+                && let Some(name) = v.get("name").and_then(|x| x.as_str())
+            {
+                on_event(CompareEvent::Done {
+                    name,
+                    status: repack_status(&v),
+                    bytes: v
+                        .get("bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                });
+            }
+        })?;
+        parse_repack(&out, &self.host)
+    }
 }
 
-/// Classify a per-tensor result line for the live view's status mark.
+/// Classify a per-tensor repack result for the live view's status mark: a format
+/// violation or a read error is `Error` (✗), differing indices are `Changed` (≠),
+/// equivalent is `Identical` (✓).
+fn repack_status(v: &serde_json::Value) -> CompareStatus {
+    let u = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    if v.get("error").is_some() || u("sparse_bad") > 0 || u("dense_bad") > 0 {
+        return CompareStatus::Error;
+    }
+    if u("differing") > 0 {
+        CompareStatus::Changed
+    } else {
+        CompareStatus::Identical
+    }
+}
+
+/// Classify a per-tensor value result line for the live view's status mark.
 fn compare_status(v: &serde_json::Value) -> CompareStatus {
     if v.get("error").is_some() {
         return CompareStatus::Error;
@@ -949,6 +1051,125 @@ emit({"summary": {"tensors": total, "compared": compared, "bytes": int(read_byte
         .replace("__STATUS__", STATUS_TAG)
 }
 
+/// The repack-equivalence script for two `s3://` cstorch checkpoints: for each
+/// `(old_name, new_name)` pair whose shapes fold along dim 0, reinterpret both
+/// tensors' raw 16-bit words, decode the `bits`-wide indices (old: one per word;
+/// new: `fold = ceil(E/W)` per word, expert `e` at word `e//fold` shift
+/// `(e%fold)*bits`), and check they match — chunked over the inner dims so memory
+/// stays bounded. Also validates the packing: old words must have zero bits above
+/// `bits`, new words zero bits above `fold*bits`. Streams `STAT` events + one
+/// sentinel result line per tensor.
+///
+/// **Read-only:** only `cstorch.load` (lazy) + per-tensor materialize; no writes.
+fn repack_verify_script(
+    old_uri: &str,
+    new_uri: &str,
+    pairs: &[(String, String)],
+    bits: usize,
+) -> String {
+    let old_lit = serde_json::to_string(old_uri).unwrap_or_else(|_| "\"\"".into());
+    let new_lit = serde_json::to_string(new_uri).unwrap_or_else(|_| "\"\"".into());
+    let pairs_lit = serde_json::to_string(pairs).unwrap_or_else(|_| "[]".into());
+    let bits_lit = bits.max(1).to_string();
+    const TEMPLATE: &str = r#"
+import sys, json, time
+OLD = __OLD__
+NEW = __NEW__
+PAIRS = __PAIRS__
+BITS = __BITS__
+CHUNK = 4000000
+S = "__SENTINEL__"
+ST = "__STATUS__"
+def emit(o):
+    sys.stdout.write(S + json.dumps(o) + "\n"); sys.stdout.flush()
+def stat(s):
+    sys.stdout.write(ST + s + "\n"); sys.stdout.flush()
+try:
+    import cerebras.pytorch as cstorch
+except Exception as e:
+    emit({"error": "import cerebras.pytorch failed: %r" % (e,)}); sys.exit(0)
+try:
+    import numpy as np
+    import torch
+except Exception as e:
+    emit({"error": "import numpy/torch failed (needed to verify): %r" % (e,)}); sys.exit(0)
+try:
+    stat("load\told")
+    old_sd = cstorch.load(OLD, map_location=None)
+    stat("load\tnew")
+    new_sd = cstorch.load(NEW, map_location=None)
+except Exception as e:
+    emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
+def to_u16(t):
+    # Reinterpret the raw 16-bit words regardless of the stored dtype (F16/U16/I16).
+    return t.to("cpu").contiguous().view(torch.int16).numpy().view(np.uint16)
+mask = np.uint16((1 << BITS) - 1)
+total = len(PAIRS)
+t0 = time.time()
+read_bytes = 0
+compared = 0
+for idx in range(total):
+    oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
+    stat("start\t%d\t%d\t%s" % (idx + 1, total, nname))
+    res = {"name": nname}
+    try:
+        a = old_sd[oname]; b = new_sd[nname]
+        ashape = [int(d) for d in a.shape]; bshape = [int(d) for d in b.shape]
+        E = ashape[0] if ashape else 0
+        W = bshape[0] if bshape else 0
+        if not ashape or not bshape or ashape[1:] != bshape[1:] or W <= 0 or E <= W:
+            res["error"] = "not a fold pair (shapes %r vs %r)" % (ashape, bshape)
+            emit(res); continue
+        fold = (E + W - 1) // W
+        if W != (E + fold - 1) // fold:
+            res["error"] = "fold mismatch (E=%d W=%d -> fold=%d)" % (E, W, fold)
+            emit(res); continue
+        if fold * BITS > 16:
+            res["error"] = "fold*bits=%d exceeds the 16-bit word" % (fold * BITS)
+            emit(res); continue
+        ao = to_u16(a); bo = to_u16(b)
+        tb = int(ao.nbytes) + int(bo.nbytes)
+        res["bytes"] = tb; read_bytes += tb
+        ao = ao.reshape(E, -1); bo = bo.reshape(W, -1)
+        N = ao.shape[1]
+        we = (np.arange(E) // fold)
+        se = ((np.arange(E) % fold) * BITS).astype(np.uint16)
+        # Format checks over the whole tensors (cheap vs. the compare): old words'
+        # bits above BITS, new words' bits above fold*BITS, must all be zero.
+        sparse_bad = int(np.count_nonzero(ao >> np.uint16(BITS)))
+        dense_bad = int(np.count_nonzero(bo >> np.uint16(fold * BITS)))
+        differing = 0
+        first = None
+        blk = max(1, CHUNK // max(1, E))
+        for n0 in range(0, N, blk):
+            n1 = min(n0 + blk, N)
+            o = ao[:, n0:n1] & mask
+            nd = (bo[we, n0:n1] >> se[:, None]) & mask
+            ne = o != nd
+            cnt = int(np.count_nonzero(ne))
+            differing += cnt
+            if first is None and cnt:
+                p = np.argwhere(ne)[0]
+                e = int(p[0]); col = n0 + int(p[1])
+                first = [e, col, int(o[p[0], p[1]]), int(nd[p[0], p[1]])]
+        res.update({"elements": E * N, "differing": differing, "sparse_bad": sparse_bad, "dense_bad": dense_bad, "fold": fold})
+        if first is not None:
+            res["first"] = first
+        compared += 1
+    except Exception as e:
+        res["error"] = "%r" % (e,)
+    emit(res)
+emit({"summary": {"tensors": total, "compared": compared, "bytes": int(read_bytes), "elapsed_s": time.time() - t0}})
+"#;
+    TEMPLATE
+        .replace("__OLD__", &old_lit)
+        .replace("__NEW__", &new_lit)
+        .replace("__PAIRS__", &pairs_lit)
+        .replace("__BITS__", &bits_lit)
+        .replace("__SENTINEL__", SENTINEL)
+        .replace("__STATUS__", STATUS_TAG)
+}
+
 /// The boto3 object-listing script for an `s3://…` checkpoint: a single paginated
 /// `list_objects_v2` emitting one sentinel-tagged JSON line
 /// `{objects:[[rel_key,size],…]}` (or `{error:…}`). Keys are made
@@ -1152,6 +1373,68 @@ fn parse_value_stats(s: &serde_json::Value) -> Option<RemoteValueStats> {
             .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0),
     })
+}
+
+/// Parse [`RemoteRead::verify_repack`]'s streamed output into per-tensor
+/// [`RepackResult`]s keyed by name, plus the final I/O summary. Mirrors
+/// [`parse_value_diff`]: a `name`-less `error` line is fatal.
+fn parse_repack(
+    out: &str,
+    host: &str,
+) -> Result<(HashMap<String, RepackResult>, Option<RemoteValueStats>)> {
+    let mut map = HashMap::new();
+    let mut stats = None;
+    let mut saw = false;
+    for line in out.lines() {
+        let Some(payload) = line.strip_prefix(SENTINEL) else {
+            continue;
+        };
+        saw = true;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        match v.get("name").and_then(|x| x.as_str()) {
+            Some(name) => {
+                map.insert(name.to_string(), parse_repack_result(&v));
+            }
+            None if v.get("error").is_some() => bail!("remote: {}", diagnose_remote_error(&v)),
+            None => {
+                if let Some(s) = v.get("summary") {
+                    stats = parse_value_stats(s);
+                }
+            }
+        }
+    }
+    if !saw {
+        bail!(
+            "no repack-verification output returned from {host} — remote output was:\n{}",
+            out.trim()
+        );
+    }
+    Ok((map, stats))
+}
+
+/// Build one tensor's [`RepackResult`] from its result JSON.
+fn parse_repack_result(v: &serde_json::Value) -> RepackResult {
+    let u = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let first = v.get("first").and_then(|f| f.as_array()).and_then(|a| {
+        Some((
+            a.first()?.as_u64()?,
+            a.get(1)?.as_u64()?,
+            a.get(2)?.as_u64()? as u32,
+            a.get(3)?.as_u64()? as u32,
+        ))
+    });
+    RepackResult {
+        elements: u("elements"),
+        differing: u("differing"),
+        sparse_bad: u("sparse_bad"),
+        dense_bad: u("dense_bad"),
+        fold: u("fold") as usize,
+        first_mismatch: first,
+        bytes: u("bytes"),
+        error: v.get("error").and_then(|e| e.as_str()).map(str::to_string),
+    }
 }
 
 /// Build one tensor's [`RemoteTensorDiff`] from its result JSON.
@@ -1707,6 +1990,58 @@ mod tests {
         }
         // The summary shift is present alongside the full data.
         assert_eq!(m["w"].hist_shift, Some((0.5, 2)));
+    }
+
+    #[test]
+    fn repack_verify_script_embeds_inputs_and_checks_format() {
+        let pairs = vec![("w.down".to_string(), "w.down".to_string())];
+        let s = repack_verify_script("s3://b/old", "s3://b/new", &pairs, 3);
+        assert!(s.contains(r#"OLD = "s3://b/old""#), "{s}");
+        assert!(s.contains(r#"[["w.down","w.down"]]"#), "{s}");
+        assert!(s.contains("BITS = 3"), "{s}");
+        // Derives the fold, decodes, and runs BOTH format checks.
+        assert!(s.contains("fold = (E + W - 1) // W"), "{s}");
+        assert!(s.contains("sparse_bad"), "{s}");
+        assert!(s.contains("dense_bad"), "{s}");
+        assert!(s.contains("view(torch.int16)"), "{s}");
+        assert!(s.contains(STATUS_TAG) && s.contains(SENTINEL));
+        // Read-only.
+        for forbidden in [
+            "cstorch.save",
+            "torch.save",
+            "put_object",
+            "delete_object",
+            "open(",
+        ] {
+            assert!(
+                !s.contains(forbidden),
+                "repack script must stay read-only: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_repack_reads_results_and_flags_format() {
+        let out = format!(
+            "{s}{{\"name\":\"a\",\"elements\":100,\"differing\":0,\"sparse_bad\":0,\"dense_bad\":0,\"fold\":5}}\n\
+             {s}{{\"name\":\"b\",\"elements\":100,\"differing\":7,\"sparse_bad\":0,\"dense_bad\":0,\"fold\":5,\"first\":[3,12,5,2]}}\n\
+             {s}{{\"name\":\"c\",\"elements\":100,\"differing\":0,\"sparse_bad\":9,\"dense_bad\":0,\"fold\":5}}\n\
+             {s}{{\"summary\":{{\"tensors\":3,\"compared\":3,\"bytes\":2048,\"elapsed_s\":2.0}}}}\n",
+            s = SENTINEL
+        );
+        let (m, stats) = parse_repack(&out, "host").unwrap();
+        assert_eq!(m.len(), 3);
+        assert!(m["a"].equivalent(), "a should be equivalent");
+        assert_eq!(m["b"].differing, 7);
+        assert_eq!(m["b"].first_mismatch, Some((3, 12, 5, 2)));
+        assert!(!m["b"].equivalent());
+        // A format violation makes it non-equivalent even with 0 differing.
+        assert_eq!(m["c"].sparse_bad, 9);
+        assert!(!m["c"].equivalent());
+        assert_eq!(stats.unwrap().compared, 3);
+
+        // A name-less error line is fatal.
+        assert!(parse_repack(&format!("{SENTINEL}{{\"error\":\"boom\"}}\n"), "h").is_err());
     }
 
     #[test]
