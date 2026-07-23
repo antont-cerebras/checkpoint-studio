@@ -1508,6 +1508,218 @@ fn remote_compare_block(frame: usize, st: &RemoteCompareState, width: usize) -> 
     vec![line1, line2]
 }
 
+/// One tensor's download state in the repack view.
+struct RepackTensorDl {
+    name: String,
+    old_total: u64,
+    new_total: u64,
+    old_done: u64,
+    new_done: u64,
+    phase: RepackDlPhase,
+}
+
+enum RepackDlPhase {
+    Downloading,
+    Comparing,
+    Done(crate::remote::CompareStatus),
+}
+
+#[derive(Default)]
+struct RepackDlInner {
+    loading: Option<String>,
+    tensors: Vec<RepackTensorDl>,
+}
+
+struct RepackDlState {
+    inner: std::sync::Mutex<RepackDlInner>,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+/// Live view for `--verify-repack`: **one line per tensor**, each a real download
+/// bar over (old + new) bytes with per-side sizes and a phase (downloading /
+/// comparing / done ✓≠✗). Reads run in parallel on the proxy, so several bars fill
+/// at once. Erased when done; a no-op off a TTY.
+struct RepackView {
+    state: Option<std::sync::Arc<RepackDlState>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RepackView {
+    fn start() -> Self {
+        use std::io::IsTerminal;
+        if !std::io::stderr().is_terminal() {
+            return Self {
+                state: None,
+                handle: None,
+            };
+        }
+        let state = std::sync::Arc::new(RepackDlState {
+            inner: std::sync::Mutex::new(RepackDlInner::default()),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        });
+        let worker = std::sync::Arc::clone(&state);
+        let handle = std::thread::spawn(move || repack_view_loop(worker));
+        Self {
+            state: Some(state),
+            handle: Some(handle),
+        }
+    }
+
+    fn on(&self, ev: crate::remote::RepackEvent) {
+        use crate::remote::RepackEvent as E;
+        let Some(st) = &self.state else { return };
+        let Ok(mut i) = st.inner.lock() else { return };
+        // Locate (or create) the tensor row by name.
+        let row = |i: &mut RepackDlInner, name: &str| -> usize {
+            if let Some(p) = i.tensors.iter().position(|t| t.name == name) {
+                p
+            } else {
+                i.tensors.push(RepackTensorDl {
+                    name: name.to_string(),
+                    old_total: 0,
+                    new_total: 0,
+                    old_done: 0,
+                    new_done: 0,
+                    phase: RepackDlPhase::Downloading,
+                });
+                i.tensors.len() - 1
+            }
+        };
+        match ev {
+            E::Loading(w) => i.loading = Some(w.to_string()),
+            E::Start { name, .. } => {
+                i.loading = None;
+                row(&mut i, name);
+            }
+            E::Size {
+                name,
+                old_bytes,
+                new_bytes,
+            } => {
+                let r = row(&mut i, name);
+                i.tensors[r].old_total = old_bytes;
+                i.tensors[r].new_total = new_bytes;
+            }
+            E::Bytes {
+                name,
+                old_done,
+                new_done,
+            } => {
+                let r = row(&mut i, name);
+                i.tensors[r].old_done = old_done;
+                i.tensors[r].new_done = new_done;
+            }
+            E::Comparing(name) => {
+                let r = row(&mut i, name);
+                i.tensors[r].phase = RepackDlPhase::Comparing;
+            }
+            E::Done { name, status } => {
+                let r = row(&mut i, name);
+                // Snap the bar to full on success.
+                i.tensors[r].old_done = i.tensors[r].old_total;
+                i.tensors[r].new_done = i.tensors[r].new_total;
+                i.tensors[r].phase = RepackDlPhase::Done(status);
+            }
+        }
+    }
+
+    fn finish(mut self) {
+        use std::sync::atomic::Ordering;
+        if let Some(st) = &self.state {
+            st.stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn repack_view_loop(st: std::sync::Arc<RepackDlState>) {
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    let width = match crossterm::terminal::size() {
+        Ok((c, _)) if c > 0 => c as usize,
+        _ => 100,
+    };
+    let mut prev = 0usize;
+    let mut frame = 0usize;
+    while !st.stop.load(Ordering::Relaxed) {
+        if let Ok(i) = st.inner.lock() {
+            draw_block(&repack_view_block(frame, &i, width), &mut prev);
+        }
+        frame += 1;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    erase_block(prev);
+    let _ = std::io::stderr().flush();
+}
+
+/// A `[███░░░]`-style bar of `w` columns for `done/total` (empty if total is 0).
+fn mini_bar(done: u64, total: u64, w: usize) -> String {
+    let filled = if total == 0 {
+        0
+    } else {
+        (((done as f64 / total as f64) * w as f64).round() as usize).min(w)
+    };
+    format!("{}{}", "█".repeat(filled), "░".repeat(w - filled))
+}
+
+fn repack_view_block(frame: usize, i: &RepackDlInner, width: usize) -> Vec<String> {
+    use crate::remote::CompareStatus::*;
+    const GREEN: &str = "\x1b[1;32m";
+    const YELLOW: &str = "\x1b[1;33m";
+    const RED: &str = "\x1b[1;31m";
+    const CYAN: &str = "\x1b[1;36m";
+    const DIM: &str = "\x1b[2m";
+    const RESET: &str = "\x1b[0m";
+    let spin = DIFF_SPINNER[frame % DIFF_SPINNER.len()];
+    if let Some(w) = &i.loading {
+        return vec![format!(
+            "{CYAN}{spin}{RESET} {DIM}loading {w} checkpoint …{RESET}"
+        )];
+    }
+    let mut lines = Vec::with_capacity(i.tensors.len());
+    for t in &i.tensors {
+        let done = t.old_done + t.new_done;
+        let total = t.old_total + t.new_total;
+        let (mark, phase) = match t.phase {
+            RepackDlPhase::Downloading => {
+                (format!("{CYAN}{spin}{RESET}"), "downloading".to_string())
+            }
+            RepackDlPhase::Comparing => (
+                format!("{CYAN}{spin}{RESET}"),
+                format!("{DIM}comparing…{RESET}"),
+            ),
+            RepackDlPhase::Done(Identical) => (
+                format!("{GREEN}✓{RESET}"),
+                format!("{GREEN}equivalent{RESET}"),
+            ),
+            RepackDlPhase::Done(Changed) => (
+                format!("{YELLOW}≠{RESET}"),
+                format!("{YELLOW}differ{RESET}"),
+            ),
+            RepackDlPhase::Done(Error) => (format!("{RED}✗{RESET}"), format!("{RED}error{RESET}")),
+        };
+        let bar = mini_bar(done, total, 18);
+        let sizes = format!(
+            "{}/{} {DIM}(old {}, new {}){RESET}",
+            utils::format_size(done as usize),
+            utils::format_size(total as usize),
+            utils::format_size(t.old_total as usize),
+            utils::format_size(t.new_total as usize),
+        );
+        // name — trimmed to fit, keeping the informative tail.
+        let name = truncate_tail(&t.name, width.saturating_sub(64).max(16));
+        lines.push(format!(
+            "{mark} {name}  {CYAN}{bar}{RESET} {sizes}  {phase}"
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(format!("{CYAN}{spin}{RESET} {DIM}starting…{RESET}"));
+    }
+    lines
+}
+
 /// Human-readable elapsed time: `850ms`, `12.3s`, or `2m3s`.
 fn format_elapsed(d: std::time::Duration) -> String {
     let secs = d.as_secs_f64();
@@ -2057,12 +2269,13 @@ fn fetch_remote_repack(
 ) -> Result<HashMap<String, crate::remote::RepackResult>> {
     let session = r.open_with(password)?;
     eprintln!(
-        "checkpoint-explorer diff: verifying repack of {} tensor(s) on {} \
-         (decoding {bits}-bit indices on the remote; this reads the full tensors) …",
+        "checkpoint-explorer diff: verifying repack of {} tensor(s) on {}, decoding {bits}-bit \
+         indices on the remote (reads the full tensors, {} at a time):\n  old (sparse) {old_uri}\n  new (dense)  {new_uri}",
         pairs.len(),
         r.host,
+        pairs.len().clamp(1, 4),
     );
-    let view = RemoteCompareView::start(pairs.len(), 0);
+    let view = RepackView::start();
     let out = r.verify_repack(&session, old_uri, new_uri, pairs, bits, |ev| view.on(ev));
     view.finish();
     let (map, stats) = out?;
@@ -2130,6 +2343,7 @@ fn render_repack_verdict(
                  {} sparse word(s) with non-zero top bits, {} dense word(s) with non-zero MSB {dim}({counts}){reset}",
                 rr.sparse_bad, rr.dense_bad,
             );
+            print_repack_sample(rr, red, dim, reset);
         } else if rr.differing > 0 {
             all_ok = false;
             let where_ = rr
@@ -2143,6 +2357,7 @@ fn render_repack_verdict(
                 crate::utils::format_parameters(rr.differing as usize),
                 crate::utils::format_parameters(rr.elements as usize),
             );
+            print_repack_sample(rr, red, dim, reset);
         } else {
             println!("  {green}✓{reset} {name}  {dim}equivalent ({counts}){reset}");
         }
@@ -2164,6 +2379,48 @@ fn render_repack_verdict(
              no other differences"
         );
         0
+    }
+}
+
+/// Print the decoded 2-D index window (experts × inner-offset) for a mismatched
+/// tensor: the OLD grid, then the NEW grid with cells that differ from old in red —
+/// so the pattern of the difference is visible (a consistent shift ⇒ a mapping bug;
+/// scattered ±1 ⇒ independent quantizations). Indices are 0..7 (single digit).
+fn print_repack_sample(rr: &crate::remote::RepackResult, red: &str, dim: &str, reset: &str) {
+    let Some(s) = &rr.sample else { return };
+    let rows = s.old.len().min(s.new.len());
+    if rows == 0 {
+        return;
+    }
+    let cols = s.old.first().map(|r| r.len()).unwrap_or(0);
+    println!(
+        "      {dim}decoded index slice — experts {}..{} (rows) × offset {}..{} (cols); \
+         new cells that differ from old are red:{reset}",
+        s.e0,
+        s.e0 + rows as u64,
+        s.off0,
+        s.off0 + cols as u64,
+    );
+    println!("      {dim}old:{reset}");
+    for (i, row) in s.old.iter().take(rows).enumerate() {
+        let cells: String = row.iter().map(|v| format!(" {v}")).collect();
+        println!("        {dim}e{:<4}{reset}{cells}", s.e0 + i as u64);
+    }
+    println!("      {dim}new:{reset}");
+    for (i, row) in s.new.iter().take(rows).enumerate() {
+        let orow = &s.old[i];
+        let cells: String = row
+            .iter()
+            .enumerate()
+            .map(|(j, v)| {
+                if orow.get(j) != Some(v) {
+                    format!(" {red}{v}{reset}")
+                } else {
+                    format!(" {v}")
+                }
+            })
+            .collect();
+        println!("        {dim}e{:<4}{reset}{cells}", s.e0 + i as u64);
     }
 }
 

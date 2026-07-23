@@ -152,10 +152,23 @@ pub struct RepackResult {
     pub fold: usize,
     /// First differing `(expert, inner_offset, old_idx, new_idx)`, for diagnostics.
     pub first_mismatch: Option<(u64, u64, u32, u32)>,
+    /// A small decoded window (experts × inner-offset), centred on the first
+    /// mismatch, so the caller can show where old and new diverge.
+    pub sample: Option<RepackSample>,
     /// Bytes read from S3 for this tensor (both sides).
     pub bytes: u64,
     /// Set when the tensor couldn't be verified (bad shapes / read error).
     pub error: Option<String>,
+}
+
+/// A decoded 2-D window of indices for both sides — the top-left is
+/// `(expert e0, inner-offset off0)`, `cols` columns wide.
+#[derive(Debug, Clone, Default)]
+pub struct RepackSample {
+    pub e0: u64,
+    pub off0: u64,
+    pub old: Vec<Vec<u32>>,
+    pub new: Vec<Vec<u32>>,
 }
 
 impl RepackResult {
@@ -209,6 +222,40 @@ pub enum CompareStatus {
     Changed,
     /// Couldn't be compared (shape mismatch / read error).
     Error,
+}
+
+/// A live event streamed from the remote repack verification, driving the
+/// per-tensor download bars. Richer than [`CompareEvent`]: it reports each side's
+/// download size + progress so the view can show real bars, not just spinners.
+#[derive(Debug)]
+pub enum RepackEvent<'a> {
+    /// A checkpoint is loading (`"old"` / `"new"`).
+    Loading(&'a str),
+    /// Tensor `done` of `total` has begun.
+    Start {
+        done: usize,
+        total: usize,
+        name: &'a str,
+    },
+    /// The download sizes for this tensor's two sides are known.
+    Size {
+        name: &'a str,
+        old_bytes: u64,
+        new_bytes: u64,
+    },
+    /// Cumulative bytes downloaded for this tensor's two sides.
+    Bytes {
+        name: &'a str,
+        old_done: u64,
+        new_done: u64,
+    },
+    /// Download done; now decoding + comparing the indices.
+    Comparing(&'a str),
+    /// The tensor finished, with its verification outcome.
+    Done {
+        name: &'a str,
+        status: CompareStatus,
+    },
 }
 
 /// Upper bound on SSH sessions used to read one safetensors dir's shards in
@@ -628,11 +675,11 @@ impl RemoteRead {
     /// Verify that shape-folded expert tensors in two `s3://` cstorch checkpoints
     /// encode the *same* 3-bit indices in different packings (old: one index per
     /// 16-bit word; new: `fold` indices per word, folded along dim 0). Runs on the
-    /// proxy: per pair it reinterprets both tensors' raw 16-bit words, decodes the
-    /// indices, checks equality, and validates the format (old words' top bits and
-    /// new words' MSB must be zero). Streams the same [`CompareEvent`]s as
-    /// [`Self::value_diff`] for the live view. Returns per-tensor [`RepackResult`]s
-    /// keyed by name. **Read-only.**
+    /// proxy: per pair it streams both tensors' S3 objects (in parallel, with byte
+    /// progress), reinterprets the raw 16-bit words, decodes the indices, checks
+    /// equality, and validates the format (old words' top bits and new words' MSB
+    /// must be zero). Emits [`RepackEvent`]s for the live per-tensor download bars.
+    /// Returns per-tensor [`RepackResult`]s keyed by name. **Read-only.**
     pub fn verify_repack(
         &self,
         session: &RemoteSession,
@@ -640,7 +687,7 @@ impl RemoteRead {
         new_uri: &str,
         pairs: &[(String, String)],
         bits: usize,
-        mut on_event: impl FnMut(CompareEvent),
+        mut on_event: impl FnMut(RepackEvent),
     ) -> Result<(HashMap<String, RepackResult>, Option<RemoteValueStats>)> {
         let script = repack_verify_script(old_uri, new_uri, pairs, bits);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
@@ -650,14 +697,41 @@ impl RemoteRead {
                 match f.next() {
                     Some("load") => {
                         if let Some(w) = f.next() {
-                            on_event(CompareEvent::Loading(w));
+                            on_event(RepackEvent::Loading(w));
                         }
                     }
                     Some("start") => {
                         if let (Some(i), Some(t), Some(name)) = (f.next(), f.next(), f.next())
                             && let (Ok(done), Ok(total)) = (i.parse(), t.parse())
                         {
-                            on_event(CompareEvent::Start { done, total, name });
+                            on_event(RepackEvent::Start { done, total, name });
+                        }
+                    }
+                    Some("size") => {
+                        if let (Some(name), Some(o), Some(n)) = (f.next(), f.next(), f.next())
+                            && let (Ok(old_bytes), Ok(new_bytes)) = (o.parse(), n.parse())
+                        {
+                            on_event(RepackEvent::Size {
+                                name,
+                                old_bytes,
+                                new_bytes,
+                            });
+                        }
+                    }
+                    Some("bytes") => {
+                        if let (Some(name), Some(o), Some(n)) = (f.next(), f.next(), f.next())
+                            && let (Ok(old_done), Ok(new_done)) = (o.parse(), n.parse())
+                        {
+                            on_event(RepackEvent::Bytes {
+                                name,
+                                old_done,
+                                new_done,
+                            });
+                        }
+                    }
+                    Some("phase") => {
+                        if let Some(name) = f.next() {
+                            on_event(RepackEvent::Comparing(name));
                         }
                     }
                     _ => {}
@@ -666,13 +740,9 @@ impl RemoteRead {
                 && let Ok(v) = serde_json::from_str::<serde_json::Value>(payload)
                 && let Some(name) = v.get("name").and_then(|x| x.as_str())
             {
-                on_event(CompareEvent::Done {
+                on_event(RepackEvent::Done {
                     name,
                     status: repack_status(&v),
-                    bytes: v
-                        .get("bytes")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
                 });
             }
         })?;
@@ -1071,19 +1141,27 @@ fn repack_verify_script(
     let new_lit = serde_json::to_string(new_uri).unwrap_or_else(|_| "\"\"".into());
     let pairs_lit = serde_json::to_string(pairs).unwrap_or_else(|_| "[]".into());
     let bits_lit = bits.max(1).to_string();
+    let jobs_lit = pairs.len().clamp(1, 4).to_string();
     const TEMPLATE: &str = r#"
-import sys, json, time
+import sys, json, time, threading
+from concurrent.futures import ThreadPoolExecutor
 OLD = __OLD__
 NEW = __NEW__
 PAIRS = __PAIRS__
 BITS = __BITS__
-CHUNK = 4000000
+JOBS = __JOBS__
+DL = 16 << 20        # S3 download chunk
+CMP = 4000000        # compare column block
+EMIT = 64 << 20      # byte-progress emit granularity
 S = "__SENTINEL__"
 ST = "__STATUS__"
+_lock = threading.Lock()
 def emit(o):
-    sys.stdout.write(S + json.dumps(o) + "\n"); sys.stdout.flush()
+    with _lock:
+        sys.stdout.write(S + json.dumps(o) + "\n"); sys.stdout.flush()
 def stat(s):
-    sys.stdout.write(ST + s + "\n"); sys.stdout.flush()
+    with _lock:
+        sys.stdout.write(ST + s + "\n"); sys.stdout.flush()
 try:
     import cerebras.pytorch as cstorch
 except Exception as e:
@@ -1091,8 +1169,9 @@ except Exception as e:
 try:
     import numpy as np
     import torch
+    import zstandard
 except Exception as e:
-    emit({"error": "import numpy/torch failed (needed to verify): %r" % (e,)}); sys.exit(0)
+    emit({"error": "import numpy/torch/zstandard failed: %r" % (e,)}); sys.exit(0)
 try:
     stat("load\told")
     old_sd = cstorch.load(OLD, map_location=None)
@@ -1100,47 +1179,95 @@ try:
     new_sd = cstorch.load(NEW, map_location=None)
 except Exception as e:
     emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
-def to_u16(t):
-    # Reinterpret the raw 16-bit words regardless of the stored dtype (F16/U16/I16).
-    return t.to("cpu").contiguous().view(torch.int16).numpy().view(np.uint16)
 mask = np.uint16((1 << BITS) - 1)
+# Resolve a lazy tensor to its backing S3 object (thread-safe client + key) so we
+# can stream it ourselves with progress, rather than cstorch's one-shot read.
+def resolve(dt):
+    do = getattr(dt, "deferred", None)
+    if do is None:
+        return None
+    r = do._reader
+    return (r.s3_client, r.bucket, "%s/%s" % (r.key, do._key))
+def head(loc):
+    client, bucket, key = loc
+    h = client.head_object(Bucket=bucket, Key=key)
+    md = h.get("Metadata") or {}
+    try:
+        meta = json.loads(md.get("metadata") or md.get("Metadata") or "{}")
+    except Exception:
+        meta = {}
+    return int(h.get("ContentLength", 0)), bool(meta.get("compressed")), ("__NUMPY__" in meta)
+def download(loc, compressed, on):
+    client, bucket, key = loc
+    body = client.get_object(Bucket=bucket, Key=key)["Body"]
+    buf = bytearray()
+    while True:
+        c = body.read(DL)
+        if not c:
+            break
+        buf += c
+        on(len(buf))
+    if compressed:
+        return np.frombuffer(zstandard.decompress(bytes(buf)), dtype=np.uint16)
+    return np.frombuffer(buf, dtype=np.uint16)     # raw 16-bit words, zero-copy
+def to_u16(dt):   # fallback via cstorch (no byte progress)
+    return dt.to("cpu").contiguous().view(torch.int16).numpy().view(np.uint16)
 total = len(PAIRS)
 t0 = time.time()
-read_bytes = 0
-compared = 0
-for idx in range(total):
+agg_lock = threading.Lock()
+read_bytes = [0]
+compared = [0]
+def work(idx):
     oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
     stat("start\t%d\t%d\t%s" % (idx + 1, total, nname))
     res = {"name": nname}
     try:
-        a = old_sd[oname]; b = new_sd[nname]
-        ashape = [int(d) for d in a.shape]; bshape = [int(d) for d in b.shape]
+        da = old_sd[oname]; db = new_sd[nname]
+        ashape = [int(x) for x in da.shape]; bshape = [int(x) for x in db.shape]
         E = ashape[0] if ashape else 0
         W = bshape[0] if bshape else 0
         if not ashape or not bshape or ashape[1:] != bshape[1:] or W <= 0 or E <= W:
-            res["error"] = "not a fold pair (shapes %r vs %r)" % (ashape, bshape)
-            emit(res); continue
+            res["error"] = "not a fold pair (shapes %r vs %r)" % (ashape, bshape); emit(res); return
         fold = (E + W - 1) // W
         if W != (E + fold - 1) // fold:
-            res["error"] = "fold mismatch (E=%d W=%d -> fold=%d)" % (E, W, fold)
-            emit(res); continue
+            res["error"] = "fold mismatch (E=%d W=%d -> fold=%d)" % (E, W, fold); emit(res); return
         if fold * BITS > 16:
-            res["error"] = "fold*bits=%d exceeds the 16-bit word" % (fold * BITS)
-            emit(res); continue
-        ao = to_u16(a); bo = to_u16(b)
-        tb = int(ao.nbytes) + int(bo.nbytes)
-        res["bytes"] = tb; read_bytes += tb
+            res["error"] = "fold*bits=%d exceeds the 16-bit word" % (fold * BITS); emit(res); return
+        lo = resolve(da); ln = resolve(db)
+        odone = [0]; ndone = [0]; last = [0]
+        def bump():
+            s = odone[0] + ndone[0]
+            if s - last[0] >= EMIT:
+                last[0] = s
+                stat("bytes\t%s\t%d\t%d" % (nname, odone[0], ndone[0]))
+        if lo is not None and ln is not None:
+            osz, ocomp, onp = head(lo); nsz, ncomp, nnp = head(ln)
+            stat("size\t%s\t%d\t%d" % (nname, osz, nsz))
+            if onp and nnp:
+                def oon(n): odone[0] = n; bump()
+                def non(n): ndone[0] = n; bump()
+                ao = download(lo, ocomp, oon)
+                bo = download(ln, ncomp, non)
+                stat("bytes\t%s\t%d\t%d" % (nname, osz, nsz))
+                tb = osz + nsz
+            else:
+                ao = to_u16(da); bo = to_u16(db)   # not numpy-stored: no byte progress
+                tb = int(ao.nbytes) + int(bo.nbytes)
+        else:
+            ao = to_u16(da); bo = to_u16(db)
+            tb = int(ao.nbytes) + int(bo.nbytes)
+            stat("size\t%s\t%d\t%d" % (nname, int(ao.nbytes), int(bo.nbytes)))
+        stat("phase\t%s\tcomparing" % (nname,))
         ao = ao.reshape(E, -1); bo = bo.reshape(W, -1)
         N = ao.shape[1]
         we = (np.arange(E) // fold)
         se = ((np.arange(E) % fold) * BITS).astype(np.uint16)
-        # Format checks over the whole tensors (cheap vs. the compare): old words'
-        # bits above BITS, new words' bits above fold*BITS, must all be zero.
+        # Format checks: old words' bits above BITS, new words' bits above fold*BITS,
+        # must all be zero (else the packing assumption is wrong).
         sparse_bad = int(np.count_nonzero(ao >> np.uint16(BITS)))
         dense_bad = int(np.count_nonzero(bo >> np.uint16(fold * BITS)))
-        differing = 0
-        first = None
-        blk = max(1, CHUNK // max(1, E))
+        differing = 0; first = None
+        blk = max(1, CMP // max(1, E))
         for n0 in range(0, N, blk):
             n1 = min(n0 + blk, N)
             o = ao[:, n0:n1] & mask
@@ -1149,23 +1276,40 @@ for idx in range(total):
             cnt = int(np.count_nonzero(ne))
             differing += cnt
             if first is None and cnt:
-                p = np.argwhere(ne)[0]
-                e = int(p[0]); col = n0 + int(p[1])
+                p = np.argwhere(ne)[0]; e = int(p[0]); col = n0 + int(p[1])
                 first = [e, col, int(o[p[0], p[1]]), int(nd[p[0], p[1]])]
-        res.update({"elements": E * N, "differing": differing, "sparse_bad": sparse_bad, "dense_bad": dense_bad, "fold": fold})
+        res.update({"elements": E * N, "differing": differing, "sparse_bad": sparse_bad, "dense_bad": dense_bad, "fold": fold, "bytes": tb})
         if first is not None:
             res["first"] = first
-        compared += 1
+        # A small decoded window (experts × inner-offset), centred on the first
+        # mismatch (or the top-left corner), so the caller can SHOW old vs new and
+        # see where/how they diverge.
+        se0 = max(0, first[0] - 3) if first else 0
+        so0 = max(0, first[1] - 8) if first else 0
+        se1 = min(E, se0 + 8); so1 = min(N, so0 + 24)
+        ew = np.arange(se0, se1)
+        sold = (ao[se0:se1, so0:so1] & mask).astype(np.uint16).tolist()
+        snew = ((bo[ew // fold][:, so0:so1] >> ((ew % fold) * BITS).astype(np.uint16)[:, None]) & mask).astype(np.uint16).tolist()
+        res["sample"] = {"e0": int(se0), "off0": int(so0), "cols": int(so1 - so0), "old": sold, "new": snew}
+        with agg_lock:
+            read_bytes[0] += tb; compared[0] += 1
     except Exception as e:
         res["error"] = "%r" % (e,)
     emit(res)
-emit({"summary": {"tensors": total, "compared": compared, "bytes": int(read_bytes), "elapsed_s": time.time() - t0}})
+if JOBS <= 1:
+    for i in range(total):
+        work(i)
+else:
+    with ThreadPoolExecutor(max_workers=JOBS) as ex:
+        list(ex.map(work, range(total)))
+emit({"summary": {"tensors": total, "compared": compared[0], "bytes": int(read_bytes[0]), "elapsed_s": time.time() - t0}})
 "#;
     TEMPLATE
         .replace("__OLD__", &old_lit)
         .replace("__NEW__", &new_lit)
         .replace("__PAIRS__", &pairs_lit)
         .replace("__BITS__", &bits_lit)
+        .replace("__JOBS__", &jobs_lit)
         .replace("__SENTINEL__", SENTINEL)
         .replace("__STATUS__", STATUS_TAG)
 }
@@ -1425,6 +1569,28 @@ fn parse_repack_result(v: &serde_json::Value) -> RepackResult {
             a.get(3)?.as_u64()? as u32,
         ))
     });
+    let grid = |val: Option<&serde_json::Value>| -> Vec<Vec<u32>> {
+        val.and_then(|g| g.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| {
+                        r.as_array()
+                            .map(|cs| cs.iter().map(|c| c.as_u64().unwrap_or(0) as u32).collect())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let sample = v.get("sample").map(|s| RepackSample {
+        e0: s.get("e0").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        off0: s
+            .get("off0")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        old: grid(s.get("old")),
+        new: grid(s.get("new")),
+    });
     RepackResult {
         elements: u("elements"),
         differing: u("differing"),
@@ -1432,6 +1598,7 @@ fn parse_repack_result(v: &serde_json::Value) -> RepackResult {
         dense_bad: u("dense_bad"),
         fold: u("fold") as usize,
         first_mismatch: first,
+        sample,
         bytes: u("bytes"),
         error: v.get("error").and_then(|e| e.as_str()).map(str::to_string),
     }
@@ -2003,9 +2170,15 @@ mod tests {
         assert!(s.contains("fold = (E + W - 1) // W"), "{s}");
         assert!(s.contains("sparse_bad"), "{s}");
         assert!(s.contains("dense_bad"), "{s}");
-        assert!(s.contains("view(torch.int16)"), "{s}");
+        // Streams the objects itself (thread-safe client) with byte progress, a
+        // decoded sample window, in parallel.
+        assert!(s.contains("ThreadPoolExecutor"), "{s}");
+        assert!(s.contains("get_object"), "{s}");
+        assert!(s.contains("stat(\"size"), "{s}");
+        assert!(s.contains("stat(\"bytes"), "{s}");
+        assert!(s.contains("res[\"sample\"]"), "{s}");
         assert!(s.contains(STATUS_TAG) && s.contains(SENTINEL));
-        // Read-only.
+        // Read-only: reads objects, never writes/uploads/deletes.
         for forbidden in [
             "cstorch.save",
             "torch.save",
