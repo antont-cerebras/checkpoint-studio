@@ -1466,20 +1466,29 @@ fn remote_compare_block(frame: usize, st: &RemoteCompareState, width: usize) -> 
     let spin = DIFF_SPINNER[frame % DIFF_SPINNER.len()];
     let done = st.done.load(Ordering::Relaxed);
     let done_b = st.done_bytes.load(Ordering::Relaxed);
-    let counts = format!(
-        "{done}/{} · {}/{}",
-        st.total,
+    // Labelled progress: how many tensors compared, and how much data read so far,
+    // with a bar over the byte total. `read` advances as each tensor completes (the
+    // remote materialises a tensor in one shot, so there's no sub-tensor progress).
+    let bar = mini_bar(done_b, st.total_bytes, 12);
+    let read = format!(
+        "{}/{} read",
         utils::format_size(done_b as usize),
         utils::format_size(st.total_bytes as usize),
     );
+    // Plain-text version of the tail, for budgeting the name width (ANSI-free).
+    let tail_plain = format!("  {done}/{} tensors · {} {read}", st.total, "-".repeat(12));
     let (loading, current, last) = st
         .inner
         .lock()
         .map(|i| (i.loading.clone(), i.current.clone(), i.last.clone()))
         .unwrap_or_default();
 
-    // Line 1 — the tensor last compared, with its outcome.
-    let name_budget = width.saturating_sub(counts.chars().count() + 6).max(12);
+    // Line 1 — the tensor last compared, with its outcome + overall progress.
+    let counts_col = format!(
+        "{DIM}{done}/{} tensors ·{RESET} {CYAN}{bar}{RESET} {DIM}{read}{RESET}",
+        st.total
+    );
+    let name_budget = width.saturating_sub(tail_plain.chars().count() + 4).max(12);
     let line1 = if let Some((name, status)) = last {
         use crate::remote::CompareStatus::*;
         let (color, mark) = match status {
@@ -1488,11 +1497,11 @@ fn remote_compare_block(frame: usize, st: &RemoteCompareState, width: usize) -> 
             Error => (RED, '✗'),
         };
         format!(
-            "{color}{mark}{RESET} {DIM}{}{RESET}  {DIM}{counts}{RESET}",
+            "{color}{mark}{RESET} {DIM}{}{RESET}  {counts_col}",
             truncate_tail(&name, name_budget)
         )
     } else {
-        format!("{DIM}(reading…)  {counts}{RESET}")
+        format!("{DIM}(starting…){RESET}  {counts_col}")
     };
 
     // Line 2 — what's happening right now.
@@ -1500,8 +1509,8 @@ fn remote_compare_block(frame: usize, st: &RemoteCompareState, width: usize) -> 
         format!("{CYAN}{spin}{RESET} {DIM}loading {what} checkpoint …{RESET}")
     } else if let Some(name) = current {
         format!(
-            "{CYAN}{spin}{RESET} {}",
-            truncate_tail(&name, width.saturating_sub(3).max(12))
+            "{CYAN}{spin}{RESET} {DIM}reading{RESET} {}",
+            truncate_tail(&name, width.saturating_sub(11).max(12))
         )
     } else {
         format!("{CYAN}{spin}{RESET} {DIM}…{RESET}")
@@ -2021,6 +2030,11 @@ fn run_diff(
     // Scope the diff to the selected subset (no-op when no filter was given).
     filter.apply(&mut old_sum, &mut new_sum);
 
+    // `(compared, differing)` tensor counts for the explicit value-comparison summary
+    // (so the output states "values identical" rather than leaving it implicit in the
+    // unchanged count). Set in the `--values`/`--histogram` branch below.
+    let mut value_summary: Option<(usize, usize)> = None;
+
     let mut report = if opts.values || opts.histogram {
         use rayon::prelude::*;
         // The old side is keyed by its *post-rename* name (the same names `common`
@@ -2121,6 +2135,17 @@ fn run_diff(
             progress.finish();
             pairs.into_iter().map(|(n, e)| (n.to_string(), e)).collect()
         };
+        // Count compared tensors and how many actually differ in value/distribution,
+        // for the explicit summary line below.
+        let compared = extras.len();
+        let differ = extras
+            .values()
+            .filter(|e| {
+                e.values.is_some_and(|v| v.differing > 0)
+                    || e.histogram.is_some_and(|h| h.tvd > 0.0)
+            })
+            .count();
+        value_summary = Some((compared, differ));
         // Feed the precomputed extras into the (pure) comparison. Each common name
         // is requested exactly once, so `remove` moves the value out (no clone).
         let extras = std::cell::RefCell::new(extras);
@@ -2198,6 +2223,25 @@ fn run_diff(
         (None, None) => {}
     }
     print!("{}", report.render(&old_label, &new_label, opts));
+
+    // Explicit value-comparison verdict (so "values identical" is stated, not just
+    // implied by the unchanged count).
+    if let Some((compared, differ)) = value_summary {
+        let what = if opts.values && opts.histogram {
+            "values/distribution"
+        } else if opts.histogram {
+            "distribution"
+        } else {
+            "element values"
+        };
+        if compared == 0 {
+            println!("{what}: no common same-shape tensor(s) to compare");
+        } else if differ == 0 {
+            println!("{what}: all {compared} compared tensor(s) IDENTICAL");
+        } else {
+            println!("{what}: {differ} of {compared} compared tensor(s) differ");
+        }
+    }
 
     // `--verify-repack`: after the structural diff, confirm the shape-folded expert
     // tensors encode the same indices in old (sparse) vs new (dense) packing. Runs on
