@@ -699,6 +699,7 @@ impl RemoteRead {
     /// equality, and validates the format (old words' top bits and new words' MSB
     /// must be zero). Emits [`RepackEvent`]s for the live per-tensor download bars.
     /// Returns per-tensor [`RepackResult`]s keyed by name. **Read-only.**
+    #[allow(clippy::too_many_arguments)]
     pub fn verify_repack(
         &self,
         session: &RemoteSession,
@@ -706,9 +707,10 @@ impl RemoteRead {
         new_uri: &str,
         pairs: &[(String, String)],
         bits: usize,
+        auto_sparse: bool,
         mut on_event: impl FnMut(RepackEvent),
     ) -> Result<(HashMap<String, RepackResult>, Option<RemoteValueStats>)> {
-        let script = repack_verify_script(old_uri, new_uri, pairs, bits);
+        let script = repack_verify_script(old_uri, new_uri, pairs, bits, auto_sparse);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
         let out = session.exec_capture(&command, &script, |line| {
             dispatch_stream_line(line, &repack_status, &mut on_event);
@@ -1231,12 +1233,14 @@ fn repack_verify_script(
     new_uri: &str,
     pairs: &[(String, String)],
     bits: usize,
+    auto_sparse: bool,
 ) -> String {
     let old_lit = serde_json::to_string(old_uri).unwrap_or_else(|_| "\"\"".into());
     let new_lit = serde_json::to_string(new_uri).unwrap_or_else(|_| "\"\"".into());
     let pairs_lit = serde_json::to_string(pairs).unwrap_or_else(|_| "[]".into());
     let bits_lit = bits.max(1).to_string();
     let jobs_lit = pairs.len().clamp(1, 4).to_string();
+    let auto_lit = if auto_sparse { "True" } else { "False" };
     const TEMPLATE: &str = r#"
 import sys, json, time, threading
 from concurrent.futures import ThreadPoolExecutor
@@ -1245,6 +1249,7 @@ NEW = __NEW__
 PAIRS = __PAIRS__
 BITS = __BITS__
 JOBS = __JOBS__
+AUTO = __AUTO__      # sparse<->sparse auto (--values): same shape both sides, fold 1
 DL = 16 << 20        # S3 download chunk
 CMP = 4000000        # compare column block
 EMIT = 64 << 20      # byte-progress emit granularity
@@ -1344,11 +1349,17 @@ def work(idx):
         ashape = [int(x) for x in da.shape]; bshape = [int(x) for x in db.shape]
         E = ashape[0] if ashape else 0
         W = bshape[0] if bshape else 0
-        if not ashape or not bshape or ashape[1:] != bshape[1:] or W <= 0 or E <= W:
-            res["error"] = "not a fold pair (shapes %r vs %r)" % (ashape, bshape); emit(res); return
-        fold = (E + W - 1) // W
-        if W != (E + fold - 1) // fold:
-            res["error"] = "fold mismatch (E=%d W=%d -> fold=%d)" % (E, W, fold); emit(res); return
+        if AUTO:
+            # Sparse<->sparse: same shape both sides, one index per word (fold 1).
+            if not ashape or ashape != bshape:
+                res["error"] = "sparse compare needs equal shapes (%r vs %r)" % (ashape, bshape); emit(res); return
+            fold = 1
+        else:
+            if not ashape or not bshape or ashape[1:] != bshape[1:] or W <= 0 or E <= W:
+                res["error"] = "not a fold pair (shapes %r vs %r)" % (ashape, bshape); emit(res); return
+            fold = (E + W - 1) // W
+            if W != (E + fold - 1) // fold:
+                res["error"] = "fold mismatch (E=%d W=%d -> fold=%d)" % (E, W, fold); emit(res); return
         if fold * BITS > 16:
             res["error"] = "fold*bits=%d exceeds the 16-bit word" % (fold * BITS); emit(res); return
         lo = resolve(da); ln = resolve(db)
@@ -1394,7 +1405,7 @@ def work(idx):
         dshift = fold * BITS
         dense_bad = 0 if dshift >= 16 else int(np.count_nonzero(bo >> np.uint16(dshift)))
         differing = 0; first = None; maxdelta = 0; big = 0
-        sum_abs = 0; sum_old = 0; sum_new = 0
+        sum_abs = 0; sum_old = 0; sum_new = 0; zeros = 0
         blk = max(1, CMP // max(1, E))
         for n0 in range(0, N, blk):
             n1 = min(n0 + blk, N)
@@ -1406,6 +1417,7 @@ def work(idx):
             sum_abs += int(ad.sum())
             sum_old += int(o.sum(dtype=np.uint64))
             sum_new += int(nd.sum(dtype=np.uint64))
+            zeros += int(np.count_nonzero(o == 0)) + int(np.count_nonzero(nd == 0))  # both sides
             ne = o != nd
             cnt = int(np.count_nonzero(ne))
             differing += cnt
@@ -1417,11 +1429,32 @@ def work(idx):
                 p = np.argwhere(ne)[0]; e = int(p[0]); col = n0 + int(p[1])
                 first = [e, col, int(o[p[0], p[1]]), int(nd[p[0], p[1]])]
         elems = E * N
-        res.update({"elements": elems, "differing": differing, "sparse_bad": sparse_bad, "dense_bad": dense_bad, "fold": fold, "bytes": tb, "maxdelta": maxdelta, "big": big,
+        res.update({"elements": elems, "differing": differing, "sparse_bad": sparse_bad, "dense_bad": dense_bad, "fold": fold, "bits": BITS, "bytes": tb, "maxdelta": maxdelta, "big": big,
                     "sum_abs": int(sum_abs),
                     "mean_abs": (sum_abs / elems) if elems else 0.0,
                     "mean_old": (sum_old / elems) if elems else 0.0,
-                    "mean_new": (sum_new / elems) if elems else 0.0})
+                    "mean_new": (sum_new / elems) if elems else 0.0,
+                    "zero_frac": (zeros / (2.0 * elems)) if elems else 0.0})
+        # Auto (--values) fallback: the top-bits check failed, so these aren't packed
+        # indices — compare the raw words as stored floats instead (same bytes, viewed
+        # as float16), so a mis-detected tensor is still meaningfully diffed.
+        if AUTO and (sparse_bad > 0 or dense_bad > 0):
+            dts = str(db.dtype).replace("torch.", "")
+            # Compare in the real stored dtype: F16 words as floats, otherwise the
+            # raw 16-bit integers (dense-packed U16, etc.).
+            if dts == "float16":
+                fa = ao.view(np.float16).astype(np.float64); fb = bo.view(np.float16).astype(np.float64)
+            else:
+                fa = ao.astype(np.float64); fb = bo.astype(np.float64)
+            fd = np.abs(fa - fb)
+            fin = np.isfinite(fd)   # F16 bits can be NaN/Inf → JSON-unsafe; mask them
+            label = {"float16": "F16", "bfloat16": "BF16", "uint16": "U16", "int16": "I16"}.get(dts, dts.upper())
+            res["fallback"] = {"dtype": label,
+                               "elements": int(ao.size),
+                               # Exact bit inequality (NaN-safe; identical bits ⇒ 0).
+                               "differing": int(np.count_nonzero(ao != bo)),
+                               "max_abs": float(fd[fin].max()) if bool(fin.any()) else 0.0,
+                               "mean_abs": float(fd[fin].mean()) if bool(fin.any()) else 0.0}
         if first is not None:
             res["first"] = first
         # A decoded window (experts × inner-offset), centred on the first mismatch
@@ -1461,6 +1494,7 @@ emit({"summary": {"tensors": total, "compared": compared[0], "bytes": int(read_b
         .replace("__PAIRS__", &pairs_lit)
         .replace("__BITS__", &bits_lit)
         .replace("__JOBS__", &jobs_lit)
+        .replace("__AUTO__", auto_lit)
         .replace("__SENTINEL__", SENTINEL)
         .replace("__STATUS__", STATUS_TAG)
 }
@@ -2379,7 +2413,7 @@ mod tests {
     #[test]
     fn repack_verify_script_embeds_inputs_and_checks_format() {
         let pairs = vec![("w.down".to_string(), "w.down".to_string())];
-        let s = repack_verify_script("s3://b/old", "s3://b/new", &pairs, 3);
+        let s = repack_verify_script("s3://b/old", "s3://b/new", &pairs, 3, false);
         assert!(s.contains(r#"OLD = "s3://b/old""#), "{s}");
         assert!(s.contains(r#"[["w.down","w.down"]]"#), "{s}");
         assert!(s.contains("BITS = 3"), "{s}");

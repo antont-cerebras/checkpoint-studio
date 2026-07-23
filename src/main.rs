@@ -1686,6 +1686,11 @@ fn run_diff(
     // (so the output states "values identical" rather than leaving it implicit in the
     // unchanged count). Set in the `--values`/`--histogram` branch below.
     let mut value_summary: Option<(usize, usize)> = None;
+    // Auto-detected sparse-packed expert weights (`--values`): compared as N-bit
+    // indices (repack-style), rendered in their own section after the report.
+    let mut sparse_pairs: Vec<(String, String)> = Vec::new();
+    let mut sparse_bits = 0usize;
+    let mut sparse_results: HashMap<String, crate::remote::RepackResult> = HashMap::new();
 
     let mut report = if opts.values || opts.histogram {
         use rayon::prelude::*;
@@ -1699,12 +1704,25 @@ fn run_diff(
         let new_map: HashMap<&str, &TensorInfo> =
             new_t.iter().map(|t| (t.name.as_str(), t)).collect();
         // The tensors present on both sides — the ones we actually read/compare.
-        let common: Vec<&str> = old_sum
+        let mut common: Vec<&str> = old_sum
             .tensors
             .keys()
             .filter(|k| new_sum.tensors.contains_key(*k))
             .map(String::as_str)
             .collect();
+
+        // Auto-detect sparse-packed expert weights (a `*.weight` with a sibling
+        // `*.codebook`): those are quantized indices, not floats — compare them as
+        // N-bit indices below (repack-style), so drop them and their codebook/qscale
+        // siblings from the plain value pass (their raw bits as F16 are meaningless).
+        if opts.values {
+            let (fp, fb, handled) = auto_sparse_families(&common, &old_map, &new_map);
+            if let Some(b) = fb {
+                sparse_pairs = fp;
+                sparse_bits = b;
+                common.retain(|k| !handled.contains(*k));
+            }
+        }
 
         // The per-tensor extras, keyed by (post-rename) name — computed on the proxy
         // (s3-vs-s3) or locally.
@@ -1736,22 +1754,28 @@ fn run_diff(
                 full_hist: false, // bulk path needs only the TVD summary
                 jobs: jobs.clamp(1, 32),
             };
-            match fetch_remote_value_diff(
-                remote.expect("remote_values implies a remote"),
-                &mut password,
-                &old_str,
-                &new_str,
-                &pairs,
-                &vopts,
-                total_bytes,
-            ) {
-                Ok(m) => m
-                    .into_iter()
-                    .map(|(k, rd)| (k, extras_from_remote(&rd)))
-                    .collect(),
-                Err(e) => {
-                    eprintln!("checkpoint-explorer diff: {e:#}");
-                    return 2;
+            if pairs.is_empty() {
+                // Everything was auto-detected as sparse-packed (compared as indices
+                // below) — don't load the checkpoints again for a no-op float pass.
+                HashMap::new()
+            } else {
+                match fetch_remote_value_diff(
+                    remote.expect("remote_values implies a remote"),
+                    &mut password,
+                    &old_str,
+                    &new_str,
+                    &pairs,
+                    &vopts,
+                    total_bytes,
+                ) {
+                    Ok(m) => m
+                        .into_iter()
+                        .map(|(k, rd)| (k, extras_from_remote(&rd)))
+                        .collect(),
+                    Err(e) => {
+                        eprintln!("checkpoint-explorer diff: {e:#}");
+                        return 2;
+                    }
                 }
             }
         } else {
@@ -1797,7 +1821,25 @@ fn run_diff(
                     || e.histogram.is_some_and(|h| h.tvd > 0.0)
             })
             .count();
-        value_summary = Some((compared, differ));
+        // Only the plain-float tensors count toward the "element values" verdict;
+        // the sparse-packed families get their own section. Suppress the float
+        // verdict when there were none (else it wrongly says "nothing to compare").
+        value_summary = (compared > 0 || sparse_pairs.is_empty()).then_some((compared, differ));
+        // Compare the auto-detected sparse-packed expert weights as N-bit indices
+        // (repack-style, on the proxy for s3:// or locally) — reads their data once.
+        if !sparse_pairs.is_empty() {
+            sparse_results = run_auto_sparse(
+                remote,
+                &mut password,
+                s3_pair,
+                &old_str,
+                &new_str,
+                &old_t,
+                &new_t,
+                &sparse_pairs,
+                sparse_bits,
+            );
+        }
         // Feed the precomputed extras into the (pure) comparison. Each common name
         // is requested exactly once, so `remove` moves the value out (no clone).
         let extras = std::cell::RefCell::new(extras);
@@ -1912,10 +1954,17 @@ fn run_diff(
             repack_bits,
         );
     }
+    // Auto-detected sparse-packed expert weights (`--values`): their index / value
+    // comparison prints its own section and contributes to the exit code.
+    let sparse_differs = if !sparse_pairs.is_empty() {
+        render_auto_sparse(&sparse_pairs, &sparse_results) == 1
+    } else {
+        false
+    };
     // Under a `--name` filter the exit code reflects the compared tensor subset
     // only; whole-prefix S3 object-metadata deltas (e.g. a re-uploaded `__METADATA__`
     // or last-modified bumps) are out of that scope, like the metadata section.
-    i32::from(report.has_differences_with(!opts.filtered))
+    i32::from(report.has_differences_with(!opts.filtered) || sparse_differs)
 }
 
 /// The `diff --verify-repack` path: find tensors present on both sides whose shapes
@@ -1988,7 +2037,7 @@ fn run_repack_verify(
     let other_differs = added || removed || other_changed || old_sum.metadata != new_sum.metadata;
 
     let results = if let Some(r) = remote.filter(|_| s3_pair) {
-        match fetch_remote_repack(r, password, old_uri, new_uri, &pairs, bits) {
+        match fetch_remote_repack(r, password, old_uri, new_uri, &pairs, bits, false) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("checkpoint-explorer diff: {e:#}");
@@ -1996,7 +2045,7 @@ fn run_repack_verify(
             }
         }
     } else {
-        local_repack(old_t, new_t, &pairs, bits)
+        local_repack(old_t, new_t, &pairs, bits, None)
     };
     render_repack_verdict(&pairs, &results, bits, other_differs)
 }
@@ -2009,6 +2058,7 @@ fn local_repack(
     new_t: &[TensorInfo],
     pairs: &[(String, String)],
     bits: usize,
+    fold_override: Option<usize>,
 ) -> HashMap<String, crate::remote::RepackResult> {
     let find = |ts: &[TensorInfo], n: &str| ts.iter().find(|t| t.name == n).cloned();
     let mut out = HashMap::new();
@@ -2016,7 +2066,9 @@ fn local_repack(
         let (Some(ow), Some(nw)) = (find(old_t, oname), find(new_t, nname)) else {
             continue;
         };
-        let Some(fold) = detect_fold(&ow.shape, &nw.shape) else {
+        // Auto sparse↔sparse forces fold 1 (same shape both sides); --verify-repack
+        // derives the fold from the shrinking dim-0.
+        let Some(fold) = fold_override.or_else(|| detect_fold(&ow.shape, &nw.shape)) else {
             continue;
         };
         // Sibling codebook / scale tensor names (weight name minus ".weight").
@@ -2050,6 +2102,59 @@ fn local_repack(
     out
 }
 
+/// Index bit-width from a codebook tensor's centroid count (its last dim): the bits
+/// needed to address one centroid, `ceil(log2(centroids))` — `8`→3, `16`→4,
+/// `2048`→11. `None` for a degenerate shape (detection then declines).
+fn codebook_index_bits(cb_shape: &[usize]) -> Option<usize> {
+    let c = *cb_shape.last()?;
+    (c >= 2).then(|| ((c - 1).ilog2() + 1) as usize)
+}
+
+/// Detect sparse-packed expert-weight families for the auto `--values` path: a
+/// `*.weight` present (equal shape) on both sides whose sibling `*.codebook` is also
+/// present on both sides marks the weight as quantized indices. Returns the
+/// `(old_name, new_name)` weight pairs, the index width `N` from the codebook's
+/// centroid count (its last dim; assumed uniform, taken from the first family), and
+/// the set of post-rename names handled here (each weight + its `.codebook`/`.qscale`
+/// siblings) so the float value pass skips them — they're compared as indices (or,
+/// if the top-bits check fails, as a fallback value diff) with their siblings.
+fn auto_sparse_families(
+    common: &[&str],
+    old_map: &HashMap<String, &TensorInfo>,
+    new_map: &HashMap<&str, &TensorInfo>,
+) -> (
+    Vec<(String, String)>,
+    Option<usize>,
+    std::collections::HashSet<String>,
+) {
+    let mut pairs = Vec::new();
+    let mut bits = None;
+    let mut handled = std::collections::HashSet::new();
+    for &k in common {
+        let Some(stem) = k.strip_suffix(".weight") else {
+            continue;
+        };
+        let cb = format!("{stem}.codebook");
+        // The weight and its codebook must be present on both sides (the common key
+        // space is post-rename, matching both maps).
+        let (Some(ow), Some(_nw)) = (old_map.get(k), new_map.get(k)) else {
+            continue;
+        };
+        let (Some(_ocb), Some(ncb)) = (old_map.get(cb.as_str()), new_map.get(cb.as_str())) else {
+            continue;
+        };
+        let Some(n) = codebook_index_bits(&ncb.shape) else {
+            continue;
+        };
+        bits.get_or_insert(n);
+        pairs.push((ow.name.clone(), k.to_string())); // old original name, new/common name
+        handled.insert(k.to_string());
+        handled.insert(cb);
+        handled.insert(format!("{stem}.qscale"));
+    }
+    (pairs, bits, handled)
+}
+
 /// Open a session (reusing the password) and run the proxy repack verification with
 /// the live two-line view + a final I/O line (mirrors [`fetch_remote_value_diff`]).
 fn fetch_remote_repack(
@@ -2059,15 +2164,25 @@ fn fetch_remote_repack(
     new_uri: &str,
     pairs: &[(String, String)],
     bits: usize,
+    auto_sparse: bool,
 ) -> Result<HashMap<String, crate::remote::RepackResult>> {
     let session = r.open_with(password)?;
-    eprintln!(
-        "checkpoint-explorer diff: verifying repack of {} tensor(s) on {}, decoding {bits}-bit \
-         indices on the remote (reads the full tensors, {} at a time):\n  old (sparse) {old_uri}\n  new (dense)  {new_uri}",
-        pairs.len(),
-        r.host,
-        pairs.len().clamp(1, 4),
-    );
+    if auto_sparse {
+        eprintln!(
+            "checkpoint-explorer diff: comparing {} sparse-packed expert weight(s) as {bits}-bit \
+             indices on {} (auto-detected sibling codebook), decoding on the remote …",
+            pairs.len(),
+            r.host,
+        );
+    } else {
+        eprintln!(
+            "checkpoint-explorer diff: verifying repack of {} tensor(s) on {}, decoding {bits}-bit \
+             indices on the remote (reads the full tensors, {} at a time):\n  old (sparse) {old_uri}\n  new (dense)  {new_uri}",
+            pairs.len(),
+            r.host,
+            pairs.len().clamp(1, 4),
+        );
+    }
     // One standard progress bar per tensor (labelled by the *new* name), each
     // filling over its (old + new) S3 byte size as the proxy streams the two sides.
     let bars = progress::Bars::start(pairs.iter().map(|(_, n)| n.clone()).collect());
@@ -2077,7 +2192,7 @@ fn fetch_remote_repack(
         .map(|(i, (_, n))| (n.as_str(), i))
         .collect();
     let finished = std::cell::RefCell::new(vec![false; pairs.len()]);
-    let out = r.verify_repack(&session, old_uri, new_uri, pairs, bits, |ev| {
+    let out = r.verify_repack(&session, old_uri, new_uri, pairs, bits, auto_sparse, |ev| {
         drive_bars(&bars, &index, &finished, ev)
     });
     // Settle any bar that never got a Done (a fatal mid-run error) so the animation
@@ -2214,6 +2329,153 @@ fn render_repack_verdict(
         );
         0
     }
+}
+
+/// Whether a sibling codebook/qscale diff counts as a difference (missing on a
+/// side, shape mismatch, or any differing value).
+fn aux_differs(aux: Option<&crate::remote::RepackAux>) -> bool {
+    aux.is_some_and(|a| !a.present() || a.shape_mismatch.is_some() || a.differing > 0)
+}
+
+/// Run the auto-detected sparse-packed index comparison over `pairs` (codebooked
+/// expert weights, sparse↔sparse, fold 1, index width `bits`) — on the ssh proxy for
+/// `s3://`, else locally — reusing the repack machinery. Keyed by the new name;
+/// empty on a remote error (already reported) or a non-s3 remote (data unreachable).
+#[allow(clippy::too_many_arguments)]
+fn run_auto_sparse(
+    remote: Option<&crate::remote::RemoteRead>,
+    password: &mut Option<String>,
+    s3_pair: bool,
+    old_uri: &str,
+    new_uri: &str,
+    old_t: &[TensorInfo],
+    new_t: &[TensorInfo],
+    pairs: &[(String, String)],
+    bits: usize,
+) -> HashMap<String, crate::remote::RepackResult> {
+    if let Some(r) = remote.filter(|_| s3_pair) {
+        match fetch_remote_repack(r, password, old_uri, new_uri, pairs, bits, true) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("checkpoint-explorer diff: sparse index compare: {e:#}");
+                HashMap::new()
+            }
+        }
+    } else if remote.is_some() {
+        eprintln!(
+            "checkpoint-explorer diff: sparse index compare needs s3:// data over --ssh-read \
+             (a remote safetensors dir isn't reachable) — skipped"
+        );
+        HashMap::new()
+    } else {
+        local_repack(old_t, new_t, pairs, bits, Some(1))
+    }
+}
+
+/// Render the auto-detected sparse-packed index comparison (the `--values` path on
+/// codebooked expert weights): per tensor, the index verdict (±1 / format / 2-D
+/// slice) + the zero fraction, or — when the top-bits check fails — a fallback plain
+/// stored-dtype value diff. Also diffs the sibling codebook/qscale. Returns 1 if
+/// anything differs, else 0.
+fn render_auto_sparse(
+    pairs: &[(String, String)],
+    results: &HashMap<String, crate::remote::RepackResult>,
+) -> i32 {
+    use std::io::IsTerminal;
+    let color = std::io::stdout().is_terminal();
+    let (green, yellow, red, dim, reset) = if color {
+        ("\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "", "", "", "")
+    };
+    println!("\nsparse-packed expert indices (auto-detected via sibling codebook):");
+    let mut differs = false;
+    let mut names: Vec<&String> = pairs.iter().map(|(_, n)| n).collect();
+    names.sort();
+    for name in names {
+        let Some(rr) = results.get(name) else {
+            differs = true;
+            println!("  {red}✗{reset} {name}  {dim}(no result returned){reset}");
+            continue;
+        };
+        if let Some(err) = &rr.error {
+            differs = true;
+            println!("  {red}✗{reset} {name}  {red}error:{reset} {err}");
+            continue;
+        }
+        if let Some(fb) = &rr.fallback {
+            // Top bits set ⇒ not packed indices; show the plain value comparison.
+            let (mark, col) = if fb.differing > 0 {
+                differs = true;
+                (yellow, "≠")
+            } else {
+                (green, "✓")
+            };
+            let verdict = if fb.differing > 0 {
+                format!(
+                    "{} of {} values differ (max |Δ| {:.5}, mean {:.5})",
+                    crate::utils::format_parameters(fb.differing as usize),
+                    crate::utils::format_parameters(fb.elements as usize),
+                    fb.max_abs,
+                    fb.mean_abs,
+                )
+            } else {
+                "values identical".to_string()
+            };
+            println!(
+                "  {mark}{col}{reset} {name}  {dim}not sparse-packed ({} word(s) with bits above {}) — compared as {} values:{reset} {verdict}",
+                rr.sparse_bad + rr.dense_bad,
+                rr.bits,
+                fb.dtype,
+            );
+        } else {
+            let counts = format!(
+                "{}-bit, {} indices, {:.0}% zero",
+                rr.bits,
+                crate::utils::format_parameters(rr.elements as usize),
+                rr.zero_frac * 100.0,
+            );
+            if rr.differing > 0 {
+                differs = true;
+                let where_ = rr
+                    .first_mismatch
+                    .map(|(e, off, o, n)| {
+                        format!(" {dim}(first: expert {e}, offset {off}: {o} vs {n}){reset}")
+                    })
+                    .unwrap_or_default();
+                let adj = if rr.max_delta <= 1 {
+                    format!("{dim}all by ±1 (same weights, independently re-quantized){reset}")
+                } else {
+                    format!(
+                        "{dim}max |Δ| {}, {} by >1{reset}",
+                        rr.max_delta,
+                        crate::utils::format_parameters(rr.differing_gt1 as usize),
+                    )
+                };
+                println!(
+                    "  {yellow}≠{reset} {name}  {yellow}{} of {} indices differ{reset} — {adj}{where_} {dim}({counts}){reset}",
+                    crate::utils::format_parameters(rr.differing as usize),
+                    crate::utils::format_parameters(rr.elements as usize),
+                );
+                println!(
+                    "      {dim}Σ|Δ| {} · mean |Δ|/param {:.4} · mean index {:.4} → {:.4} (Δ {:+.4}){reset}",
+                    crate::utils::format_parameters(rr.sum_abs as usize),
+                    rr.mean_abs,
+                    rr.mean_old,
+                    rr.mean_new,
+                    rr.mean_new - rr.mean_old,
+                );
+                print_repack_sample(rr, red, dim, reset);
+            } else {
+                println!("  {green}✓{reset} {name}  {dim}indices identical ({counts}){reset}");
+            }
+        }
+        // The sibling codebook / scale value-diff (quantized expert weights).
+        print_repack_aux("codebook", rr.codebook.as_ref(), green, yellow, dim, reset);
+        print_repack_aux("qscale", rr.qscale.as_ref(), green, yellow, dim, reset);
+        differs |= aux_differs(rr.codebook.as_ref()) || aux_differs(rr.qscale.as_ref());
+    }
+    i32::from(differs)
 }
 
 /// Print the decoded 2-D index window (experts × inner-offset) for a mismatched
