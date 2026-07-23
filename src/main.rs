@@ -1643,6 +1643,22 @@ fn run_diff(
         _ => false,
     };
 
+    // Heads-up when both sides' S3 objects are byte-identical (same key + ETag) —
+    // e.g. diffing a checkpoint against itself. The comparison still runs (so it can
+    // be exercised / confirm identity); this just flags that it will read the data
+    // and can only report "identical". The structure read already had the metadata,
+    // so the check is free.
+    if remote_values
+        && let (Some(o), Some(n)) = (&old_s3, &new_s3)
+        && s3_objects_identical(o, n)
+    {
+        eprintln!(
+            "checkpoint-explorer diff: note — both sides are byte-identical (same S3 objects); \
+             the value comparison will read the data and confirm every tensor is identical. \
+             Pass two different checkpoints to see real value differences."
+        );
+    }
+
     let (old_schemas, new_schemas) = if compares_data && !remote_values {
         (
             sample::parse_packing_schemas(&old_t, &old_m),
@@ -1680,6 +1696,7 @@ fn run_diff(
                         histogram: opts.histogram,
                         bins,
                         full_hist: true,
+                        jobs: jobs.clamp(1, 32),
                     };
                     match fetch_remote_value_diff(
                         remote.expect("remote_values implies a remote"),
@@ -1770,8 +1787,8 @@ fn run_diff(
             .map(String::as_str)
             .collect();
 
-        // The per-tensor extras, keyed by (post-rename) name — computed either on the
-        // proxy (s3-vs-s3) or locally.
+        // The per-tensor extras, keyed by (post-rename) name — computed on the proxy
+        // (s3-vs-s3) or locally.
         let extras: HashMap<String, diff::TensorExtras> = if remote_values {
             // One proxy script reads both checkpoints and compares each common
             // same-shape pair; the pair carries (old original name, new/common name).
@@ -1798,6 +1815,7 @@ fn run_diff(
                 histogram: opts.histogram,
                 bins,
                 full_hist: false, // bulk path needs only the TVD summary
+                jobs: jobs.clamp(1, 32),
             };
             match fetch_remote_value_diff(
                 remote.expect("remote_values implies a remote"),
@@ -1968,10 +1986,12 @@ fn fetch_remote_value_diff(
     let session = r.open_with(password)?;
     eprintln!(
         "checkpoint-explorer diff: comparing {} tensor(s) on {} — reading ≈ {} from S3 \
-         (tensor data is processed on the remote, not streamed here) …",
+         (processed on the remote, not streamed here; {}-way parallel — use --jobs to tune, \
+         --jobs 1 if the remote misbehaves) …",
         pairs.len(),
         r.host,
         crate::utils::format_size(total_bytes as usize),
+        vopts.jobs.max(1),
     );
     let view = RemoteCompareView::start(pairs.len(), total_bytes);
     let out = r.value_diff(&session, old_uri, new_uri, pairs, vopts, |ev| view.on(ev));
@@ -2004,6 +2024,26 @@ fn fetch_remote_value_diff(
         );
     }
     Ok(map)
+}
+
+/// Whether two S3 object sets are byte-identical: the same `(key, ETag, size)` for
+/// every object (order-independent, non-empty). An ETag is a content hash, so equal
+/// key+ETag ⇒ identical bytes ⇒ identical tensor values — letting a value diff skip
+/// the data read entirely (e.g. a checkpoint vs. itself or an unchanged copy).
+fn s3_objects_identical(a: &crate::remote::S3Meta, b: &crate::remote::S3Meta) -> bool {
+    if a.objects.is_empty() || a.objects.len() != b.objects.len() {
+        return false;
+    }
+    let sorted = |m: &crate::remote::S3Meta| {
+        let mut v: Vec<(String, String, u64)> = m
+            .objects
+            .iter()
+            .map(|o| (o.key.clone(), o.etag.clone(), o.size))
+            .collect();
+        v.sort();
+        v
+    };
+    sorted(a) == sorted(b)
 }
 
 /// Map a proxy-computed [`RemoteTensorDiff`](crate::remote::RemoteTensorDiff) into the

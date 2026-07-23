@@ -97,6 +97,10 @@ pub struct RemoteValueOpts {
     /// Ship the full per-bin histogram (the single-tensor `--tensor` table needs it);
     /// the bulk path leaves this off so only the small TVD summary crosses the wire.
     pub full_hist: bool,
+    /// How many tensors to read + compare concurrently on the proxy. Reading each
+    /// tensor's S3 object is latency-bound, so overlapping them is the main speedup;
+    /// `1` runs sequentially (the safe fallback if cstorch dislikes threads).
+    pub jobs: usize,
 }
 
 /// One tensor's remote value/distribution comparison. Fields are independently
@@ -788,8 +792,10 @@ fn value_diff_script(
         .map(|b| b.to_string())
         .unwrap_or_else(|| "None".into());
     let b = |x: bool| if x { "True" } else { "False" };
+    let jobs_lit = opts.jobs.max(1).to_string();
     const TEMPLATE: &str = r#"
-import sys, json, time
+import sys, json, time, threading
+from concurrent.futures import ThreadPoolExecutor
 OLD = __OLD__
 NEW = __NEW__
 PAIRS = __PAIRS__
@@ -797,13 +803,17 @@ WANT_VALUES = __WANT_VALUES__
 WANT_HIST = __WANT_HIST__
 FULL_HIST = __FULL_HIST__
 BINS = __BINS__
+JOBS = __JOBS__
 CHUNK = 4000000
 S = "__SENTINEL__"
 ST = "__STATUS__"
+_lock = threading.Lock()
 def emit(o):
-    sys.stdout.write(S + json.dumps(o) + "\n"); sys.stdout.flush()
+    with _lock:
+        sys.stdout.write(S + json.dumps(o) + "\n"); sys.stdout.flush()
 def stat(s):
-    sys.stdout.write(ST + s + "\n"); sys.stdout.flush()
+    with _lock:
+        sys.stdout.write(ST + s + "\n"); sys.stdout.flush()
 try:
     import cerebras.pytorch as cstorch
 except Exception as e:
@@ -827,22 +837,21 @@ total = len(PAIRS)
 t0 = time.time()
 read_bytes = 0
 compared = 0
-for idx in range(total):
+def work(idx):
     oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
     stat("start\t%d\t%d\t%s" % (idx + 1, total, nname))
     res = {"name": nname}
+    tb = 0
     try:
         a = old_sd[oname]; b = new_sd[nname]
         ashape = [int(d) for d in a.shape]; bshape = [int(d) for d in b.shape]
         if ashape != bshape:
-            res["error"] = "shapes differ"; emit(res); continue
+            res["error"] = "shapes differ"; emit(res); return 0
         # Realise each side to CPU once (one read of its stored bytes from S3); the
         # per-chunk float64 conversions below then work off the in-memory copy.
         ra = a.to("cpu"); rb = b.to("cpu")
         tb = ra.element_size() * ra.nelement() + rb.element_size() * rb.nelement()
         res["bytes"] = int(tb)
-        read_bytes += tb
-        compared += 1
         scalar = (len(ashape) == 0)
         d0 = 0 if scalar else ashape[0]
         inner = 1
@@ -913,6 +922,18 @@ for idx in range(total):
     except Exception as e:
         res["error"] = "%r" % (e,)
     emit(res)
+    return tb
+# Reading each tensor's S3 object is latency-bound, so overlap JOBS of them; results
+# are order-independent. JOBS<=1 stays sequential (the safe fallback). Byte + count
+# tallies happen in this main thread as results land, so no locking is needed there.
+if JOBS <= 1:
+    tbs = (work(i) for i in range(total))
+else:
+    ex = ThreadPoolExecutor(max_workers=JOBS)
+    tbs = ex.map(work, range(total))
+for tb in tbs:
+    if tb > 0:
+        read_bytes += tb; compared += 1
 emit({"summary": {"tensors": total, "compared": compared, "bytes": int(read_bytes), "elapsed_s": time.time() - t0}})
 "#;
     TEMPLATE
@@ -923,6 +944,7 @@ emit({"summary": {"tensors": total, "compared": compared, "bytes": int(read_byte
         .replace("__WANT_HIST__", b(opts.histogram))
         .replace("__FULL_HIST__", b(opts.full_hist))
         .replace("__BINS__", &bins_lit)
+        .replace("__JOBS__", &jobs_lit)
         .replace("__SENTINEL__", SENTINEL)
         .replace("__STATUS__", STATUS_TAG)
 }
@@ -1545,6 +1567,7 @@ mod tests {
             histogram: true,
             bins: Some(32),
             full_hist: false,
+            jobs: 8,
         };
         let s = value_diff_script("s3://b/old", "s3://b/new", &pairs, &opts);
         assert!(s.contains(r#"OLD = "s3://b/old""#), "{s}");
@@ -1562,6 +1585,9 @@ mod tests {
         assert!(s.contains("stat(\"load\\told\")"), "{s}");
         assert!(s.contains("stat(\"start\\t"), "{s}");
         assert!(s.contains("res[\"bytes\"]"), "{s}");
+        // Parallel reads driven by JOBS via a thread pool.
+        assert!(s.contains("JOBS = 8"), "{s}");
+        assert!(s.contains("ThreadPoolExecutor"), "{s}");
         // Read-only: it loads + reads to compare, never saves/writes/uploads/deletes.
         for forbidden in [
             "cstorch.save",
@@ -1588,10 +1614,12 @@ mod tests {
                 histogram: false,
                 bins: None,
                 full_hist: false,
+                jobs: 1,
             },
         );
         assert!(vonly.contains("WANT_HIST = False"), "{vonly}");
         assert!(vonly.contains("BINS = None"), "{vonly}");
+        assert!(vonly.contains("JOBS = 1"), "{vonly}");
     }
 
     #[test]
