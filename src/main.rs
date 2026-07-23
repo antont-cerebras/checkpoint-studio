@@ -1351,10 +1351,20 @@ fn drive_bars(
 ) {
     use crate::remote::RepackEvent as E;
     match ev {
-        // Loading a checkpoint / starting a tensor / switching to the compare phase
-        // needs no bar change — the bar sweeps (total unknown) until the byte sizes
-        // arrive, then fills as they stream in.
-        E::Loading(_) | E::Start { .. } | E::Comparing(_) => {}
+        // Loading a checkpoint / starting a tensor needs no bar change — the bar
+        // sweeps (total unknown) until the byte sizes arrive, then fills as they
+        // stream in.
+        E::Loading(_) | E::Start { .. } => {}
+        // Bytes all read; the proxy now decodes + compares the tensor. Flag it so
+        // the (now full) byte bar shows `· comparing…` with its still-running timer
+        // instead of looking stuck.
+        E::Comparing(name) => {
+            if let Some(&i) = index.get(name)
+                && let Some(p) = bars.progress(i)
+            {
+                p.set_phase(progress::Phase::Comparing);
+            }
+        }
         E::Size {
             name,
             old_bytes,

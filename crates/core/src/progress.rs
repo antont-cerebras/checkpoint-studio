@@ -22,6 +22,9 @@ pub struct LoadProgress {
     total: AtomicUsize,
     /// What the count counts, for the bar's label (0 = unlabelled).
     unit: AtomicU8,
+    /// A trailing activity note (0 = none) for a bar whose count has maxed out but
+    /// whose work continues — see [`Phase`].
+    phase: AtomicU8,
 }
 
 /// What a [`LoadProgress`] count measures — shown after the `done/total` on the
@@ -38,6 +41,16 @@ pub enum Unit {
     /// Bytes read (a per-tensor download bar on the ssh proxy) — rendered as human
     /// sizes (`3.2 GiB/12.6 GiB`) instead of a raw count.
     Bytes,
+}
+
+/// A short trailing note on a bar whose count has reached its total but whose work
+/// isn't finished — so a full bar with a still-running timer reads as *active*, not
+/// stuck. Used by the remote value comparison: once a tensor's bytes are all read,
+/// the proxy still has to decode + compare it (which the byte bar can't show).
+#[derive(Clone, Copy)]
+pub enum Phase {
+    /// Bytes all read; the proxy is now decoding + comparing the tensor.
+    Comparing,
 }
 
 impl LoadProgress {
@@ -76,6 +89,22 @@ impl LoadProgress {
     /// Whether the count is a byte count (rendered as human sizes, not a raw count).
     pub fn is_bytes(&self) -> bool {
         self.unit.load(Ordering::Relaxed) == 5
+    }
+
+    /// Set the trailing activity note (shown only while the bar is still running).
+    pub fn set_phase(&self, phase: Phase) {
+        let code = match phase {
+            Phase::Comparing => 1,
+        };
+        self.phase.store(code, Ordering::Relaxed);
+    }
+
+    /// The trailing activity note for the bar (`""` when none).
+    pub fn phase_note(&self) -> &'static str {
+        match self.phase.load(Ordering::Relaxed) {
+            1 => " · comparing…",
+            _ => "",
+        }
     }
 
     /// Mark one more unit complete.
@@ -215,8 +244,10 @@ fn spawn(
     // wrap and break the fixed-height redraw. Truncate in the *middle* so both
     // ends — the `s3://`/`host:` prefix and the checkpoint tail — stay visible.
     let cols = crate::utils::term_width(80);
-    // "  ⠋ <label>  [bar]  123/456  12.3s"
-    let budget = cols.saturating_sub(BAR_COLS + 30).max(20);
+    // Reserve room for the widest possible tail so the line can't wrap: the bar
+    // itself + a byte count (`999.9 MiB/999.9 MiB`) + the `· comparing…` note +
+    // the timer + separators — "  ⠋ <label>  [bar] 999.9 MiB/999.9 MiB · comparing…  12.3s".
+    let budget = cols.saturating_sub(BAR_COLS + 48).max(20);
     let labels: Vec<String> = labels.iter().map(|l| truncate_middle(l, budget)).collect();
     std::thread::spawn(move || {
         const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -271,8 +302,16 @@ fn spawn(
                     } else {
                         format!("{done}/{total}{unit}")
                     };
+                    // A trailing note (e.g. `· comparing…`) when work continues past
+                    // a full bar — but only while running, so a finished `✓` bar
+                    // doesn't keep claiming to compare.
+                    let note = if st == RUNNING {
+                        progress[k].phase_note()
+                    } else {
+                        ""
+                    };
                     format!(
-                        "  {color}{}{RESET}{DIM}{}{RESET} {count}",
+                        "  {color}{}{RESET}{DIM}{}{RESET} {count}{DIM}{note}{RESET}",
                         "━".repeat(filled),
                         "━".repeat(BAR_COLS - filled),
                     )
@@ -312,7 +351,7 @@ fn spawn(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadProgress, Unit, filled_cols, sweep_pos, truncate_middle};
+    use super::{LoadProgress, Phase, Unit, filled_cols, sweep_pos, truncate_middle};
 
     #[test]
     fn load_progress_tracks_done_and_total() {
@@ -325,6 +364,14 @@ mod tests {
         p.advance();
         assert_eq!(p.snapshot(), (2, 48));
         assert_eq!(p.unit_label(), " shards");
+    }
+
+    #[test]
+    fn phase_note_is_off_until_set() {
+        let p = LoadProgress::new();
+        assert_eq!(p.phase_note(), ""); // no note by default
+        p.set_phase(Phase::Comparing);
+        assert_eq!(p.phase_note(), " · comparing…");
     }
 
     #[test]
