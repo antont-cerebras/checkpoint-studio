@@ -184,12 +184,28 @@ pub struct RepackResult {
 /// shows them "unchanged" even when their values differ.
 #[derive(Debug, Clone)]
 pub struct RepackAux {
-    /// `Some((old_shape, new_shape))` when the shapes differ (not compared).
+    /// The tensor names actually looked up (old side, new side) — so the report can
+    /// show exactly what was compared. Equal when there was no rename.
+    pub old_name: String,
+    pub new_name: String,
+    /// Whether the sibling was found on each side (the derived name may be wrong).
+    pub old_present: bool,
+    pub new_present: bool,
+    /// The new side's shape (empty when not found).
+    pub shape: Vec<usize>,
+    /// `Some((old_shape, new_shape))` when the shapes differ (not value-compared).
     pub shape_mismatch: Option<(Vec<usize>, Vec<usize>)>,
     pub elements: u64,
     pub differing: u64,
     pub max_abs: f64,
     pub mean_abs: f64,
+}
+
+impl RepackAux {
+    /// Found on both sides.
+    pub fn present(&self) -> bool {
+        self.old_present && self.new_present
+    }
 }
 
 /// A decoded 2-D window of indices for both sides — the top-left is
@@ -1248,14 +1264,20 @@ def read_aux(sd, name):   # a small float sibling tensor (codebook / scale), as 
         return None
     return sd[name].to("cpu").to(torch.float64).numpy()
 def cmp_aux(oname_a, nname_a):
+    # Always returns a dict recording the tensor NAMES tried, so the caller can show
+    # exactly what was compared (and flag when the sibling wasn't found).
     a = read_aux(old_sd, oname_a); b = read_aux(new_sd, nname_a)
+    out = {"old_name": oname_a, "new_name": nname_a,
+           "old_present": a is not None, "new_present": b is not None}
     if a is None or b is None:
-        return None
+        return out
+    out["shape_old"] = [int(x) for x in a.shape]; out["shape_new"] = [int(x) for x in b.shape]
     if list(a.shape) != list(b.shape):
-        return {"shape_old": [int(x) for x in a.shape], "shape_new": [int(x) for x in b.shape]}
+        return out
     d = np.abs(a - b)
-    return {"elements": int(a.size), "differing": int(np.count_nonzero(a != b)),
-            "max_abs": float(d.max()) if d.size else 0.0, "mean_abs": float(d.mean()) if d.size else 0.0}
+    out.update({"elements": int(a.size), "differing": int(np.count_nonzero(a != b)),
+                "max_abs": float(d.max()) if d.size else 0.0, "mean_abs": float(d.mean()) if d.size else 0.0})
+    return out
 total = len(PAIRS)
 t0 = time.time()
 agg_lock = threading.Lock()
@@ -1357,10 +1379,8 @@ def work(idx):
         # (the same weights quantised against a different codebook).
         if oname.endswith(".weight") and nname.endswith(".weight"):
             op = oname[:-7]; npx = nname[:-7]
-            cb = cmp_aux(op + ".codebook", npx + ".codebook")
-            if cb is not None: res["codebook"] = cb
-            qs = cmp_aux(op + ".qscale", npx + ".qscale")
-            if qs is not None: res["qscale"] = qs
+            res["codebook"] = cmp_aux(op + ".codebook", npx + ".codebook")
+            res["qscale"] = cmp_aux(op + ".qscale", npx + ".qscale")
         with agg_lock:
             read_bytes[0] += tb; compared[0] += 1
     except Exception as e:
@@ -1674,12 +1694,27 @@ fn parse_repack_result(v: &serde_json::Value) -> RepackResult {
                 })
                 .unwrap_or_default()
         };
-        let shape_mismatch = a
-            .get("shape_old")
-            .map(|_| (dims("shape_old"), dims("shape_new")));
         let au = |k: &str| a.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
         let af = |k: &str| a.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+        let astr = |k: &str| {
+            a.get(k)
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let ab = |k: &str| {
+            a.get(k)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        };
+        let (so, sn) = (dims("shape_old"), dims("shape_new"));
+        let shape_mismatch = (!so.is_empty() && so != sn).then(|| (so, sn.clone()));
         Some(RepackAux {
+            old_name: astr("old_name"),
+            new_name: astr("new_name"),
+            old_present: ab("old_present"),
+            new_present: ab("new_present"),
+            shape: sn,
             shape_mismatch,
             elements: au("elements"),
             differing: au("differing"),
@@ -2306,23 +2341,31 @@ mod tests {
     fn parse_repack_reads_results_and_flags_format() {
         let out = format!(
             "{s}{{\"name\":\"a\",\"elements\":100,\"differing\":0,\"sparse_bad\":0,\"dense_bad\":0,\"fold\":5,\
-             \"codebook\":{{\"elements\":64,\"differing\":0,\"max_abs\":0.0,\"mean_abs\":0.0}}}}\n\
+             \"codebook\":{{\"old_name\":\"a.codebook\",\"new_name\":\"a.codebook\",\"old_present\":true,\"new_present\":true,\
+             \"shape_old\":[8,8],\"shape_new\":[8,8],\"elements\":64,\"differing\":0,\"max_abs\":0.0,\"mean_abs\":0.0}}}}\n\
              {s}{{\"name\":\"b\",\"elements\":100,\"differing\":7,\"sparse_bad\":0,\"dense_bad\":0,\"fold\":5,\"first\":[3,12,5,2],\
-             \"codebook\":{{\"elements\":64,\"differing\":9,\"max_abs\":0.03,\"mean_abs\":0.001}},\
-             \"qscale\":{{\"shape_old\":[8,2],\"shape_new\":[8,3]}}}}\n\
-             {s}{{\"name\":\"c\",\"elements\":100,\"differing\":0,\"sparse_bad\":9,\"dense_bad\":0,\"fold\":5}}\n\
+             \"codebook\":{{\"old_name\":\"b.codebook\",\"new_name\":\"b.codebook\",\"old_present\":true,\"new_present\":true,\
+             \"shape_old\":[8,8],\"shape_new\":[8,8],\"elements\":64,\"differing\":9,\"max_abs\":0.03,\"mean_abs\":0.001}},\
+             \"qscale\":{{\"old_name\":\"b.qscale\",\"new_name\":\"b.qscale\",\"old_present\":true,\"new_present\":true,\
+             \"shape_old\":[8,2],\"shape_new\":[8,3]}}}}\n\
+             {s}{{\"name\":\"c\",\"elements\":100,\"differing\":0,\"sparse_bad\":9,\"dense_bad\":0,\"fold\":5,\
+             \"codebook\":{{\"old_name\":\"c.codebook\",\"new_name\":\"c.codebook\",\"old_present\":true,\"new_present\":false}}}}\n\
              {s}{{\"summary\":{{\"tensors\":3,\"compared\":3,\"bytes\":2048,\"elapsed_s\":2.0}}}}\n",
             s = SENTINEL
         );
         let (m, stats) = parse_repack(&out, "host").unwrap();
         assert_eq!(m.len(), 3);
         assert!(m["a"].equivalent(), "a should be equivalent");
-        assert!(m["a"].codebook.as_ref().unwrap().differing == 0);
+        let acb = m["a"].codebook.as_ref().unwrap();
+        assert!(acb.present() && acb.differing == 0);
+        assert_eq!(acb.new_name, "a.codebook");
         assert_eq!(m["b"].differing, 7);
         assert_eq!(m["b"].first_mismatch, Some((3, 12, 5, 2)));
         assert!(!m["b"].equivalent());
-        // The sibling codebook diff is parsed alongside.
+        // The sibling codebook diff is parsed alongside, with its name + shape.
         let cb = m["b"].codebook.as_ref().unwrap();
+        assert_eq!(cb.new_name, "b.codebook");
+        assert_eq!(cb.shape, vec![8, 8]);
         assert_eq!(cb.differing, 9);
         assert!((cb.max_abs - 0.03).abs() < 1e-9);
         // A shape mismatch on a sibling is carried too.
@@ -2330,6 +2373,8 @@ mod tests {
             m["b"].qscale.as_ref().unwrap().shape_mismatch,
             Some((vec![8, 2], vec![8, 3]))
         );
+        // A sibling missing on one side is reported (not silently dropped).
+        assert!(!m["c"].codebook.as_ref().unwrap().present());
         // A format violation makes it non-equivalent even with 0 differing.
         assert_eq!(m["c"].sparse_bad, 9);
         assert!(!m["c"].equivalent());

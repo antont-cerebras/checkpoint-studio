@@ -2490,13 +2490,34 @@ fn print_repack_aux(
     reset: &str,
 ) {
     let Some(a) = aux else { return };
-    if let Some((o, n)) = &a.shape_mismatch {
-        println!("      {label}: {yellow}shape differs{reset} {dim}{o:?} vs {n:?}{reset}");
+    // Show exactly which sibling tensor was compared (so a wrong-name inference is
+    // visible), plus its shape.
+    let named = if a.old_name == a.new_name {
+        format!("{dim}{}{reset}", a.new_name)
+    } else {
+        format!("{dim}{} vs {}{reset}", a.old_name, a.new_name)
+    };
+    if !a.present() {
+        let miss = match (a.old_present, a.new_present) {
+            (false, false) => "not found on either side",
+            (false, true) => "not found in old",
+            (true, false) => "not found in new",
+            _ => "",
+        };
+        println!("      {label} ({named}): {dim}{miss}{reset}");
+    } else if let Some((o, n)) = &a.shape_mismatch {
+        println!(
+            "      {label} ({named}): {yellow}shape differs{reset} {dim}{o:?} vs {n:?}{reset}"
+        );
     } else if a.differing == 0 {
-        println!("      {label}: {green}identical{reset}");
+        println!(
+            "      {label} ({named} {:?}): {green}identical{reset}",
+            a.shape
+        );
     } else {
         println!(
-            "      {label}: {yellow}differs{reset} {dim}— max |Δ| {:.5}, mean {:.5}, {}/{} entries{reset}",
+            "      {label} ({named} {:?}): {yellow}differs{reset} {dim}— max |Δ| {:.5}, mean {:.5}, {}/{} entries{reset}",
+            a.shape,
             a.max_abs,
             a.mean_abs,
             crate::utils::format_parameters(a.differing as usize),
