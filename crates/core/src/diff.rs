@@ -957,15 +957,26 @@ pub struct DiffReport {
 impl DiffReport {
     /// True when anything was added, removed, or changed — drives the exit code
     /// (`1` like `diff`, vs `0` when the two checkpoints are structurally identical).
-    pub fn has_differences(&self) -> bool {
+    /// `count_s3` folds in whole-prefix S3 object-metadata material changes (a
+    /// re-uploaded object, a differing ETag, …); pass `false` when a `--name` filter
+    /// scoped the diff to a subset of tensors, since the S3 comparison is
+    /// whole-prefix and thus out of that scope — exactly like the metadata section,
+    /// which is likewise "not compared (filtered subset)". Timestamp-only S3 deltas
+    /// never count either way.
+    pub fn has_differences_with(&self, count_s3: bool) -> bool {
         !self.tensors_removed.is_empty()
             || !self.tensors_added.is_empty()
             || !self.tensors_changed.is_empty()
             || !self.meta_removed.is_empty()
             || !self.meta_added.is_empty()
             || !self.meta_changed.is_empty()
-            // S3 material changes count; timestamp-only deltas never do.
-            || self.s3.as_ref().is_some_and(S3Diff::has_material_changes)
+            || (count_s3 && self.s3.as_ref().is_some_and(S3Diff::has_material_changes))
+    }
+
+    /// [`Self::has_differences_with`] counting S3 material changes — the default
+    /// whole-checkpoint comparison (no `--name` filter).
+    pub fn has_differences(&self) -> bool {
+        self.has_differences_with(true)
     }
 
     /// Render the report as plain text: a `---`/`+++` header naming the two sides,
@@ -1335,6 +1346,22 @@ impl DiffReport {
                 for (tmpl, n) in collapse(keys) {
                     let _ = writeln!(s, "  ~ {tmpl}{}  ({fields})", count(n));
                 }
+            }
+            // Under a `--name` filter the diff is scoped to a subset of tensors, but
+            // the S3 comparison is always whole-prefix — so these object-level changes
+            // are outside the compared scope and don't drive the exit code (the value
+            // verdict / tensor diff of the subset does). Say so, or a `~1` above next
+            // to exit 0 looks contradictory.
+            if opts.filtered && !by_fields.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "{}",
+                    paint(
+                        "  info: S3 object changes are whole-prefix — not counted for the exit code under a --name filter (compares the named subset only)",
+                        opts.color,
+                        DIM
+                    )
+                );
             }
             // Timestamp-only deltas are informational — never a difference. Summarise
             // them by field-set (a per-object list of "differs only in last-modified"
@@ -2720,6 +2747,45 @@ mod tests {
         assert!(!r.has_differences());
         assert_eq!(r.tensors_unchanged, 1);
         assert_eq!(r.meta_unchanged, 1);
+    }
+
+    #[test]
+    fn filtered_diff_ignores_whole_prefix_s3_changes_for_exit_code() {
+        // Tensors on both sides match, but a whole-prefix S3 object (e.g. a
+        // re-uploaded `__METADATA__`) differs in ETag — a material change.
+        let a = summary(&[("w", sig("F16", &[2, 2]))], &[]);
+        let b = summary(&[("w", sig("F16", &[2, 2]))], &[]);
+        let mut r = compare(&a, &b);
+        let old = S3Meta {
+            objects: vec![s3obj("__METADATA__", "md5aaa", 10, &[], &[], "t")],
+            warnings: vec![],
+        };
+        let new = S3Meta {
+            objects: vec![s3obj("__METADATA__", "md5bbb", 10, &[], &[], "t")],
+            warnings: vec![],
+        };
+        r.s3 = Some(compare_s3(&old, &new));
+        // Whole-checkpoint compare: the S3 material change counts (exit 1).
+        assert!(r.has_differences());
+        assert!(r.has_differences_with(true));
+        // Under a `--name` filter the S3 diff is out of the compared subset's scope,
+        // so it no longer drives the exit code — the tensors matched → exit 0.
+        assert!(!r.has_differences_with(false));
+        // …and the report explains why a `~1` above sits next to exit 0.
+        let opts = DiffOpts {
+            color: false,
+            metadata: true,
+            group: true,
+            values: true,
+            histogram: false,
+            filtered: true,
+        };
+        let out = r.render("s3://old", "s3://new", opts);
+        assert!(out.contains("S3 objects: -0 +0 ~1"), "{out}");
+        assert!(
+            out.contains("not counted for the exit code under a --name filter"),
+            "{out}"
+        );
     }
 
     #[test]

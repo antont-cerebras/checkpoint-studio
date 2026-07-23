@@ -1902,7 +1902,10 @@ fn run_diff(
             repack_bits,
         );
     }
-    i32::from(report.has_differences())
+    // Under a `--name` filter the exit code reflects the compared tensor subset
+    // only; whole-prefix S3 object-metadata deltas (e.g. a re-uploaded `__METADATA__`
+    // or last-modified bumps) are out of that scope, like the metadata section.
+    i32::from(report.has_differences_with(!opts.filtered))
 }
 
 /// The `diff --verify-repack` path: find tensors present on both sides whose shapes
