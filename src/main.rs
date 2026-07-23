@@ -1336,415 +1336,57 @@ fn erase_block(prev_lines: usize) {
     }
 }
 
-/// Shared state for the remote value-comparison's live two-line view (below).
-struct RemoteCompareState {
-    inner: std::sync::Mutex<RemoteCompareInner>,
-    done: std::sync::atomic::AtomicUsize,
-    done_bytes: std::sync::atomic::AtomicU64,
-    total: usize,
-    total_bytes: u64,
-    stop: std::sync::atomic::AtomicBool,
-}
-
-#[derive(Default)]
-struct RemoteCompareInner {
-    /// `Some("old"/"new")` while a checkpoint is loading (before comparison starts).
-    loading: Option<String>,
-    /// The tensor being compared right now.
-    current: Option<String>,
-    /// The most recently finished tensor and its outcome.
-    last: Option<(String, crate::remote::CompareStatus)>,
-}
-
-/// Live view of the remote value comparison: **two lines** on stderr — the tensor
-/// last compared (with a ✓/≠/✗ status mark + running count and bytes), and the one
-/// in progress (spinner) — so the slow `cstorch.load` and each tensor are visible
-/// rather than a frozen counter. Erased when done, leaving the diff report clean.
-/// A no-op off a TTY. Fed by [`crate::remote::CompareEvent`]s.
-struct RemoteCompareView {
-    state: Option<std::sync::Arc<RemoteCompareState>>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl RemoteCompareView {
-    fn start(total: usize, total_bytes: u64) -> Self {
-        use std::io::IsTerminal;
-        if !std::io::stderr().is_terminal() {
-            return Self {
-                state: None,
-                handle: None,
-            };
-        }
-        let state = std::sync::Arc::new(RemoteCompareState {
-            inner: std::sync::Mutex::new(RemoteCompareInner::default()),
-            done: std::sync::atomic::AtomicUsize::new(0),
-            done_bytes: std::sync::atomic::AtomicU64::new(0),
-            total,
-            total_bytes,
-            stop: std::sync::atomic::AtomicBool::new(false),
-        });
-        let worker = std::sync::Arc::clone(&state);
-        let handle = std::thread::spawn(move || remote_compare_loop(worker));
-        Self {
-            state: Some(state),
-            handle: Some(handle),
-        }
-    }
-
-    /// Apply one streamed event to the shared state.
-    fn on(&self, ev: crate::remote::CompareEvent) {
-        use crate::remote::CompareEvent;
-        use std::sync::atomic::Ordering;
-        let Some(st) = &self.state else { return };
-        match ev {
-            CompareEvent::Loading(what) => {
-                if let Ok(mut i) = st.inner.lock() {
-                    i.loading = Some(what.to_string());
-                    i.current = None;
-                }
+/// Drive one standard [`progress::Bars`] bar per compared tensor from the remote
+/// comparison's [`RepackEvent`](crate::remote::RepackEvent) stream — shared by
+/// `--values` and `--verify-repack`. Each bar's total is the tensor's (old + new)
+/// S3 byte size (rendered as human sizes) and it fills as the proxy streams the two
+/// sides, settling to ✓ (compared / equivalent) or ✗ (error) as each lands. The
+/// comparison itself stays on the proxy — only the byte counts cross ssh. Names
+/// not among the pairs we asked for are ignored.
+fn drive_bars(
+    bars: &progress::Bars,
+    index: &std::collections::HashMap<&str, usize>,
+    finished: &std::cell::RefCell<Vec<bool>>,
+    ev: crate::remote::RepackEvent,
+) {
+    use crate::remote::RepackEvent as E;
+    match ev {
+        // Loading a checkpoint / starting a tensor / switching to the compare phase
+        // needs no bar change — the bar sweeps (total unknown) until the byte sizes
+        // arrive, then fills as they stream in.
+        E::Loading(_) | E::Start { .. } | E::Comparing(_) => {}
+        E::Size {
+            name,
+            old_bytes,
+            new_bytes,
+        } => {
+            if let Some(&i) = index.get(name)
+                && let Some(p) = bars.progress(i)
+            {
+                p.set_unit(progress::Unit::Bytes);
+                p.set_total((old_bytes + new_bytes) as usize);
             }
-            CompareEvent::Start { name, .. } => {
-                if let Ok(mut i) = st.inner.lock() {
-                    i.loading = None;
-                    i.current = Some(name.to_string());
-                }
+        }
+        E::Bytes {
+            name,
+            old_done,
+            new_done,
+        } => {
+            if let Some(&i) = index.get(name)
+                && let Some(p) = bars.progress(i)
+            {
+                p.set_done((old_done + new_done) as usize);
             }
-            CompareEvent::Done {
-                name,
-                status,
-                bytes,
-            } => {
-                st.done.fetch_add(1, Ordering::Relaxed);
-                st.done_bytes.fetch_add(bytes, Ordering::Relaxed);
-                if let Ok(mut i) = st.inner.lock() {
-                    i.last = Some((name.to_string(), status));
-                    i.current = None;
+        }
+        E::Done { name, status } => {
+            if let Some(&i) = index.get(name) {
+                bars.finish(i, status != crate::remote::CompareStatus::Error);
+                if let Some(f) = finished.borrow_mut().get_mut(i) {
+                    *f = true;
                 }
             }
         }
     }
-
-    fn finish(mut self) {
-        use std::sync::atomic::Ordering;
-        if let Some(st) = &self.state {
-            st.stop.store(true, Ordering::Relaxed);
-        }
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-/// The two-line view's render thread: redraw ~10×/s until stopped, then erase.
-fn remote_compare_loop(st: std::sync::Arc<RemoteCompareState>) {
-    use std::io::Write;
-    use std::sync::atomic::Ordering;
-    let width = match crossterm::terminal::size() {
-        Ok((c, _)) if c > 0 => c as usize,
-        _ => 100,
-    };
-    let mut prev_lines = 0usize;
-    let mut frame = 0usize;
-    while !st.stop.load(Ordering::Relaxed) {
-        draw_block(&remote_compare_block(frame, &st, width), &mut prev_lines);
-        frame += 1;
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    erase_block(prev_lines);
-    let _ = std::io::stderr().flush();
-}
-
-/// Build the two lines: last-compared (status mark + count + bytes) and in-progress.
-fn remote_compare_block(frame: usize, st: &RemoteCompareState, width: usize) -> Vec<String> {
-    use std::sync::atomic::Ordering;
-    const GREEN: &str = "\x1b[1;32m";
-    const YELLOW: &str = "\x1b[1;33m";
-    const RED: &str = "\x1b[1;31m";
-    const CYAN: &str = "\x1b[1;36m";
-    const DIM: &str = "\x1b[2m";
-    const RESET: &str = "\x1b[0m";
-    let spin = DIFF_SPINNER[frame % DIFF_SPINNER.len()];
-    let done = st.done.load(Ordering::Relaxed);
-    let done_b = st.done_bytes.load(Ordering::Relaxed);
-    // Labelled progress: how many tensors compared, and how much data read so far,
-    // with a bar over the byte total. `read` advances as each tensor completes (the
-    // remote materialises a tensor in one shot, so there's no sub-tensor progress).
-    let bar = mini_bar(done_b, st.total_bytes, 12);
-    let read = format!(
-        "{}/{} read",
-        utils::format_size(done_b as usize),
-        utils::format_size(st.total_bytes as usize),
-    );
-    // Plain-text version of the tail, for budgeting the name width (ANSI-free).
-    let tail_plain = format!("  {done}/{} tensors · {} {read}", st.total, "-".repeat(12));
-    let (loading, current, last) = st
-        .inner
-        .lock()
-        .map(|i| (i.loading.clone(), i.current.clone(), i.last.clone()))
-        .unwrap_or_default();
-
-    // Line 1 — the tensor last compared, with its outcome + overall progress.
-    let counts_col = format!(
-        "{DIM}{done}/{} tensors ·{RESET} {CYAN}{bar}{RESET} {DIM}{read}{RESET}",
-        st.total
-    );
-    let name_budget = width.saturating_sub(tail_plain.chars().count() + 4).max(12);
-    let line1 = if let Some((name, status)) = last {
-        use crate::remote::CompareStatus::*;
-        let (color, mark) = match status {
-            Identical => (GREEN, '✓'),
-            Changed => (YELLOW, '≠'),
-            Error => (RED, '✗'),
-        };
-        format!(
-            "{color}{mark}{RESET} {DIM}{}{RESET}  {counts_col}",
-            truncate_tail(&name, name_budget)
-        )
-    } else {
-        format!("{DIM}(starting…){RESET}  {counts_col}")
-    };
-
-    // Line 2 — what's happening right now.
-    let line2 = if let Some(what) = loading {
-        format!("{CYAN}{spin}{RESET} {DIM}loading {what} checkpoint …{RESET}")
-    } else if let Some(name) = current {
-        format!(
-            "{CYAN}{spin}{RESET} {DIM}reading{RESET} {}",
-            truncate_tail(&name, width.saturating_sub(11).max(12))
-        )
-    } else {
-        format!("{CYAN}{spin}{RESET} {DIM}…{RESET}")
-    };
-    vec![line1, line2]
-}
-
-/// One tensor's download state in the repack view.
-struct RepackTensorDl {
-    name: String,
-    old_total: u64,
-    new_total: u64,
-    old_done: u64,
-    new_done: u64,
-    phase: RepackDlPhase,
-}
-
-enum RepackDlPhase {
-    Downloading,
-    Comparing,
-    Done(crate::remote::CompareStatus),
-}
-
-#[derive(Default)]
-struct RepackDlInner {
-    loading: Option<String>,
-    tensors: Vec<RepackTensorDl>,
-}
-
-struct RepackDlState {
-    inner: std::sync::Mutex<RepackDlInner>,
-    stop: std::sync::atomic::AtomicBool,
-}
-
-/// Live view for `--verify-repack`: **one line per tensor**, each a real download
-/// bar over (old + new) bytes with per-side sizes and a phase (downloading /
-/// comparing / done ✓≠✗). Reads run in parallel on the proxy, so several bars fill
-/// at once. Erased when done; a no-op off a TTY.
-struct RepackView {
-    state: Option<std::sync::Arc<RepackDlState>>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl RepackView {
-    fn start() -> Self {
-        use std::io::IsTerminal;
-        if !std::io::stderr().is_terminal() {
-            return Self {
-                state: None,
-                handle: None,
-            };
-        }
-        let state = std::sync::Arc::new(RepackDlState {
-            inner: std::sync::Mutex::new(RepackDlInner::default()),
-            stop: std::sync::atomic::AtomicBool::new(false),
-        });
-        let worker = std::sync::Arc::clone(&state);
-        let handle = std::thread::spawn(move || repack_view_loop(worker));
-        Self {
-            state: Some(state),
-            handle: Some(handle),
-        }
-    }
-
-    fn on(&self, ev: crate::remote::RepackEvent) {
-        use crate::remote::RepackEvent as E;
-        let Some(st) = &self.state else { return };
-        let Ok(mut i) = st.inner.lock() else { return };
-        // Locate (or create) the tensor row by name.
-        let row = |i: &mut RepackDlInner, name: &str| -> usize {
-            if let Some(p) = i.tensors.iter().position(|t| t.name == name) {
-                p
-            } else {
-                i.tensors.push(RepackTensorDl {
-                    name: name.to_string(),
-                    old_total: 0,
-                    new_total: 0,
-                    old_done: 0,
-                    new_done: 0,
-                    phase: RepackDlPhase::Downloading,
-                });
-                i.tensors.len() - 1
-            }
-        };
-        match ev {
-            E::Loading(w) => i.loading = Some(w.to_string()),
-            E::Start { name, .. } => {
-                i.loading = None;
-                row(&mut i, name);
-            }
-            E::Size {
-                name,
-                old_bytes,
-                new_bytes,
-            } => {
-                let r = row(&mut i, name);
-                i.tensors[r].old_total = old_bytes;
-                i.tensors[r].new_total = new_bytes;
-            }
-            E::Bytes {
-                name,
-                old_done,
-                new_done,
-            } => {
-                let r = row(&mut i, name);
-                i.tensors[r].old_done = old_done;
-                i.tensors[r].new_done = new_done;
-            }
-            E::Comparing(name) => {
-                let r = row(&mut i, name);
-                i.tensors[r].phase = RepackDlPhase::Comparing;
-            }
-            E::Done { name, status } => {
-                let r = row(&mut i, name);
-                // Snap the bar to full on success.
-                i.tensors[r].old_done = i.tensors[r].old_total;
-                i.tensors[r].new_done = i.tensors[r].new_total;
-                i.tensors[r].phase = RepackDlPhase::Done(status);
-            }
-        }
-    }
-
-    fn finish(mut self) {
-        use std::sync::atomic::Ordering;
-        if let Some(st) = &self.state {
-            st.stop.store(true, Ordering::Relaxed);
-        }
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-fn repack_view_loop(st: std::sync::Arc<RepackDlState>) {
-    use std::io::Write;
-    use std::sync::atomic::Ordering;
-    let width = match crossterm::terminal::size() {
-        Ok((c, _)) if c > 0 => c as usize,
-        _ => 100,
-    };
-    let mut prev = 0usize;
-    let mut frame = 0usize;
-    while !st.stop.load(Ordering::Relaxed) {
-        if let Ok(i) = st.inner.lock() {
-            draw_block(&repack_view_block(frame, &i, width), &mut prev);
-        }
-        frame += 1;
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    erase_block(prev);
-    let _ = std::io::stderr().flush();
-}
-
-/// A `[███░░░]`-style bar of `w` columns for `done/total` (empty if total is 0).
-fn mini_bar(done: u64, total: u64, w: usize) -> String {
-    let filled = if total == 0 {
-        0
-    } else {
-        (((done as f64 / total as f64) * w as f64).round() as usize).min(w)
-    };
-    format!("{}{}", "█".repeat(filled), "░".repeat(w - filled))
-}
-
-fn repack_view_block(frame: usize, i: &RepackDlInner, width: usize) -> Vec<String> {
-    use crate::remote::CompareStatus::*;
-    const GREEN: &str = "\x1b[1;32m";
-    const YELLOW: &str = "\x1b[1;33m";
-    const RED: &str = "\x1b[1;31m";
-    const CYAN: &str = "\x1b[1;36m";
-    const DIM: &str = "\x1b[2m";
-    const RESET: &str = "\x1b[0m";
-    let spin = DIFF_SPINNER[frame % DIFF_SPINNER.len()];
-    if let Some(w) = &i.loading {
-        return vec![format!(
-            "{CYAN}{spin}{RESET} {DIM}loading {w} checkpoint …{RESET}"
-        )];
-    }
-    const BARW: usize = 18;
-    let mut lines = Vec::with_capacity(i.tensors.len());
-    for t in &i.tensors {
-        let done = t.old_done + t.new_done;
-        let total = t.old_total + t.new_total;
-        let (mark, phase_plain, phase_col): (String, &str, String) = match t.phase {
-            RepackDlPhase::Downloading => (
-                format!("{CYAN}{spin}{RESET}"),
-                "downloading",
-                "downloading".into(),
-            ),
-            RepackDlPhase::Comparing => (
-                format!("{CYAN}{spin}{RESET}"),
-                "comparing…",
-                format!("{DIM}comparing…{RESET}"),
-            ),
-            RepackDlPhase::Done(Identical) => (
-                format!("{GREEN}✓{RESET}"),
-                "equivalent",
-                format!("{GREEN}equivalent{RESET}"),
-            ),
-            RepackDlPhase::Done(Changed) => (
-                format!("{YELLOW}≠{RESET}"),
-                "differ",
-                format!("{YELLOW}differ{RESET}"),
-            ),
-            RepackDlPhase::Done(Error) => (
-                format!("{RED}✗{RESET}"),
-                "error",
-                format!("{RED}error{RESET}"),
-            ),
-        };
-        let bar = mini_bar(done, total, BARW);
-        let (d, tt) = (
-            utils::format_size(done as usize),
-            utils::format_size(total as usize),
-        );
-        let (ot, nt) = (
-            utils::format_size(t.old_total as usize),
-            utils::format_size(t.new_total as usize),
-        );
-        let sizes_plain = format!("{d}/{tt} (old {ot}, new {nt})");
-        let sizes_col = format!("{d}/{tt} {DIM}(old {ot}, new {nt}){RESET}");
-        // Budget the name so the WHOLE line fits the terminal width (mark + name +
-        // bar + sizes + phase, plus separators) — a wrapped line breaks the in-place
-        // redraw (draw_block counts logical lines), corrupting later output.
-        let overhead =
-            1 + 1 + 2 + BARW + 1 + sizes_plain.chars().count() + 2 + phase_plain.chars().count();
-        let name = truncate_tail(&t.name, width.saturating_sub(overhead + 1).max(8));
-        lines.push(format!(
-            "{mark} {name}  {CYAN}{bar}{RESET} {sizes_col}  {phase_col}"
-        ));
-    }
-    if lines.is_empty() {
-        lines.push(format!("{CYAN}{spin}{RESET} {DIM}starting…{RESET}"));
-    }
-    lines
 }
 
 /// Human-readable elapsed time: `850ms`, `12.3s`, or `2m3s`.
@@ -2413,9 +2055,26 @@ fn fetch_remote_repack(
         r.host,
         pairs.len().clamp(1, 4),
     );
-    let view = RepackView::start();
-    let out = r.verify_repack(&session, old_uri, new_uri, pairs, bits, |ev| view.on(ev));
-    view.finish();
+    // One standard progress bar per tensor (labelled by the *new* name), each
+    // filling over its (old + new) S3 byte size as the proxy streams the two sides.
+    let bars = progress::Bars::start(pairs.iter().map(|(_, n)| n.clone()).collect());
+    let index: std::collections::HashMap<&str, usize> = pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (_, n))| (n.as_str(), i))
+        .collect();
+    let finished = std::cell::RefCell::new(vec![false; pairs.len()]);
+    let out = r.verify_repack(&session, old_uri, new_uri, pairs, bits, |ev| {
+        drive_bars(&bars, &index, &finished, ev)
+    });
+    // Settle any bar that never got a Done (a fatal mid-run error) so the animation
+    // thread sees every bar finished and `join` returns.
+    for (i, done) in finished.borrow().iter().enumerate() {
+        if !done {
+            bars.finish(i, false);
+        }
+    }
+    bars.join();
     let (map, stats) = out?;
     if let Some(s) = stats {
         let elapsed = std::time::Duration::from_secs_f64(s.elapsed_s.max(0.0));
@@ -2686,11 +2345,11 @@ fn tensor_histogram(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> Option<di
 /// Open a session (reusing the already-entered `password`, so no second prompt) and
 /// run the proxy value comparison for `pairs`. The comparison happens **on the
 /// remote** (it holds the S3 access); only the small per-tensor results come back,
-/// never tensor data. A live two-line view ([`RemoteCompareView`]) shows what's
-/// loading / comparing now, and a final line reports the I/O throughput.
-/// `total_bytes` is the data to be read (both sides, stored dtype) — for the view's
-/// total and the intro. Used for both the bulk `--values`/`--histogram` run and the
-/// single `--tensor` focus.
+/// never tensor data. One standard [`progress::Bars`] bar per tensor fills over its
+/// S3 byte size as the proxy streams the two sides ([`drive_bars`]), and a final
+/// line reports the I/O throughput. `total_bytes` is the data to be read (both
+/// sides, stored dtype) — for the intro estimate. Used for both the bulk
+/// `--values`/`--histogram` run and the single `--tensor` focus.
 fn fetch_remote_value_diff(
     r: &crate::remote::RemoteRead,
     password: &mut Option<String>,
@@ -2710,9 +2369,25 @@ fn fetch_remote_value_diff(
         crate::utils::format_size(total_bytes as usize),
         vopts.jobs.max(1),
     );
-    let view = RemoteCompareView::start(pairs.len(), total_bytes);
-    let out = r.value_diff(&session, old_uri, new_uri, pairs, vopts, |ev| view.on(ev));
-    view.finish();
+    // One standard progress bar per compared tensor, each filling over its
+    // (old + new) S3 byte size as the proxy streams the two sides (the values are
+    // still compared on the proxy — only the byte counts and result cross ssh).
+    let bars = progress::Bars::start(pairs.iter().map(|(_, n)| n.clone()).collect());
+    let index: std::collections::HashMap<&str, usize> = pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (_, n))| (n.as_str(), i))
+        .collect();
+    let finished = std::cell::RefCell::new(vec![false; pairs.len()]);
+    let out = r.value_diff(&session, old_uri, new_uri, pairs, vopts, |ev| {
+        drive_bars(&bars, &index, &finished, ev)
+    });
+    for (i, done) in finished.borrow().iter().enumerate() {
+        if !done {
+            bars.finish(i, false);
+        }
+    }
+    bars.join();
     let (map, stats) = out?;
     // I/O + timing from the proxy: bytes read from S3 and the throughput, so a long
     // comparison's performance is visible (on stderr, keeping stdout's diff clean).

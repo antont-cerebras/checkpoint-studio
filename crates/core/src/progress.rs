@@ -35,6 +35,9 @@ pub enum Unit {
     /// Tensors compared value-by-value (the remote `diff --values`/`--histogram`
     /// phase, computed on the ssh proxy).
     Compared,
+    /// Bytes read (a per-tensor download bar on the ssh proxy) — rendered as human
+    /// sizes (`3.2 GiB/12.6 GiB`) instead of a raw count.
+    Bytes,
 }
 
 impl LoadProgress {
@@ -54,6 +57,7 @@ impl LoadProgress {
             Unit::Tensors => 2,
             Unit::S3Objects => 3,
             Unit::Compared => 4,
+            Unit::Bytes => 5,
         };
         self.unit.store(code, Ordering::Relaxed);
     }
@@ -67,6 +71,11 @@ impl LoadProgress {
             4 => " compared",
             _ => "",
         }
+    }
+
+    /// Whether the count is a byte count (rendered as human sizes, not a raw count).
+    pub fn is_bytes(&self) -> bool {
+        self.unit.load(Ordering::Relaxed) == 5
     }
 
     /// Mark one more unit complete.
@@ -250,10 +259,20 @@ fn spawn(
                 let bar = if total > 0 {
                     // Determinate: a thin bar in the TUI `LineGauge` style
                     // (`symbols::line::THICK`) — done part in the mark's colour, the
-                    // rest dim — plus the `done/total` count and its unit.
+                    // rest dim — plus the `done/total` count (human sizes for a byte
+                    // count) and its unit.
                     let filled = filled_cols(done, total, BAR_COLS);
+                    let count = if progress[k].is_bytes() {
+                        format!(
+                            "{}/{}",
+                            crate::utils::format_size(done),
+                            crate::utils::format_size(total)
+                        )
+                    } else {
+                        format!("{done}/{total}{unit}")
+                    };
                     format!(
-                        "  {color}{}{RESET}{DIM}{}{RESET} {done}/{total}{unit}",
+                        "  {color}{}{RESET}{DIM}{}{RESET} {count}",
                         "━".repeat(filled),
                         "━".repeat(BAR_COLS - filled),
                     )

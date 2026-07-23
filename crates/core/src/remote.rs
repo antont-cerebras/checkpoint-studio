@@ -238,28 +238,6 @@ const PROGRESS_TAG: &str = "CKPT_EXPLORER_PROG:";
 /// per-tensor start), so the two-line comparison view shows what's happening.
 const STATUS_TAG: &str = "CKPT_EXPLORER_STAT:";
 
-/// A live event streamed from the remote value comparison, driving the two-line
-/// progress view. Borrowed names point into the current output line (copy what you
-/// keep).
-#[derive(Debug)]
-pub enum CompareEvent<'a> {
-    /// A checkpoint is being loaded (`"old"` / `"new"`) — the slow cstorch.load
-    /// step, shown so a long load isn't mistaken for a hang.
-    Loading(&'a str),
-    /// Tensor `done` of `total` has begun comparing.
-    Start {
-        done: usize,
-        total: usize,
-        name: &'a str,
-    },
-    /// A tensor finished comparing, with its outcome and the bytes read for it.
-    Done {
-        name: &'a str,
-        status: CompareStatus,
-        bytes: u64,
-    },
-}
-
 /// The outcome of one tensor's value comparison, for the live view's status mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareStatus {
@@ -271,9 +249,10 @@ pub enum CompareStatus {
     Error,
 }
 
-/// A live event streamed from the remote repack verification, driving the
-/// per-tensor download bars. Richer than [`CompareEvent`]: it reports each side's
-/// download size + progress so the view can show real bars, not just spinners.
+/// A live event streamed from a remote value comparison (`--values` or
+/// `--verify-repack`), driving the standard per-tensor progress bars: it reports
+/// each side's S3 download size + byte progress so the bars fill for real, not just
+/// spin, then a per-tensor outcome as each one lands.
 #[derive(Debug)]
 pub enum RepackEvent<'a> {
     /// A checkpoint is loading (`"old"` / `"new"`).
@@ -662,10 +641,12 @@ impl RemoteRead {
     /// (never tensor data); the map returned is keyed by the *new* (post-rename)
     /// tensor name — the same key the diff report is built from.
     ///
-    /// `on_event` receives live [`CompareEvent`]s (checkpoint loading, each tensor
-    /// starting, each tensor finishing with its outcome + bytes) as the remote
-    /// streams them, so the caller can drive a live view of exactly what's being
-    /// compared — cstorch.load and a slow tensor are then visible, not a frozen bar.
+    /// Each side's S3 object is streamed on the proxy in chunks (in parallel across
+    /// `opts.jobs` tensors) purely so the byte progress can be reported — the values
+    /// are still compared on the proxy; only the counts and the small result cross
+    /// ssh. `on_event` receives live [`RepackEvent`]s (checkpoint loading, per-tensor
+    /// download size + byte progress, then each tensor's outcome) so the caller can
+    /// drive one standard progress bar per compared tensor.
     ///
     /// **Read-only:** loads (lazily) and reads tensor data to compare; it never
     /// writes, saves, or otherwise mutates either checkpoint.
@@ -676,45 +657,12 @@ impl RemoteRead {
         new_uri: &str,
         pairs: &[(String, String)],
         opts: &RemoteValueOpts,
-        mut on_event: impl FnMut(CompareEvent),
+        mut on_event: impl FnMut(RepackEvent),
     ) -> Result<(HashMap<String, RemoteTensorDiff>, Option<RemoteValueStats>)> {
         let script = value_diff_script(old_uri, new_uri, pairs, opts);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
         let out = session.exec_capture(&command, &script, |line| {
-            if let Some(rest) = line.strip_prefix(STATUS_TAG) {
-                // `load\t<old|new>` or `start\t<i>\t<total>\t<name>`.
-                let mut f = rest.split('\t');
-                match f.next() {
-                    Some("load") => {
-                        if let Some(w) = f.next() {
-                            on_event(CompareEvent::Loading(w));
-                        }
-                    }
-                    Some("start") => {
-                        if let (Some(i), Some(t), Some(name)) = (f.next(), f.next(), f.next())
-                            && let (Ok(done), Ok(total)) = (i.parse(), t.parse())
-                        {
-                            on_event(CompareEvent::Start { done, total, name });
-                        }
-                    }
-                    _ => {}
-                }
-            } else if let Some(payload) = line.strip_prefix(SENTINEL) {
-                // Each per-tensor result line is a "done" event (the summary line has
-                // no `name`, so it's skipped here and picked up by parse below).
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload)
-                    && let Some(name) = v.get("name").and_then(|x| x.as_str())
-                {
-                    on_event(CompareEvent::Done {
-                        name,
-                        status: compare_status(&v),
-                        bytes: v
-                            .get("bytes")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0),
-                    });
-                }
-            }
+            dispatch_stream_line(line, &compare_status, &mut on_event);
         })?;
         parse_value_diff(&out, &self.host)
     }
@@ -739,61 +687,73 @@ impl RemoteRead {
         let script = repack_verify_script(old_uri, new_uri, pairs, bits);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
         let out = session.exec_capture(&command, &script, |line| {
-            if let Some(rest) = line.strip_prefix(STATUS_TAG) {
-                let mut f = rest.split('\t');
-                match f.next() {
-                    Some("load") => {
-                        if let Some(w) = f.next() {
-                            on_event(RepackEvent::Loading(w));
-                        }
-                    }
-                    Some("start") => {
-                        if let (Some(i), Some(t), Some(name)) = (f.next(), f.next(), f.next())
-                            && let (Ok(done), Ok(total)) = (i.parse(), t.parse())
-                        {
-                            on_event(RepackEvent::Start { done, total, name });
-                        }
-                    }
-                    Some("size") => {
-                        if let (Some(name), Some(o), Some(n)) = (f.next(), f.next(), f.next())
-                            && let (Ok(old_bytes), Ok(new_bytes)) = (o.parse(), n.parse())
-                        {
-                            on_event(RepackEvent::Size {
-                                name,
-                                old_bytes,
-                                new_bytes,
-                            });
-                        }
-                    }
-                    Some("bytes") => {
-                        if let (Some(name), Some(o), Some(n)) = (f.next(), f.next(), f.next())
-                            && let (Ok(old_done), Ok(new_done)) = (o.parse(), n.parse())
-                        {
-                            on_event(RepackEvent::Bytes {
-                                name,
-                                old_done,
-                                new_done,
-                            });
-                        }
-                    }
-                    Some("phase") => {
-                        if let Some(name) = f.next() {
-                            on_event(RepackEvent::Comparing(name));
-                        }
-                    }
-                    _ => {}
-                }
-            } else if let Some(payload) = line.strip_prefix(SENTINEL)
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(payload)
-                && let Some(name) = v.get("name").and_then(|x| x.as_str())
-            {
-                on_event(RepackEvent::Done {
-                    name,
-                    status: repack_status(&v),
-                });
-            }
+            dispatch_stream_line(line, &repack_status, &mut on_event);
         })?;
         parse_repack(&out, &self.host)
+    }
+}
+
+/// Parse one streamed line into a [`RepackEvent`] — the `STAT`
+/// `load`/`start`/`size`/`bytes`/`phase` events, or a sentinel per-tensor result
+/// (classified by `status`). Shared by the value diff and the repack verify (both
+/// stream the same way).
+fn dispatch_stream_line(
+    line: &str,
+    status: &impl Fn(&serde_json::Value) -> CompareStatus,
+    on_event: &mut impl FnMut(RepackEvent),
+) {
+    if let Some(rest) = line.strip_prefix(STATUS_TAG) {
+        let mut f = rest.split('\t');
+        match f.next() {
+            Some("load") => {
+                if let Some(w) = f.next() {
+                    on_event(RepackEvent::Loading(w));
+                }
+            }
+            Some("start") => {
+                if let (Some(i), Some(t), Some(name)) = (f.next(), f.next(), f.next())
+                    && let (Ok(done), Ok(total)) = (i.parse(), t.parse())
+                {
+                    on_event(RepackEvent::Start { done, total, name });
+                }
+            }
+            Some("size") => {
+                if let (Some(name), Some(o), Some(n)) = (f.next(), f.next(), f.next())
+                    && let (Ok(old_bytes), Ok(new_bytes)) = (o.parse(), n.parse())
+                {
+                    on_event(RepackEvent::Size {
+                        name,
+                        old_bytes,
+                        new_bytes,
+                    });
+                }
+            }
+            Some("bytes") => {
+                if let (Some(name), Some(o), Some(n)) = (f.next(), f.next(), f.next())
+                    && let (Ok(old_done), Ok(new_done)) = (o.parse(), n.parse())
+                {
+                    on_event(RepackEvent::Bytes {
+                        name,
+                        old_done,
+                        new_done,
+                    });
+                }
+            }
+            Some("phase") => {
+                if let Some(name) = f.next() {
+                    on_event(RepackEvent::Comparing(name));
+                }
+            }
+            _ => {}
+        }
+    } else if let Some(payload) = line.strip_prefix(SENTINEL)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(payload)
+        && let Some(name) = v.get("name").and_then(|x| x.as_str())
+    {
+        on_event(RepackEvent::Done {
+            name,
+            status: status(&v),
+        });
     }
 }
 
@@ -1024,6 +984,8 @@ FULL_HIST = __FULL_HIST__
 BINS = __BINS__
 JOBS = __JOBS__
 CHUNK = 4000000
+DL = 16 << 20        # S3 download chunk
+EMIT = 64 << 20      # byte-progress emit granularity
 S = "__SENTINEL__"
 ST = "__STATUS__"
 _lock = threading.Lock()
@@ -1040,8 +1002,9 @@ except Exception as e:
 try:
     import numpy as np
     import torch
+    import zstandard
 except Exception as e:
-    emit({"error": "import numpy/torch failed (needed to compare values): %r" % (e,)}); sys.exit(0)
+    emit({"error": "import numpy/torch/zstandard failed (needed to compare values): %r" % (e,)}); sys.exit(0)
 try:
     stat("load\told")
     old_sd = cstorch.load(OLD, map_location=None)
@@ -1052,6 +1015,38 @@ except Exception as e:
 def to_f64(rt, i, j):
     sl = rt if i is None else rt[i:j]
     return sl.to(torch.float64).numpy().reshape(-1)
+# Map a numpy dtype name (from an object's __NUMPY__ metadata) to a torch dtype, so
+# we can stream the S3 object ourselves (chunked, with progress) rather than letting
+# cstorch materialise it in one shot with no progress. Comparison stays on the proxy.
+NP2T = {}
+for _n in ("float16","float32","float64","bfloat16","uint8","int8","int16","uint16","int32","uint32","int64","uint64","bool"):
+    _t = getattr(torch, _n, None)
+    if _t is not None: NP2T[_n] = _t
+def prep(dt):
+    do = getattr(dt, "deferred", None)
+    if do is None: return None
+    r = do._reader
+    key = "%s/%s" % (r.key, do._key)
+    try:
+        head = r.s3_client.head_object(Bucket=r.bucket, Key=key)
+        md = head.get("Metadata") or {}
+        meta = json.loads(md.get("metadata") or md.get("Metadata") or "{}")
+    except Exception:
+        return None
+    nm = meta.get("__NUMPY__")
+    td = NP2T.get(nm.get("dtype")) if nm else None
+    if td is None: return None
+    return (r.s3_client, r.bucket, key, int(head.get("ContentLength", 0)), bool(meta.get("compressed")), td, [int(x) for x in nm["shape"]])
+def stream_tensor(p, on):
+    client, bucket, key, total, comp, td, shape = p
+    body = client.get_object(Bucket=bucket, Key=key)["Body"]
+    buf = bytearray()
+    while True:
+        c = body.read(DL)
+        if not c: break
+        buf += c; on(len(buf))
+    raw = zstandard.decompress(bytes(buf)) if comp else buf
+    return torch.frombuffer(bytearray(raw), dtype=td).reshape(shape)
 total = len(PAIRS)
 t0 = time.time()
 read_bytes = 0
@@ -1066,10 +1061,28 @@ def work(idx):
         ashape = [int(d) for d in a.shape]; bshape = [int(d) for d in b.shape]
         if ashape != bshape:
             res["error"] = "shapes differ"; emit(res); return 0
-        # Realise each side to CPU once (one read of its stored bytes from S3); the
-        # per-chunk float64 conversions below then work off the in-memory copy.
-        ra = a.to("cpu"); rb = b.to("cpu")
-        tb = ra.element_size() * ra.nelement() + rb.element_size() * rb.nelement()
+        # Stream each side's S3 object on the proxy (chunked, with byte progress); the
+        # per-chunk float64 conversions below work off the in-memory copy. Values are
+        # compared here — only progress + the small result cross ssh. Fall back to
+        # cstorch materialise (no byte progress) for a non-numpy-stored tensor.
+        pa = prep(a); pb = prep(b)
+        if pa is not None and pb is not None:
+            osz = pa[3]; nsz = pb[3]
+            stat("size\t%s\t%d\t%d" % (nname, osz, nsz))
+            od = [0]; nd = [0]; last = [0]
+            def bump():
+                s = od[0] + nd[0]
+                if s - last[0] >= EMIT:
+                    last[0] = s; stat("bytes\t%s\t%d\t%d" % (nname, od[0], nd[0]))
+            ra = stream_tensor(pa, lambda n: (od.__setitem__(0, n), bump()))
+            rb = stream_tensor(pb, lambda n: (nd.__setitem__(0, n), bump()))
+            stat("bytes\t%s\t%d\t%d" % (nname, osz, nsz))
+            tb = osz + nsz
+        else:
+            ra = a.to("cpu"); rb = b.to("cpu")
+            tb = ra.element_size() * ra.nelement() + rb.element_size() * rb.nelement()
+            stat("size\t%s\t%d\t%d" % (nname, int(ra.element_size() * ra.nelement()), int(rb.element_size() * rb.nelement())))
+        stat("phase\t%s\tcomparing" % (nname,))
         res["bytes"] = int(tb)
         scalar = (len(ashape) == 0)
         d0 = 0 if scalar else ashape[0]
