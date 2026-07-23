@@ -3,8 +3,8 @@
 // their `crate::tree::…` / `crate::stats::…` paths unchanged during the refactor.
 pub use checkpoint_explorer_core::{
     check, codec, config, diff, filetree, filter, gguf, health, kernel, model, npy, progress,
-    readers, remote, rename, s3, safelayout, sample, sftp, stats, stheader, tensorfilter, tree,
-    utils, viewstate,
+    readers, remote, rename, repack, s3, safelayout, sample, sftp, stats, stheader, tensorfilter,
+    tree, utils, viewstate,
 };
 #[cfg(feature = "hdf5")]
 pub use checkpoint_explorer_core::{convert, hdf5, hdf5_lz4, hdf5_zstd};
@@ -2208,6 +2208,8 @@ fn run_diff(
             &old_str,
             &new_str,
             s3_pair,
+            &old_t,
+            &new_t,
             &old_sum,
             &new_sum,
             repack_bits,
@@ -2218,9 +2220,9 @@ fn run_diff(
 
 /// The `diff --verify-repack` path: find tensors present on both sides whose shapes
 /// fold along dim 0 (already scoped by `--name`, in `old_sum`/`new_sum`), verify
-/// their packed indices match on the proxy, and print a verdict. Returns the exit
-/// code: 0 = every matched tensor is equivalent (and nothing else differs), 1
-/// otherwise, 2 on trouble.
+/// their packed indices match — on the ssh proxy for `s3://` sources, or locally for
+/// local checkpoint files — and print a verdict. Returns the exit code: 0 = every
+/// matched tensor is equivalent (and nothing else differs), 1 otherwise, 2 on trouble.
 #[allow(clippy::too_many_arguments)]
 fn run_repack_verify(
     remote: Option<&crate::remote::RemoteRead>,
@@ -2228,17 +2230,21 @@ fn run_repack_verify(
     old_uri: &str,
     new_uri: &str,
     s3_pair: bool,
+    old_t: &[TensorInfo],
+    new_t: &[TensorInfo],
     old_sum: &diff::CheckpointSummary,
     new_sum: &diff::CheckpointSummary,
     bits: usize,
 ) -> i32 {
-    let Some(r) = remote.filter(|_| s3_pair) else {
+    // A non-s3 remote (safetensors dir over SFTP) can't do this — the data isn't
+    // reachable. Local files and s3-vs-s3 both can.
+    if remote.is_some() && !s3_pair {
         eprintln!(
-            "checkpoint-explorer diff: --verify-repack needs both sides to be s3:// cstorch \
-             checkpoints over --ssh-read (the data is read on the remote)"
+            "checkpoint-explorer diff: --verify-repack over --ssh-read needs both sides to be \
+             s3:// cstorch checkpoints (a remote safetensors dir isn't supported)"
         );
         return 2;
-    };
+    }
     // Candidate pairs: same name on both sides, shape folds along dim 0. Scoped by
     // `--name` already (old_sum/new_sum are the filtered summaries).
     let mut pairs: Vec<(String, String)> = Vec::new();
@@ -2275,14 +2281,67 @@ fn run_repack_verify(
     });
     let other_differs = added || removed || other_changed || old_sum.metadata != new_sum.metadata;
 
-    let results = match fetch_remote_repack(r, password, old_uri, new_uri, &pairs, bits) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("checkpoint-explorer diff: {e:#}");
-            return 2;
+    let results = if let Some(r) = remote.filter(|_| s3_pair) {
+        match fetch_remote_repack(r, password, old_uri, new_uri, &pairs, bits) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("checkpoint-explorer diff: {e:#}");
+                return 2;
+            }
         }
+    } else {
+        local_repack(old_t, new_t, &pairs, bits)
     };
     render_repack_verdict(&pairs, &results, bits, other_differs)
+}
+
+/// Verify the fold-pairs locally (reading the checkpoint files here): decode both
+/// sides' indices, compare, and diff the sibling codebook / scale tensors. Sequential
+/// — each expert weight is read whole, so memory is one pair at a time.
+fn local_repack(
+    old_t: &[TensorInfo],
+    new_t: &[TensorInfo],
+    pairs: &[(String, String)],
+    bits: usize,
+) -> HashMap<String, crate::remote::RepackResult> {
+    let find = |ts: &[TensorInfo], n: &str| ts.iter().find(|t| t.name == n).cloned();
+    let mut out = HashMap::new();
+    for (oname, nname) in pairs {
+        let (Some(ow), Some(nw)) = (find(old_t, oname), find(new_t, nname)) else {
+            continue;
+        };
+        let Some(fold) = detect_fold(&ow.shape, &nw.shape, bits) else {
+            continue;
+        };
+        // Sibling codebook / scale tensor names (weight name minus ".weight").
+        let sib = |name: &str, kind: &str| {
+            name.strip_suffix(".weight")
+                .map(|p| format!("{p}.{kind}"))
+                .unwrap_or_default()
+        };
+        let (ocb, ncb) = (sib(oname, "codebook"), sib(nname, "codebook"));
+        let (oqs, nqs) = (sib(oname, "qscale"), sib(nname, "qscale"));
+        let rr = crate::repack::verify_local(
+            &ow,
+            &nw,
+            fold,
+            bits,
+            (
+                &ocb,
+                &ncb,
+                find(old_t, &ocb).as_ref(),
+                find(new_t, &ncb).as_ref(),
+            ),
+            (
+                &oqs,
+                &nqs,
+                find(old_t, &oqs).as_ref(),
+                find(new_t, &nqs).as_ref(),
+            ),
+        );
+        out.insert(nname.clone(), rr);
+    }
+    out
 }
 
 /// Open a session (reusing the password) and run the proxy repack verification with
@@ -3339,7 +3398,8 @@ fn collect_safetensors_files(
                 if matches!(
                     ext,
                     Some("safetensors" | "gguf" | "h5" | "hdf5" | "npy" | "npz")
-                ) {
+                ) || (ext != Some("safetensors") && readers::looks_like_hdf5(&expanded_path))
+                {
                     files.push(expanded_path.clone());
                 } else {
                     eprintln!(

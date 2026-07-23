@@ -244,19 +244,40 @@ fn read_shard_header(file_path: &Path) -> Result<Option<ShardHeader>> {
             let (tensors, metadata) = read_npz(file_path, &source_path)?;
             Ok(Some(shard(source_path, file_path, tensors, metadata)))
         }
-        Some("h5") | Some("hdf5") => {
-            #[cfg(feature = "hdf5")]
-            {
-                let (tensors, metadata) = crate::hdf5::read(file_path)?;
-                Ok(Some(shard(source_path, file_path, tensors, metadata)))
-            }
-            #[cfg(not(feature = "hdf5"))]
-            {
-                Ok(None)
-            }
+        // Recognized HDF5 by extension, OR an extensionless file whose magic says
+        // HDF5 (Cerebras checkpoints are often written without an extension).
+        Some("h5") | Some("hdf5") => read_hdf5_shard(file_path, source_path),
+        other if other != Some("safetensors") && looks_like_hdf5(file_path) => {
+            read_hdf5_shard(file_path, source_path)
         }
         _ => Ok(None),
     }
+}
+
+/// Read an HDF5 shard header (a no-op returning `None` when the `hdf5` feature is off).
+fn read_hdf5_shard(file_path: &Path, source_path: String) -> Result<Option<ShardHeader>> {
+    #[cfg(feature = "hdf5")]
+    {
+        let (tensors, metadata) = crate::hdf5::read(file_path)?;
+        Ok(Some(shard(source_path, file_path, tensors, metadata)))
+    }
+    #[cfg(not(feature = "hdf5"))]
+    {
+        let _ = (file_path, source_path);
+        Ok(None)
+    }
+}
+
+/// Whether `path`'s first bytes are the HDF5 signature (`\x89HDF\r\n\x1a\n`) — so an
+/// extensionless HDF5 checkpoint is recognized. Cheap (reads 8 bytes); false on any
+/// read error.
+pub fn looks_like_hdf5(path: &Path) -> bool {
+    use std::io::Read;
+    let mut buf = [0u8; 8];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok()
+        && buf == [0x89, b'H', b'D', b'F', b'\r', b'\n', 0x1a, b'\n']
 }
 
 /// A [`ShardHeader`] for a non-safetensors format: `total_len` = the file size,

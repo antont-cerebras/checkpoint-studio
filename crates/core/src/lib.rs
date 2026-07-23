@@ -21,6 +21,7 @@ pub mod progress;
 pub mod readers;
 pub mod remote;
 pub mod rename;
+pub mod repack;
 pub mod s3;
 pub mod safelayout;
 pub mod sample;

@@ -1397,8 +1397,44 @@ pub fn open_reader(t: &TensorInfo) -> Result<Box<dyn TensorReader>, String> {
         "npz" => Ok(Box::new(BlobReader::open_npz(t)?)),
         #[cfg(feature = "hdf5")]
         "h5" | "hdf5" => Ok(Box::new(Hdf5Reader::open(t)?)),
+        // An extensionless HDF5 checkpoint (matched by magic, as the loader does).
+        #[cfg(feature = "hdf5")]
+        _ if crate::readers::looks_like_hdf5(std::path::Path::new(&t.source_path)) => {
+            Ok(Box::new(Hdf5Reader::open(t)?))
+        }
         _ => Err("reading tensor data is not supported for this format".to_string()),
     }
+}
+
+/// Read a whole tensor's stored 16-bit containers as raw little-endian `u16` words,
+/// regardless of the stored dtype (F16/U16/I16) — for the repack index decode, which
+/// reinterprets the raw bits rather than the decoded value. Errors unless the
+/// container is 2 bytes.
+pub fn read_all_u16(t: &TensorInfo) -> Result<Vec<u16>, String> {
+    if item_size(&t.dtype) != Some(2) {
+        return Err(format!("expected a 16-bit dtype, got {}", t.dtype));
+    }
+    let r = open_reader(t)?;
+    let ranges: Vec<Range<usize>> = r.shape().iter().map(|&d| 0..d).collect();
+    let bytes = r.read_region(&ranges)?;
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect())
+}
+
+/// Read a whole tensor decoded to `f64` (per its stored dtype) — for comparing the
+/// small codebook / scale sibling tensors by value.
+pub fn read_all_f64(t: &TensorInfo) -> Result<Vec<f64>, String> {
+    let prim = parse_prim(&t.dtype).ok_or_else(|| format!("dtype {} not comparable", t.dtype))?;
+    let item = item_size(&t.dtype).ok_or_else(|| format!("dtype {} not comparable", t.dtype))?;
+    let r = open_reader(t)?;
+    let ranges: Vec<Range<usize>> = r.shape().iter().map(|&d| 0..d).collect();
+    let bytes = r.read_region(&ranges)?;
+    Ok(bytes
+        .chunks_exact(item)
+        .map(|c| decode_prim(prim, c))
+        .collect())
 }
 
 /// Decompose a flat row-major container index into per-dimension indices.
