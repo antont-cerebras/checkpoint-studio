@@ -12,9 +12,16 @@ import { tree as treeData } from './server';
 
 export type DataTab = 'info' | 'heatmap' | 'values' | 'histogram';
 
+/** Data-view (heatmap / numeric grid) params carried in the detail hash so a
+ * specific view — mode, sample size, dtype override, window offsets, base/zebra,
+ * ratio lock — is reproducible from a shared/bookmarked URL and across back/forward.
+ * Raw strings; `DataView` owns the semantics + defaults. */
+export const DV_KEYS = ['mode', 'rows', 'cols', 'dtype', 'roff', 'coff', 'slice', 'base', 'zebra', 'lock'] as const;
+export type DvParams = Partial<Record<(typeof DV_KEYS)[number], string>>;
+
 export type Screen =
   | { kind: 'tree' }
-  | { kind: 'detail'; tensor: string; tab: DataTab }
+  | { kind: 'detail'; tensor: string; tab: DataTab; dv?: DvParams }
   | { kind: 'files' }
   | { kind: 'layout'; file?: string }
   | { kind: 'stats' }
@@ -30,8 +37,14 @@ function screenToHash(s: Screen): string {
   switch (s.kind) {
     case 'tree':
       return 'tree';
-    case 'detail':
-      return `detail?t=${enc(s.tensor)}&tab=${s.tab}`;
+    case 'detail': {
+      let h = `detail?t=${enc(s.tensor)}&tab=${s.tab}`;
+      for (const k of DV_KEYS) {
+        const v = s.dv?.[k];
+        if (v != null) h += `&${k}=${enc(v)}`;
+      }
+      return h;
+    }
     case 'files':
       return 'files';
     case 'layout':
@@ -54,7 +67,14 @@ function parseHash(): Screen {
       const t = q.get('t');
       const raw = q.get('tab') ?? 'info';
       const tab = (['info', 'heatmap', 'values', 'histogram'].includes(raw) ? raw : 'info') as DataTab;
-      if (t) return { kind: 'detail', tensor: t, tab };
+      if (t) {
+        const dv: DvParams = {};
+        for (const k of DV_KEYS) {
+          const v = q.get(k);
+          if (v != null) dv[k] = v;
+        }
+        return { kind: 'detail', tensor: t, tab, dv: Object.keys(dv).length ? dv : undefined };
+      }
       break;
     }
     case 'files':
@@ -325,7 +345,24 @@ export function setTab(tab: DataTab): void {
   const s = get(screen);
   // A tab is view state within the detail, not a navigation step: replace the URL
   // so Esc / Back leaves the detail in one press from any tab (still deep-linkable).
-  if (s.kind === 'detail') navigate({ ...s, tab }, true);
+  // Drop the data-view params — they're per-tab (a heatmap's rows/mode don't carry
+  // to the grid), so each tab starts from its own defaults.
+  if (s.kind === 'detail') navigate({ kind: 'detail', tensor: s.tensor, tab, dv: undefined }, true);
+}
+
+/** The saved data-view params for the current detail screen (empty otherwise) —
+ * `DataView` reads these on mount to restore a deep-linked view. */
+export function getDataView(): DvParams {
+  const s = get(screen);
+  return s.kind === 'detail' ? { ...(s.dv ?? {}) } : {};
+}
+
+/** Mirror `DataView`'s current params into the detail hash (replace, so it's view
+ * state within the screen, not a history step). No-op off a detail screen. */
+export function setDataView(dv: DvParams): void {
+  const s = get(screen);
+  if (s.kind !== 'detail') return;
+  navigate({ ...s, dv }, true);
 }
 
 // ---- tree cursor movement (mirrors kernel::TreeState nav) ----

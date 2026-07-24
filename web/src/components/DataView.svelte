@@ -1,5 +1,6 @@
 <script lang="ts">
   import { cachedSample } from '../stores/server';
+  import { getDataView, setDataView, type DvParams } from '../stores/view';
   import type { SampleDto } from '../lib/types';
   import { viridis } from '../lib/color';
   import { num } from '../lib/format';
@@ -9,21 +10,24 @@
   export let kind: 'heatmap' | 'values';
 
   type Mode = 'overview' | 'absmax' | 'window' | 'edges';
+  // Any params saved in the URL (a shared / bookmarked deep link) override the
+  // computed defaults below, so the exact view is reproducible.
+  const dv0 = getDataView();
   // The numeric grid defaults to a navigable window (real, contiguous values you can
   // scroll through the whole tensor); the heatmap defaults to the strided overview.
-  let mode: Mode = kind === 'values' ? 'window' : 'overview';
-  let dtype = ''; // '' = stored
-  let slice = 0;
-  let rowOff = 0;
-  let colOff = 0;
-  let rows = kind === 'heatmap' ? 128 : 24;
-  let cols = kind === 'heatmap' ? 128 : 16;
-  let base: 'dec' | 'hex' | 'oct' | 'bin' = 'dec';
-  let zebra: 'off' | 'rows' | 'cols' = 'rows';
+  let mode: Mode = (dv0.mode as Mode) ?? (kind === 'values' ? 'window' : 'overview');
+  let dtype = dv0.dtype ?? ''; // '' = stored
+  let slice = dv0.slice ? +dv0.slice : 0;
+  let rowOff = dv0.roff ? +dv0.roff : 0;
+  let colOff = dv0.coff ? +dv0.coff : 0;
+  let rows = dv0.rows ? +dv0.rows : kind === 'heatmap' ? 128 : 24;
+  let cols = dv0.cols ? +dv0.cols : kind === 'heatmap' ? 128 : 16;
+  let base: 'dec' | 'hex' | 'oct' | 'bin' = (dv0.base as 'dec' | 'hex' | 'oct' | 'bin') ?? 'dec';
+  let zebra: 'off' | 'rows' | 'cols' = (dv0.zebra as 'off' | 'rows' | 'cols') ?? 'rows';
   // Heatmap: keep the sampled grid's aspect ~ the tensor's true shape, so a
   // 151936×2048 tensor samples as a tall strip, not a misleading 256×128. On by
   // default; the toggle frees the two dimensions.
-  let lockRatio = kind === 'heatmap';
+  let lockRatio = dv0.lock != null ? dv0.lock === '1' : kind === 'heatmap';
 
   let data: SampleDto | null = null;
   let err = '';
@@ -57,6 +61,23 @@
     raw: kind === 'values' && base !== 'dec' ? 1 : undefined,
   };
   $: load(tensor, params);
+
+  // Mirror the current params into the URL (replace, so no history spam) — a shared
+  // link reproduces the exact view. mode/rows/cols always (their defaults are
+  // dynamic — snapped / per-tab); the rest only when non-default, to keep links lean.
+  // References every param directly so Svelte re-runs it on any change.
+  $: {
+    const dv: DvParams = { mode, rows: String(rows), cols: String(cols) };
+    if (dtype) dv.dtype = dtype;
+    if (mode === 'window' && rowOff) dv.roff = String(rowOff);
+    if (mode === 'window' && colOff) dv.coff = String(colOff);
+    if (slice) dv.slice = String(slice);
+    if (kind === 'values' && base !== 'dec') dv.base = base;
+    if (kind === 'values' && zebra !== 'rows') dv.zebra = zebra;
+    if (kind === 'heatmap' && !lockRatio) dv.lock = '0';
+    setDataView(dv);
+  }
+
   // Only the latest request may write `data` — rapid panning fires overlapping
   // requests, and without this guard an earlier one resolving late would desync
   // the view from the current offset.
@@ -96,7 +117,8 @@
   const clampDim = (n: number) => Math.max(1, Math.min(4096, Math.round(n)));
   // Snap both dims to the source ratio once per tensor: budget the long side to ~256
   // cells, the short side proportional (>= 1). So an extreme shape reads as a strip.
-  let snappedFor = '';
+  // Dims restored from the URL win over the auto-snap (mark this tensor done).
+  let snappedFor = dv0.rows || dv0.cols ? tensor : '';
   $: if (lockRatio && aspect && tensor !== snappedFor) {
     const b = 256;
     if (aspect >= 1) { rows = clampDim(b); cols = clampDim(b / aspect); }
