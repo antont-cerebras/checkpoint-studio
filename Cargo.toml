@@ -1,8 +1,8 @@
 [package]
-name = "checkpoint-explorer"
+name = "checkpoint-studio"
 version = "0.2.1"
 edition = "2024"
-repository = "https://github.com/antont-cerebras/checkpoint-explorer"
+repository = "https://github.com/antont-cerebras/checkpoint-studio"
 license = "MIT"
 authors = ["Eric Buehler"]
 description = "CLI utility to inspect and explore .safetensors, .gguf and HDF5 checkpoint files"
@@ -14,7 +14,7 @@ resolver = "2"
 [dependencies]
 # The frontend-free core: model + readers + views + reports. The TUI/CLI here
 # drive it and render its serializable outputs.
-checkpoint-explorer-core = { path = "crates/core" }
+checkpoint-studio-core = { path = "crates/core" }
 safetensors = "0.4"
 clap = { version = "4.0", features = ["derive"] }
 anyhow = "1.0"
@@ -94,7 +94,7 @@ libc = "0.2"
 insta = { version = "1", features = ["filters"] }
 
 [features]
-hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "dep:half", "dep:zstd", "checkpoint-explorer-core/hdf5"]
+hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "dep:half", "dep:zstd", "checkpoint-studio-core/hdf5"]
 
 # Diagnostic: dump dataset shape/chunk/filter layout of an HDF5 file.
 [[example]]

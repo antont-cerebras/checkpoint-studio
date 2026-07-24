@@ -357,7 +357,7 @@ impl RemoteRead {
     pub fn fetch_with_config(&self, src: &str) -> Result<FetchedCheckpoint> {
         let mut password = None;
         let session = self.open_with(&mut password)?;
-        eprintln!("checkpoint-explorer: reading tensor metadata over ssh …");
+        eprintln!("checkpoint-studio: reading tensor metadata over ssh …");
         let bars = crate::progress::Bars::start(vec![src.to_string()]);
         let progress = bars.progress(0);
         // Interactive browse doesn't use S3 object metadata (that's a `diff`-only

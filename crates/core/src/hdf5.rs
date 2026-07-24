@@ -119,7 +119,7 @@ fn dataset_info(file: &hdf5_metno::File, key: &str, source_path: &str) -> Option
 /// if no top-level dataset decodes to `name`, so the caller can fall back to a
 /// full load (which surfaces the "tensor not found" message).
 ///
-/// This is the fast path behind `checkpoint-explorer … --tensor X` for a cold
+/// This is the fast path behind `checkpoint-studio … --tensor X` for a cold
 /// HDF5 file: enumerating every dataset's chunk index can take seconds, but a
 /// direct tensor view only needs that one tensor and its schema.
 pub fn read_one(

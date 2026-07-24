@@ -2,7 +2,7 @@
 source: tests/cli.rs
 expression: out
 ---
-checkpoint-explorer check: [FIXTURE]
+checkpoint-studio check: [FIXTURE]
   1 file(s) · 7 tensors · 124 params
   ✓ Byte-range integrity  — safetensors spans contiguous, sized correctly, no truncation
   ⊘ HDF5 integrity        — n/a for this checkpoint

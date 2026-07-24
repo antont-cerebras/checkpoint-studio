@@ -76,7 +76,7 @@ for i in range(6):
 write_safetensors(
     f"{OUT}/model.safetensors",
     model,
-    {"format": "pt", "producer": "checkpoint-explorer demo"},
+    {"format": "pt", "producer": "checkpoint-studio demo"},
 )
 
 # --- the diff pair: dtype change, shape change, add, remove, metadata edit ----

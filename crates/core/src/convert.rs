@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn repacks_datasets_and_roundtrips() {
-        let dir = std::env::temp_dir().join("checkpoint_explorer_convert_test");
+        let dir = std::env::temp_dir().join("checkpoint_studio_convert_test");
         let _ = std::fs::create_dir_all(&dir);
         let src = dir.join("src.h5");
         let dst = dir.join("dst.h5");

@@ -8119,7 +8119,7 @@ mod tests {
             applicable: false,
             scroll: 0,
             error: None,
-            cli: Some("checkpoint-explorer convert /ckpt --map 'a=>b'"),
+            cli: Some("checkpoint-studio convert /ckpt --map 'a=>b'"),
             copied: None,
         };
         let mut clicks = Vec::new();

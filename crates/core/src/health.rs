@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn detects_file_and_tensor_mismatches() {
-        let dir = std::env::temp_dir().join("checkpoint_explorer_health_test");
+        let dir = std::env::temp_dir().join("checkpoint_studio_health_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

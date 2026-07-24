@@ -1,4 +1,4 @@
-//! Frontend-free core of checkpoint-explorer.
+//! Frontend-free core of checkpoint-studio.
 //!
 //! Holds the serializable checkpoint model, the readers (local + SSH/S3) that
 //! fill it, the derived views (tensor tree, file tree, byte layout), and the

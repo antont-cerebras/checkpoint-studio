@@ -135,7 +135,7 @@ pub fn bind(host: IpAddr, port: u16) -> Result<tiny_http::Server> {
                 .map_err(|e2| anyhow::anyhow!("failed to start web server on {host}: {e2}"))?;
             let freed = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
             eprintln!(
-                "checkpoint-explorer: port {port} is already in use ({e}) — serving on free \
+                "checkpoint-studio: port {port} is already in use ({e}) — serving on free \
                  port {freed} instead (use --port to pick another, or free {port} first)."
             );
             Ok(server)
@@ -165,7 +165,7 @@ pub fn serve_on(server: tiny_http::Server, state: Arc<WebState>, host: IpAddr) -
         host.to_string()
     };
     let url = format!("http://{display}:{bound}/");
-    println!("checkpoint-explorer web UI: {url}  (Ctrl-C to stop)");
+    println!("checkpoint-studio web UI: {url}  (Ctrl-C to stop)");
 
     // A small worker pool so a static-asset / metadata request stays responsive
     // while another worker is inside a multi-second tensor scan.

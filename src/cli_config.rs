@@ -26,14 +26,14 @@ impl CliConfig {
             .unwrap_or_default()
     }
 
-    /// The config file path: `$XDG_CONFIG_HOME/checkpoint-explorer/config.toml`, or
-    /// `$HOME/.config/checkpoint-explorer/config.toml`. `None` if neither var is set.
+    /// The config file path: `$XDG_CONFIG_HOME/checkpoint-studio/config.toml`, or
+    /// `$HOME/.config/checkpoint-studio/config.toml`. `None` if neither var is set.
     pub fn path() -> Option<PathBuf> {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-        Some(base.join("checkpoint-explorer").join("config.toml"))
+        Some(base.join("checkpoint-studio").join("config.toml"))
     }
 
     /// Parse `key = "value"` lines (a TOML subset): blank lines and `#` comments are

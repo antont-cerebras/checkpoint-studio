@@ -259,7 +259,7 @@ impl CheckReport {
         let _ = writeln!(
             s,
             "{} {}",
-            paint("checkpoint-explorer check:", color, BOLD),
+            paint("checkpoint-studio check:", color, BOLD),
             self.label
         );
         let _ = writeln!(
@@ -457,9 +457,9 @@ impl CheckReport {
             "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
             "runs": [{
                 "tool": { "driver": {
-                    "name": "checkpoint-explorer",
+                    "name": "checkpoint-studio",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "informationUri": "https://github.com/antont-cerebras/checkpoint-explorer",
+                    "informationUri": "https://github.com/antont-cerebras/checkpoint-studio",
                     "rules": rules,
                 }},
                 "results": results,

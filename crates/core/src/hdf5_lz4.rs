@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn writes_and_reads_lz4_compressed_dataset() {
         register();
-        let dir = std::env::temp_dir().join("checkpoint_explorer_lz4_write_test");
+        let dir = std::env::temp_dir().join("checkpoint_studio_lz4_write_test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("l.h5");
         let _ = std::fs::remove_file(&path);

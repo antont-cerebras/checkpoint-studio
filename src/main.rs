@@ -1,13 +1,13 @@
-// The frontend-free core modules live in `checkpoint-explorer-core`. Re-export
+// The frontend-free core modules live in `checkpoint-studio-core`. Re-export
 // them at the crate root so the (still bin-side) `explorer`/`ui` keep resolving
 // their `crate::tree::…` / `crate::stats::…` paths unchanged during the refactor.
-pub use checkpoint_explorer_core::{
+pub use checkpoint_studio_core::{
     check, codec, config, diff, filetree, filter, gguf, health, kernel, model, npy, progress,
     readers, remote, rename, repack, s3, safelayout, sample, sftp, stats, stheader, tensorfilter,
     tree, utils, viewstate,
 };
 #[cfg(feature = "hdf5")]
-pub use checkpoint_explorer_core::{convert, hdf5, hdf5_lz4, hdf5_zstd};
+pub use checkpoint_studio_core::{convert, hdf5, hdf5_lz4, hdf5_zstd};
 
 mod cli_config;
 mod explorer;
@@ -60,40 +60,40 @@ fn examples_help() -> String {
         "\
 {title}Examples:{r}
   {group}Browse a checkpoint{r} — a single file, a sharded directory, or a glob:
-      checkpoint-explorer model.safetensors
-      checkpoint-explorer /path/to/sharded-model/
-      checkpoint-explorer 'model-*.safetensors'
+      checkpoint-studio model.safetensors
+      checkpoint-studio /path/to/sharded-model/
+      checkpoint-studio 'model-*.safetensors'
 
   {group}Look inside a tensor's data{r} — heatmap, numeric grid, histogram, statistics:
-      checkpoint-explorer model.safetensors --tensor model.layers.0.mlp.down_proj.weight --heatmap
-      checkpoint-explorer model.safetensors --tensor NAME --values --dtype u4   # decode packed 4-bit
+      checkpoint-studio model.safetensors --tensor model.layers.0.mlp.down_proj.weight --heatmap
+      checkpoint-studio model.safetensors --tensor NAME --values --dtype u4   # decode packed 4-bit
 
   {group}Read a remote / S3 checkpoint over SSH{r} (only metadata leaves the host):
-      checkpoint-explorer --ssh-proxy user@host s3://bucket/model/checkpoint
-      checkpoint-explorer user@host:/opt/models/some-model          # scp-style; a safetensors dir
+      checkpoint-studio --ssh-proxy user@host s3://bucket/model/checkpoint
+      checkpoint-studio user@host:/opt/models/some-model          # scp-style; a safetensors dir
 
   {group}Export the structure for scripts / agents{r} (text, or --format json):
-      checkpoint-explorer model.safetensors --print-tree
-      checkpoint-explorer model.safetensors --print-tensors --format json
-      checkpoint-explorer model.safetensors --print-tree --name '*.mlp.*'   # !GLOB excludes
+      checkpoint-studio model.safetensors --print-tree
+      checkpoint-studio model.safetensors --print-tensors --format json
+      checkpoint-studio model.safetensors --print-tree --name '*.mlp.*'   # !GLOB excludes
 
   {group}Compare two checkpoints{r} (exit 0 = identical, 1 = differ, 2 = error):
-      checkpoint-explorer diff old.safetensors new.safetensors
-      checkpoint-explorer diff old/ new/ --values --name '*.mlp.*'
+      checkpoint-studio diff old.safetensors new.safetensors
+      checkpoint-studio diff old/ new/ --values --name '*.mlp.*'
 
   {group}Health-check a checkpoint{r} (exit 0 = healthy, 1 = problems, 2 = error):
-      checkpoint-explorer check /path/to/model/
-      checkpoint-explorer check model.safetensors --values   # also scan for NaN/±Inf, all-zero
+      checkpoint-studio check /path/to/model/
+      checkpoint-studio check model.safetensors --values   # also scan for NaN/±Inf, all-zero
 
   {group}Repack an HDF5 checkpoint with an alternative codec{r} — smaller on disk (hdf5 build only):
-      checkpoint-explorer convert in.hdf5 out.hdf5 --codec zstd
+      checkpoint-studio convert in.hdf5 out.hdf5 --codec zstd
 
-  Per-subcommand help:  checkpoint-explorer diff --help  ·  checkpoint-explorer convert --help"
+  Per-subcommand help:  checkpoint-studio diff --help  ·  checkpoint-studio convert --help"
     )
 }
 
 #[derive(Parser)]
-#[command(name = "checkpoint-explorer")]
+#[command(name = "checkpoint-studio")]
 #[command(version)]
 #[command(
     about = "Explore model checkpoints in the terminal — browse the tree, look inside tensor data, and diff (.safetensors / .gguf / .npy / .npz / .hdf5)"
@@ -111,7 +111,7 @@ Sharded / multi-file models, directories, and globs merge into one tree.
 Remote checkpoints are read over an SSH proxy — a safetensors directory/file via SFTP, \
 or an s3:// cstorch checkpoint via a remote venv — sending only metadata off the host, \
 so data and credentials stay remote. Set the proxy you use most in a config file \
-(~/.config/checkpoint-explorer/config.toml) so you needn't pass --ssh-proxy every time:
+(~/.config/checkpoint-studio/config.toml) so you needn't pass --ssh-proxy every time:
     ssh_proxy = \"user@host\"
     ssh_venv  = \"~/venv\"      # optional; defaults to ~/venv
 An explicit --ssh-proxy / --ssh-venv flag always overrides the config.
@@ -825,7 +825,7 @@ fn main() -> Result<()> {
             ) {
                 Ok(f) => f,
                 Err(e) => {
-                    eprintln!("checkpoint-explorer diff: {e:#}");
+                    eprintln!("checkpoint-studio diff: {e:#}");
                     std::process::exit(2);
                 }
             };
@@ -833,7 +833,7 @@ fn main() -> Result<()> {
             let name_map = match build_name_map(&map, map_from.as_deref()) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("checkpoint-explorer diff: {e:#}");
+                    eprintln!("checkpoint-studio diff: {e:#}");
                     std::process::exit(2);
                 }
             };
@@ -876,7 +876,7 @@ fn main() -> Result<()> {
             if code != 2 {
                 use std::io::IsTerminal;
                 let msg = format!(
-                    "checkpoint-explorer diff: done in {}",
+                    "checkpoint-studio diff: done in {}",
                     format_elapsed(started.elapsed())
                 );
                 let dim = !no_color
@@ -971,7 +971,7 @@ fn run_check(
     let filter = match filter::NameFilter::parse(name) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("checkpoint-explorer check: {e:#}");
+            eprintln!("checkpoint-studio check: {e:#}");
             return 2;
         }
     };
@@ -980,7 +980,7 @@ fn run_check(
     let report: Result<check::CheckReport, i32> = if let Some(r) = remote {
         if values {
             eprintln!(
-                "checkpoint-explorer check: --values needs the checkpoint locally \
+                "checkpoint-studio check: --values needs the checkpoint locally \
                  (only metadata is read over --ssh-proxy)"
             );
             return 2;
@@ -989,7 +989,7 @@ fn run_check(
         (|| -> Result<check::CheckReport> {
             let mut password: Option<String> = None;
             let session = r.open_with(&mut password)?;
-            eprintln!("checkpoint-explorer check: reading tensor metadata over ssh …");
+            eprintln!("checkpoint-studio check: reading tensor metadata over ssh …");
             let bars = progress::Bars::start(vec![src.clone()]);
             let progress = bars.progress(0);
             let out = r
@@ -1017,7 +1017,7 @@ fn run_check(
             ))
         })()
         .map_err(|e: anyhow::Error| {
-            eprintln!("checkpoint-explorer check: {e:#}");
+            eprintln!("checkpoint-studio check: {e:#}");
             2
         })
     } else {
@@ -1054,7 +1054,7 @@ fn run_check(
             ))
         })()
         .map_err(|e: anyhow::Error| {
-            eprintln!("checkpoint-explorer check: {e:#}");
+            eprintln!("checkpoint-studio check: {e:#}");
             2
         })
     };
@@ -1520,7 +1520,7 @@ fn run_diff(
             let sa = r.open_with(&mut password)?;
             let sb = r.open_with(&mut password)?;
             eprintln!(
-                "checkpoint-explorer diff: reading each checkpoint's tensor list over ssh \
+                "checkpoint-studio diff: reading each checkpoint's tensor list over ssh \
                  (names/dtypes/shapes only — no tensor data is transferred) …"
             );
             let bars = progress::Bars::start(vec![old_str.to_string(), new_str.to_string()]);
@@ -1598,7 +1598,7 @@ fn run_diff(
     let (((old_t, old_m), old_s3), ((new_t, new_m), new_s3)) = match loaded {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("checkpoint-explorer diff: {e:#}");
+            eprintln!("checkpoint-studio diff: {e:#}");
             return 2;
         }
     };
@@ -1618,7 +1618,7 @@ fn run_diff(
     let remote_values = match remote {
         Some(_) if compares_data && !s3_pair => {
             eprintln!(
-                "checkpoint-explorer diff: value/distribution comparison over --ssh-proxy needs \
+                "checkpoint-studio diff: value/distribution comparison over --ssh-proxy needs \
                  both sides to be s3:// cstorch checkpoints — comparing structure only"
             );
             false
@@ -1628,7 +1628,7 @@ fn run_diff(
             // views (`--dtype u4/unpacked/…`) don't apply on the remote.
             if !matches!(view, sample::ViewDtype::Stored) {
                 eprintln!(
-                    "checkpoint-explorer diff: --dtype is ignored for s3:// cstorch checkpoints \
+                    "checkpoint-studio diff: --dtype is ignored for s3:// cstorch checkpoints \
                      (their tensors are already the logical values)"
                 );
             }
@@ -1647,7 +1647,7 @@ fn run_diff(
         && s3_objects_identical(o, n)
     {
         eprintln!(
-            "checkpoint-explorer diff: note — both sides are byte-identical (same S3 objects); \
+            "checkpoint-studio diff: note — both sides are byte-identical (same S3 objects); \
              the value comparison will read the data and confirm every tensor is identical. \
              Pass two different checkpoints to see real value differences."
         );
@@ -1673,13 +1673,13 @@ fn run_diff(
     // the whole-checkpoint diff below, so note if both were given.)
     if let Some(name) = tensor {
         if filter.is_active() {
-            eprintln!("checkpoint-explorer diff: --tensor takes precedence; filters ignored");
+            eprintln!("checkpoint-studio diff: --tensor takes precedence; filters ignored");
         }
         if !name_map.is_empty() {
-            eprintln!("checkpoint-explorer diff: --map is ignored with --tensor");
+            eprintln!("checkpoint-studio diff: --map is ignored with --tensor");
         }
         if verify_repack {
-            eprintln!("checkpoint-explorer diff: --verify-repack is ignored with --tensor");
+            eprintln!("checkpoint-studio diff: --verify-repack is ignored with --tensor");
         }
         // Remote (s3-vs-s3): compare this one tensor's values/distribution on the
         // proxy. `full_hist` so the bin-by-bin table can be rendered locally.
@@ -1706,7 +1706,7 @@ fn run_diff(
                     ) {
                         Ok(mut m) => m.remove(name),
                         Err(e) => {
-                            eprintln!("checkpoint-explorer diff: {e:#}");
+                            eprintln!("checkpoint-studio diff: {e:#}");
                             return 2;
                         }
                     }
@@ -1745,12 +1745,12 @@ fn run_diff(
     if !name_map.is_empty() {
         let collisions = name_map.remap_summary(&mut old_sum);
         eprintln!(
-            "checkpoint-explorer diff: applied {} rename rule(s) to {old_label}",
+            "checkpoint-studio diff: applied {} rename rule(s) to {old_label}",
             name_map.len()
         );
         for target in &collisions {
             eprintln!(
-                "checkpoint-explorer diff: warning: a rename rule maps multiple tensors onto {target:?} (keeping the last)"
+                "checkpoint-studio diff: warning: a rename rule maps multiple tensors onto {target:?} (keeping the last)"
             );
         }
     }
@@ -1856,7 +1856,7 @@ fn run_diff(
                         .map(|(k, rd)| (k, extras_from_remote(&rd)))
                         .collect(),
                     Err(e) => {
-                        eprintln!("checkpoint-explorer diff: {e:#}");
+                        eprintln!("checkpoint-studio diff: {e:#}");
                         return 2;
                     }
                 }
@@ -1950,11 +1950,11 @@ fn run_diff(
         names.dedup();
         if names.is_empty() {
             eprintln!(
-                "checkpoint-explorer diff: filter [{desc}] matched 0 of {total_tensors} tensor(s)"
+                "checkpoint-studio diff: filter [{desc}] matched 0 of {total_tensors} tensor(s)"
             );
         } else {
             eprintln!(
-                "checkpoint-explorer diff: filter [{desc}] matched {} of {total_tensors} tensor(s):",
+                "checkpoint-studio diff: filter [{desc}] matched {} of {total_tensors} tensor(s):",
                 names.len()
             );
             let schema = diff::name_schema(&names);
@@ -1980,7 +1980,7 @@ fn run_diff(
     match (&old_s3, &new_s3) {
         (Some(o), Some(n)) => {
             let count = o.objects.len().max(n.objects.len());
-            eprintln!("checkpoint-explorer diff: compared {count} S3 object(s)' metadata");
+            eprintln!("checkpoint-studio diff: compared {count} S3 object(s)' metadata");
             // Each checkpoint's last-modified = the newest object under its prefix
             // (ISO-8601 UTC strings sort chronologically), shown in the summary.
             let latest = |m: &crate::remote::S3Meta| {
@@ -1995,7 +1995,7 @@ fn run_diff(
             report.s3 = Some(diff::compare_s3(o, n));
         }
         (Some(_), None) | (None, Some(_)) => eprintln!(
-            "checkpoint-explorer diff: S3 object metadata compared only for s3-vs-s3 (one side isn't s3://)"
+            "checkpoint-studio diff: S3 object metadata compared only for s3-vs-s3 (one side isn't s3://)"
         ),
         (None, None) => {}
     }
@@ -2072,7 +2072,7 @@ fn run_repack_verify(
     // reachable. Local files and s3-vs-s3 both can.
     if remote.is_some() && !s3_pair {
         eprintln!(
-            "checkpoint-explorer diff: --verify-repack over --ssh-proxy needs both sides to be \
+            "checkpoint-studio diff: --verify-repack over --ssh-proxy needs both sides to be \
              s3:// cstorch checkpoints (a remote safetensors dir isn't supported)"
         );
         return 2;
@@ -2092,7 +2092,7 @@ fn run_repack_verify(
     }
     if pairs.is_empty() {
         eprintln!(
-            "checkpoint-explorer diff: --verify-repack: no fold-pair tensors matched — check \
+            "checkpoint-studio diff: --verify-repack: no fold-pair tensors matched — check \
              --name and that the shapes fold along dim 0 (old E, new ceil(E/fold))"
         );
         return 2;
@@ -2124,7 +2124,7 @@ fn run_repack_verify(
         match fetch_remote_repack(r, password, old_uri, new_uri, &pairs, &labels, bits, false) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("checkpoint-explorer diff: {e:#}");
+                eprintln!("checkpoint-studio diff: {e:#}");
                 return 2;
             }
         }
@@ -2283,14 +2283,14 @@ fn fetch_remote_repack(
     let session = r.open_with(password)?;
     if auto_sparse {
         eprintln!(
-            "checkpoint-explorer diff: comparing {} sparse-packed expert weight(s) as {bits}-bit \
+            "checkpoint-studio diff: comparing {} sparse-packed expert weight(s) as {bits}-bit \
              indices on {} (auto-detected sibling codebook), decoding on the remote …",
             pairs.len(),
             r.host,
         );
     } else {
         eprintln!(
-            "checkpoint-explorer diff: verifying repack of {} tensor(s) on {}, decoding {bits}-bit \
+            "checkpoint-studio diff: verifying repack of {} tensor(s) on {}, decoding {bits}-bit \
              indices on the remote (reads the full tensors, {} at a time):\n  old (sparse) {old_uri}\n  new (dense)  {new_uri}",
             pairs.len(),
             r.host,
@@ -2331,7 +2331,7 @@ fn fetch_remote_repack(
             String::new()
         };
         eprintln!(
-            "checkpoint-explorer diff: verified {} tensor(s) on the remote in {} · read {read}{rate}",
+            "checkpoint-studio diff: verified {} tensor(s) on the remote in {} · read {read}{rate}",
             s.compared,
             format_elapsed(elapsed),
         );
@@ -2473,13 +2473,13 @@ fn run_auto_sparse(
         match fetch_remote_repack(r, password, old_uri, new_uri, pairs, &labels, bits, true) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("checkpoint-explorer diff: sparse index compare: {e:#}");
+                eprintln!("checkpoint-studio diff: sparse index compare: {e:#}");
                 HashMap::new()
             }
         }
     } else if remote.is_some() {
         eprintln!(
-            "checkpoint-explorer diff: sparse index compare needs s3:// data over --ssh-proxy \
+            "checkpoint-studio diff: sparse index compare needs s3:// data over --ssh-proxy \
              (a remote safetensors dir isn't reachable) — skipped"
         );
         HashMap::new()
@@ -2752,7 +2752,7 @@ fn fetch_remote_value_diff(
 ) -> Result<HashMap<String, crate::remote::RemoteTensorDiff>> {
     let session = r.open_with(password)?;
     eprintln!(
-        "checkpoint-explorer diff: comparing {} tensor(s) on {} — reading ≈ {} from S3 \
+        "checkpoint-studio diff: comparing {} tensor(s) on {} — reading ≈ {} from S3 \
          (processed on the remote, not streamed here; {}-way parallel — use --jobs to tune, \
          --jobs 1 if the remote misbehaves) …",
         pairs.len(),
@@ -2801,7 +2801,7 @@ fn fetch_remote_value_diff(
             String::new()
         };
         eprintln!(
-            "checkpoint-explorer diff: compared {} tensor(s){skip_note} on the remote in {} · read {read}{rate}",
+            "checkpoint-studio diff: compared {} tensor(s){skip_note} on the remote in {} · read {read}{rate}",
             s.compared,
             format_elapsed(elapsed),
         );
@@ -2861,7 +2861,7 @@ fn run_diff_tensor(
     let old_info = old_t.iter().find(|t| t.name == name);
     let new_info = new_t.iter().find(|t| t.name == name);
     if old_info.is_none() && new_info.is_none() {
-        eprintln!("checkpoint-explorer diff: tensor '{name}' not found in either checkpoint");
+        eprintln!("checkpoint-studio diff: tensor '{name}' not found in either checkpoint");
         return 2;
     }
 
@@ -2902,7 +2902,7 @@ fn run_diff_tensor(
                     print!("{}", diff::render_histogram_table(name, hd, opts.color));
                 }
                 None => eprintln!(
-                    "checkpoint-explorer diff: histogram: not available for this tensor over ssh"
+                    "checkpoint-studio diff: histogram: not available for this tensor over ssh"
                 ),
             }
         } else {
@@ -2918,7 +2918,7 @@ fn run_diff_tensor(
                     hist_differs = hd.differs();
                     print!("{}", diff::render_histogram_table(name, &hd, opts.color));
                 }
-                Err(e) => eprintln!("checkpoint-explorer diff: histogram: {e}"),
+                Err(e) => eprintln!("checkpoint-studio diff: histogram: {e}"),
             }
         }
     }
@@ -3078,25 +3078,25 @@ fn run_web(
 
 fn run_explore(mut args: ExploreArgs) -> Result<()> {
     if args.paths.is_empty() {
-        eprintln!("checkpoint-explorer: no checkpoint given.\n");
+        eprintln!("checkpoint-studio: no checkpoint given.\n");
         eprintln!("Usage:");
         eprintln!(
-            "  checkpoint-explorer <PATH>...            browse a checkpoint (file, directory, or glob)"
+            "  checkpoint-studio <PATH>...            browse a checkpoint (file, directory, or glob)"
         );
         eprintln!(
-            "  checkpoint-explorer <PATH> --print-tree  dump its structure (text, or --format json)"
+            "  checkpoint-studio <PATH> --print-tree  dump its structure (text, or --format json)"
         );
-        eprintln!("  checkpoint-explorer diff <OLD> <NEW>     compare two checkpoints");
+        eprintln!("  checkpoint-studio diff <OLD> <NEW>     compare two checkpoints");
         eprintln!(
-            "  checkpoint-explorer --ssh-proxy <HOST> <s3://…|/remote/path>   read a remote / S3 checkpoint"
+            "  checkpoint-studio --ssh-proxy <HOST> <s3://…|/remote/path>   read a remote / S3 checkpoint"
         );
-        eprintln!("\nRun `checkpoint-explorer --help` for all options and examples.");
+        eprintln!("\nRun `checkpoint-studio --help` for all options and examples.");
         std::process::exit(1);
     }
 
     // Support scp-style positional paths (`[user@]host:/path`) without an explicit
     // --ssh-proxy: derive the host and read the path part remotely, so
-    // `checkpoint-explorer host:/opt/model` just works.
+    // `checkpoint-studio host:/opt/model` just works.
     if args.ssh_proxy.is_none()
         && let Some((host, _)) = args
             .paths
@@ -3142,7 +3142,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
             .collect();
         if !hdf5.is_empty() {
             eprintln!(
-                "Error: this build of checkpoint-explorer was compiled without HDF5 support, so it cannot read:"
+                "Error: this build of checkpoint-studio was compiled without HDF5 support, so it cannot read:"
             );
             for path in &hdf5 {
                 eprintln!("  {}", path.display());

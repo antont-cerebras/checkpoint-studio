@@ -10,7 +10,7 @@ with agg. It only needs python3 and agg (no vhs, no browser, no ffmpeg).
   python3 record_demo.py                     # drive the TUI -> /tmp/demo.cast
   agg --theme dracula --font-size 14 /tmp/demo.cast demo.gif
 
-Requires `checkpoint-explorer` on PATH (`cargo install --path . --features hdf5`)
+Requires `checkpoint-studio` on PATH (`cargo install --path . --features hdf5`)
 and `agg` (`cargo install --git https://github.com/asciinema/agg`).
 
 The tour mirrors demo.tape: browse the grouped tree + fuzzy search, a tensor's
@@ -79,20 +79,20 @@ ENTER, DOWN, ESC, BS, CTRLC = "\r", "\x1b[B", "\x1b", "\x7f", "\x03"
 feed(0.4); send("clear\r"); feed(0.5)
 
 # 1) browse the grouped tree + fuzzy search
-cmd("checkpoint-explorer /tmp/ckpt-demo/model.safetensors --tree-state expanded"); feed(2.6)
+cmd("checkpoint-studio /tmp/ckpt-demo/model.safetensors --tree-state expanded"); feed(2.6)
 send(DOWN * 8); feed(1.6)
 send("/"); feed(0.4); send("down_proj"); feed(2.0); send(ESC); feed(1.0); send(CTRLC); feed(1.0)
 
 # 2) a tensor's detail: stats + histogram, heatmap, numeric grid
-cmd("checkpoint-explorer /tmp/ckpt-demo/model.safetensors --tensor model.layers.0.mlp.down_proj.weight --compute-stats"); feed(2.6)
+cmd("checkpoint-studio /tmp/ckpt-demo/model.safetensors --tensor model.layers.0.mlp.down_proj.weight --compute-stats"); feed(2.6)
 send("h"); feed(2.2); send("m"); feed(2.6); send(BS); feed(0.7); send("v"); feed(2.6); send(CTRLC); feed(1.0)
 
 # 3) decode a packed 4-bit weight (U8 -> u4)
-cmd("checkpoint-explorer /tmp/ckpt-demo/model.safetensors --tensor model.layers.0.mlp.gate_proj.qweight --dtype u4 --values"); feed(3.0); send(CTRLC); feed(1.0)
+cmd("checkpoint-studio /tmp/ckpt-demo/model.safetensors --tensor model.layers.0.mlp.gate_proj.qweight --dtype u4 --values"); feed(3.0); send(CTRLC); feed(1.0)
 
 # 4) coloured structural diff  (clear first — diff prints to the normal screen)
 send("clear\r"); feed(0.5)
-cmd("checkpoint-explorer diff /tmp/ckpt-demo/old.safetensors /tmp/ckpt-demo/new.safetensors"); feed(4.0)
+cmd("checkpoint-studio diff /tmp/ckpt-demo/old.safetensors /tmp/ckpt-demo/new.safetensors"); feed(4.0)
 
 send("exit\r"); feed(1.0)
 try:

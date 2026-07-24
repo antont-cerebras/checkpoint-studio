@@ -168,12 +168,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9555578bc9e57714c812a1f84e4fc5b4d21fcb063490c624de019f7464c91268"
 
 [[package]]
-name = "checkpoint-explorer"
+name = "checkpoint-studio"
 version = "0.2.1"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
- "checkpoint-explorer-core",
+ "checkpoint-studio-core",
  "clap",
  "colored_json",
  "crossterm",
@@ -208,7 +208,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "checkpoint-explorer-core"
+name = "checkpoint-studio-core"
 version = "0.2.1"
 dependencies = [
  "anyhow",

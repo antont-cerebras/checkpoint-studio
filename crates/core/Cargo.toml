@@ -1,10 +1,10 @@
 [package]
-name = "checkpoint-explorer-core"
+name = "checkpoint-studio-core"
 version = "0.2.1"
 edition = "2024"
-repository = "https://github.com/antont-cerebras/checkpoint-explorer"
+repository = "https://github.com/antont-cerebras/checkpoint-studio"
 license = "MIT"
-description = "Frontend-free core of checkpoint-explorer: the serializable checkpoint model, readers (local + SSH/S3), derived views, and reports."
+description = "Frontend-free core of checkpoint-studio: the serializable checkpoint model, readers (local + SSH/S3), derived views, and reports."
 
 [dependencies]
 anyhow = "1.0"

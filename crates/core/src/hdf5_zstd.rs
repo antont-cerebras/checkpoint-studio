@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn writes_and_reads_zstd_compressed_dataset() {
         register();
-        let dir = std::env::temp_dir().join("checkpoint_explorer_zstd_test");
+        let dir = std::env::temp_dir().join("checkpoint_studio_zstd_test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("z.h5");
         let _ = std::fs::remove_file(&path);

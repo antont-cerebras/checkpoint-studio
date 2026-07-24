@@ -9,9 +9,9 @@ expression: out
     {
       "tool": {
         "driver": {
-          "name": "checkpoint-explorer",
+          "name": "checkpoint-studio",
           "version": "[VERSION]",
-          "informationUri": "https://github.com/antont-cerebras/checkpoint-explorer",
+          "informationUri": "https://github.com/antont-cerebras/checkpoint-studio",
           "rules": [
             {
               "id": "byte_ranges",

@@ -120,7 +120,7 @@ impl RemoteSession {
                 Ok(()) => return Ok(RemoteSession { session }),
                 Err(e) => {
                     if attempt < max_attempts {
-                        let msg = format!("checkpoint-explorer: {e} — try again");
+                        let msg = format!("checkpoint-studio: {e} — try again");
                         // Bold yellow on a colour terminal (respecting NO_COLOR);
                         // plain when piped.
                         if std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()

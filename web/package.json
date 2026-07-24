@@ -1,8 +1,8 @@
 {
-  "name": "checkpoint-explorer-web",
+  "name": "checkpoint-studio-web",
   "version": "0.1.0",
   "private": true,
-  "description": "Svelte web UI for checkpoint-explorer (served by the Rust --web server)",
+  "description": "Svelte web UI for checkpoint-studio (served by the Rust --web server)",
   "type": "module",
   "engines": {
     "node": ">=16 <21"

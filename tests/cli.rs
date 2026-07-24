@@ -175,10 +175,10 @@ fn ensure_moe_fixture() {
 
 /// Run the binary with exactly `args` and return its stdout.
 fn run_bin(args: &[&str]) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
         .args(args)
         .output()
-        .expect("run checkpoint-explorer");
+        .expect("run checkpoint-studio");
     assert!(
         out.status.success(),
         "non-zero exit; stderr:\n{}",
@@ -190,10 +190,10 @@ fn run_bin(args: &[&str]) -> String {
 /// Run the binary and return `(stdout, exit code)` without asserting success —
 /// `check` / `diff` use a nonzero exit to signal findings, not failure.
 fn run_bin_status(args: &[&str]) -> (String, i32) {
-    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
         .args(args)
         .output()
-        .expect("run checkpoint-explorer");
+        .expect("run checkpoint-studio");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         out.status.code().unwrap_or(-1),
@@ -220,7 +220,7 @@ fn assert_y_roundtrip(fixture: &str, extra_args: &[&str]) {
     emit.push("--emit-command");
     let command = run_bin(&emit);
 
-    // The command is `checkpoint-explorer <path> <flags…>`; drop the program name
+    // The command is `checkpoint-studio <path> <flags…>`; drop the program name
     // and render what's left (the fixture's names/paths are shell-safe, so the
     // tokens never need de-quoting).
     let mut reopen: Vec<&str> = command.split_whitespace().skip(1).collect();
@@ -402,7 +402,7 @@ fn check_detects_truncation() {
     // A copy with the last 8 data bytes lopped off — a classic interrupted
     // download. The byte-range check should fail the run (exit 1).
     let bytes = std::fs::read(FIXTURE).expect("read fixture");
-    let dir = std::env::temp_dir().join("checkpoint_explorer_check_trunc");
+    let dir = std::env::temp_dir().join("checkpoint_studio_check_trunc");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join("model.safetensors");
@@ -556,16 +556,16 @@ fn run_plain_err(extra_args: &[&str]) -> String {
     let mut args = vec![FIXTURE];
     args.extend_from_slice(extra_args);
     args.push("--plain");
-    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
         .args(&args)
         .output()
-        .expect("run checkpoint-explorer");
+        .expect("run checkpoint-studio");
     assert!(
         !out.status.success(),
         "expected non-zero exit for {extra_args:?}, got success"
     );
     format!(
-        "$ checkpoint-explorer {}\n{}",
+        "$ checkpoint-studio {}\n{}",
         args.join(" "),
         String::from_utf8_lossy(&out.stderr)
     )
@@ -603,10 +603,10 @@ fn hdf5_without_feature_errors() {
     for extra in [&[][..], &["--exit"][..], &["--plain"][..]] {
         let mut args = vec![H5];
         args.extend_from_slice(extra);
-        let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+        let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
             .args(&args)
             .output()
-            .expect("run checkpoint-explorer");
+            .expect("run checkpoint-studio");
         assert!(
             !out.status.success(),
             "expected non-zero exit for {args:?}, got success"
@@ -912,7 +912,7 @@ fn ensure_diff_fixtures() {
 fn run_diff(args: &[&str]) -> (String, i32) {
     let mut full = vec!["diff"];
     full.extend_from_slice(args);
-    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
         .args(&full)
         .output()
         .expect("run diff");
@@ -1192,7 +1192,7 @@ fn diff_parallel_matches_sequential_and_reports_time() {
     let (par, _) = run_diff(&[DIFF_OLD, DIFF_NEW, "--values", "--jobs", "4"]);
     assert_eq!(seq, par, "parallel diff must match sequential");
     // Elapsed time is reported by default (on stderr, so stdout stays clean).
-    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
         .args(["diff", DIFF_OLD, DIFF_NEW, "--values"])
         .output()
         .expect("run diff");
@@ -1208,7 +1208,7 @@ fn diff_filter_reports_matched_schema_on_stderr() {
     ensure_group_fixtures();
     // The filter context goes to stderr: "matched M of N" plus the matched names
     // collapsed into their index-templated schema (which layers/experts matched).
-    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
         .args([
             "diff",
             DIFF_GROUP_OLD,
@@ -1314,7 +1314,7 @@ fn diff_map_bad_regex_exits_2() {
 fn diff_map_collision_warns_on_stderr() {
     ensure_map_fixtures();
     // A rule that drops the layer index collapses all three layers onto one name.
-    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
         .args([
             "diff",
             MAP_OLD,

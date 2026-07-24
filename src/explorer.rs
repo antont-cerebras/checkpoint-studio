@@ -362,7 +362,7 @@ struct CachedReader {
 const STATS_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// The program name used when building the copyable CLI commands (`y`).
-const PROGRAM: &str = "checkpoint-explorer";
+const PROGRAM: &str = "checkpoint-studio";
 
 // Data-view header rows above the grid. Summed to size the grid so the header
 // (tensor name + file path) and the footer always stay on screen.
@@ -4484,7 +4484,7 @@ impl Explorer {
             let mut pw = self.remote.as_ref().unwrap().password.borrow_mut();
             r.open_with(&mut pw)?
         };
-        eprintln!("checkpoint-explorer: reading tensor metadata over ssh …");
+        eprintln!("checkpoint-studio: reading tensor metadata over ssh …");
 
         let mut tensors: Vec<TensorInfo> = Vec::new();
         let mut metadata: Vec<MetadataInfo> = Vec::new();
@@ -10153,7 +10153,7 @@ impl Explorer {
         }
     }
 
-    /// `checkpoint-explorer <file-or-dir> --tensor <name>`, plus the active dtype
+    /// `checkpoint-studio <file-or-dir> --tensor <name>`, plus the active dtype
     /// and shape overrides — the shared prefix for the detail and data-view
     /// commands. Uses the checkpoint's launch path(s), not the tensor's specific
     /// shard, so a directory checkpoint reopens whole.

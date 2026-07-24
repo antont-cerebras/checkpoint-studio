@@ -2592,7 +2592,7 @@ mod tests {
     #[ignore = "manual benchmark"]
     fn window_pan_open_cost() {
         use std::time::Instant;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_bench_pan");
+        let dir = std::env::temp_dir().join("checkpoint_studio_bench_pan");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("bench.h5");
         let _ = std::fs::remove_file(&path);
@@ -2752,7 +2752,7 @@ mod tests {
     #[test]
     fn samples_a_contiguous_window_at_an_offset() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_win");
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_win");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("w.safetensors");
         // 6x6 f32, value[r][c] = r*6 + c.
@@ -2844,7 +2844,7 @@ mod tests {
     #[test]
     fn samples_a_safetensors_tensor_by_value() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_st");
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_st");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("w.safetensors");
         // 4x5 f32, value[r][c] = r*5 + c
@@ -2875,7 +2875,7 @@ mod tests {
     #[test]
     fn grid_max_aggregates_blocks_and_catches_off_grid_outliers() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_gridmax");
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_gridmax");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("w.safetensors");
         // 8x8 f32, all 1.0 except a -100.0 outlier at (3,3) — deliberately off the
@@ -2929,7 +2929,7 @@ mod tests {
     #[test]
     fn samples_a_npy_array() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_npy");
+        let dir = std::env::temp_dir().join("checkpoint_studio_npy");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("w.npy");
         // 3x4 f32, value[r][c] = r*4 + c.
@@ -2977,7 +2977,7 @@ mod tests {
     #[test]
     fn samples_a_deflated_npz_entry() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_npz");
+        let dir = std::env::temp_dir().join("checkpoint_studio_npz");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("a.npz");
         // A 2x3 f32 array stored as a DEFLATE-compressed `w.npy` entry, to
@@ -3015,7 +3015,7 @@ mod tests {
     #[test]
     fn reshape_across_stored_rows() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_reshape");
+        let dir = std::env::temp_dir().join("checkpoint_studio_reshape");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("w.safetensors");
         // 4x5 f32 (value = flat index), reshaped to 5x4 — the override rows
@@ -3120,7 +3120,7 @@ mod tests {
     #[test]
     fn computes_exact_whole_tensor_stats() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_stats");
+        let dir = std::env::temp_dir().join("checkpoint_studio_stats");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("w.safetensors");
         // 4x5 f32, values 0..=19 (so one exact zero, mean 9.5).
@@ -3156,7 +3156,7 @@ mod tests {
     #[test]
     fn samples_a_3d_safetensors_slice() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_3d");
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_3d");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("w.safetensors");
         // [2, 3, 4] f32, value[s][r][c] = s*12 + r*4 + c
@@ -3202,7 +3202,7 @@ mod tests {
     #[test]
     fn previews_a_4d_tensor_with_a_unit_dim_as_3d() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_4d1");
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_4d1");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("w.safetensors");
         // [2, 1, 3, 4] f32 — same 24 bytes as the [2, 3, 4] case, with an inert
@@ -3234,7 +3234,7 @@ mod tests {
     #[test]
     fn previews_a_leading_unit_dim_as_lower_rank() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_1xn");
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_1xn");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("w.safetensors");
         // [1, 5] f32 → squeezes to a single row of 5.
@@ -3257,7 +3257,7 @@ mod tests {
     #[test]
     fn reinterprets_packed_4bit_views() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_u4");
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_u4");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("w.safetensors");
         // Shape [2] of F16 (2-byte containers): u16 values 0x1234 and 0x00AB.
@@ -3293,7 +3293,7 @@ mod tests {
     #[test]
     fn raw_bits_capture_the_stored_pattern() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_rawbits");
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_rawbits");
         let _ = std::fs::create_dir_all(&dir);
 
         // F32 [1,3] = 1.0, 2.0, -1.0 → IEEE-754 bits 0x3f800000 / 0x40000000 /
@@ -3468,7 +3468,7 @@ mod tests {
     #[test]
     fn unpacked_unmerges_fields_along_first_dim() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("checkpoint_explorer_unpacked");
+        let dir = std::env::temp_dir().join("checkpoint_studio_unpacked");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("w.safetensors");
         // U16 [2,2,2]: word at flat index f packs field0=f (low nibble) and
@@ -3648,7 +3648,7 @@ mod hdf5_tests {
 
     #[test]
     fn samples_an_hdf5_dataset_by_value() {
-        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_h5");
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_h5");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("d.h5");
         let _ = std::fs::remove_file(&path);
@@ -3705,7 +3705,7 @@ mod hdf5_tests {
         // A small I16 dataset whose values pack two 4-bit nibbles each, so the
         // packed-u4 view should unpack them — proving HDF5 reads honour overrides
         // by reinterpreting the stored bytes (not libhdf5's converted values).
-        let dir = std::env::temp_dir().join("checkpoint_explorer_reinterp_h5");
+        let dir = std::env::temp_dir().join("checkpoint_studio_reinterp_h5");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("q.h5");
         let _ = std::fs::remove_file(&path);
@@ -3757,7 +3757,7 @@ mod hdf5_tests {
         // A 3D dataset [d0=2, d1=3, d2=4] of values v = d0*100 + d1*10 + d2, so
         // each element identifies its own (slice, row, col). Verifies the reader
         // maps a sampled (slice, row, col) to the right dataset element.
-        let dir = std::env::temp_dir().join("checkpoint_explorer_3d_h5");
+        let dir = std::env::temp_dir().join("checkpoint_studio_3d_h5");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("v3.h5");
         let _ = std::fs::remove_file(&path);
