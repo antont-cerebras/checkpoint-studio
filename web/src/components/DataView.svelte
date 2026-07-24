@@ -223,15 +223,19 @@
   }
 
   // ---- values ----
-  function cellText(i: number, j: number): string {
-    if (!data) return '';
-    if (base === 'dec') return num(data.values[i][j]);
-    const hex = data.raw?.[i]?.[j];
+  // Takes `d` and `b` as arguments (rather than closing over `data`/`base`) so the
+  // `{cellText(data, base, i, j)}` call in the markup names them as dependencies —
+  // otherwise Svelte, seeing only `i`/`j` in the expression, would render each cell
+  // once and never update its text on pan/seek/base-change (the header, bound to
+  // `data.rows[i]`, would relabel while the values stayed frozen at the origin).
+  function cellText(d: SampleDto, b: 'dec' | 'hex' | 'oct' | 'bin', i: number, j: number): string {
+    if (b === 'dec') return num(d.values[i][j]);
+    const hex = d.raw?.[i]?.[j];
     if (hex == null) return '';
-    if (base === 'hex') return hex;
-    const w = data.raw_width ?? hex.length * 4;
+    if (b === 'hex') return hex;
+    const w = d.raw_width ?? hex.length * 4;
     const big = BigInt('0x' + hex);
-    return base === 'oct' ? big.toString(8).padStart(Math.ceil(w / 3), '0') : big.toString(2).padStart(w, '0');
+    return b === 'oct' ? big.toString(8).padStart(Math.ceil(w / 3), '0') : big.toString(2).padStart(w, '0');
   }
 
   function pan(dr: number, dc: number) {
@@ -419,7 +423,7 @@
               <tr>
                 <th class="dim">{data.rows[i]}</th>
                 {#each row as _, j}
-                  <td class="mono">{cellText(i, j)}</td>
+                  <td class="mono">{cellText(data, base, i, j)}</td>
                   {#if j === colGap}<td class="sep">⋯</td>{/if}
                 {/each}
               </tr>
