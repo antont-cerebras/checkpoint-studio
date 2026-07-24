@@ -222,7 +222,16 @@ fn handle(state: &WebState, req: tiny_http::Request) {
         let q = parse_query(query_str);
         let (status, body) = route_api(state, api, &q);
         let data = serde_json::to_vec(&body).unwrap_or_default();
-        send(req, status, data, "application/json; charset=utf-8", gzip);
+        // The API reflects one read-once checkpoint; a browser must never reuse a
+        // response from a prior server run (a different checkpoint on the same port).
+        send(
+            req,
+            status,
+            data,
+            "application/json; charset=utf-8",
+            gzip,
+            Some("no-store"),
+        );
     } else {
         respond_asset(req, path, gzip);
     }
@@ -265,11 +274,24 @@ fn parse_query(qs: &str) -> Query {
 fn respond_asset(req: tiny_http::Request, path: &str, gzip: bool) {
     let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
-    // Serve the asset, else fall back to index.html (client-side routing).
-    let (data, ctype) = match assets::WebAssets::get(rel) {
-        Some(f) => (f.data.into_owned(), assets::content_type(rel)),
+    // Serve the asset, else fall back to index.html (client-side routing). Vite
+    // fingerprints everything under `assets/` (index-<hash>.js), so those are
+    // immutable-forever; index.html (and any SPA fallback) must revalidate every
+    // load, else a redeploy is invisible until a hard refresh — the cause of more
+    // than one "tested a stale bundle" review.
+    let (data, ctype, cache) = match assets::WebAssets::get(rel) {
+        Some(f) if rel.starts_with("assets/") => (
+            f.data.into_owned(),
+            assets::content_type(rel),
+            "public, max-age=31536000, immutable",
+        ),
+        Some(f) => (f.data.into_owned(), assets::content_type(rel), "no-cache"),
         None => match assets::WebAssets::get("index.html") {
-            Some(f) => (f.data.into_owned(), assets::content_type("index.html")),
+            Some(f) => (
+                f.data.into_owned(),
+                assets::content_type("index.html"),
+                "no-cache",
+            ),
             None => {
                 let resp = tiny_http::Response::from_string(
                     "web UI not built — run `cd web && npm ci && npm run build`",
@@ -280,13 +302,23 @@ fn respond_asset(req: tiny_http::Request, path: &str, gzip: bool) {
             }
         },
     };
-    send(req, 200, data, ctype, gzip);
+    send(req, 200, data, ctype, gzip, Some(cache));
 }
 
 /// Send a response, gzip-compressing the body when the client accepts it and the
 /// payload is large enough to be worth it (the tensor-tree JSON is tens of MB).
-fn send(req: tiny_http::Request, status: u16, data: Vec<u8>, content_type: &str, gzip: bool) {
+fn send(
+    req: tiny_http::Request,
+    status: u16,
+    data: Vec<u8>,
+    content_type: &str,
+    gzip: bool,
+    cache_control: Option<&str>,
+) {
     let mut headers = vec![header("Content-Type", content_type)];
+    if let Some(cc) = cache_control {
+        headers.push(header("Cache-Control", cc));
+    }
     let body = if gzip && data.len() > 1024 {
         match gzip_bytes(&data) {
             Ok(compressed) => {
