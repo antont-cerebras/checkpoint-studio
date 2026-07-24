@@ -10899,8 +10899,10 @@ fn parse_slice_input(input: &str, slices: usize) -> Result<Option<usize>, String
             return Err(format!("{pct}% is out of range — use 0% to 100%"));
         }
         // 0% -> first slice, 100% -> last slice; round to the nearest.
-        let idx = ((pct / 100.0) * (slices - 1) as f64).round() as usize;
-        Ok(Some(idx.min(slices - 1)))
+        // saturating: an empty leading dimension means there is no slice to pick.
+        let last = slices.saturating_sub(1);
+        let idx = ((pct / 100.0) * last as f64).round() as usize;
+        Ok(Some(idx.min(last)))
     } else {
         let n: usize = s
             .parse()
@@ -10910,7 +10912,7 @@ fn parse_slice_input(input: &str, slices: usize) -> Result<Option<usize>, String
         } else {
             Err(format!(
                 "index {n} is out of range — the last slice is {}",
-                slices - 1
+                slices.saturating_sub(1)
             ))
         }
     }

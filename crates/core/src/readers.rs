@@ -334,7 +334,9 @@ fn read_gguf(file_path: &Path, source_path: &str) -> Result<(Vec<TensorInfo>, Ve
     for tensor in &gguf.tensors {
         let shape: Vec<usize> = tensor.dimensions.iter().map(|&d| d as usize).collect();
         let num_elements = shape.iter().product::<usize>();
-        let size_bytes = (num_elements as f32 * tensor.tensor_type.element_size_bytes()) as usize;
+        // Exact integer block arithmetic — an f32 bytes-per-element product lost
+        // precision on large tensors and dropped the final partial block.
+        let size_bytes = tensor.tensor_type.stored_size(num_elements);
         tensors.push(TensorInfo {
             name: tensor.name.clone(),
             dtype: tensor.tensor_type.to_string(),

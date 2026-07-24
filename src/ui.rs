@@ -1798,7 +1798,9 @@ impl UI {
         Paragraph::new(hint_lines).render(
             Rect {
                 x: 0,
-                y: (height as usize - footer_rows) as u16,
+                // saturating: a narrow terminal wraps the hint chips onto enough
+                // lines that `footer_rows` can exceed the height, which underflowed.
+                y: (height as usize).saturating_sub(footer_rows) as u16,
                 width,
                 height: footer_rows as u16,
             },
@@ -1926,7 +1928,8 @@ impl UI {
 
         // Clickable footer chips (hints start at the footer's top row) + `[×]`
         // (→ back to the tensor tree, like the file view's close).
-        let footer_top = (height as usize - footer_rows) as u16;
+        // saturating for the same reason as the layout footer above.
+        let footer_top = (height as usize).saturating_sub(footer_rows) as u16;
         let mut regions = chip_regions(&chips, footer_top);
         regions.extend(close_button(
             frame,

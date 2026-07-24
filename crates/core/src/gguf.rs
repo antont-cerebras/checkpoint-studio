@@ -119,43 +119,58 @@ impl GGMLType {
         }
     }
 
-    /// Get the size in bytes per element for this type
-    /// For quantized types, this is an approximation
-    pub fn element_size_bytes(&self) -> f32 {
+    /// This type's storage block as `(bytes_per_block, elements_per_block)`.
+    ///
+    /// GGUF quantizes in whole blocks, so a tensor's size is
+    /// `ceil(elements / elements_per_block) * bytes_per_block`. Kept as an exact
+    /// integer ratio rather than a bytes-per-element `f32`: that had only 24 mantissa
+    /// bits, so large tensors came out wrong (an F32 tensor of 20,000,001 elements
+    /// measured 80,000,000 instead of 80,000,004), and truncating the product also
+    /// dropped the final partial block.
+    pub fn block_layout(&self) -> (usize, usize) {
         match self {
-            GGMLType::F32 | GGMLType::I32 => 4.0,
-            GGMLType::F16 | GGMLType::BF16 | GGMLType::I16 => 2.0,
-            GGMLType::F64 | GGMLType::I64 => 8.0,
-            GGMLType::I8 => 1.0,
+            GGMLType::F32 | GGMLType::I32 => (4, 1),
+            GGMLType::F16 | GGMLType::BF16 | GGMLType::I16 => (2, 1),
+            GGMLType::F64 | GGMLType::I64 => (8, 1),
+            GGMLType::I8 => (1, 1),
 
             // Legacy Q‑quants (block of 32 weights)
-            GGMLType::Q4_0 => 0.5625, // 18  / 32  bytes
-            GGMLType::Q4_1 => 0.625,  // 20  / 32
-            GGMLType::Q5_0 => 0.6875, // 22  / 32
-            GGMLType::Q5_1 => 0.75,   // 24  / 32
-            GGMLType::Q8_0 => 1.0625, // 34  / 32
-            GGMLType::Q8_1 => 1.125,  // 36  / 32
+            GGMLType::Q4_0 => (18, 32),
+            GGMLType::Q4_1 => (20, 32),
+            GGMLType::Q5_0 => (22, 32),
+            GGMLType::Q5_1 => (24, 32),
+            GGMLType::Q8_0 => (34, 32),
+            GGMLType::Q8_1 => (36, 32),
 
-            // K‑quants (super‑block of 256 weights)
-            GGMLType::Q2_K => 0.328_125,   // 2.625  bpw
-            GGMLType::Q3_K => 0.429_687_5, // 3.4375 bpw
-            GGMLType::Q4_K => 0.5625,      // 4.5    bpw
-            GGMLType::Q5_K => 0.6875,      // 5.5    bpw
-            GGMLType::Q6_K => 0.820_312_5, // 6.5625 bpw
-            GGMLType::Q8_K => 1.140_625,   // 9.125  bpw
+            // K‑quants (super‑block of 256 weights); bytes = bpw * 256 / 8
+            GGMLType::Q2_K => (84, 256),  // 2.625  bpw
+            GGMLType::Q3_K => (110, 256), // 3.4375 bpw
+            GGMLType::Q4_K => (144, 256), // 4.5    bpw
+            GGMLType::Q5_K => (176, 256), // 5.5    bpw
+            GGMLType::Q6_K => (210, 256), // 6.5625 bpw
+            GGMLType::Q8_K => (292, 256), // 9.125  bpw
 
-            // Importance‑quants (IQ‑family, super‑block 256)
-            GGMLType::IQ1_S => 0.195_312_5,      // 1.5625 bpw
-            GGMLType::IQ1_M => 0.218_75,         // 1.75   bpw
-            GGMLType::IQ2_XXS => 0.257_812_5,    // 2.0625 bpw
-            GGMLType::IQ2_XS => 0.289_062_5,     // 2.3125 bpw
-            GGMLType::IQ2_S => 0.3125,           // 2.5    bpw
-            GGMLType::IQ3_XXS => 0.382_812_5,    // 3.0625 bpw
-            GGMLType::IQ3_S => 0.429_687_5,      // 3.4375 bpw
-            GGMLType::IQ4_NL => 0.53125,         // 4.25   bpw
-            GGMLType::IQ4_XS => 0.53125,         // 4.25   bpw
-            GGMLType::GGML_TYPE_Q1_58 => 0.1975, // 1.58 / 8
+            // Importance‑quants (IQ‑family, super‑block 256 except IQ4_NL's 32)
+            GGMLType::IQ1_S => (50, 256),   // 1.5625 bpw
+            GGMLType::IQ1_M => (56, 256),   // 1.75   bpw
+            GGMLType::IQ2_XXS => (66, 256), // 2.0625 bpw
+            GGMLType::IQ2_XS => (74, 256),  // 2.3125 bpw
+            GGMLType::IQ2_S => (80, 256),   // 2.5    bpw
+            GGMLType::IQ3_XXS => (98, 256), // 3.0625 bpw
+            GGMLType::IQ3_S => (110, 256),  // 3.4375 bpw
+            GGMLType::IQ4_NL => (17, 32),   // 4.25   bpw
+            GGMLType::IQ4_XS => (136, 256), // 4.25   bpw
+            // 1.58 bpw doesn't land on a whole byte per 256, so keep the exact ratio
+            // this type has always been measured with (0.1975 B/elem = 79/400).
+            GGMLType::GGML_TYPE_Q1_58 => (79, 400),
         }
+    }
+
+    /// Exact stored size of `elements` values of this type, rounded up to whole
+    /// blocks (see [`GGMLType::block_layout`]).
+    pub fn stored_size(&self, elements: usize) -> usize {
+        let (bytes, per_block) = self.block_layout();
+        elements.div_ceil(per_block.max(1)).saturating_mul(bytes)
     }
 }
 
@@ -410,5 +425,69 @@ impl GGUFFile {
         let mut buf = [0u8; 8];
         cursor.read_exact(&mut buf)?;
         Ok(f64::from_le_bytes(buf))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sizes were computed as `elements as f32 * bytes_per_element`, which has only 24
+    /// mantissa bits and truncated the trailing partial block. Both errors are visible
+    /// on realistic tensor sizes, and the result feeds the displayed size, the
+    /// checkpoint totals, and the exact `size>N` filter.
+    #[test]
+    fn stored_size_is_exact_and_rounds_up_to_whole_blocks() {
+        // f32 rounding: 20_000_001 * 4.0 lost the last increment.
+        assert_eq!(GGMLType::F32.stored_size(20_000_001), 80_000_004);
+        assert_eq!(GGMLType::F16.stored_size(20_000_001), 40_000_002);
+        // Whole-block rounding: 24_990_001 elements is 780_938 blocks of 32 (the last
+        // holding a single value), not the truncated 780_937.
+        assert_eq!(GGMLType::Q4_0.stored_size(24_990_001), 780_938 * 18);
+        assert_eq!(GGMLType::Q4_0.stored_size(24_990_001), 14_056_884);
+        // Exact multiples stay exact.
+        assert_eq!(GGMLType::Q4_0.stored_size(32), 18);
+        assert_eq!(GGMLType::Q4_K.stored_size(256), 144);
+        assert_eq!(GGMLType::Q4_K.stored_size(257), 288); // spills into a second block
+        // Empty tensors have no blocks.
+        assert_eq!(GGMLType::F32.stored_size(0), 0);
+        assert_eq!(GGMLType::Q6_K.stored_size(0), 0);
+        // Every type reports a usable block (no zero divisor, no zero-byte block).
+        for t in [
+            GGMLType::F32,
+            GGMLType::F16,
+            GGMLType::F64,
+            GGMLType::BF16,
+            GGMLType::I8,
+            GGMLType::I16,
+            GGMLType::I32,
+            GGMLType::I64,
+            GGMLType::Q4_0,
+            GGMLType::Q4_1,
+            GGMLType::Q5_0,
+            GGMLType::Q5_1,
+            GGMLType::Q8_0,
+            GGMLType::Q8_1,
+            GGMLType::Q2_K,
+            GGMLType::Q3_K,
+            GGMLType::Q4_K,
+            GGMLType::Q5_K,
+            GGMLType::Q6_K,
+            GGMLType::Q8_K,
+            GGMLType::IQ1_S,
+            GGMLType::IQ1_M,
+            GGMLType::IQ2_XXS,
+            GGMLType::IQ2_XS,
+            GGMLType::IQ2_S,
+            GGMLType::IQ3_XXS,
+            GGMLType::IQ3_S,
+            GGMLType::IQ4_NL,
+            GGMLType::IQ4_XS,
+            GGMLType::GGML_TYPE_Q1_58,
+        ] {
+            let (bytes, per_block) = t.block_layout();
+            assert!(bytes > 0 && per_block > 0, "{t} has an empty block layout");
+            assert!(t.stored_size(1) > 0, "{t} sized one element as 0 bytes");
+        }
     }
 }
