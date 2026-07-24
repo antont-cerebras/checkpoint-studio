@@ -222,10 +222,16 @@ ssh_proxy = "you@host.example.com"
 ssh_venv  = "~/venv"   # optional — the cstorch venv on that host (default: ~/venv)
 ```
 Then plain `checkpoint-studio s3://my-bucket/…/checkpoint` (or `diff`, `check`,
-`web`) reads through that proxy with no flag. An explicit `--ssh-proxy` /
-`--ssh-venv` on the command line always overrides the config, and a missing or
-malformed config file is simply ignored. (`--ssh-read` still works as an alias for
-`--ssh-proxy`, so older commands keep running.)
+`web`) reads through that proxy with no flag. For a **remote filesystem path** (which
+looks just like a local one), prefix it with `:` to route it there:
+```bash
+checkpoint-studio :/opt/models/some-model-4bit     # = --ssh-proxy <config host> /opt/models/…
+```
+The `:` is the explicit opt-in, so a same-named *local* directory is never silently
+read off-host (and `:PATH` with no proxy configured is an error, not a local read).
+An explicit `--ssh-proxy` / `--ssh-venv` on the command line always overrides the
+config, and a missing or malformed config file is simply ignored. (`--ssh-read` still
+works as an alias for `--ssh-proxy`, so older commands keep running.)
 
 > **Read-only, guaranteed.** `--ssh-proxy` never modifies the remote checkpoint.
 > Files are opened strictly read-only (`OpenFlags::READ` — no create/write/

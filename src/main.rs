@@ -71,6 +71,7 @@ fn examples_help() -> String {
   {group}Read a remote / S3 checkpoint over SSH{r} (only metadata leaves the host):
       checkpoint-studio --ssh-proxy user@host s3://bucket/model/checkpoint
       checkpoint-studio user@host:/opt/models/some-model          # scp-style; a safetensors dir
+      checkpoint-studio :/opt/models/some-model                   # ':' prefix = the config's ssh_proxy
 
   {group}Export the structure for scripts / agents{r} (text, or --format json):
       checkpoint-studio model.safetensors --print-tree
@@ -114,7 +115,10 @@ so data and credentials stay remote. Set the proxy you use most in a config file
 (~/.config/checkpoint-studio/config.toml) so you needn't pass --ssh-proxy every time:
     ssh_proxy = \"user@host\"
     ssh_venv  = \"~/venv\"      # optional; defaults to ~/venv
-An explicit --ssh-proxy / --ssh-venv flag always overrides the config.
+An explicit --ssh-proxy / --ssh-venv flag always overrides the config. With a proxy \
+configured, prefix a path with `:` to read it there — `checkpoint-studio :/opt/models/foo` \
+reads that path on the config's proxy host (the `:` keeps it explicit, so a same-named \
+local directory is never routed off-host).
 
 For scripts and agents there are one-shot --print-tree / --print-tensors exports (text \
 or JSON) and a `diff` subcommand with diff-style exit codes.
@@ -140,6 +144,7 @@ struct ExploreArgs {
                 \n\
                 Remote paths work too (read over SSH — only metadata leaves the host):\n  \
                 [USER@]HOST:/path   scp-style path, like --ssh-proxy\n  \
+                :/path              read /path on the config's ssh_proxy host\n  \
                 s3://…              an S3 checkpoint; pass with --ssh-proxy <HOST>")]
     paths: Vec<PathBuf>,
 
@@ -812,11 +817,18 @@ fn main() -> Result<()> {
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
             // the `Result` convention `main` uses elsewhere, so exit explicitly.
-            // `--ssh-proxy` (or, for an s3:// pair, the config default): read each
-            // checkpoint's structure via cstorch on the remote (secrets stay there).
-            let src_s3 = is_s3_source(&old) || is_s3_source(&new);
-            let remote = resolve_ssh_proxy(ssh_proxy, ssh_venv, &cfg, src_s3)
-                .map(|(host, venv)| crate::remote::RemoteRead::new(host, venv));
+            // `--ssh-proxy` (or, for an s3:// pair / `:PATH`, the config default):
+            // read each checkpoint's structure via the remote (secrets stay there).
+            let (srcs, remote) =
+                match resolve_remote_sources(&[old, new], ssh_proxy, ssh_venv, &cfg) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("checkpoint-studio diff: {e:#}");
+                        std::process::exit(2);
+                    }
+                };
+            let (old, new) = (&srcs[0], &srcs[1]);
+            let remote = remote.map(|(host, venv)| crate::remote::RemoteRead::new(host, venv));
             let filter = match build_tensor_filter(
                 &name,
                 names.as_deref(),
@@ -857,8 +869,8 @@ fn main() -> Result<()> {
             });
             let started = std::time::Instant::now();
             let code = run_diff(
-                &old,
-                &new,
+                old,
+                new,
                 recursive,
                 tensor.as_deref(),
                 view,
@@ -908,13 +920,8 @@ fn main() -> Result<()> {
                     .map(|n| n.get())
                     .unwrap_or(4)
             });
-            let remote = resolve_ssh_proxy(
-                ssh_proxy,
-                ssh_venv,
-                &cfg,
-                paths.iter().any(|p| is_s3_source(p)),
-            )
-            .map(|(host, venv)| crate::remote::RemoteRead::new(host, venv));
+            let (paths, remote) = resolve_remote_sources(&paths, ssh_proxy, ssh_venv, &cfg)?;
+            let remote = remote.map(|(host, venv)| crate::remote::RemoteRead::new(host, venv));
             std::process::exit(run_check(
                 &paths,
                 recursive,
@@ -936,26 +943,20 @@ fn main() -> Result<()> {
             ssh_proxy,
             ssh_venv,
         }) => {
-            let s3 = paths.iter().any(|p| is_s3_source(p));
-            run_web(
-                &paths,
-                recursive,
-                no_health_check,
-                host,
-                port,
-                resolve_ssh_proxy(ssh_proxy, ssh_venv, &cfg, s3),
-            )
+            let (paths, ssh) = resolve_remote_sources(&paths, ssh_proxy, ssh_venv, &cfg)?;
+            run_web(&paths, recursive, no_health_check, host, port, ssh)
         }
         None => {
             // The default (no subcommand) is the interactive explorer. Fill the SSH
             // proxy/venv from the config file when the flags weren't given — but only
-            // for an s3:// source, so a configured default never routes a local path
-            // through SSH (an explicit --ssh-proxy still does).
+            // for a source that needs it (`s3://` or a `:PATH`), so a configured
+            // default never routes a plain local path through SSH (an explicit
+            // --ssh-proxy still does). `[user@]host:/path` is handled in run_explore.
             let mut args = cli.explore;
-            let src_s3 = args.paths.iter().any(|p| is_s3_source(p));
-            if let Some((host, venv)) =
-                resolve_ssh_proxy(args.ssh_proxy.take(), args.ssh_venv.take(), &cfg, src_s3)
-            {
+            let (proxy, venv) = (args.ssh_proxy.take(), args.ssh_venv.take());
+            let (paths, remote) = resolve_remote_sources(&args.paths, proxy, venv, &cfg)?;
+            args.paths = paths;
+            if let Some((host, venv)) = remote {
                 args.ssh_proxy = Some(host);
                 args.ssh_venv = Some(venv);
             }
@@ -1470,29 +1471,78 @@ fn is_aborted_err(e: &anyhow::Error) -> bool {
         .any(|c| c.to_string().contains(crate::sftp::RemoteSession::ABORTED))
 }
 
+/// An effective SSH proxy for a read: `(host, venv)`.
+type SshProxy = (String, String);
+
 /// Resolve the effective SSH proxy for a read. An explicit `--ssh-proxy` flag wins
 /// and forces the proxy for *any* source. The config file's `ssh_proxy` default only
-/// engages when the source is `s3://` (which genuinely can't be read without a
-/// proxy) — so a configured default never hijacks a **local** path into an SSH read.
-/// Returns `(host, venv)` (venv: flag → config → `~/venv`), or `None` for a plain
-/// local read.
+/// engages when the source genuinely needs a proxy — an `s3://` URI or a `:`-prefixed
+/// remote path — so a configured default never hijacks a plain **local** path into an
+/// SSH read. Returns `(host, venv)` (venv: flag → config → `~/venv`), or `None` for a
+/// plain local read.
 fn resolve_ssh_proxy(
     proxy: Option<String>,
     venv: Option<String>,
     cfg: &cli_config::CliConfig,
-    source_is_s3: bool,
-) -> Option<(String, String)> {
-    let host = proxy.or_else(|| source_is_s3.then(|| cfg.ssh_proxy.clone()).flatten())?;
+    source_needs_proxy: bool,
+) -> Option<SshProxy> {
+    let host = proxy.or_else(|| source_needs_proxy.then(|| cfg.ssh_proxy.clone()).flatten())?;
     let venv = venv
         .or_else(|| cfg.ssh_venv.clone())
         .unwrap_or_else(|| "~/venv".to_string());
     Some((host, venv))
 }
 
-/// Whether a path string names an `s3://` source — the case a configured default
-/// proxy applies to (a local path is never routed through the config proxy).
+/// Whether a path string names an `s3://` source — one case a configured default
+/// proxy applies to (a plain local path is never routed through the config proxy).
 fn is_s3_source(p: &Path) -> bool {
     p.to_string_lossy().starts_with("s3://")
+}
+
+/// A leading `:` on a positional path is the terse scp-style form for "read this over
+/// my configured SSH proxy": `:/opt/models/foo` reads `/opt/models/foo` on the
+/// `ssh_proxy` host from the config file. It complements the explicit
+/// `[user@]host:/path` form (which carries its own host); unlike a bare local path
+/// it's an unambiguous opt-in, so a same-named local directory is never silently
+/// routed off-host.
+fn config_proxy_prefixed(p: &Path) -> bool {
+    p.to_string_lossy().starts_with(':')
+}
+
+/// Strip the leading `:` config-proxy marker (a no-op when absent).
+fn strip_config_proxy_prefix(p: &Path) -> PathBuf {
+    match p.to_string_lossy().strip_prefix(':') {
+        Some(rest) => PathBuf::from(rest),
+        None => p.to_path_buf(),
+    }
+}
+
+/// Resolve a command's positional sources + its effective SSH proxy in one place:
+/// strip any `:` remote markers, then decide whether the read is remote — an explicit
+/// `--ssh-proxy` (any source), or the config `ssh_proxy` default for an `s3://` URI or
+/// a `:`-prefixed path. A `:`-prefixed source with no proxy resolvable is an error
+/// (the `:` explicitly asked to go remote; don't silently read a local path instead).
+/// Returns the de-prefixed paths and the proxy (`None` = local read).
+fn resolve_remote_sources(
+    paths: &[PathBuf],
+    proxy: Option<String>,
+    venv: Option<String>,
+    cfg: &cli_config::CliConfig,
+) -> Result<(Vec<PathBuf>, Option<SshProxy>)> {
+    let prefixed = paths.iter().any(|p| config_proxy_prefixed(p));
+    let needs_proxy = prefixed || paths.iter().any(|p| is_s3_source(p));
+    let stripped: Vec<PathBuf> = paths.iter().map(|p| strip_config_proxy_prefix(p)).collect();
+    let remote = resolve_ssh_proxy(proxy, venv, cfg, needs_proxy);
+    if prefixed && remote.is_none() {
+        let where_ = cli_config::CliConfig::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "the config file".to_string());
+        anyhow::bail!(
+            "`:PATH` reads over the SSH proxy, but none is configured — \
+             set `ssh_proxy` in {where_}, or pass --ssh-proxy <HOST>"
+        );
+    }
+    Ok((stripped, remote))
 }
 
 #[allow(clippy::too_many_arguments)] // a CLI entry point; each arg is a distinct flag
@@ -3702,6 +3752,36 @@ mod tests {
             resolve_ssh_proxy(None, None, &cli_config::CliConfig::default(), true),
             None
         );
+    }
+
+    #[test]
+    fn colon_prefix_reads_via_config_proxy_and_strips_the_marker() {
+        let cfg = cli_config::CliConfig {
+            ssh_proxy: Some("cfg@host".into()),
+            ssh_venv: None,
+        };
+        // `:PATH` engages the config proxy (like s3://) and the `:` is stripped so the
+        // remote reader gets the bare path.
+        let (paths, remote) =
+            resolve_remote_sources(&[PathBuf::from(":/opt/models/m")], None, None, &cfg).unwrap();
+        assert_eq!(paths, vec![PathBuf::from("/opt/models/m")]);
+        assert_eq!(remote, Some(("cfg@host".into(), "~/venv".into())));
+
+        // A plain local path is untouched and stays local, even with a config proxy set.
+        let (paths, remote) =
+            resolve_remote_sources(&[PathBuf::from("/opt/models/m")], None, None, &cfg).unwrap();
+        assert_eq!(paths, vec![PathBuf::from("/opt/models/m")]);
+        assert_eq!(remote, None);
+
+        // `:PATH` with no proxy resolvable is an error (don't silently read locally).
+        let err = resolve_remote_sources(
+            &[PathBuf::from(":/opt/models/m")],
+            None,
+            None,
+            &cli_config::CliConfig::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("SSH proxy"), "{err}");
     }
 
     #[test]
