@@ -2973,8 +2973,8 @@ impl UI {
         let mut fold_lines: Vec<usize> = Vec::new();
 
         // Title column width, including the synthetic "Value scan" row.
-        let width = report
-            .results
+        let checks = report.checks();
+        let width = checks
             .iter()
             .map(|r| r.title.len())
             .chain(std::iter::once("Value scan".len()))
@@ -2991,7 +2991,7 @@ impl UI {
             Style::default().fg(palette::DIM),
         ))];
 
-        for r in &report.results {
+        for r in &checks {
             let (mark, mc) = match r.status() {
                 Status::Pass => ("✓", palette::SUCCESS),
                 Status::Warn => ("⚠", palette::WARN),
@@ -7095,7 +7095,7 @@ mod tests {
     // core `check` module keeps the data-level checks.
     #[test]
     fn check_popup_folds_findings_like_the_stats_popup() {
-        use crate::check::{CheckReport, CheckResult, Finding};
+        use crate::check::{CheckReport, CheckResult, CheckpointFormat, Finding, StorageCheck};
         let findings: Vec<Finding> = (0..250)
             .map(|i| Finding::error(Some(format!("tensor-{i:04}")), "bad byte range".into()))
             .collect();
@@ -7105,12 +7105,14 @@ mod tests {
             n_tensors: 250,
             params: 1,
             values: false,
-            results: vec![CheckResult::done(
-                "id",
+            format: CheckpointFormat::Safetensors,
+            storage: StorageCheck::ByteRanges(CheckResult::done(
+                "byte_ranges",
                 "Byte-range integrity",
                 "n",
                 findings,
-            )],
+            )),
+            results: vec![],
         };
         let render = |expanded| {
             crate::tui::headless_render(200, 400, |f| {

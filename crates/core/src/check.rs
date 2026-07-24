@@ -178,15 +178,31 @@ pub struct CheckReport {
     pub params: usize,
     /// Whether the value tier ran (drives the "value scan skipped" note).
     pub values: bool,
+    /// The checkpoint's on-disk format — gates format-specific reporting.
+    pub format: CheckpointFormat,
+    /// The one applicable storage-integrity check (or none) for this format.
+    pub storage: StorageCheck,
+    /// Format-agnostic checks: layers, shapes/dtypes, config, files, and (with
+    /// `--values`) the value scan. The storage check lives in `storage`, not here.
     pub results: Vec<CheckResult>,
 }
 
 impl CheckReport {
+    /// Every check in display order: the format's storage-integrity check first (when
+    /// it has one), then the universal checks — so renderers iterate uniformly
+    /// without matching on the storage variant.
+    pub fn checks(&self) -> Vec<&CheckResult> {
+        self.storage
+            .check()
+            .into_iter()
+            .chain(self.results.iter())
+            .collect()
+    }
     pub fn errors(&self) -> usize {
-        self.results.iter().map(CheckResult::errors).sum()
+        self.checks().iter().map(|r| r.errors()).sum()
     }
     pub fn warnings(&self) -> usize {
-        self.results.iter().map(CheckResult::warnings).sum()
+        self.checks().iter().map(|r| r.warnings()).sum()
     }
     /// `diff`-style: `1` when the checkpoint is unhealthy, else `0`. Errors
     /// always count; warnings only when `strict`.
@@ -229,6 +245,92 @@ impl CheckResult {
             Status::Warn
         } else {
             Status::Pass
+        }
+    }
+}
+
+/// The checkpoint's on-disk format, derived once from the tensors' source files. It
+/// selects which storage-integrity check applies (see [`StorageCheck`]) and gates
+/// format-specific reporting — so e.g. an "HDF5 integrity" section on a safetensors
+/// checkpoint, or index reconciliation on a non-safetensors one, can't appear.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointFormat {
+    Safetensors,
+    Hdf5,
+    Numpy,
+    Gguf,
+    /// e.g. an `s3://` cstorch checkpoint read metadata-only — no local file format.
+    Other,
+}
+
+impl CheckpointFormat {
+    fn detect(tensors: &[TensorInfo]) -> CheckpointFormat {
+        let has = |exts: &[&str]| {
+            tensors.iter().any(|t| {
+                let p = t.source_path.to_ascii_lowercase();
+                exts.iter().any(|e| p.ends_with(e))
+            })
+        };
+        if has(&[".hdf5", ".h5"]) {
+            CheckpointFormat::Hdf5
+        } else if has(&[".gguf"]) {
+            CheckpointFormat::Gguf
+        } else if has(&[".npy", ".npz"]) {
+            CheckpointFormat::Numpy
+        } else if has(&[".safetensors"]) {
+            CheckpointFormat::Safetensors
+        } else {
+            CheckpointFormat::Other
+        }
+    }
+
+    /// Whether this format uses `model.safetensors.index.json` (so index
+    /// reconciliation is meaningful) — safetensors only.
+    pub fn has_index(self) -> bool {
+        matches!(self, CheckpointFormat::Safetensors)
+    }
+}
+
+/// The **format-specific storage-integrity check** — exactly one variant exists per
+/// checkpoint, so the wrong one (HDF5 chunk integrity on a byte-range file, or
+/// byte-range integrity on an HDF5 one) is unrepresentable, and a checkpoint with no
+/// on-disk layout (e.g. remote metadata-only) simply carries none. Chosen by the
+/// tensors' [`Layout`], not the file extension, so it matches what can actually be
+/// verified.
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StorageCheck {
+    /// safetensors / NumPy: contiguous byte-range integrity.
+    ByteRanges(CheckResult),
+    /// HDF5: chunk/dtype integrity.
+    Hdf5(CheckResult),
+    /// No on-disk layout to validate (GGUF offsets, or a metadata-only remote read).
+    Opaque,
+}
+
+impl StorageCheck {
+    fn detect(tensors: &[TensorInfo]) -> StorageCheck {
+        if tensors
+            .iter()
+            .any(|t| matches!(t.layout, Layout::Chunked { .. }))
+        {
+            StorageCheck::Hdf5(check_hdf5(tensors))
+        } else if tensors
+            .iter()
+            .any(|t| matches!(t.layout, Layout::ByteRange { .. }))
+        {
+            StorageCheck::ByteRanges(check_byte_ranges(tensors))
+        } else {
+            StorageCheck::Opaque
+        }
+    }
+
+    /// The integrity check to render, when the format has one.
+    pub fn check(&self) -> Option<&CheckResult> {
+        match self {
+            StorageCheck::ByteRanges(c) | StorageCheck::Hdf5(c) => Some(c),
+            StorageCheck::Opaque => None,
         }
     }
 }
@@ -277,13 +379,9 @@ impl CheckReport {
             ),
         );
 
-        let width = self
-            .results
-            .iter()
-            .map(|r| r.title.len())
-            .max()
-            .unwrap_or(0);
-        for r in &self.results {
+        let checks = self.checks();
+        let width = checks.iter().map(|r| r.title.len()).max().unwrap_or(0);
+        for r in &checks {
             let (mark, mcolor) = match r.status() {
                 Status::Pass => ("✓", GREEN),
                 Status::Warn => ("⚠", YELLOW),
@@ -377,12 +475,15 @@ impl CheckReport {
     pub fn to_json(&self, strict: bool) -> serde_json::Value {
         use serde_json::json;
         let checks: Vec<serde_json::Value> = self
-            .results
+            .checks()
             .iter()
             .map(|r| {
                 json!({
                     "id": r.id,
                     "title": r.title,
+                    // `note` = "what passing means" — surfaced as the UI's per-check
+                    // explanation (web tooltip).
+                    "note": r.note,
                     "status": r.status().as_str(),
                     "findings": r.findings().iter().map(|f| json!({
                         "severity": match f.severity {
@@ -397,6 +498,7 @@ impl CheckReport {
             .collect();
         json!({
             "checkpoint": self.label,
+            "format": self.format,
             "summary": {
                 "files": self.n_files,
                 "tensors": self.n_tensors,
@@ -418,8 +520,8 @@ impl CheckReport {
     pub fn to_sarif(&self) -> serde_json::Value {
         use serde_json::{Value, json};
 
-        let rules: Vec<Value> = self
-            .results
+        let all = self.checks();
+        let rules: Vec<Value> = all
             .iter()
             .map(|r| {
                 json!({
@@ -431,7 +533,7 @@ impl CheckReport {
             .collect();
 
         let mut results: Vec<Value> = Vec::new();
-        for r in &self.results {
+        for r in &all {
             for f in r.findings() {
                 let level = match f.severity {
                     Severity::Error => "error",
@@ -512,9 +614,11 @@ pub fn run(
     jobs: usize,
 ) -> CheckReport {
     let params = tensors.iter().map(|t| t.num_elements).sum();
+    // The storage-integrity check is format-tagged (only the applicable one exists);
+    // the rest are format-agnostic.
+    let format = CheckpointFormat::detect(tensors);
+    let storage = StorageCheck::detect(tensors);
     let mut results = vec![
-        check_byte_ranges(tensors),
-        check_hdf5(tensors),
         check_layers(tensors),
         check_shapes_dtypes(tensors),
         check_config(tensors, config),
@@ -537,6 +641,8 @@ pub fn run(
         n_tensors: tensors.len(),
         params,
         values,
+        format,
+        storage,
         results,
     }
 }
@@ -1766,6 +1872,8 @@ mod tests {
             n_tensors: 0,
             params: 0,
             values: false,
+            format: CheckpointFormat::Other,
+            storage: StorageCheck::Opaque,
             results: vec![CheckResult::done(
                 "t",
                 "T",

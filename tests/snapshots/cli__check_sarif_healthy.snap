@@ -21,13 +21,6 @@ expression: out
               }
             },
             {
-              "id": "hdf5",
-              "name": "HDF5 integrity",
-              "shortDescription": {
-                "text": "chunk shapes consistent with tensor shapes, datatypes recognized"
-              }
-            },
-            {
               "id": "layers",
               "name": "Layer completeness",
               "shortDescription": {

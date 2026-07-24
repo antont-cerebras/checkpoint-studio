@@ -13,10 +13,15 @@
   interface Check {
     id: string;
     title: string;
+    /** "what passing means" — shown as the per-check hover explanation. */
+    note: string;
     status: string;
     findings: Finding[];
   }
   interface CheckReport {
+    /** Checkpoint format (safetensors / hdf5 / numpy / gguf / other) — gates
+     * format-specific sections (index reconciliation is safetensors-only). */
+    format: string;
     summary: { files: number; tensors: number; params: number; errors: number; warnings: number };
     checks: Check[];
     healthy: boolean;
@@ -85,14 +90,15 @@
 
     <!-- structural checks -->
     <section>
-      <h3>Structural checks</h3>
+      <h3 title="Header-only checks (no tensor data read): each row explains what passing verifies — hover it.">Structural checks</h3>
       <ul class="checks">
         {#each checks as c}
           {@const st = STATUS[c.status] ?? STATUS.na}
           <li>
             <div class="checkhead">
               <span class="badge {st.cls}" title={st.label}>{st.icon}</span>
-              <span class="ctitle">{c.title}</span>
+              <span class="ctitle" title={c.note}>{c.title}</span>
+              <span class="what dim" title={c.note}>ⓘ</span>
               {#if c.findings.length}<span class="dim">· {c.findings.length}</span>{/if}
             </div>
             {#if c.findings.length}
@@ -111,9 +117,10 @@
       </ul>
     </section>
 
-    <!-- index reconciliation -->
+    <!-- index reconciliation — safetensors only (other formats have no index.json) -->
+    {#if check.format === 'safetensors'}
     <section>
-      <h3>Index health</h3>
+      <h3 title="Cross-checks model.safetensors.index.json against the shards on disk: files and tensors the index lists vs. what's actually present.">Index health</h3>
       {#if !health.length}
         <p class="dim">No <code>model.safetensors.index.json</code> to reconcile.</p>
       {:else if !indexIssues.length}
@@ -139,6 +146,7 @@
         {/each}
       {/if}
     </section>
+    {/if}
   {/if}
   </div>
 </div>
@@ -218,6 +226,10 @@
   }
   .ctitle {
     color: var(--fg);
+  }
+  .what {
+    font-size: 11px;
+    cursor: help;
   }
   .badge {
     display: inline-flex;
