@@ -362,7 +362,7 @@ impl RemoteRead {
         let progress = bars.progress(0);
         // Interactive browse doesn't use S3 object metadata (that's a `diff`-only
         // comparison), so skip the extra per-object HEADs here.
-        let out = self.read(&session, src, &password, progress.as_deref(), false);
+        let out = self.read(&session, src, &password, progress.as_deref(), false, None);
         bars.finish(0, out.is_ok());
         bars.join();
         let rc = out?;
@@ -444,13 +444,17 @@ impl RemoteRead {
         password: &Option<String>,
         progress: Option<&LoadProgress>,
         want_s3: bool,
+        abort: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<RemoteCheckpoint> {
         if src.starts_with("s3://") {
             // An s3:// cstorch checkpoint isn't a local filesystem path, so there's
             // no block allocation to measure, and it has no HF index to check. The
             // S3 object metadata (an extra HEAD per object) is fetched only when the
-            // caller wants it (`diff`) — a plain browse skips that cost.
-            let (tensors, metadata, s3) = self.read_cstorch(session, src, progress, want_s3)?;
+            // caller wants it (`diff`) — a plain browse skips that cost. `abort` lets
+            // a parallel `diff` cut this (slow) scan short if the *other* side has
+            // already failed to load.
+            let (tensors, metadata, s3) =
+                self.read_cstorch(session, src, progress, want_s3, abort)?;
             Ok(RemoteCheckpoint {
                 tensors,
                 metadata,
@@ -620,11 +624,12 @@ impl RemoteRead {
         src: &str,
         progress: Option<&LoadProgress>,
         want_s3: bool,
+        abort: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>, S3Meta)> {
         let script = dump_script(src, want_s3);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
         // Feed the streamed `PROG:done/total` lines into the load bar as they land.
-        let out = session.exec_capture(&command, &script, |line| {
+        let out = session.exec_capture_abortable(&command, &script, abort, |line| {
             // `PROG:done/total[/unit]` — the optional unit switches the bar's label
             // for the second (S3-metadata) phase; absent ⇒ tensors (back-compat).
             if let Some(rest) = line.strip_prefix(PROGRESS_TAG) {

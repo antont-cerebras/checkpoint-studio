@@ -149,8 +149,29 @@ impl RemoteSession {
         &self,
         command: &str,
         stdin: &str,
+        on_line: impl FnMut(&str),
+    ) -> Result<String> {
+        self.exec_capture_abortable(command, stdin, None, on_line)
+    }
+
+    /// Marker in the error returned when a read is cut short via the `abort` flag —
+    /// so a caller running two reads in parallel can prefer the *real* failure over
+    /// this consequential one when reporting.
+    pub const ABORTED: &'static str = "read aborted (the other side failed first)";
+
+    /// [`Self::exec_capture`], but cut short if `abort` is set (checked between
+    /// reads — so it takes effect within one streamed chunk of a script that emits
+    /// progress). Dropping the channel on abort tears down the remote command, so a
+    /// parallel sibling that has already failed needn't wait for this one to finish.
+    pub fn exec_capture_abortable(
+        &self,
+        command: &str,
+        stdin: &str,
+        abort: Option<&std::sync::atomic::AtomicBool>,
         mut on_line: impl FnMut(&str),
     ) -> Result<String> {
+        use std::sync::atomic::Ordering;
+        let aborted = || abort.is_some_and(|a| a.load(Ordering::Relaxed));
         let mut ch = self
             .session
             .channel_session()
@@ -171,6 +192,9 @@ impl RemoteSession {
         let mut pending: Vec<u8> = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
+            if aborted() {
+                bail!("{}", Self::ABORTED); // drops `ch`, tearing down the remote command
+            }
             let n = ch.read(&mut buf).context("reading the remote output")?;
             if n == 0 {
                 break;

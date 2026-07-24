@@ -4500,7 +4500,7 @@ impl Explorer {
             // /ETags/tags — a HEAD per object), so the stats report's S3 section is
             // ready; `want_s3` is a no-op for an SFTP source.
             let pw = self.remote.as_ref().unwrap().password.borrow().clone();
-            let out = r.read(&session, &as_str, &pw, progress.as_deref(), true);
+            let out = r.read(&session, &as_str, &pw, progress.as_deref(), true, None);
             bars.finish(0, out.is_ok());
             bars.join();
             let rc = out?;

@@ -975,7 +975,7 @@ fn run_check(
             let bars = progress::Bars::start(vec![src.clone()]);
             let progress = bars.progress(0);
             let out = r
-                .read(&session, &src, &password, progress.as_deref(), false)
+                .read(&session, &src, &password, progress.as_deref(), false, None)
                 .with_context(|| format!("reading {src}"));
             bars.finish(0, out.is_ok());
             bars.join();
@@ -1482,13 +1482,28 @@ fn run_diff(
                  (names/dtypes/shapes only — no tensor data is transferred) …"
             );
             let bars = progress::Bars::start(vec![old_str.to_string(), new_str.to_string()]);
+            // If one side fails to load, there's no point finishing the *other*
+            // side's (slow) S3-object-metadata scan — the diff can't proceed. A
+            // failing read trips this flag; the sibling's read loop checks it between
+            // streamed progress lines and bails promptly.
+            let abort = std::sync::atomic::AtomicBool::new(false);
             let read =
                 |session: &crate::sftp::RemoteSession, src: &str, i: usize| -> Result<SideLoad> {
                     let progress = bars.progress(i);
                     let out = r
                         // `diff` compares S3 object metadata for s3-vs-s3 → fetch it.
-                        .read(session, src, &password, progress.as_deref(), true)
+                        .read(
+                            session,
+                            src,
+                            &password,
+                            progress.as_deref(),
+                            true,
+                            Some(&abort),
+                        )
                         .with_context(|| format!("reading {src}"));
+                    if out.is_err() {
+                        abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     bars.finish(i, out.is_ok());
                     // `diff` compares structure + (for s3://) S3 object metadata, not
                     // the on-disk footprint or health.
@@ -1501,9 +1516,31 @@ fn run_diff(
                 (ta.join(), tb.join())
             });
             bars.join();
-            let ra = ra.map_err(|_| anyhow::anyhow!("remote read thread panicked"))??;
-            let rb = rb.map_err(|_| anyhow::anyhow!("remote read thread panicked"))??;
-            Ok((ra, rb))
+            let ra = ra.map_err(|_| anyhow::anyhow!("remote read thread panicked"))?;
+            let rb = rb.map_err(|_| anyhow::anyhow!("remote read thread panicked"))?;
+            match (ra, rb) {
+                (Ok(a), Ok(b)) => Ok((a, b)),
+                (ra, rb) => {
+                    // At least one side failed. Prefer the *real* failure over an
+                    // abort-induced one (the sibling we cut short), so the reported
+                    // error names the checkpoint that actually couldn't load.
+                    let is_abort = |e: &anyhow::Error| {
+                        e.chain()
+                            .any(|c| c.to_string().contains(crate::sftp::RemoteSession::ABORTED))
+                    };
+                    Err(match (ra.err(), rb.err()) {
+                        (Some(ea), Some(eb)) => {
+                            if is_abort(&ea) {
+                                eb
+                            } else {
+                                ea
+                            }
+                        }
+                        (Some(e), None) | (None, Some(e)) => e,
+                        (None, None) => unreachable!("matched the failure arm"),
+                    })
+                }
+            }
         })(),
         None => (|| {
             Ok((
