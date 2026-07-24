@@ -270,9 +270,28 @@
   // cols + the skipped-cols divider column (when present).
   $: colspan = data ? 1 + data.cols.length + (colGap >= 0 ? 1 : 0) : 1;
 
+  // Give the data pane keyboard focus on mount so the arrow / Page / Home / End pan
+  // keys work immediately. Without a focusable pane the focus sits on a control (or
+  // body): the window key handler then either adjusts that control (its INPUT/SELECT
+  // guard) or, since a plain table can't take focus, never gets a pannable target —
+  // which read as "arrows do nothing" while a stray keystroke hit whatever WAS
+  // focused. `preventScroll` so grabbing focus can't jump the page.
+  function grabFocus(node: HTMLElement) {
+    node.focus({ preventScroll: true });
+  }
+  // Also take focus on any click into the pane (belt-and-suspenders with the mount
+  // grab): clicking a cell must leave the grid focused so the very next arrow key
+  // pans. `currentTarget` is the pane itself, so a click on any descendant counts.
+  function focusPane(e: MouseEvent) {
+    (e.currentTarget as HTMLElement).focus({ preventScroll: true });
+  }
+
   // Keyboard panning in window mode — mirrors the TUI's data view (arrows pan by a
-  // window, Home/End = col start/end, PageUp/PageDown = row start/end). Ignored when
-  // typing into a control so sliders/inputs keep their own arrow behavior.
+  // window, Home/End = col start/end, PageUp/PageDown = row start/end). Attached to
+  // the focusable pane (like `onWheel`), NOT to window: a window keydown handler
+  // competes with the app-global one and proved unreliable, whereas the pane's own
+  // element handler fires whenever the grid has focus (mount-grabbed, or click-to-
+  // focus). Unhandled keys fall through (no preventDefault) to the global shortcuts.
   function onKey(e: KeyboardEvent) {
     if (mode !== 'window' || e.ctrlKey || e.metaKey || e.altKey) return;
     const tag = (e.target as HTMLElement)?.tagName;
@@ -293,7 +312,7 @@
   }
 </script>
 
-<svelte:window on:keydown={onKey} on:resize={fitToPane} />
+<svelte:window on:resize={fitToPane} />
 
 <div class="dv">
   <div class="controls">
@@ -384,11 +403,16 @@
     </div>
 
     {#if kind === 'heatmap'}
+      <!-- svelte-ignore a11y-no-noninteractive-tabindex a11y-no-static-element-interactions -->
       <div
         class="canvaswrap"
+        tabindex="0"
+        use:grabFocus
         bind:clientWidth={wrapW}
         bind:clientHeight={wrapH}
         on:wheel|nonpassive={onWheel}
+        on:keydown={onKey}
+        on:mousedown={focusPane}
       >
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
         <canvas
@@ -406,8 +430,8 @@
         <span class="mono">{num(data.max)}</span>
       </div>
     {:else}
-      <!-- svelte-ignore a11y-no-static-element-interactions -->
-      <div class="tablewrap" bind:this={tableWrap} on:wheel|nonpassive={onWheel}>
+      <!-- svelte-ignore a11y-no-static-element-interactions a11y-no-noninteractive-tabindex -->
+      <div class="tablewrap" tabindex="0" use:grabFocus bind:this={tableWrap} on:wheel|nonpassive={onWheel} on:keydown={onKey} on:mousedown={focusPane}>
         <table class="zebra-{zebra}" bind:this={tableEl}>
           <thead>
             <tr>
@@ -564,6 +588,17 @@
     max-width: 100%;
     border: 1px solid var(--border);
     border-radius: 6px;
+  }
+  /* The panes hold keyboard focus (arrow/Page/Home/End pan). Suppress the default
+     ring on the programmatic mount-focus; show a subtle accent only on keyboard nav. */
+  .tablewrap:focus,
+  .canvaswrap:focus {
+    outline: none;
+  }
+  .tablewrap:focus-visible,
+  .canvaswrap:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
   table {
     border-collapse: collapse;
