@@ -9,7 +9,9 @@
   export let kind: 'heatmap' | 'values';
 
   type Mode = 'overview' | 'absmax' | 'window' | 'edges';
-  let mode: Mode = 'overview';
+  // The numeric grid defaults to a navigable window (real, contiguous values you can
+  // scroll through the whole tensor); the heatmap defaults to the strided overview.
+  let mode: Mode = kind === 'values' ? 'window' : 'overview';
   let dtype = ''; // '' = stored
   let slice = 0;
   let rowOff = 0;
@@ -178,6 +180,33 @@
     colOff = Math.min(maxCol, Math.max(0, colOff + dc * cols));
   }
 
+  // Mouse-wheel panning in window mode (both views): a vertical wheel moves the
+  // window down/up, a horizontal wheel (trackpad / shift-wheel) moves it right/left —
+  // a fine scroll complementing the ←↑↓→ (page) keys and the "go to row" jump. Each
+  // move fetches the new window, so you can reach any part of the tensor.
+  function onWheel(e: WheelEvent) {
+    if (mode !== 'window' || !data) return;
+    e.preventDefault(); // capture the gesture as a pan, not a page/inner scroll
+    const stepR = Math.max(1, Math.round(rows / 4));
+    const stepC = Math.max(1, Math.round(cols / 4));
+    if (e.deltaY) rowOff = Math.min(maxRow, Math.max(0, rowOff + Math.sign(e.deltaY) * stepR));
+    if (e.deltaX) colOff = Math.min(maxCol, Math.max(0, colOff + Math.sign(e.deltaX) * stepC));
+  }
+
+  // Edges mode skips a contiguous middle block; find where the row/col index jumps so
+  // the table can show a "⋯ skipped ⋯" divider there (−1 = no gap / other modes).
+  const gapAt = (idx: number[]): number => {
+    for (let i = 0; i + 1 < idx.length; i++) if (idx[i + 1] - idx[i] > 1) return i;
+    return -1;
+  };
+  $: rowGap = mode === 'edges' && data ? gapAt(data.rows) : -1;
+  $: colGap = mode === 'edges' && data ? gapAt(data.cols) : -1;
+  $: rowsSkipped = rowGap >= 0 && data ? data.rows[rowGap + 1] - data.rows[rowGap] - 1 : 0;
+  $: colsSkipped = colGap >= 0 && data ? data.cols[colGap + 1] - data.cols[colGap] - 1 : 0;
+  // Total table columns for the skipped-rows divider's colspan: index header + data
+  // cols + the skipped-cols divider column (when present).
+  $: colspan = data ? 1 + data.cols.length + (colGap >= 0 ? 1 : 0) : 1;
+
   // Keyboard panning in window mode — mirrors the TUI's data view (arrows pan by a
   // window, Home/End = col start/end, PageUp/PageDown = row start/end). Ignored when
   // typing into a control so sliders/inputs keep their own arrow behavior.
@@ -291,7 +320,12 @@
     </div>
 
     {#if kind === 'heatmap'}
-      <div class="canvaswrap" bind:clientWidth={wrapW} bind:clientHeight={wrapH}>
+      <div
+        class="canvaswrap"
+        bind:clientWidth={wrapW}
+        bind:clientHeight={wrapH}
+        on:wheel|nonpassive={onWheel}
+      >
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
         <canvas
           bind:this={canvas}
@@ -308,17 +342,30 @@
         <span class="mono">{num(data.max)}</span>
       </div>
     {:else}
-      <div class="tablewrap">
+      <!-- svelte-ignore a11y-no-static-element-interactions -->
+      <div class="tablewrap" on:wheel|nonpassive={onWheel}>
         <table class="zebra-{zebra}">
           <thead>
-            <tr><th></th>{#each data.cols as c}<th class="dim">{c}</th>{/each}</tr>
+            <tr>
+              <th></th>
+              {#each data.cols as c, j}
+                <th class="dim">{c}</th>
+                {#if j === colGap}<th class="sep" title="{colsSkipped.toLocaleString()} columns skipped">⋯</th>{/if}
+              {/each}
+            </tr>
           </thead>
           <tbody>
             {#each data.values as row, i}
               <tr>
                 <th class="dim">{data.rows[i]}</th>
-                {#each row as _, j}<td class="mono">{cellText(i, j)}</td>{/each}
+                {#each row as _, j}
+                  <td class="mono">{cellText(i, j)}</td>
+                  {#if j === colGap}<td class="sep">⋯</td>{/if}
+                {/each}
               </tr>
+              {#if i === rowGap}
+                <tr class="seprow"><td colspan={colspan}>⋯ {rowsSkipped.toLocaleString()} rows skipped ⋯</td></tr>
+              {/if}
             {/each}
           </tbody>
         </table>
@@ -455,6 +502,25 @@
   }
   .zebra-cols tbody td:nth-child(even) {
     background: var(--bg-hover);
+  }
+  /* Edges mode: a clear divider where the skipped middle block was elided, so the
+     first- and last-index rows/cols aren't mistaken for contiguous data. */
+  td.sep,
+  th.sep {
+    text-align: center;
+    color: var(--fg-dim);
+    background: var(--bg-hover);
+    border-left: 1px dashed var(--border);
+    border-right: 1px dashed var(--border);
+  }
+  .seprow td {
+    text-align: center;
+    color: var(--fg-dim);
+    background: var(--bg-hover);
+    border-top: 1px dashed var(--border);
+    border-bottom: 1px dashed var(--border);
+    font-size: 11px;
+    letter-spacing: 0.03em;
   }
   .err {
     color: var(--danger);
