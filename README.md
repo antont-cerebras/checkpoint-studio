@@ -896,6 +896,24 @@ checkpoint-studio diff old.safetensors new.safetensors
 checkpoint-studio diff old.safetensors new.safetensors --values
 ```
 
+**Scoping a side to a subtree (`#SUBTREE`).** When two checkpoints hold the same
+weights under different top-level namespaces — e.g. an HF export nests everything
+under `language_model.` (`language_model.model.layers.…`) while a converted
+checkpoint has it at the root (`model.layers.…`) — append `#SUBTREE` to a source to
+**descend into that subtree** and compare from there, so the names line up:
+```bash
+checkpoint-studio diff ':/opt/models/hf#language_model' s3://bkt/converted
+#                                      └── compares the HF model's language_model.*
+#                                          (as model.layers.*) vs the other side's root
+```
+It's a **scope change**, not a rename: the comparison starts N levels down, sibling
+subtrees (`vision_tower`, `mm_projector`, …) fall outside it, and the totals + header
+reflect the subtree. It applies to **either or both** operands. A local `--values` /
+`--histogram` comparison is scoped the same way (data is read by byte offset, so the
+tensors keep their real names); over `--ssh-proxy` the value comparison runs on the
+remote *by name*, so there it's structural only. Split is on the last `#`, so a `#`
+inside a path/key is preserved.
+
 A remote structural diff of two `s3://` cstorch checkpoints — read over a single
 SSH session (one password prompt), rendered in colour (old **red**, new **green**,
 secondary detail dimmed):

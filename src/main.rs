@@ -81,6 +81,7 @@ fn examples_help() -> String {
   {group}Compare two checkpoints{r} (exit 0 = identical, 1 = differ, 2 = error):
       checkpoint-studio diff old.safetensors new.safetensors
       checkpoint-studio diff old/ new/ --values --name '*.mlp.*'
+      checkpoint-studio diff ':/opt/models/hf#language_model' s3://bkt/converted   # scope a side to a subtree
 
   {group}Health-check a checkpoint{r} (exit 0 = healthy, 1 = problems, 2 = error):
       checkpoint-studio check /path/to/model/
@@ -533,9 +534,15 @@ enum Command {
     /// Exit status follows `diff`: 0 = structurally identical, 1 = differences
     /// found, 2 = trouble (a path couldn't be read).
     Diff {
-        /// The baseline ("old") checkpoint — a file, directory, or glob.
+        /// The baseline ("old") checkpoint — a file, directory, or glob. Append
+        /// `#SUBTREE` to scope the comparison to a subtree, e.g.
+        /// `hf-model#language_model` compares that model's `language_model.*` against
+        /// the other side's root (descends into the subtree; siblings like
+        /// `vision_tower` are left out of scope). Composes with --values locally;
+        /// over --ssh-proxy it's structure-only.
         old: PathBuf,
-        /// The checkpoint to compare against the baseline ("new").
+        /// The checkpoint to compare against the baseline ("new"). Also takes a
+        /// `#SUBTREE` scope suffix (see OLD).
         new: PathBuf,
         /// Recursively search directories for checkpoint files.
         #[arg(short, long)]
@@ -817,6 +824,10 @@ fn main() -> Result<()> {
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
             // the `Result` convention `main` uses elsewhere, so exit explicitly.
+            // Split off a `SOURCE#subtree` re-root (per operand) before touching the
+            // address, so the reader gets a clean path/URI.
+            let (old, old_root) = split_reroot(&old);
+            let (new, new_root) = split_reroot(&new);
             // `--ssh-proxy` (or, for an s3:// pair / `:PATH`, the config default):
             // read each checkpoint's structure via the remote (secrets stay there).
             let (srcs, remote) =
@@ -882,6 +893,8 @@ fn main() -> Result<()> {
                 remote.as_ref(),
                 verify_repack,
                 repack_bits,
+                old_root.as_deref(),
+                new_root.as_deref(),
             );
             // Report how long it took, by default (on stderr, so a piped diff on
             // stdout stays clean). Skip on trouble (exit 2) — the error already said.
@@ -1545,6 +1558,42 @@ fn resolve_remote_sources(
     Ok((stripped, remote))
 }
 
+/// Split a `SOURCE#subtree` re-root suffix off a checkpoint source: `#language_model`
+/// scopes the read to that subtree and re-roots it (see [`reroot_tensors`]). Split on
+/// the LAST `#` — a subtree is always a dotted tensor-name prefix (no `#`), so a `#`
+/// inside a path/key is preserved. `s3://` URIs and scp/`:` markers never contain `#`.
+fn split_reroot(p: &Path) -> (PathBuf, Option<String>) {
+    match p.to_string_lossy().rsplit_once('#') {
+        Some((addr, sub)) if !sub.is_empty() => (PathBuf::from(addr), Some(sub.to_string())),
+        _ => (p.to_path_buf(), None),
+    }
+}
+
+/// The comparison *key* for a tensor under a `#subtree` re-root: `Some(sub-path)`
+/// when the tensor is inside the subtree, `None` when it's a sibling to leave out of
+/// scope. A `None` root keeps every name as-is. This is a scope change, not a rename:
+/// only the *match key* moves; each tensor keeps its real name for data I/O.
+fn scope_key(name: &str, root: Option<&str>) -> Option<String> {
+    match root {
+        None => Some(name.to_string()),
+        Some(p) => name
+            .strip_prefix(&format!("{}.", p.trim_end_matches('.')))
+            .map(str::to_string),
+    }
+}
+
+/// A scoped copy of a tensor list for the structural summary: keep only the tensors
+/// inside `prefix` and re-key them to their sub-path, so the summary's names and
+/// totals describe the subtree. The originals are untouched (kept for value I/O).
+fn scope_tensors(tensors: &[TensorInfo], prefix: &str) -> Vec<TensorInfo> {
+    tensors
+        .iter()
+        .filter_map(|t| {
+            scope_key(&t.name, Some(prefix)).map(|name| TensorInfo { name, ..t.clone() })
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)] // a CLI entry point; each arg is a distinct flag
 fn run_diff(
     old: &Path,
@@ -1560,6 +1609,8 @@ fn run_diff(
     remote: Option<&crate::remote::RemoteRead>,
     verify_repack: bool,
     repack_bits: Option<usize>,
+    old_root: Option<&str>,
+    new_root: Option<&str>,
 ) -> i32 {
     let load_local = |path: &Path| -> Result<SideLoad> {
         let (files, _index_specs) =
@@ -1674,7 +1725,29 @@ fn run_diff(
         }
     };
 
-    let (old_label, new_label) = (old.display().to_string(), new.display().to_string());
+    // A `#subtree` re-root descends into a subtree and compares from there. Its value
+    // comparison over --ssh-proxy runs on the remote *by tensor name*, and that path
+    // doesn't yet re-root the names it fetches — so a scoped value comparison is
+    // supported locally (data is read by byte offset, name-independent) but not over
+    // the proxy. Refuse that one combination rather than mislead.
+    if remote.is_some()
+        && (old_root.is_some() || new_root.is_some())
+        && (opts.values || opts.histogram || tensor.is_some())
+    {
+        eprintln!(
+            "checkpoint-studio diff: over --ssh-proxy a '#subtree' re-root compares structure \
+             only (the remote value comparison keys by tensor name) — drop --values / \
+             --histogram / --tensor, or run the scoped value diff on local checkpoints"
+        );
+        return 2;
+    }
+
+    // Show the re-root in the diff header so a scoped comparison is self-explanatory.
+    let label = |p: &Path, root: Option<&str>| match root {
+        Some(r) => format!("{}#{r}", p.display()),
+        None => p.display().to_string(),
+    };
+    let (old_label, new_label) = (label(old, old_root), label(new, new_root));
 
     // Packing schemas (for the `unpacked` view) come from the full metadata —
     // independent of `--only-tensors`, which only hides the metadata *diff*. Only
@@ -1806,8 +1879,40 @@ fn run_diff(
     let empty: Vec<MetadataInfo> = Vec::new();
     let old_meta: &[MetadataInfo] = if opts.metadata { &old_m } else { &empty };
     let new_meta: &[MetadataInfo] = if opts.metadata { &new_m } else { &empty };
-    let mut old_sum = diff::CheckpointSummary::from_loaded(&old_t, old_meta);
-    let mut new_sum = diff::CheckpointSummary::from_loaded(&new_t, new_meta);
+    // A `#subtree` re-root scopes the structural summary to that subtree (names +
+    // totals describe it); the originals stay untouched for value I/O. A prefix that
+    // matches nothing is a likely typo → stop with a clear message.
+    let (old_scoped, new_scoped);
+    let old_sum_src: &[TensorInfo] = match old_root {
+        None => &old_t,
+        Some(p) => {
+            old_scoped = scope_tensors(&old_t, p);
+            &old_scoped
+        }
+    };
+    let new_sum_src: &[TensorInfo] = match new_root {
+        None => &new_t,
+        Some(p) => {
+            new_scoped = scope_tensors(&new_t, p);
+            &new_scoped
+        }
+    };
+    for (src, root, label) in [
+        (old_sum_src, old_root, &old_str),
+        (new_sum_src, new_root, &new_str),
+    ] {
+        if let Some(prefix) = root
+            && src.is_empty()
+        {
+            eprintln!(
+                "checkpoint-studio diff: '#{prefix}' matched no tensors in {label} — \
+                 no names start with '{prefix}.'"
+            );
+            return 2;
+        }
+    }
+    let mut old_sum = diff::CheckpointSummary::from_loaded(old_sum_src, old_meta);
+    let mut new_sum = diff::CheckpointSummary::from_loaded(new_sum_src, new_meta);
     // Rename rules (`--map` / `--map-from`) rewrite the OLD side's tensor names
     // into the NEW side's naming scheme, so corresponding tensors line up in the
     // comparison below instead of showing as a removed/added pair. Applied before
@@ -1848,15 +1953,20 @@ fn run_diff(
 
     let mut report = if opts.values || opts.histogram {
         use rayon::prelude::*;
-        // The old side is keyed by its *post-rename* name (the same names `common`
-        // is drawn from), so a mapped tensor still finds its data; the value carries
-        // its original (pre-rename) name for the remote lookup.
+        // Keyed by the *match* name (re-root sub-path, then any `--map` rename — the
+        // same key space `common` and the summaries use), while the value keeps the
+        // original `TensorInfo` (real name + byte offsets) for data I/O. An
+        // out-of-scope tensor (re-root sibling) is dropped from the key space.
         let old_map: HashMap<String, &TensorInfo> = old_t
             .iter()
-            .map(|t| (name_map.map(&t.name).into_owned(), t))
+            .filter_map(|t| {
+                scope_key(&t.name, old_root).map(|s| (name_map.map(&s).into_owned(), t))
+            })
             .collect();
-        let new_map: HashMap<&str, &TensorInfo> =
-            new_t.iter().map(|t| (t.name.as_str(), t)).collect();
+        let new_map: HashMap<String, &TensorInfo> = new_t
+            .iter()
+            .filter_map(|t| scope_key(&t.name, new_root).map(|s| (s, t)))
+            .collect();
         // The tensors present on both sides — the ones we actually read/compare.
         let mut common: Vec<&str> = old_sum
             .tensors
@@ -2276,7 +2386,7 @@ fn codebook_index_bits(cb_shape: &[usize]) -> Option<usize> {
 fn auto_sparse_families(
     common: &[&str],
     old_map: &HashMap<String, &TensorInfo>,
-    new_map: &HashMap<&str, &TensorInfo>,
+    new_map: &HashMap<String, &TensorInfo>,
 ) -> (
     Vec<(String, String)>,
     Option<usize>,
@@ -3782,6 +3892,78 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("SSH proxy"), "{err}");
+    }
+
+    #[test]
+    fn splits_reroot_suffix_off_the_source() {
+        // `#subtree` splits off; the address keeps its `:`/scp/s3 form intact.
+        assert_eq!(
+            split_reroot(&PathBuf::from(":/opt/m/Kimi#language_model")),
+            (PathBuf::from(":/opt/m/Kimi"), Some("language_model".into()))
+        );
+        assert_eq!(
+            split_reroot(&PathBuf::from("s3://b/ckpt#language_model")),
+            (PathBuf::from("s3://b/ckpt"), Some("language_model".into()))
+        );
+        // No suffix → unchanged. A trailing bare `#` is not a re-root.
+        assert_eq!(
+            split_reroot(&PathBuf::from("/opt/m/Kimi")),
+            (PathBuf::from("/opt/m/Kimi"), None)
+        );
+        assert_eq!(
+            split_reroot(&PathBuf::from("/opt/m/Kimi#")),
+            (PathBuf::from("/opt/m/Kimi#"), None)
+        );
+        // Split on the LAST `#`, so a `#` inside the path is preserved.
+        assert_eq!(
+            split_reroot(&PathBuf::from("/od d/a#b/ckpt#model")),
+            (PathBuf::from("/od d/a#b/ckpt"), Some("model".into()))
+        );
+    }
+
+    #[test]
+    fn scope_key_is_a_scope_not_a_rename() {
+        // No root → identity. In scope → sub-path. Sibling → None (out of scope).
+        assert_eq!(
+            scope_key("model.norm.weight", None).as_deref(),
+            Some("model.norm.weight")
+        );
+        assert_eq!(
+            scope_key("language_model.model.norm.weight", Some("language_model")).as_deref(),
+            Some("model.norm.weight")
+        );
+        assert_eq!(
+            scope_key("vision_tower.enc.weight", Some("language_model")),
+            None
+        );
+        // The prefix itself with no sub-path is not "inside" it.
+        assert_eq!(scope_key("language_model", Some("language_model")), None);
+    }
+
+    #[test]
+    fn scope_tensors_keeps_originals_and_drops_siblings() {
+        use crate::tree::{Layout, Storage};
+        let mk = |name: &str| TensorInfo {
+            name: name.into(),
+            dtype: "BF16".into(),
+            shape: vec![7168],
+            size_bytes: 14336,
+            num_elements: 7168,
+            storage: Storage::Unknown,
+            source_path: "shard.safetensors".into(),
+            layout: Layout::None,
+        };
+        let originals = vec![
+            mk("language_model.model.norm.weight"),
+            mk("vision_tower.encoder.0.weight"), // sibling — out of scope
+        ];
+        let scoped = scope_tensors(&originals, "language_model");
+        // Only the in-scope tensor, re-keyed to its sub-path…
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].name, "model.norm.weight");
+        // …while the source_path (for I/O) is preserved and the originals untouched.
+        assert_eq!(scoped[0].source_path, "shard.safetensors");
+        assert_eq!(originals[0].name, "language_model.model.norm.weight");
     }
 
     #[test]
