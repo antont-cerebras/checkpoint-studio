@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import { cachedSample } from '../stores/server';
   import { getDataView, setDataView, type DvParams } from '../stores/view';
   import type { SampleDto } from '../lib/types';
@@ -35,6 +36,12 @@
   let canvas: HTMLCanvasElement;
   let cell = 4;
   let hover = '';
+  // The numeric grid auto-sizes rows×cols to fill its pane (no scrollbars, no empty
+  // space) until the user sets a size (via a control or a deep link) — then it's
+  // theirs to keep. Measured from the rendered table + the pane box.
+  let autoFit = kind === 'values' && !dv0.rows && !dv0.cols;
+  let tableEl: HTMLTableElement;
+  let tableWrap: HTMLDivElement;
   // Live size of the canvas's container, so the heatmap fills the pane (fit-to-box,
   // square cells, centered) and re-renders on window resize / tab switch.
   let wrapW = 0;
@@ -85,18 +92,46 @@
   async function load(t: string, p: typeof params) {
     const seq = ++reqSeq;
     loading = true;
-    err = '';
     try {
       const d = await cachedSample(t, p);
       if (seq !== reqSeq) return; // superseded
       data = d;
+      err = '';
     } catch (e) {
       if (seq !== reqSeq) return;
       err = e instanceof Error ? e.message : String(e);
-      data = null;
+      // Keep the last good `data` on a refetch error, so panning never blanks the
+      // view — the error shows as a chip while the previous window stays visible.
     }
     if (seq === reqSeq) loading = false;
   }
+
+  // Size the numeric grid to fill its pane: measure the rendered cell size and floor
+  // to whole cells (a slight under-fill so a rounding overshoot can't trip a
+  // scrollbar). Runs after each render while auto-fitting — converges in one step,
+  // then a no-op — and on window resize.
+  async function fitToPane() {
+    if (!autoFit || kind !== 'values') return;
+    await tick();
+    const head = tableEl?.querySelector('thead tr') as HTMLElement | null;
+    const body = tableEl?.querySelector('tbody tr') as HTMLElement | null;
+    if (!head || !body || !tableWrap) return;
+    const rowH = body.offsetHeight;
+    const headH = head.offsetHeight;
+    const rowHeaderW = (body.children[0] as HTMLElement | undefined)?.offsetWidth ?? 0;
+    // Widest data cell in the sample row — conservative, so columns never overflow.
+    const dataCols = Array.from(body.children).slice(1) as HTMLElement[];
+    const colW = Math.max(1, ...dataCols.map((c) => c.offsetWidth));
+    if (rowH < 2 || colW < 2) return;
+    const fitR = Math.max(1, Math.floor((tableWrap.clientHeight - headH - 2) / rowH));
+    const fitC = Math.max(1, Math.floor((tableWrap.clientWidth - rowHeaderW - 2) / colW));
+    if (fitR !== rows || fitC !== cols) {
+      rows = fitR;
+      cols = fitC;
+    }
+  }
+  // Re-fit after each render (data change) while auto-fitting, and on resize.
+  $: if (data && autoFit) fitToPane();
 
   $: nSlices = data?.slices ?? 1;
   // Furthest valid top-left of the window, so offsets/seek/pan can't run past the
@@ -127,8 +162,10 @@
   }
   // Editing one dimension recomputes the other from the source aspect (either drives
   // the other). No-op when unlocked or for the numeric grid.
-  function onRows() { if (lockRatio && aspect) cols = clampDim(rows / aspect); }
-  function onCols() { if (lockRatio && aspect) rows = clampDim(cols * aspect); }
+  // A manual rows/cols edit takes over from auto-fit (and, on the heatmap, keeps the
+  // aspect ratio when locked).
+  function onRows() { autoFit = false; if (lockRatio && aspect) cols = clampDim(rows / aspect); }
+  function onCols() { autoFit = false; if (lockRatio && aspect) rows = clampDim(cols * aspect); }
   function toggleLock() {
     lockRatio = !lockRatio;
     if (lockRatio) onRows(); // re-apply the ratio, keeping the current row count
@@ -252,7 +289,7 @@
   }
 </script>
 
-<svelte:window on:keydown={onKey} />
+<svelte:window on:keydown={onKey} on:resize={fitToPane} />
 
 <div class="dv">
   <div class="controls">
@@ -325,11 +362,10 @@
     {/if}
   </div>
 
-  {#if loading}
-    <Spinner label={kind === 'heatmap' ? 'sampling…' : 'reading…'} />
-  {:else if err}
-    <p class="err">{err}</p>
-  {:else if data}
+  <!-- Keep the last-loaded view mounted while a new window is fetched, so scrolling
+       updates in place instead of blanking to a spinner (no blink). The spinner
+       shows only on the very first load; a refetch error is a chip, not a blank. -->
+  {#if data}
     <div class="meta dim">
       {data.values.length}×{data.values[0]?.length ?? 0} of {data.total_rows}×{data.total_cols}
       · view {data.view}{data.mode !== 'grid' ? ` · ${data.mode}` : ''}
@@ -338,6 +374,8 @@
       {:else if mode === 'overview'}
         · <span class="pill" title="Overview is a strided subsample — a lone outlier between sampled indices may not appear. Use window mode for exact 1:1 inspection.">subsample</span>
       {/if}
+      {#if loading}<span class="busy" title="loading…">⟳</span>{/if}
+      {#if err}<span class="ferr" title={err}>⚠</span>{/if}
       <span class="hover mono">{hover}</span>
     </div>
 
@@ -365,8 +403,8 @@
       </div>
     {:else}
       <!-- svelte-ignore a11y-no-static-element-interactions -->
-      <div class="tablewrap" on:wheel|nonpassive={onWheel}>
-        <table class="zebra-{zebra}">
+      <div class="tablewrap" bind:this={tableWrap} on:wheel|nonpassive={onWheel}>
+        <table class="zebra-{zebra}" bind:this={tableEl}>
           <thead>
             <tr>
               <th></th>
@@ -393,6 +431,10 @@
         </table>
       </div>
     {/if}
+  {:else if loading}
+    <Spinner label={kind === 'heatmap' ? 'sampling…' : 'reading…'} />
+  {:else if err}
+    <p class="err">{err}</p>
   {/if}
 </div>
 
@@ -464,6 +506,21 @@
   .hover {
     color: var(--accent);
     margin-left: auto;
+  }
+  /* Non-blocking refetch indicators: the view stays put while a new window loads. */
+  .busy {
+    color: var(--accent);
+    display: inline-block;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .ferr {
+    color: var(--warn);
+    cursor: help;
   }
   .canvaswrap {
     flex: 1 1 auto;
