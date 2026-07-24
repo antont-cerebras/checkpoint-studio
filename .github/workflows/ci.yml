@@ -133,15 +133,20 @@ jobs:
         with:
           python-version: '3.9'
 
+      # Three complementary tools, all configured in pyproject.toml. They disagree
+      # usefully: ty caught wrong return annotations that pyright's inference accepted,
+      # and ruff enforces that the annotations exist in the first place.
       - name: Install tools
-        run: pip install ruff pyright
+        run: pip install ruff pyright ty
 
-      # Config for both lives in pyproject.toml.
       - name: Lint (ruff)
         run: ruff check .
 
       - name: Typecheck (pyright)
         run: pyright
+
+      - name: Typecheck (ty)
+        run: ty check crates/core/src/python gen_demo.py record_demo.py
 
       # Cheap syntax gate on the interpreter version we claim to support.
       - name: Byte-compile the remote scripts

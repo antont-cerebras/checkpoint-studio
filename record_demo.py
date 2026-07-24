@@ -20,6 +20,7 @@ coloured structural `diff`. Tweak the feed()/send() timings to taste.
 
 import fcntl
 import json
+import contextlib
 import os
 import pty
 import select
@@ -33,9 +34,8 @@ COLS, ROWS = 100, 30
 # A minimal rcfile for a clean `$ ` prompt (bash inherits it via --rcfile). We
 # also start bash with --noediting so readline doesn't emit its bracketed-paste
 # init (which prints a stray char before the first prompt).
-rc = tempfile.NamedTemporaryFile("w", suffix=".bashrc", delete=False)
-rc.write("PS1='$ '\nHISTFILE=/dev/null\nunset PROMPT_COMMAND\n")
-rc.close()
+with tempfile.NamedTemporaryFile("w", suffix=".bashrc", delete=False) as rc:
+    rc.write("PS1='$ '\nHISTFILE=/dev/null\nunset PROMPT_COMMAND\n")
 
 env = dict(os.environ, TERM="xterm-256color", COLUMNS=str(COLS), LINES=str(ROWS),
            PS1="$ ", HISTFILE="/dev/null")
@@ -47,7 +47,7 @@ fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 events, start = [], time.time()
 
 
-def feed(dur):
+def feed(dur: float) -> bool:
     end = time.time() + dur
     while True:
         rem = end - time.time()
@@ -64,11 +64,11 @@ def feed(dur):
             events.append([round(time.time() - start, 3), "o", data.decode("utf-8", "replace")])
 
 
-def send(s):
+def send(s: str) -> None:
     os.write(fd, s.encode())
 
 
-def cmd(s):
+def cmd(s: str) -> None:
     send(s)
     feed(0.25)
     send("\r")  # show the command, then run it
@@ -95,10 +95,9 @@ send("clear\r"); feed(0.5)
 cmd("checkpoint-studio diff /tmp/ckpt-demo/old.safetensors /tmp/ckpt-demo/new.safetensors"); feed(4.0)
 
 send("exit\r"); feed(1.0)
-try:
+# The pty may already be gone once the child exits; either way we are done with it.
+with contextlib.suppress(OSError):
     os.close(fd)
-except OSError:
-    pass
 os.waitpid(pid, 0)
 os.unlink(rc.name)
 

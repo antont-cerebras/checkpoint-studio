@@ -7,11 +7,16 @@ pair.
 
 Read-only: loads and compares; never writes to either checkpoint.
 """
+# Annotations are lazy (PEP 563) so they never execute at import time on the
+# cluster's interpreter, and modern syntax works on our 3.9 floor.
+from __future__ import annotations
+
 import sys
 import json
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, NamedTuple
 
 # Parameters from the Rust caller: the single `__PARAMS__` slot is replaced with a
 # JSON object (see `remote.rs::with_params`). One substitution point keeps the rest
@@ -31,10 +36,10 @@ EMIT = 64 << 20      # byte-progress emit granularity
 S = PARAMS["sentinel"]
 ST = PARAMS["status"]
 _lock = threading.Lock()
-def emit(o):
+def emit(o: dict[str, Any]) -> None:
     with _lock:
         sys.stdout.write(S + json.dumps(o) + "\n"); sys.stdout.flush()
-def stat(s):
+def stat(s: str) -> None:
     with _lock:
         sys.stdout.write(ST + s + "\n"); sys.stdout.flush()
 try:
@@ -54,7 +59,7 @@ try:
     new_sd = cstorch.load(NEW, map_location=None)
 except Exception as e:
     emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
-def to_f64(rt, i, j):
+def to_f64(rt: Any, i: int | None, j: int | None) -> Any:
     sl = rt if i is None else rt[i:j]
     return sl.to(torch.float64).numpy().reshape(-1)
 # Map a numpy dtype name (from an object's __NUMPY__ metadata) to a torch dtype, so
@@ -64,7 +69,16 @@ NP2T = {}
 for _n in ("float16","float32","float64","bfloat16","uint8","int8","int16","uint16","int32","uint32","int64","uint64","bool"):
     _t = getattr(torch, _n, None)
     if _t is not None: NP2T[_n] = _t
-def prep(dt):
+class Obj(NamedTuple):
+    """One tensor's backing S3 object: where it lives plus how to decode it."""
+    client: Any        # boto3 S3 client (thread-safe)
+    bucket: str
+    key: str
+    size: int          # ContentLength, for sizing the progress bar up front
+    compressed: bool
+    dtype: Any         # torch dtype
+    shape: list[int]
+def prep(dt: Any) -> Obj | None:
     do = getattr(dt, "deferred", None)
     if do is None: return None
     r = do._reader
@@ -78,27 +92,26 @@ def prep(dt):
     nm = meta.get("__NUMPY__")
     td = NP2T.get(nm.get("dtype")) if nm else None
     if td is None: return None
-    return (r.s3_client, r.bucket, key, int(head.get("ContentLength", 0)), bool(meta.get("compressed")), td, [int(x) for x in nm["shape"]])
-def stream_raw(p, on):
+    return Obj(r.s3_client, r.bucket, key, int(head.get("ContentLength", 0)),
+               bool(meta.get("compressed")), td, [int(x) for x in nm["shape"]])
+def stream_raw(p: Obj, on: Callable[[int], object]) -> bytearray:
     # Just the network read (with byte progress). Decompression + reshape is deferred
     # (see decode_tensor) so the bar reaches 100% before the slow decode, not during it.
-    client, bucket, key, total, comp, td, shape = p
-    body = client.get_object(Bucket=bucket, Key=key)["Body"]
+    body = p.client.get_object(Bucket=p.bucket, Key=p.key)["Body"]
     buf = bytearray()
     while True:
         c = body.read(DL)
         if not c: break
         buf += c; on(len(buf))
     return buf
-def decode_tensor(buf, p):
-    client, bucket, key, total, comp, td, shape = p
-    raw = zstandard.decompress(bytes(buf)) if comp else buf
-    return torch.frombuffer(bytearray(raw), dtype=td).reshape(shape)
+def decode_tensor(buf: bytearray, p: Obj) -> Any:
+    raw = zstandard.decompress(bytes(buf)) if p.compressed else buf
+    return torch.frombuffer(bytearray(raw), dtype=p.dtype).reshape(p.shape)
 total = len(PAIRS)
 t0 = time.time()
 read_bytes = 0
 compared = 0
-def work(idx):
+def work(idx: int) -> int:
     oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
     stat("start\t%d\t%d\t%s" % (idx + 1, total, nname))
     res = {"name": nname}
@@ -112,30 +125,31 @@ def work(idx):
         # per-chunk float64 conversions below work off the in-memory copy. Values are
         # compared here — only progress + the small result cross ssh. Fall back to
         # cstorch materialise (no byte progress) for a non-numpy-stored tensor.
+        def comparing() -> None:
+            # Bytes are all read (bar at 100%); decompress + decode is the slow part, so
+            # flag the phase BEFORE it, not after.
+            stat("phase\t%s\tcomparing" % (nname,))
         pa = prep(a); pb = prep(b)
-        streamed = None   # (raw_a, raw_b) when read over the network
+        # Each branch decodes its own tensors, so `ra`/`rb` are bound on every path.
         if pa is not None and pb is not None:
-            osz = pa[3]; nsz = pb[3]
+            osz = pa.size; nsz = pb.size
             stat("size\t%s\t%d\t%d" % (nname, osz, nsz))
             od = [0]; nd = [0]; last = [0]
-            def bump():
+            def bump() -> None:
                 s = od[0] + nd[0]
                 if s - last[0] >= EMIT:
                     last[0] = s; stat("bytes\t%s\t%d\t%d" % (nname, od[0], nd[0]))
             rawa = stream_raw(pa, lambda n: (od.__setitem__(0, n), bump()))
             rawb = stream_raw(pb, lambda n: (nd.__setitem__(0, n), bump()))
             stat("bytes\t%s\t%d\t%d" % (nname, osz, nsz))
-            streamed = (rawa, rawb)
             tb = osz + nsz
+            comparing()
+            ra = decode_tensor(rawa, pa); rb = decode_tensor(rawb, pb)
         else:
             ra = a.to("cpu"); rb = b.to("cpu")
             tb = ra.element_size() * ra.nelement() + rb.element_size() * rb.nelement()
             stat("size\t%s\t%d\t%d" % (nname, int(ra.element_size() * ra.nelement()), int(rb.element_size() * rb.nelement())))
-        # Bytes are all read (bar at 100%); decompress + decode below is the slow part,
-        # so flag "comparing" now — not after it.
-        stat("phase\t%s\tcomparing" % (nname,))
-        if streamed is not None:
-            ra = decode_tensor(streamed[0], pa); rb = decode_tensor(streamed[1], pb)
+            comparing()
         res["bytes"] = int(tb)
         scalar = (len(ashape) == 0)
         d0 = 0 if scalar else ashape[0]

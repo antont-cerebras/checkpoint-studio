@@ -10,6 +10,7 @@ Stdlib only (no numpy) — writes valid `.safetensors` files into /tmp/ckpt-demo
   new.safetensors     added/removed tensor, and metadata — for the `diff` demo
 """
 
+from collections.abc import Sequence
 import json
 import os
 import random
@@ -22,14 +23,18 @@ os.makedirs(OUT, exist_ok=True)
 DT_SIZE = {"F32": 4, "F16": 2, "BF16": 2, "U16": 2, "U8": 1, "I8": 1}
 
 
-def numel(shape):
+def numel(shape: Sequence[int]) -> int:
     n = 1
     for s in shape:
         n *= s
     return n
 
 
-def write_safetensors(path, tensors, metadata):
+def write_safetensors(
+    path: str,
+    tensors: Sequence[tuple[str, str, Sequence[int], bytes]],
+    metadata: dict[str, str],
+) -> None:
     """tensors: list of (name, dtype, shape, data_bytes)."""
     header, blob = {}, bytearray()
     for name, dtype, shape, data in tensors:
@@ -49,16 +54,16 @@ def write_safetensors(path, tensors, metadata):
         f.write(bytes(blob))
 
 
-def f32(shape):
+def f32(shape: Sequence[int]) -> bytes:
     """A real-valued F32 tensor (standard-normal) so the data views look alive."""
     return struct.pack("<%df" % numel(shape), *[random.gauss(0.0, 1.0) for _ in range(numel(shape))])
 
 
-def u8(shape):
+def u8(shape: Sequence[int]) -> bytes:
     return bytes(random.randrange(256) for _ in range(numel(shape)))
 
 
-def zeros(dtype, shape):
+def zeros(dtype: str, shape: Sequence[int]) -> bytes:
     return b"\x00" * (numel(shape) * DT_SIZE[dtype])
 
 

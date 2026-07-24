@@ -1,0 +1,11 @@
+{
+  "//": "Pyright's own config. Kept separate from pyproject.toml (which configures ruff",
+  "// ": "and ty) because pyright reads this file first and unambiguously; a project-wide",
+  "//  ": "scan that walked target/ took minutes on this NFS-backed tree.",
+  "include": ["crates/core/src/python", "gen_demo.py", "record_demo.py"],
+  "exclude": ["**/target", "**/node_modules", "web"],
+  "pythonVersion": "3.9",
+  "typeCheckingMode": "standard",
+  "reportMissingImports": false,
+  "reportMissingModuleSource": false
+}

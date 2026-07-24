@@ -7,8 +7,13 @@ sentinel-tagged JSON line, optionally followed by per-object S3 metadata.
 Read-only: this only *loads* (lazily) and writes to stdout — it never opens a file
 for writing, calls `cstorch.save`/`torch.save`, or otherwise mutates the checkpoint.
 """
+# Annotations are lazy (PEP 563) so they never execute at import time on the
+# cluster's interpreter, and modern syntax works on our 3.9 floor.
+from __future__ import annotations
+
 import sys
 import json
+from typing import Any
 
 # Parameters from the Rust caller: the single `__PARAMS__` slot is replaced with a
 # JSON object (see `remote.rs::with_params`). One substitution point keeps the rest
@@ -18,14 +23,14 @@ SRC = PARAMS["uri"]
 WANT_S3 = PARAMS["want_s3"]
 S = PARAMS["sentinel"]
 P = PARAMS["progress"]
-def emit(obj):
+def emit(obj: dict[str, Any]) -> None:
     sys.stdout.write(S + json.dumps(obj) + "\n")
     sys.stdout.flush()
-def prog(done, total, unit=None):
+def prog(done: int, total: int, unit: str | None = None) -> None:
     tail = ("/" + unit) if unit else ""
     sys.stdout.write("%s%d/%d%s\n" % (P, done, total, tail))
     sys.stdout.flush()
-def probe_s3(src):
+def probe_s3(src: str) -> dict[str, Any]:
     # Best-effort, LIST-ONLY diagnosis of a load failure: enumerate the objects
     # under the prefix and report how many are empty (0 bytes) plus whether the
     # cstorch metadata object itself is empty, so the caller can explain *why*

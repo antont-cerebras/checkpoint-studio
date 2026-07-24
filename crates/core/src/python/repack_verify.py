@@ -6,11 +6,16 @@ and reports whether the unpacked values agree. Only verdicts cross ssh.
 
 Read-only: loads and compares; never writes to either checkpoint.
 """
+# Annotations are lazy (PEP 563) so they never execute at import time on the
+# cluster's interpreter, and modern syntax works on our 3.9 floor.
+from __future__ import annotations
+
 import sys
 import json
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, NamedTuple
 
 # Parameters from the Rust caller: the single `__PARAMS__` slot is replaced with a
 # JSON object (see `remote.rs::with_params`). One substitution point keeps the rest
@@ -28,10 +33,10 @@ EMIT = 64 << 20      # byte-progress emit granularity
 S = PARAMS["sentinel"]
 ST = PARAMS["status"]
 _lock = threading.Lock()
-def emit(o):
+def emit(o: dict[str, Any]) -> None:
     with _lock:
         sys.stdout.write(S + json.dumps(o) + "\n"); sys.stdout.flush()
-def stat(s):
+def stat(s: str) -> None:
     with _lock:
         sys.stdout.write(ST + s + "\n"); sys.stdout.flush()
 try:
@@ -54,26 +59,40 @@ except Exception as e:
 mask = np.uint16((1 << BITS) - 1)
 # Resolve a lazy tensor to its backing S3 object (thread-safe client + key) so we
 # can stream it ourselves with progress, rather than cstorch's one-shot read.
-def resolve(dt):
+class Loc(NamedTuple):
+    """Where an object lives in S3 (thread-safe client + bucket + key)."""
+    client: Any
+    bucket: str
+    key: str
+class Head(NamedTuple):
+    """What a HEAD tells us about a weight object."""
+    size: int
+    compressed: bool
+    numpy: bool        # stored with `__NUMPY__` metadata, so we can stream it
+class Aux(NamedTuple):
+    """A numpy-float-stored sibling (codebook / qscale)."""
+    compressed: bool
+    dtype: Any         # numpy dtype
+    shape: list[int]
+    size: int
+def resolve(dt: Any) -> Loc | None:
     do = getattr(dt, "deferred", None)
     if do is None:
         return None
     r = do._reader
-    return (r.s3_client, r.bucket, "%s/%s" % (r.key, do._key))
-def head(loc):
-    client, bucket, key = loc
-    h = client.head_object(Bucket=bucket, Key=key)
+    return Loc(r.s3_client, r.bucket, "%s/%s" % (r.key, do._key))
+def head(loc: Loc) -> Head:
+    h = loc.client.head_object(Bucket=loc.bucket, Key=loc.key)
     md = h.get("Metadata") or {}
     try:
         meta = json.loads(md.get("metadata") or md.get("Metadata") or "{}")
     except Exception:
         meta = {}
-    return int(h.get("ContentLength", 0)), bool(meta.get("compressed")), ("__NUMPY__" in meta)
-def download_raw(loc, on):
+    return Head(int(h.get("ContentLength", 0)), bool(meta.get("compressed")), "__NUMPY__" in meta)
+def download_raw(loc: Loc, on: Callable[[int], object]) -> bytearray:
     # Just the network read (with byte progress). Decompression is deferred so the
     # bar reaches 100% before the slow decode, not during it.
-    client, bucket, key = loc
-    body = client.get_object(Bucket=bucket, Key=key)["Body"]
+    body = loc.client.get_object(Bucket=loc.bucket, Key=loc.key)["Body"]
     buf = bytearray()
     while True:
         c = body.read(DL)
@@ -82,17 +101,16 @@ def download_raw(loc, on):
         buf += c
         on(len(buf))
     return buf
-def decode_u16(buf, compressed):
+def decode_u16(buf: bytearray, compressed: bool) -> Any:
     if compressed:
         return np.frombuffer(zstandard.decompress(bytes(buf)), dtype=np.uint16)
     return np.frombuffer(buf, dtype=np.uint16)     # raw 16-bit words, zero-copy
-def to_u16(dt):   # fallback via cstorch (no byte progress)
+def to_u16(dt: Any) -> Any:   # fallback via cstorch (no byte progress)
     return dt.to("cpu").contiguous().view(torch.int16).numpy().view(np.uint16)
 NPF = {"float16": np.float16, "float32": np.float32, "float64": np.float64}
-def aux_meta(loc):
-    # (compressed, numpy_dtype, shape, size) for a numpy-float-stored sibling, else None.
-    client, bucket, key = loc
-    h = client.head_object(Bucket=bucket, Key=key)
+def aux_meta(loc: Loc) -> Aux | None:
+    # Details for a numpy-float-stored sibling, else None.
+    h = loc.client.head_object(Bucket=loc.bucket, Key=loc.key)
     md = h.get("Metadata") or {}
     try:
         meta = json.loads(md.get("metadata") or md.get("Metadata") or "{}")
@@ -101,8 +119,9 @@ def aux_meta(loc):
     nm = meta.get("__NUMPY__")
     if not nm or nm.get("dtype") not in NPF:
         return None
-    return (bool(meta.get("compressed")), NPF[nm["dtype"]], [int(x) for x in nm["shape"]], int(h.get("ContentLength", 0)))
-def stream_aux(sd, name, on_side):
+    return Aux(bool(meta.get("compressed")), NPF[nm["dtype"]],
+               [int(x) for x in nm["shape"]], int(h.get("ContentLength", 0)))
+def stream_aux(sd: Any, name: str, on_side: Callable[[int], object]) -> tuple[Any, int]:
     # Read a sibling float tensor (codebook / scale) over S3 with byte progress → f64.
     # Falls back to cstorch materialise (no progress) if it isn't numpy-float-stored.
     dt = sd[name]
@@ -111,19 +130,18 @@ def stream_aux(sd, name, on_side):
     if loc is None or am is None:
         on_side(0)
         return dt.to("cpu").to(torch.float64).numpy(), 0
-    comp, npdt, shape, size = am
     buf = download_raw(loc, on_side)
-    raw = zstandard.decompress(bytes(buf)) if comp else buf
-    return np.frombuffer(raw, dtype=npdt).reshape(shape).astype(np.float64), size
-def aux_size(sd, name):
+    raw = zstandard.decompress(bytes(buf)) if am.compressed else buf
+    return np.frombuffer(raw, dtype=am.dtype).reshape(am.shape).astype(np.float64), am.size
+def aux_size(sd: Any, name: str) -> int:
     # (old_or_new) S3 byte size of a sibling float tensor, 0 if not resolvable — used
     # to size its bar UP FRONT (before it streams), so it never shows an unsized bar.
     if name not in sd:
         return 0
     loc = resolve(sd[name])
     am = aux_meta(loc) if loc is not None else None
-    return am[3] if am else 0
-def cmp_aux(oname_a, nname_a, osz, nsz):
+    return am.size if am else 0
+def cmp_aux(oname_a: str, nname_a: str, osz: int, nsz: int) -> dict[str, Any]:
     # Streams both sides over S3 into this sibling's own bar (keyed by the new name,
     # already sized by the caller), records the NAMES tried, and — like the weight —
     # flags a `comparing` phase before the compare and finishes the bar after it.
@@ -132,7 +150,7 @@ def cmp_aux(oname_a, nname_a, osz, nsz):
     if not out["old_present"] or not out["new_present"]:
         return out
     od = [0]; nd = [0]; last = [0]
-    def bump():
+    def bump() -> None:
         s = od[0] + nd[0]
         if s - last[0] >= EMIT:
             last[0] = s; stat("bytes\t%s\t%d\t%d" % (nname_a, od[0], nd[0]))
@@ -154,7 +172,7 @@ t0 = time.time()
 agg_lock = threading.Lock()
 read_bytes = [0]
 compared = [0]
-def work(idx):
+def work(idx: int) -> None:
     oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
     stat("start\t%d\t%d\t%s" % (idx + 1, total, nname))
     res = {"name": nname}
@@ -184,41 +202,43 @@ def work(idx):
             if not ashape or not bshape or ashape[1:] != bshape[1:] or W <= 0 or E <= W:
                 res["error"] = "not a fold pair (shapes %r vs %r)" % (ashape, bshape); emit(res); return
             fold = (E + W - 1) // W
-            if W != (E + fold - 1) // fold:
+            if (E + fold - 1) // fold != W:
                 res["error"] = "fold mismatch (E=%d W=%d -> fold=%d)" % (E, W, fold); emit(res); return
         if fold * BITS > 16:
             res["error"] = "fold*bits=%d exceeds the 16-bit word" % (fold * BITS); emit(res); return
         lo = resolve(da); ln = resolve(db)
         odone = [0]; ndone = [0]; last = [0]
-        def bump():
+        def bump() -> None:
             s = odone[0] + ndone[0]
             if s - last[0] >= EMIT:
                 last[0] = s
                 stat("bytes\t%s\t%d\t%d" % (nname, odone[0], ndone[0]))
-        streamed = None   # (raw_a, comp_a, raw_b, comp_b) when read over the network
+        def comparing() -> None:
+            # Bytes are all read (bar at 100%); the decompress + decode is the slow part,
+            # so flag the phase BEFORE it, not after.
+            stat("phase\t%s\tcomparing" % (nname,))
+        # Each branch decodes its own words, so `ao`/`bo` are bound on every path.
         if lo is not None and ln is not None:
             osz, ocomp, onp = head(lo); nsz, ncomp, nnp = head(ln)
             stat("size\t%s\t%d\t%d" % (nname, osz, nsz))
             if onp and nnp:
-                def oon(n): odone[0] = n; bump()
-                def non(n): ndone[0] = n; bump()
+                def oon(n: int) -> None: odone[0] = n; bump()
+                def non(n: int) -> None: ndone[0] = n; bump()
                 ra = download_raw(lo, oon)
                 rb = download_raw(ln, non)
                 stat("bytes\t%s\t%d\t%d" % (nname, osz, nsz))
-                streamed = (ra, ocomp, rb, ncomp)
                 tb = osz + nsz
+                comparing()
+                ao = decode_u16(ra, ocomp); bo = decode_u16(rb, ncomp)
             else:
                 ao = to_u16(da); bo = to_u16(db)   # not numpy-stored: no byte progress
                 tb = int(ao.nbytes) + int(bo.nbytes)
+                comparing()
         else:
             ao = to_u16(da); bo = to_u16(db)
             tb = int(ao.nbytes) + int(bo.nbytes)
             stat("size\t%s\t%d\t%d" % (nname, int(ao.nbytes), int(bo.nbytes)))
-        # Bytes are all read (bar at 100%); the decompress + decode below is the slow
-        # part, so flag "comparing" now — not after it.
-        stat("phase\t%s\tcomparing" % (nname,))
-        if streamed is not None:
-            ao = decode_u16(streamed[0], streamed[1]); bo = decode_u16(streamed[2], streamed[3])
+            comparing()
         ao = ao.reshape(E, -1); bo = bo.reshape(W, -1)
         N = ao.shape[1]
         we = (np.arange(E) // fold)

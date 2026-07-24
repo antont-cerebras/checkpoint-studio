@@ -27,12 +27,26 @@ select = [
   "UP",  # pyupgrade, bounded by target-version above
   "RET", # return-path consistency
   "PIE", # misc lints
+  "ANN", # every function must be type-annotated (see ANN401 below)
   "RUF", # ruff's own
 ]
 ignore = [
-  # The remote scripts are deliberately dense (they cross an ssh boundary as one
-  # payload); wrapping them for line length hurts more than it helps.
-  "E501",
+  # These are scripts, not a library: they're written in a deliberately compact style
+  # (`emit(...); sys.exit(0)`) and cross an ssh boundary as a single payload. Line
+  # length and one-statement-per-line would mean reformatting ~150 lines of code that
+  # runs on a production cluster, for no behavioural gain.
+  "E501",  # line too long
+  "E701",  # multiple statements on one line (colon)
+  "E702",  # multiple statements on one line (semicolon)
+  # printf-style `%` formatting is used throughout and is fine — `%r` for repr in
+  # error paths is the idiom here. Rewriting 41 sites in cluster code buys nothing.
+  "UP031",
+  # `Any` is the honest annotation for torch / numpy / boto3 / cstorch values: those
+  # packages aren't importable at lint time (see reportMissingImports), so there is no
+  # more precise type available. Everything else IS annotated — ANN001/ANN2xx stay on.
+  "ANN401",
+  # `×` in comments is intentional (matches the Rust docs' style).
+  "RUF003",
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -43,11 +57,18 @@ ignore = [
 
 [tool.pyright]
 include = ["crates/core/src/python", "gen_demo.py", "record_demo.py"]
-exclude = ["target", "web", "**/node_modules"]
+# Globs, and `target` matters a lot: it holds gigabytes of build artifacts and
+# walking it made a project-wide run take minutes instead of seconds.
+exclude = ["**/target", "**/node_modules", "web", "target"]
 pythonVersion = "3.9"
-typeCheckingMode = "basic"
+typeCheckingMode = "standard"
 # cerebras.pytorch only exists inside the cluster venv, and numpy/boto3 aren't
 # installed in CI — so don't fail on the imports themselves. Everything else
 # (undefined names, bad arity, unreachable code) is still checked.
 reportMissingImports = false
 reportMissingModuleSource = false
+
+[tool.ty.rules]
+# cerebras.pytorch only exists in the cluster venv; torch / numpy / boto3 / zstandard
+# aren't installed in CI either. Same stance as pyright's reportMissingImports.
+unresolved-import = "ignore"
