@@ -1,9 +1,8 @@
 ---
 source: tests/cli.rs
-assertion_line: 289
 expression: "plain(&[\"--filter\", \"name:mlp\"])"
 ---
-Checkpoint Explorer - [FIXTURE] (1/1)  ·  filter: name:mlp (1 match)                           [×]
+Checkpoint Studio - [FIXTURE] (1/1)  ·  filter: name:mlp (1 match)                             [×]
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 · model.layers.0.mlp.down_proj.weight [U16, (3, 4, 5), 120 B]
 

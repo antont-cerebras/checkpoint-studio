@@ -1,4 +1,4 @@
-# Checkpoint Explorer
+# Checkpoint Studio
 
 A fast terminal UI for looking **inside** model checkpoints — not just the tree
 of tensor names and shapes, but the **actual data**: heatmaps, grids of real
@@ -1075,7 +1075,7 @@ mismatch on startup it points you to `h`.
 ## Example Output
 
 ```
-Checkpoint Explorer - model.safetensors (1/1)
+Checkpoint Studio - model.safetensors (1/1)
 ↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter open · Space/: commands · E/C all · / search · l legend · h health · s stats · c copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · q quit
 ────────────────────────────────────────────────────────────────────────────────
 

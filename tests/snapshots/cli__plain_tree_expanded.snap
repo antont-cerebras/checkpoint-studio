@@ -1,9 +1,8 @@
 ---
 source: tests/cli.rs
-assertion_line: 495
 expression: "plain(&[\"--tree-state\", \"expanded\"])"
 ---
-Checkpoint Explorer - [FIXTURE] (1/1)                                                          [×]
+Checkpoint Studio - [FIXTURE] (1/1)                                                            [×]
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ▾ [FIXTURE] (▦ 7, 124 params, 272 B)
   ▾ 🔧 Metadata (▦ 0, 0 B)

@@ -304,7 +304,7 @@
     <button class="nav" on:click={back} title="Back (Backspace)" aria-label="Back">‹</button>
     <button class="nav" on:click={forward} title="Forward (\\)" aria-label="Forward">›</button>
     <button class="home" on:click={() => navigate({ kind: 'tree' })} title="Tensor tree">
-      Checkpoint&nbsp;Explorer
+      Checkpoint&nbsp;Studio
     </button>
     {#if $screen.kind !== 'tree'}
       <span class="crumb dim">{crumb($screen)}</span>

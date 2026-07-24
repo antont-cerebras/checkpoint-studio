@@ -929,7 +929,7 @@ impl UI {
         // Title. (A health-check warning is surfaced on the status bar instead —
         // see the `⚠ health` alert beside the read-only badge below.)
         let mut title = vec![Span::raw(format!(
-            "Checkpoint Explorer - {} ({}/{})",
+            "Checkpoint Studio - {} ({}/{})",
             config.current_file,
             config.file_idx + 1,
             config.total_files
@@ -2178,7 +2178,7 @@ impl UI {
         let height = area.height;
 
         // Title (row 0), with the same "+N more" note for a multi-file load.
-        let mut title = vec![Span::raw(format!("Checkpoint Explorer - {file}"))];
+        let mut title = vec![Span::raw(format!("Checkpoint Studio - {file}"))];
         if total_files > 1 {
             title.push(dim_span(format!("  (+{} more)", total_files - 1)));
         }
