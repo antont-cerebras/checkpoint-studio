@@ -2998,10 +2998,13 @@ impl UI {
                 Status::Fail => ("✗", palette::ERROR),
                 Status::Na => ("⊘", palette::DIM),
             };
+            // Every applicable row shows its `note` — what passing verifies — as an
+            // inline explanation (the TUI has no hover, so this is its equivalent of
+            // the web's per-check tooltip); a warn/fail row adds the finding count.
             let mut trailer_text = match r.status() {
                 Status::Pass => format!("— {}", r.summary().unwrap_or(r.note)),
                 Status::Na => "— n/a for this checkpoint".to_string(),
-                _ => format!("({})", count_phrase(r.errors(), r.warnings())),
+                _ => format!("— {}  ({})", r.note, count_phrase(r.errors(), r.warnings())),
             };
             // The value scan carries its wall-clock time (like the CLI bar).
             if let Some(d) = r.elapsed() {
