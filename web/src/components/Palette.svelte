@@ -87,7 +87,6 @@
   }
 </script>
 
-<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
 <div
   class="backdrop"
   role="presentation"
@@ -99,7 +98,7 @@
     <!-- svelte-ignore a11y-autofocus -->
     <input autofocus placeholder="Run a command…" bind:value={q} on:keydown={onKey} />
     <ul>
-      {#each filtered as c, i}
+      {#each filtered as c, i (`${c.group}/${c.label}`)}
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
         <li
           class:sel={i === sel}

@@ -36,7 +36,7 @@
     }
     if (s === seq) loading = false;
   }
-  $: load($filterQuery);
+  $: void load($filterQuery);
   $: total = families.reduce((a, f) => a + f.count, 0);
 </script>
 
@@ -51,7 +51,7 @@
         <span class="c">#</span><span class="n">family</span><span class="d">dtype</span>
         <span class="s">shape</span><span class="p">params</span><span class="z">size</span>
       </div>
-      {#each families as f}
+      {#each families as f (f.name)}
         <div class="frow">
           <span class="c mono">{f.count}</span>
           <span class="n" title={f.name}><Ref name={f.name} /></span>

@@ -67,7 +67,7 @@
     col_off: mode === 'window' ? colOff : undefined,
     raw: kind === 'values' && base !== 'dec' ? 1 : undefined,
   };
-  $: load(tensor, params);
+  $: void load(tensor, params);
 
   // Mirror the current params into the URL (replace, so no history spam) — a shared
   // link reproduces the exact view. mode/rows/cols always (their defaults are
@@ -110,7 +110,7 @@
    * entries, so this really re-hits the server rather than replaying the error. */
   function retry() {
     err = '';
-    load(tensor, params);
+    void load(tensor, params);
   }
 
   // Size the numeric grid to fill its pane: measure the rendered cell size and floor
@@ -120,8 +120,8 @@
   async function fitToPane() {
     if (!autoFit || kind !== 'values') return;
     await tick();
-    const head = tableEl?.querySelector('thead tr') as HTMLElement | null;
-    const body = tableEl?.querySelector('tbody tr') as HTMLElement | null;
+    const head = tableEl?.querySelector<HTMLElement>('thead tr');
+    const body = tableEl?.querySelector<HTMLElement>('tbody tr');
     if (!head || !body || !tableWrap) return;
     const rowH = body.offsetHeight;
     const headH = head.offsetHeight;
@@ -138,7 +138,7 @@
     }
   }
   // Re-fit after each render (data change) while auto-fitting, and on resize.
-  $: if (data && autoFit) fitToPane();
+  $: if (data && autoFit) void fitToPane();
 
   $: nSlices = data?.slices ?? 1;
   // Furthest valid top-left of the window, so offsets/seek/pan can't run past the
@@ -165,6 +165,9 @@
     const b = 256;
     if (aspect >= 1) { rows = clampDim(b); cols = clampDim(b / aspect); }
     else { cols = clampDim(b); rows = clampDim(b * aspect); }
+    // Read on the NEXT run of this reactive block (the once-per-tensor guard), which
+    // ESLint's per-block flow analysis can't see.
+    // eslint-disable-next-line no-useless-assignment
     snappedFor = tensor;
   }
   // Editing one dimension recomputes the other from the source aspect (either drives
@@ -263,7 +266,7 @@
   // meta line — the same readout the heatmap has, so both views answer "what is this
   // cell?". Delegated on the table (one listener, not one per cell).
   function onCellHover(e: Event) {
-    const td = (e.target as HTMLElement)?.closest('td[data-i]') as HTMLElement | null;
+    const td = (e.target as HTMLElement)?.closest<HTMLElement>('td[data-i]');
     if (!td || !data) {
       hover = '';
       return;
@@ -369,7 +372,7 @@
 <div class="dv">
   <div class="controls">
     <div class="grp">
-      {#each modes as m}
+      {#each modes as m (m)}
         <button class:active={mode === m} on:click={() => (mode = m)}>{modeLabel(m)}</button>
       {/each}
     </div>
@@ -416,7 +419,7 @@
 
     <label title="Reinterpret the raw bytes as another dtype before display (e.g. read a packed weight as u4). 'stored' uses the tensor's real dtype.">override&nbsp;dtype
       <select bind:value={dtype}>
-        {#each DTYPES as d}<option value={d}>{d === '' ? 'stored' : d}</option>{/each}
+        {#each DTYPES as d (d)}<option value={d}>{d === '' ? 'stored' : d}</option>{/each}
       </select>
     </label>
 
@@ -467,7 +470,6 @@
         on:wheel|nonpassive={onWheel}
         on:mousedown={focusPane}
       >
-        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
         <canvas
           bind:this={canvas}
           class:clickable={mode === 'overview' || mode === 'absmax'}
@@ -498,17 +500,17 @@
           <thead>
             <tr>
               <th></th>
-              {#each data.cols as c, j}
+              {#each data.cols as c, j (j)}
                 <th class="dim" scope="col">{c}</th>
                 {#if j === colGap}<th class="sep" scope="col" title="{colsSkipped.toLocaleString()} columns skipped">⋯</th>{/if}
               {/each}
             </tr>
           </thead>
           <tbody>
-            {#each data.values as row, i}
+            {#each data.values as row, i (i)}
               <tr>
                 <th class="dim" scope="row">{data.rows[i]}</th>
-                {#each row as _, j}
+                {#each row as _, j (j)}
                   <td class="mono" data-i={i} data-j={j}>{cellText(data, base, i, j)}</td>
                   {#if j === colGap}<td class="sep">⋯</td>{/if}
                 {/each}

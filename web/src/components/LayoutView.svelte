@@ -10,7 +10,7 @@
   import Dtype from './Dtype.svelte';
   import Shape from './Shape.svelte';
 
-  let shards: string[] = [];
+  let shards: string[];
   let selected = '';
   let map: LayoutMap | null = null;
   let err = '';
@@ -23,7 +23,7 @@
   $: wanted = $screen.kind === 'layout' ? $screen.file : undefined;
   $: if (shards.length && !shards.includes(selected)) selected = shards[0] ?? '';
   $: if (wanted && shards.includes(wanted)) selected = wanted;
-  $: if (selected) load(selected);
+  $: if (selected) void load(selected);
 
   function collect(nodes: TreeNode[]): string[] {
     const set = new Set<string>();
@@ -95,7 +95,7 @@
   <div class="head">
     <label>shard
       <select bind:value={selected}>
-        {#each shards as s}<option value={s}>{s}</option>{/each}
+        {#each shards as s (s)}<option value={s}>{s}</option>{/each}
       </select>
     </label>
     {#if map}
@@ -128,7 +128,7 @@
           <span class="hover mono">{hover}</span>
         </div>
         <div class="seglist">
-          {#each map.segments as s}
+          {#each map.segments as s, si (si)}
             <!-- svelte-ignore a11y-no-noninteractive-tabindex -->
             <div
               class="seg {s.kind.kind}"
@@ -156,7 +156,7 @@
         {#if map.metadata.length}
           <table class="meta">
             <tbody>
-              {#each map.metadata as [k, v]}<tr><th>{k}</th><td class="mono">{v}</td></tr>{/each}
+              {#each map.metadata as [k, v] (k)}<tr><th>{k}</th><td class="mono">{v}</td></tr>{/each}
             </tbody>
           </table>
         {/if}

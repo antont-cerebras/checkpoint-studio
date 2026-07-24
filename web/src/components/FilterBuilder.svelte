@@ -70,10 +70,19 @@
     let quote = false;
     for (const c of q) {
       if (c === '"') quote = !quote;
-      else if (c === '(' && !quote) (depth++, (cur += c));
-      else if (c === ')' && !quote) ((depth = Math.max(0, depth - 1)), (cur += c));
+      else if (c === '(' && !quote) {
+        depth++;
+        cur += c;
+      }
+      else if (c === ')' && !quote) {
+        depth = Math.max(0, depth - 1);
+        cur += c;
+      }
       else if (/\s/.test(c) && depth === 0 && !quote) {
-        if (cur) out.push(cur), (cur = '');
+        if (cur) {
+          out.push(cur);
+          cur = '';
+        }
       } else cur += c;
     }
     if (cur) out.push(cur);
@@ -113,9 +122,16 @@
           f.neg.dtype = negate;
           break;
         case 'name':
-          if (val.startsWith('re:')) (f.nameMode = 're'), (f.name = val.slice(3));
-          else if (val.startsWith('glob:')) (f.nameMode = 'glob'), (f.name = val.slice(5));
-          else (f.nameMode = 'contains'), (f.name = val);
+          if (val.startsWith('re:')) {
+            f.nameMode = 're';
+            f.name = val.slice(3);
+          } else if (val.startsWith('glob:')) {
+            f.nameMode = 'glob';
+            f.name = val.slice(5);
+          } else {
+            f.nameMode = 'contains';
+            f.name = val;
+          }
           f.neg.name = negate;
           break;
         case 'shape':
@@ -153,7 +169,7 @@
   function rangeTerm(facet: string, min: string, max: string, negate: boolean): string {
     const m = min.trim();
     const x = max.trim();
-    let v = '';
+    let v: string;
     if (m && x) v = m === x ? m : `${m}..${x}`;
     else if (m) v = `${m}..`;
     else if (x) v = `..${x}`;
@@ -190,6 +206,8 @@
   // writes set `lastBuilt` first, so they don't round-trip and disturb typing.
   $: if ($filterQuery !== lastBuilt) {
     fields = parseQuery($filterQuery);
+    // Compared on the NEXT run to tell an external query change from our own write.
+    // eslint-disable-next-line no-useless-assignment
     lastBuilt = $filterQuery;
   }
   function commit() {
@@ -222,7 +240,7 @@
     <button type="button" class="neg" class:on={fields.neg.dtype} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('dtype')}>not</button>
     <span class="k">dtype</span>
     <div class="chips">
-      {#each present as d}
+      {#each present as d (d)}
         <button
           type="button"
           class="chip"

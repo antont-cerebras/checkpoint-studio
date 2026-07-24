@@ -12,7 +12,7 @@
 {:else}
   <span class="shape">
     <button class="brk" title="Filter by this exact shape" on:click|stopPropagation={() => filterByShape(shape)}>(</button>
-    {#each shape as d, i}
+    {#each shape as d, i (i)}
       <button class="dim" title="Filter tensors with a dimension of {d}" on:click|stopPropagation={() => filterByDim(d)}>{d}</button>{#if i < shape.length - 1}<span class="x">,&nbsp;</span>{:else if shape.length === 1}<span class="x">,</span>{/if}
     {/each}
     <button class="brk" title="Filter by this exact shape" on:click|stopPropagation={() => filterByShape(shape)}>)</button>

@@ -53,7 +53,7 @@
 </script>
 
 <div class="footer">
-  {#each hints as h}
+  {#each hints as h, hi (hi)}
     <button class="hint" on:click={h.act} title={h.label}>
       <span class="k">{h.keys}</span><span class="l">{h.label}</span>
     </button>

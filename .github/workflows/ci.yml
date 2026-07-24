@@ -96,6 +96,11 @@ jobs:
       - name: Typecheck (svelte-check)
         run: npm run check
 
+      # Type-AWARE lint (typescript-eslint + eslint-plugin-svelte): catches what the
+      # type checker won't, notably unhandled promises in the store/fetch layer.
+      - name: Lint (eslint)
+        run: npm run lint
+
       - name: Build
         run: npm run build
 

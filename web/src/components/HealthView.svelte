@@ -113,7 +113,7 @@
     <section>
       <h3 title="Header-only checks (no tensor data read): each row explains what passing verifies — hover it.">Structural checks</h3>
       <ul class="checks">
-        {#each checks as c}
+        {#each checks as c (c.id)}
           {@const st = statusOf(c.status)}
           <li>
             <div class="checkhead">
@@ -124,7 +124,7 @@
             </div>
             {#if c.findings.length}
               <ul class="findings">
-                {#each c.findings as f}
+                {#each c.findings as f, fi (fi)}
                   <li>
                     <span class="badge sm {sevOf(f.severity).cls}">{sevOf(f.severity).icon}</span>
                     <Ref name={f.subject} />
@@ -147,14 +147,14 @@
       {:else if !indexIssues.length}
         <p class="ok-line"><span class="badge ok">✓</span> Index matches the files on disk.</p>
       {:else}
-        {#each health as h}
+        {#each health as h (h.index_path)}
           {@const lists = idxLists(h)}
-          {#each lists as [heading, items, cls, refKind]}
+          {#each lists as [heading, items, cls, refKind] (heading)}
             {#if items.length}
               <div class="idxgroup">
                 <div class="idxhead"><span class="badge sm {cls}">{cls === 'fail' ? '✗' : '⚠'}</span> {heading} <span class="dim">({items.length})</span></div>
                 <ul class="idxlist">
-                  {#each items as it}<li class="mono"><Ref name={it} kind={refKind} /></li>{/each}
+                  {#each items as it (it)}<li class="mono"><Ref name={it} kind={refKind} /></li>{/each}
                 </ul>
               </div>
             {/if}

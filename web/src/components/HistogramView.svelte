@@ -19,7 +19,7 @@
   let wrapW = 0;
   let wrapH = 0;
 
-  $: load(name, bins);
+  $: void load(name, bins);
   async function load(n: string, b: number) {
     loading = true;
     err = '';

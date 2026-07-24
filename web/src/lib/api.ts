@@ -13,10 +13,15 @@ import type {
 
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
-  const body = await res.json().catch(() => null);
+  // `res.json()` is `any`; keep it `unknown` and narrow, so a malformed error
+  // envelope can't smuggle an untyped value into the app.
+  const body: unknown = await res.json().catch(() => null);
   if (!res.ok) {
-    const msg = (body && (body as { error?: string }).error) || `HTTP ${res.status}`;
-    throw new Error(msg);
+    const detail =
+      typeof body === 'object' && body !== null && 'error' in body
+        ? (body as { error?: unknown }).error
+        : undefined;
+    throw new Error(typeof detail === 'string' ? detail : `HTTP ${res.status}`);
   }
   return body as T;
 }

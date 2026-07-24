@@ -219,12 +219,14 @@
       case 'ArrowDown':
       case 'j':
         e.preventDefault();
-        e.shiftKey ? selectSibling(true) : moveSelection(1);
+        if (e.shiftKey) selectSibling(true);
+        else moveSelection(1);
         break;
       case 'ArrowUp':
       case 'k':
         e.preventDefault();
-        e.shiftKey ? selectSibling(false) : moveSelection(-1);
+        if (e.shiftKey) selectSibling(false);
+        else moveSelection(-1);
         break;
       case 'ArrowLeft':
         e.preventDefault();

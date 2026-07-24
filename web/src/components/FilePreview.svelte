@@ -10,7 +10,7 @@
   let err = '';
   let loading = true;
 
-  $: load(path);
+  $: void load(path);
   async function load(p: string) {
     loading = true;
     err = '';

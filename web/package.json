@@ -5,21 +5,27 @@
   "description": "Svelte web UI for checkpoint-studio (served by the Rust --web server)",
   "type": "module",
   "engines": {
-    "node": ">=16 <21"
+    "node": ">=20.19"
   },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "lint": "eslint ."
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@sveltejs/vite-plugin-svelte": "^2.5.3",
     "@tsconfig/svelte": "^5.0.2",
+    "eslint": "^10.7.0",
+    "eslint-plugin-svelte": "^3.22.0",
+    "globals": "^17.7.0",
     "svelte": "^4.2.19",
     "svelte-check": "^3.8.6",
     "tslib": "^2.6.3",
     "typescript": "^5.4.5",
+    "typescript-eslint": "^8.65.0",
     "vite": "^4.5.5"
   }
 }

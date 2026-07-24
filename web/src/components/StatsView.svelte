@@ -76,7 +76,7 @@
     <section>
       <h3>Data types</h3>
       <div class="dtypes">
-        {#each [...s.dtypes].sort((a, b) => b.bytes - a.bytes) as d}
+        {#each [...s.dtypes].sort((a, b) => b.bytes - a.bytes) as d (d.dtype)}
           <div class="drow">
             <span class="pillcell"><Dtype dtype={d.dtype} /></span>
             <div class="track"><div class="fill" style="width:{pct(d.bytes, dtypeTotal)}%"></div></div>
@@ -99,7 +99,7 @@
         <h3>MoE experts</h3>
         <p class="dim">{s.experts.layout.storage}{s.experts.layout.per_layer ? ` · ${s.experts.layout.per_layer} per layer` : ''}{s.experts.gate_up_fused ? ' · gate/up fused' : ''}</p>
         <div class="dtypes">
-          {#each s.experts.by_category as c}
+          {#each s.experts.by_category as c, ci (ci)}
             {@const total = s.experts.by_category.reduce((a, x) => a + x.bytes, 0)}
             <div class="drow">
               <span class="pill cat">{c.name}</span>
@@ -115,7 +115,7 @@
       <section>
         <h3>Per-layer size <span class="dim">(attn / ffn / other)</span></h3>
         <div class="layers">
-          {#each s.per_layer.rows as r, i}
+          {#each s.per_layer.rows as r, i (i)}
             <div class="lrow">
               <span class="li dim mono">{i}</span>
               <div class="stack" style="width:{pct(r.bytes, layerMax)}%">
@@ -139,7 +139,7 @@
         <table class="shards">
           <thead><tr><th>shard</th><th>apparent</th><th>allocated</th></tr></thead>
           <tbody>
-            {#each shards as sh}
+            {#each shards as sh, shi (shi)}
               <tr><td class="mono"><Ref name={sh.name} kind="file" /></td><td class="mono">{humanSize(sh.apparent)}</td><td class="mono">{humanSize(sh.allocated)}</td></tr>
             {/each}
           </tbody>
