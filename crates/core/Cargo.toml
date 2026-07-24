@@ -18,7 +18,7 @@ memmap2 = "0.9"
 rayon = "1"
 # Read NumPy `.npz` archives (a ZIP of `.npy` entries), pure-Rust deflate.
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# Pure-Rust SSH/SFTP for `--ssh-read`; vendored OpenSSL so the build is
+# Pure-Rust SSH/SFTP for `--ssh-proxy`; vendored OpenSSL so the build is
 # self-contained.
 ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
 # Read the SSH password from the tty when key/agent auth isn't available.

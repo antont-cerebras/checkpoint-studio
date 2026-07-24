@@ -15,7 +15,7 @@
 //! read-only ([`open_readonly`] — `OpenFlags::READ`, no create/write/truncate
 //! bits), and the module never issues `mkdir` / `remove` / `rename` / `setstat`
 //! or an `s3://` command that writes. The cstorch path only *loads* the
-//! checkpoint and prints metadata to stdout. So `--ssh-read` cannot create or
+//! checkpoint and prints metadata to stdout. So `--ssh-proxy` cannot create or
 //! modify anything on the server — and no tensor data crosses the wire.
 
 use std::collections::{BTreeSet, HashMap};

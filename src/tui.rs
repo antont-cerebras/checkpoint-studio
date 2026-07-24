@@ -28,7 +28,7 @@ pub type LiveTerminal = Terminal<CrosstermBackend<Stdout>>;
 /// tmux -CC / iTerm2 render an alt-screen app on a dedicated surface, dense full
 /// repaints forward far faster than they do on the primary buffer (which caused
 /// ~1s tmux -CC lag switching into a big tree). Entering it also hides any pre-TUI
-/// output (e.g. the `--ssh-read` password prompt + read spinner) without having to
+/// output (e.g. the `--ssh-proxy` password prompt + read spinner) without having to
 /// scrub the primary scrollback.
 pub fn init() -> Result<LiveTerminal> {
     terminal::enable_raw_mode()?;

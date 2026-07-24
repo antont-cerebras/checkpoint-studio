@@ -3,7 +3,7 @@
 //! Two tiers, mirroring the metadata-only / local split the rest of the tool
 //! lives by:
 //!   * **structural** checks read only headers/names, so they are cheap and work
-//!     over the metadata-only remote path (`--ssh-read` / `s3://`);
+//!     over the metadata-only remote path (`--ssh-proxy` / `s3://`);
 //!   * **value** checks (`--values`) scan tensor data and so need the bytes locally,
 //!     exactly like the heatmap / stats views.
 //!
@@ -616,7 +616,7 @@ fn check_byte_ranges(tensors: &[TensorInfo]) -> CheckResult {
         // Truncation: the file must be exactly header + blob. `cursor` is the end
         // of the last tensor, relative to the data blob (starts after the 8-byte
         // length prefix + JSON header). Only checkable when the file is local —
-        // over `--ssh-read` the span/contiguity checks above still run (they're
+        // over `--ssh-proxy` the span/contiguity checks above still run (they're
         // header-only), but there's no local file to stat.
         if !crate::remote::is_remote_source(file) {
             match safetensors_blob(file) {

@@ -2461,7 +2461,7 @@ impl Mode for DetailMode {
             )
         {
             self.overlay = Some(Overlay::Notice(
-                "Read remotely with --ssh-read: only the structure is here. Data views \
+                "Read remotely with --ssh-proxy: only the structure is here. Data views \
                  (heatmap, values, histogram, statistics) need the file locally — copy the \
                  checkpoint down to preview its values."
                     .to_string(),
@@ -3826,7 +3826,7 @@ fn stats_cmd_key(cmd: StatsCmd) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
 }
 
-/// How the file browser (`Tab` / `--files`) browses a **remote** (`--ssh-read`)
+/// How the file browser (`Tab` / `--files`) browses a **remote** (`--ssh-proxy`)
 /// checkpoint — it adapts to the source kind (`None` for a local checkpoint, which
 /// walks the local filesystem):
 /// - `Sftp(dir)`: a remote safetensors directory, listed recursively over SFTP
@@ -3839,13 +3839,13 @@ enum RemoteBrowse {
     S3(String),
 }
 
-/// Everything that makes a run **remote** (`--ssh-read`), bundled so it exists as
+/// Everything that makes a run **remote** (`--ssh-proxy`), bundled so it exists as
 /// a unit or not at all: a local checkpoint is simply `remote: None`, and the SSH
 /// session / cached password / captured on-disk usage / S3 metadata can't dangle
 /// without a remote read behind them (the old six parallel `Option`/`RefCell`
 /// fields let those states drift apart).
 struct RemoteContext {
-    /// The reader that runs cstorch/SFTP over SSH (`--ssh-read`/`--ssh-venv`).
+    /// The reader that runs cstorch/SFTP over SSH (`--ssh-proxy`/`--ssh-venv`).
     read: crate::remote::RemoteRead,
     /// The file browser's source kind, derived from the raw source at setup;
     /// `None` only for the degenerate empty-input case (nothing to browse).
@@ -3880,7 +3880,7 @@ pub struct Explorer {
     /// it in a later step. The TUI is migrating to drive this `Session` and render
     /// its `ViewModel`; today its local views/reports derive from the model here.
     session: Option<crate::kernel::Session>,
-    /// Everything remote (`--ssh-read`), or `None` for a local checkpoint. Bundles
+    /// Everything remote (`--ssh-proxy`), or `None` for a local checkpoint. Bundles
     /// the reader, browse source, live SSH session + cached password, captured
     /// on-disk usage, and S3 metadata — see [`RemoteContext`].
     remote: Option<RemoteContext>,
@@ -4305,10 +4305,10 @@ impl Explorer {
 
     /// Read `s3://…` sources' metadata over SSH via cstorch on `host` (activating
     /// the venv at `venv`), instead of directly — so credentials stay on the
-    /// remote (`--ssh-read` / `--ssh-venv`).
+    /// remote (`--ssh-proxy` / `--ssh-venv`).
     pub fn set_remote_read(&mut self, host: String, venv: String) {
         // The file browser adapts to the remote source kind, derived from the raw
-        // `--ssh-read` argument: an `s3://…` URI browses s3-natively; any other
+        // `--ssh-proxy` argument: an `s3://…` URI browses s3-natively; any other
         // path is the SFTP directory to browse (or, for a single shard, its
         // parent). `browse_root` (a local `.parent()`) doesn't apply remotely.
         let browse = self.files.first().map(|first| {
@@ -4335,7 +4335,7 @@ impl Explorer {
         });
     }
 
-    /// The remote reader (`--ssh-read`), when this is a remote run.
+    /// The remote reader (`--ssh-proxy`), when this is a remote run.
     fn remote_read(&self) -> Option<&crate::remote::RemoteRead> {
         self.remote.as_ref().map(|r| &r.read)
     }
@@ -4356,10 +4356,10 @@ impl Explorer {
     }
 
     /// Run `f` with the live remote session, reopening once (with the cached
-    /// password) if the stored session errors — a `--ssh-read` connection can idle
+    /// password) if the stored session errors — a `--ssh-proxy` connection can idle
     /// out between the initial read and a later browse. All remote file-browser /
     /// layout / sidecar reads go through this so they never re-prompt. Errors only
-    /// when there's no `--ssh-read` configured or the (re)open itself fails.
+    /// when there's no `--ssh-proxy` configured or the (re)open itself fails.
     fn with_remote_session<T>(
         &self,
         f: impl Fn(&crate::sftp::RemoteSession) -> Result<T>,
@@ -4367,7 +4367,7 @@ impl Explorer {
         let rc = self
             .remote
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no --ssh-read session configured"))?;
+            .ok_or_else(|| anyhow::anyhow!("no --ssh-proxy session configured"))?;
         // Try the stored session first; a success returns immediately.
         if let Some(session) = rc.session.borrow().as_ref()
             && let Ok(v) = f(session)
@@ -4386,7 +4386,7 @@ impl Explorer {
     }
 
     fn load_all_files(&mut self) -> Result<()> {
-        // Already loaded (e.g. a remote `--ssh-read` structure read synchronously
+        // Already loaded (e.g. a remote `--ssh-proxy` structure read synchronously
         // before the TUI started) — don't re-read.
         if self.full_loaded {
             return Ok(());
@@ -4466,7 +4466,7 @@ impl Explorer {
         Ok(())
     }
 
-    /// Remote (`--ssh-read`) structure read that **keeps** the SSH session alive on
+    /// Remote (`--ssh-proxy`) structure read that **keeps** the SSH session alive on
     /// `self` — stashed in [`Self::remote_session`], its password in
     /// [`Self::remote_password`] — so the file browser and remote layout / sidecar
     /// reads reuse it without re-prompting. Mirrors
@@ -4477,7 +4477,7 @@ impl Explorer {
         let r = self
             .remote_read()
             .cloned()
-            .expect("gather_remote_keeping_session requires --ssh-read");
+            .expect("gather_remote_keeping_session requires --ssh-proxy");
         // One authenticated session for the whole run; the password entered here is
         // cached (any later reopen after an idle timeout reuses it silently).
         let session = {
@@ -4786,7 +4786,7 @@ impl Explorer {
         files: &[PathBuf],
         remote: Option<&crate::remote::RemoteRead>,
     ) -> Result<(CheckpointParts, Option<crate::model::Checkpoint>)> {
-        // `--ssh-read`: every source is read on the remote (an s3:// cstorch
+        // `--ssh-proxy`: every source is read on the remote (an s3:// cstorch
         // checkpoint, or a remote safetensors directory/file), keeping the
         // credentials and data there. (The central model is filled by the remote
         // reader in a later step; the remote path returns the parts tuple only.)
@@ -4821,7 +4821,7 @@ impl Explorer {
             let as_str = file_path.to_string_lossy();
             if crate::s3::is_uri(&as_str) {
                 anyhow::bail!(
-                    "{as_str}: reading an s3:// checkpoint needs --ssh-read <[user@]host> \
+                    "{as_str}: reading an s3:// checkpoint needs --ssh-proxy <[user@]host> \
                      (its credentials stay on the remote)"
                 );
             }
@@ -5455,7 +5455,7 @@ impl Explorer {
             return Ok(());
         }
 
-        // A remote (`--ssh-read`) structure read runs an interactive `ssh` that may
+        // A remote (`--ssh-proxy`) structure read runs an interactive `ssh` that may
         // prompt for a password/2FA. Do it BEFORE taking over the screen, so the
         // prompt uses the normal terminal; `fetch` announces + shows a spinner
         // after the prompt. `load_all_files` then no-ops.
@@ -6246,7 +6246,7 @@ impl Explorer {
     }
 
     /// The concrete CLI command reproducing a menu `choice`, built the way `y`
-    /// builds its reopen command (real paths, scp-style / `--ssh-read` for a
+    /// builds its reopen command (real paths, scp-style / `--ssh-proxy` for a
     /// remote source), so it runs as-is.
     fn export_command(&self, choice: ExportChoice) -> String {
         let mut parts = self.command_prefix();
@@ -7103,7 +7103,7 @@ impl Explorer {
         }
     }
 
-    /// The remote host label for display (`host` from `--ssh-read`), or `remote`.
+    /// The remote host label for display (`host` from `--ssh-proxy`), or `remote`.
     fn remote_host_label(&self) -> String {
         self.remote_read()
             .map(|r| r.host.clone())
@@ -7168,7 +7168,7 @@ impl Explorer {
             Some(RemoteBrowse::S3(uri)) => {
                 let r = self
                     .remote_read()
-                    .ok_or_else(|| "no --ssh-read session configured".to_string())?;
+                    .ok_or_else(|| "no --ssh-proxy session configured".to_string())?;
                 let objects = self
                     .with_remote_session(|s| r.list_s3(s, uri))
                     .map_err(|e| format!("{e:#}"))?;
@@ -10032,7 +10032,7 @@ impl Explorer {
     /// The host to fold into an scp-style positional (`host:/path`) so the reopen
     /// command matches the shorthand launch — `Some` only for a remote checkpoint
     /// whose source is a plain path (an `s3://…` cstorch source still needs
-    /// `--ssh-read`, so `None` there and for local checkpoints).
+    /// `--ssh-proxy`, so `None` there and for local checkpoints).
     fn remote_scp_host(&self) -> Option<String> {
         let remote = self.remote_read()?;
         let any_s3 = self
@@ -10072,7 +10072,7 @@ impl Explorer {
         }
     }
 
-    /// The program name plus, for an `s3://…` remote source, `--ssh-read HOST`
+    /// The program name plus, for an `s3://…` remote source, `--ssh-proxy HOST`
     /// (and `--ssh-venv` when non-default). A remote path source carries its host
     /// scp-style in the path arg instead (see [`Self::checkpoint_path_parts`]), so
     /// it needs no flag; local checkpoints get just the program name.
@@ -10081,7 +10081,7 @@ impl Explorer {
         if let Some(remote) = self.remote_read()
             && self.remote_scp_host().is_none()
         {
-            parts.push("--ssh-read".to_string());
+            parts.push("--ssh-proxy".to_string());
             parts.push(shell_quote(&remote.host));
             if remote.venv != "~/venv" {
                 parts.push("--ssh-venv".to_string());

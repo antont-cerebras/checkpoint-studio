@@ -476,7 +476,7 @@ impl Default for DataViewState {
 /// data — the tensors deduplicated by name (first shard wins) and natural-sorted,
 /// the metadata, and the config — so a frontend never keeps its own copy that can
 /// drift. For a local checkpoint it's built from the serializable
-/// [`Checkpoint`] model ([`Session::from_model`]); a remote (`--ssh-read`) read
+/// [`Checkpoint`] model ([`Session::from_model`]); a remote (`--ssh-proxy`) read
 /// that hasn't produced a model yet supplies the parts directly
 /// ([`Session::from_parts`]).
 pub struct Session {
@@ -607,7 +607,7 @@ impl Session {
 
     /// The checkpoint stats report — computed once from the canonical data, cached.
     /// `disk` is the on-disk footprint the caller resolves (from the model for a
-    /// local read, or the captured remote usage for `--ssh-read`).
+    /// local read, or the captured remote usage for `--ssh-proxy`).
     pub fn stats_with_disk(&mut self, disk: Option<crate::stats::DiskUsage>) -> &CheckpointStats {
         if self.stats.is_none() {
             self.stats = Some(CheckpointStats::compute(

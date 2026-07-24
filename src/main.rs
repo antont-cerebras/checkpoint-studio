@@ -9,6 +9,7 @@ pub use checkpoint_explorer_core::{
 #[cfg(feature = "hdf5")]
 pub use checkpoint_explorer_core::{convert, hdf5, hdf5_lz4, hdf5_zstd};
 
+mod cli_config;
 mod explorer;
 mod tui;
 mod ui;
@@ -68,7 +69,7 @@ fn examples_help() -> String {
       checkpoint-explorer model.safetensors --tensor NAME --values --dtype u4   # decode packed 4-bit
 
   {group}Read a remote / S3 checkpoint over SSH{r} (only metadata leaves the host):
-      checkpoint-explorer --ssh-read user@host s3://bucket/model/checkpoint
+      checkpoint-explorer --ssh-proxy user@host s3://bucket/model/checkpoint
       checkpoint-explorer user@host:/opt/models/some-model          # scp-style; a safetensors dir
 
   {group}Export the structure for scripts / agents{r} (text, or --format json):
@@ -107,11 +108,16 @@ bounded blocks, so multi-GB tensors work without loading them into RAM. Packed /
 quantized weights (4-bit, fused-codebook MoE) are decoded to their true values. \
 Sharded / multi-file models, directories, and globs merge into one tree.
 
-Remote checkpoints are read over SSH — a safetensors directory/file via SFTP, or an \
-s3:// cstorch checkpoint via a remote venv — sending only metadata off the host, so \
-data and credentials stay remote. For scripts and agents there are one-shot \
---print-tree / --print-tensors exports (text or JSON) and a `diff` subcommand with \
-diff-style exit codes.
+Remote checkpoints are read over an SSH proxy — a safetensors directory/file via SFTP, \
+or an s3:// cstorch checkpoint via a remote venv — sending only metadata off the host, \
+so data and credentials stay remote. Set the proxy you use most in a config file \
+(~/.config/checkpoint-explorer/config.toml) so you needn't pass --ssh-proxy every time:
+    ssh_proxy = \"user@host\"
+    ssh_venv  = \"~/venv\"      # optional; defaults to ~/venv
+An explicit --ssh-proxy / --ssh-venv flag always overrides the config.
+
+For scripts and agents there are one-shot --print-tree / --print-tensors exports (text \
+or JSON) and a `diff` subcommand with diff-style exit codes.
 
 Give one or more paths to browse; press `l` in any screen for its key legend. See the \
 examples below and `<command> --help`.")]
@@ -133,8 +139,8 @@ struct ExploreArgs {
                 (e.g. *.safetensors, model-*.gguf, *.npy, *.npz, *.hdf5).\n\
                 \n\
                 Remote paths work too (read over SSH — only metadata leaves the host):\n  \
-                [USER@]HOST:/path   scp-style path, like --ssh-read\n  \
-                s3://…              an S3 checkpoint; pass with --ssh-read <HOST>")]
+                [USER@]HOST:/path   scp-style path, like --ssh-proxy\n  \
+                s3://…              an S3 checkpoint; pass with --ssh-proxy <HOST>")]
     paths: Vec<PathBuf>,
 
     #[arg(
@@ -441,16 +447,17 @@ struct ExploreArgs {
     filter: Option<String>,
 
     #[arg(
-        long = "ssh-read",
+        long = "ssh-proxy",
+        alias = "ssh-read",
         value_name = "[USER@]HOST",
-        help = "Read a remote checkpoint's structure over SSH on [USER@]HOST (which has the access): an s3:// checkpoint, or a path to a safetensors directory/file on that host. Only the tensor metadata (names/dtypes/shapes) leaves the host — data/secrets stay remote. Metadata-only"
+        help = "Read a remote checkpoint's structure over an SSH proxy on [USER@]HOST (which has the access): an s3:// checkpoint, or a path to a safetensors directory/file on that host. Only the tensor metadata (names/dtypes/shapes) leaves the host — data/secrets stay remote. Metadata-only. Defaults to `ssh_proxy` in the config file (see --help)"
     )]
-    ssh_read: Option<String>,
+    ssh_proxy: Option<String>,
 
     #[arg(
         long = "ssh-venv",
         value_name = "PATH",
-        help = "Path to the cstorch virtualenv on the --ssh-read host, activated with `source <PATH>/bin/activate` (default: ~/venv)"
+        help = "Path to the cstorch virtualenv on the --ssh-proxy host, activated with `source <PATH>/bin/activate` (default: ~/venv, or `ssh_venv` in the config file)"
     )]
     ssh_venv: Option<String>,
 }
@@ -510,7 +517,7 @@ enum Command {
     /// tensors (by name, dtype, shape) and metadata (by name, value) that were
     /// added, removed, or changed. Tensor data/values are not compared.
     ///
-    /// For an s3-vs-s3 diff (both sides `s3://` with `--ssh-read`), the underlying
+    /// For an s3-vs-s3 diff (both sides `s3://` with `--ssh-proxy`), the underlying
     /// S3 objects' metadata is compared too — checksum/ETag, size, tags, and user
     /// metadata (best-effort, using the remote host's own AWS access); timestamps
     /// (last-modified and timestamp-valued tags/metadata) are shown as info only.
@@ -601,9 +608,9 @@ enum Command {
         /// Data/secrets stay remote. For an s3-vs-s3 pair, --values / --histogram /
         /// --tensor also work — the value/distribution comparison runs on the remote
         /// (only the per-tensor results cross the wire, never tensor data).
-        #[arg(long = "ssh-read", value_name = "[USER@]HOST")]
-        ssh_read: Option<String>,
-        /// Path to the cstorch virtualenv on the --ssh-read host (default: ~/venv).
+        #[arg(long = "ssh-proxy", alias = "ssh-read", value_name = "[USER@]HOST")]
+        ssh_proxy: Option<String>,
+        /// Path to the cstorch virtualenv on the --ssh-proxy host (default: ~/venv).
         #[arg(long = "ssh-venv", value_name = "PATH")]
         ssh_venv: Option<String>,
         /// Rename rule applied to the OLD checkpoint's tensor names before diffing,
@@ -622,7 +629,7 @@ enum Command {
         #[arg(long = "map-from", value_name = "FILE")]
         map_from: Option<PathBuf>,
         /// Verify two s3:// cstorch checkpoints are the SAME weights in different
-        /// packings (s3-vs-s3 over --ssh-read). For each tensor present on both sides
+        /// packings (s3-vs-s3 over --ssh-proxy). For each tensor present on both sides
         /// whose shape folds along dim 0 — old (E, …) sparse: one N-bit index per
         /// 16-bit word; new (ceil(E/fold), …) dense: `fold` indices per word, expert
         /// e at word e//fold, shift (e%fold)*bits — it decodes both on the remote and
@@ -686,9 +693,9 @@ enum Command {
         /// holds the access): an s3:// checkpoint or a remote safetensors
         /// directory/file. Only metadata leaves the host, so the structural
         /// checks run but --values (value scan) does not.
-        #[arg(long = "ssh-read", value_name = "[USER@]HOST")]
-        ssh_read: Option<String>,
-        /// Path to the cstorch virtualenv on the --ssh-read host (default: ~/venv).
+        #[arg(long = "ssh-proxy", alias = "ssh-read", value_name = "[USER@]HOST")]
+        ssh_proxy: Option<String>,
+        /// Path to the cstorch virtualenv on the --ssh-proxy host (default: ~/venv).
         #[arg(long = "ssh-venv", value_name = "PATH")]
         ssh_venv: Option<String>,
     },
@@ -702,7 +709,7 @@ enum Command {
     /// it from another machine's browser with no tunnel. Local checkpoints only.
     Web {
         /// The checkpoint to serve — a file, directory, or glob (shards merge into
-        /// one checkpoint). With --ssh-read, an `s3://…` URI or a remote path.
+        /// one checkpoint). With --ssh-proxy, an `s3://…` URI or a remote path.
         #[arg(value_name = "PATH", required = true)]
         paths: Vec<PathBuf>,
         /// Recursively search directories for checkpoint files.
@@ -721,8 +728,8 @@ enum Command {
         /// Serve a remote checkpoint: read its structure over SSH on HOST (metadata
         /// only — data-value views need the file locally). PATH is then an `s3://…`
         /// URI or a remote path.
-        #[arg(long = "ssh-read", value_name = "[USER@]HOST")]
-        ssh_read: Option<String>,
+        #[arg(long = "ssh-proxy", alias = "ssh-read", value_name = "[USER@]HOST")]
+        ssh_proxy: Option<String>,
         /// The Python venv on the SSH host that has `cerebras.pytorch` (for reading
         /// s3:// cstorch checkpoints). Defaults to ~/venv.
         #[arg(long = "ssh-venv", value_name = "PATH")]
@@ -744,6 +751,9 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    // User CLI defaults (e.g. the SSH proxy they usually use) — an explicit flag
+    // always overrides (see `resolve_ssh_proxy`).
+    let cfg = cli_config::CliConfig::load();
 
     match cli.command {
         Some(Command::Convert {
@@ -793,7 +803,7 @@ fn main() -> Result<()> {
             dtype_is,
             shape_is,
             jobs,
-            ssh_read,
+            ssh_proxy,
             ssh_venv,
             map,
             map_from,
@@ -802,11 +812,10 @@ fn main() -> Result<()> {
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
             // the `Result` convention `main` uses elsewhere, so exit explicitly.
-            // `--ssh-read`: read each checkpoint's structure via cstorch on the
-            // remote (secrets stay there).
-            let remote = ssh_read.map(|host| {
-                crate::remote::RemoteRead::new(host, ssh_venv.unwrap_or_else(|| "~/venv".into()))
-            });
+            // `--ssh-proxy` (or the config default): read each checkpoint's structure
+            // via cstorch on the remote (secrets stay there).
+            let remote = resolve_ssh_proxy(ssh_proxy, ssh_venv, &cfg)
+                .map(|(host, venv)| crate::remote::RemoteRead::new(host, venv));
             let filter = match build_tensor_filter(
                 &name,
                 names.as_deref(),
@@ -890,7 +899,7 @@ fn main() -> Result<()> {
             jobs,
             format,
             no_color,
-            ssh_read,
+            ssh_proxy,
             ssh_venv,
         }) => {
             let jobs = jobs.filter(|&j| j > 0).unwrap_or_else(|| {
@@ -898,9 +907,8 @@ fn main() -> Result<()> {
                     .map(|n| n.get())
                     .unwrap_or(4)
             });
-            let remote = ssh_read.map(|host| {
-                crate::remote::RemoteRead::new(host, ssh_venv.unwrap_or_else(|| "~/venv".into()))
-            });
+            let remote = resolve_ssh_proxy(ssh_proxy, ssh_venv, &cfg)
+                .map(|(host, venv)| crate::remote::RemoteRead::new(host, venv));
             std::process::exit(run_check(
                 &paths,
                 recursive,
@@ -919,7 +927,7 @@ fn main() -> Result<()> {
             port,
             host,
             no_health_check,
-            ssh_read,
+            ssh_proxy,
             ssh_venv,
         }) => run_web(
             &paths,
@@ -927,10 +935,20 @@ fn main() -> Result<()> {
             no_health_check,
             host,
             port,
-            ssh_read,
-            ssh_venv,
+            resolve_ssh_proxy(ssh_proxy, ssh_venv, &cfg),
         ),
-        None => run_explore(cli.explore),
+        None => {
+            // The default (no subcommand) is the interactive explorer. Fill the SSH
+            // proxy/venv from the config file when the flags weren't given.
+            let mut args = cli.explore;
+            if args.ssh_proxy.is_none() {
+                args.ssh_proxy = cfg.ssh_proxy.clone();
+            }
+            if args.ssh_venv.is_none() {
+                args.ssh_venv = cfg.ssh_venv.clone();
+            }
+            run_explore(args)
+        }
     }
 }
 
@@ -963,7 +981,7 @@ fn run_check(
         if values {
             eprintln!(
                 "checkpoint-explorer check: --values needs the checkpoint locally \
-                 (only metadata is read over --ssh-read)"
+                 (only metadata is read over --ssh-proxy)"
             );
             return 2;
         }
@@ -1440,6 +1458,22 @@ fn is_aborted_err(e: &anyhow::Error) -> bool {
         .any(|c| c.to_string().contains(crate::sftp::RemoteSession::ABORTED))
 }
 
+/// Resolve the effective SSH proxy for a remote read: the `--ssh-proxy` flag if
+/// given, else the config file's `ssh_proxy` default. Returns `(host, venv)` with
+/// the venv likewise defaulting flag → config → `~/venv`; `None` when no proxy is
+/// configured at all (a local read).
+fn resolve_ssh_proxy(
+    proxy: Option<String>,
+    venv: Option<String>,
+    cfg: &cli_config::CliConfig,
+) -> Option<(String, String)> {
+    let host = proxy.or_else(|| cfg.ssh_proxy.clone())?;
+    let venv = venv
+        .or_else(|| cfg.ssh_venv.clone())
+        .unwrap_or_else(|| "~/venv".to_string());
+    Some((host, venv))
+}
+
 #[allow(clippy::too_many_arguments)] // a CLI entry point; each arg is a distinct flag
 fn run_diff(
     old: &Path,
@@ -1577,14 +1611,14 @@ fn run_diff(
     let compares_data = opts.values || opts.histogram || tensor.is_some();
 
     // A remote source's tensor *data* isn't reachable locally, so value/distribution
-    // comparison for `--ssh-read` must run on the proxy. Only an s3-vs-s3 pair is
+    // comparison for `--ssh-proxy` must run on the proxy. Only an s3-vs-s3 pair is
     // supported (both cstorch checkpoints the remote can load); for a non-s3 remote
     // (a safetensors dir) or a mixed pair, fall back to a structural diff and say so.
     let s3_pair = old_str.starts_with("s3://") && new_str.starts_with("s3://");
     let remote_values = match remote {
         Some(_) if compares_data && !s3_pair => {
             eprintln!(
-                "checkpoint-explorer diff: value/distribution comparison over --ssh-read needs \
+                "checkpoint-explorer diff: value/distribution comparison over --ssh-proxy needs \
                  both sides to be s3:// cstorch checkpoints — comparing structure only"
             );
             false
@@ -2038,7 +2072,7 @@ fn run_repack_verify(
     // reachable. Local files and s3-vs-s3 both can.
     if remote.is_some() && !s3_pair {
         eprintln!(
-            "checkpoint-explorer diff: --verify-repack over --ssh-read needs both sides to be \
+            "checkpoint-explorer diff: --verify-repack over --ssh-proxy needs both sides to be \
              s3:// cstorch checkpoints (a remote safetensors dir isn't supported)"
         );
         return 2;
@@ -2445,7 +2479,7 @@ fn run_auto_sparse(
         }
     } else if remote.is_some() {
         eprintln!(
-            "checkpoint-explorer diff: sparse index compare needs s3:// data over --ssh-read \
+            "checkpoint-explorer diff: sparse index compare needs s3:// data over --ssh-proxy \
              (a remote safetensors dir isn't reachable) — skipped"
         );
         HashMap::new()
@@ -2987,7 +3021,7 @@ fn parse_fraction_pair(s: &str) -> Result<(f32, f32)> {
 }
 
 /// Split an scp-style `[user@]host:path` into (host, path). Returns `None` for a
-/// local path or an `s3://…` URI (no host to derive — that needs `--ssh-read`).
+/// local path or an `s3://…` URI (no host to derive — that needs `--ssh-proxy`).
 /// Matches `scp`'s own rule: a `:` before any `/`, with a non-empty host to its
 /// left.
 fn split_scp(s: &str) -> Option<(String, String)> {
@@ -3011,25 +3045,23 @@ fn run_web(
     no_health_check: bool,
     host: std::net::IpAddr,
     port: u16,
-    ssh_read: Option<String>,
-    ssh_venv: Option<String>,
+    ssh: Option<(String, String)>,
 ) -> Result<()> {
     // Remote: read the structure over SSH (metadata only) into the same model a
     // local read produces, then serve it. No local files/index, so the on-disk
     // stats and data-value views (heatmap/values/histogram/scan) are unavailable —
     // the tree, per-tensor info, stats, and layout are.
-    if let Some(rhost) = ssh_read {
+    if let Some((rhost, venv)) = ssh {
         let src = match paths {
             [one] => one.to_string_lossy().into_owned(),
             _ => anyhow::bail!(
-                "web --ssh-read serves a single remote checkpoint; give one s3://… URI or remote path"
+                "web --ssh-proxy serves a single remote checkpoint; give one s3://… URI or remote path"
             ),
         };
         // Reserve the port *before* the read (5–10 s over SSH): a clash is reported
         // immediately, and if the requested port is taken we land on a free one and
         // hold it while the read runs — so the wait is never wasted.
         let server = web::bind(host, port)?;
-        let venv = ssh_venv.unwrap_or_else(|| "~/venv".to_string());
         let remote = crate::remote::RemoteRead::new(rhost, venv);
         let model = remote.read_checkpoint(&src)?;
         let state = std::sync::Arc::new(web::WebState::build(model, &[], &[]));
@@ -3056,16 +3088,16 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         );
         eprintln!("  checkpoint-explorer diff <OLD> <NEW>     compare two checkpoints");
         eprintln!(
-            "  checkpoint-explorer --ssh-read <HOST> <s3://…|/remote/path>   read a remote / S3 checkpoint"
+            "  checkpoint-explorer --ssh-proxy <HOST> <s3://…|/remote/path>   read a remote / S3 checkpoint"
         );
         eprintln!("\nRun `checkpoint-explorer --help` for all options and examples.");
         std::process::exit(1);
     }
 
     // Support scp-style positional paths (`[user@]host:/path`) without an explicit
-    // --ssh-read: derive the host and read the path part remotely, so
+    // --ssh-proxy: derive the host and read the path part remotely, so
     // `checkpoint-explorer host:/opt/model` just works.
-    if args.ssh_read.is_none()
+    if args.ssh_proxy.is_none()
         && let Some((host, _)) = args
             .paths
             .iter()
@@ -3077,17 +3109,17 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
                 Some((h, path)) if h == host => remote_paths.push(PathBuf::from(path)),
                 _ => anyhow::bail!(
                     "can't mix local and scp-style ({host}:…) paths (or different hosts); \
-                     list paths from one host, or use --ssh-read"
+                     list paths from one host, or use --ssh-proxy"
                 ),
             }
         }
         args.paths = remote_paths;
-        args.ssh_read = Some(host);
+        args.ssh_proxy = Some(host);
     }
 
-    // `--ssh-read` delegates the read to cstorch on a remote host, so the s3://
+    // `--ssh-proxy` delegates the read to cstorch on a remote host, so the s3://
     // URIs are kept verbatim (no local listing). Otherwise list local sources.
-    let (files, index_specs) = if args.ssh_read.is_some() {
+    let (files, index_specs) = if args.ssh_proxy.is_some() {
         (args.paths.clone(), Vec::new())
     } else {
         collect_safetensors_files(&args.paths, args.recursive, args.no_health_check)?
@@ -3247,7 +3279,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
     // — a CLI frontend reading the kernel's model directly (the "serializable into
     // JSON" contract). Local only for now; the remote reader fills the model next.
     if args.print_model {
-        let model = if let Some(host) = args.ssh_read.as_ref() {
+        let model = if let Some(host) = args.ssh_proxy.as_ref() {
             let venv = args
                 .ssh_venv
                 .clone()
@@ -3262,7 +3294,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
     }
 
     let mut explorer = Explorer::new(files, index_specs, open, !args.no_preload);
-    if let Some(host) = args.ssh_read {
+    if let Some(host) = args.ssh_proxy {
         let venv = args.ssh_venv.unwrap_or_else(|| "~/venv".to_string());
         explorer.set_remote_read(host, venv);
     }
@@ -3455,11 +3487,13 @@ fn collect_safetensors_files(
     let mut index_specs: Vec<health::IndexSpec> = Vec::new();
 
     for path in paths {
-        // Remote checkpoints are read via `--ssh-read` (handled before this
+        // Remote checkpoints are read via `--ssh-proxy` (handled before this
         // function); a bare `s3://` here has no local credentials to read it with.
         let raw = path.to_string_lossy();
         if s3::is_uri(&raw) {
-            eprintln!("Warning: {raw}: reading an s3:// checkpoint needs --ssh-read <[user@]host>");
+            eprintln!(
+                "Warning: {raw}: reading an s3:// checkpoint needs --ssh-proxy <[user@]host>"
+            );
             continue;
         }
 

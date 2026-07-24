@@ -23,9 +23,9 @@ use crate::tree::{MetadataInfo, TensorInfo};
 pub enum Source {
     /// A local directory / file on this machine.
     Local,
-    /// A remote safetensors directory read over SFTP (`--ssh-read host /path`).
+    /// A remote safetensors directory read over SFTP (`--ssh-proxy host /path`).
     Sftp { host: String, root: String },
-    /// An `s3://…` cstorch checkpoint read via the remote host (`--ssh-read`).
+    /// An `s3://…` cstorch checkpoint read via the remote host (`--ssh-proxy`).
     S3 { uri: String },
 }
 

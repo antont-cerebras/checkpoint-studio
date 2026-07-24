@@ -319,7 +319,7 @@ const MAX_SHARD_SESSIONS: usize = 12;
 /// several parallel readers can be merged back into a deterministic order.
 type ShardParse = (usize, Vec<TensorInfo>, Vec<MetadataInfo>);
 
-/// Whether a tensor's `source_path` refers to a remote (`--ssh-read`) source — an
+/// Whether a tensor's `source_path` refers to a remote (`--ssh-proxy`) source — an
 /// `s3://…` URI or an scp-style `[user@]host:path` — for which data views aren't
 /// available locally. The scp test (a `:` before any `/`, with a non-empty host to
 /// its left) matches how `scp` itself distinguishes a remote target from a local
@@ -334,7 +334,7 @@ pub fn is_remote_source(source_path: &str) -> bool {
     }
 }
 
-/// A remote host + cstorch venv to read checkpoint metadata through (`--ssh-read`
+/// A remote host + cstorch venv to read checkpoint metadata through (`--ssh-proxy`
 /// / `--ssh-venv`).
 #[derive(Clone, Debug)]
 pub struct RemoteRead {

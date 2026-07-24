@@ -103,7 +103,7 @@ pub fn check_loaded(spec: &IndexSpec, tensors: &[TensorInfo]) -> HealthReport {
 }
 
 /// The pure index-vs-checkpoint comparison shared by the local
-/// ([`check_loaded`]) and remote (`--ssh-read`) health checks: given the index's
+/// ([`check_loaded`]) and remote (`--ssh-proxy`) health checks: given the index's
 /// `weight_map` (tensor -> file), the `.safetensors` files actually present, and
 /// the tensor names present in each file (from the already-parsed headers), report
 /// the file- and tensor-level mismatches. No I/O — both callers supply the pieces

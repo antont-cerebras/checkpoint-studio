@@ -1,7 +1,7 @@
 //! Pure parsing of a safetensors **header** (the JSON blob after the 8-byte
 //! length) into [`TensorInfo`]/[`MetadataInfo`]. Header-only — never touches the
 //! tensor data. Shared by the local file reader, the remote SFTP reader
-//! (`crate::sftp`), and the `--ssh-read` path, so the one parse lives in the
+//! (`crate::sftp`), and the `--ssh-proxy` path, so the one parse lives in the
 //! core crate with no dependency on the TUI/`Explorer`.
 
 use anyhow::{Context, Result};

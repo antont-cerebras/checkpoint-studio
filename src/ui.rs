@@ -519,7 +519,7 @@ pub enum Overlay {
     Legend(Legend),
     /// The copied CLI command box (`y`); holds the command to display.
     Command(String),
-    /// A metadata-only / unavailable notice (e.g. a remote `--ssh-read` source has
+    /// A metadata-only / unavailable notice (e.g. a remote `--ssh-proxy` source has
     /// no local bytes for data views); holds the message to display.
     Notice(String),
 }
@@ -601,7 +601,7 @@ pub struct UI;
 /// checkpoint: whether the tool can rewrite it in place. Only a **local
 /// safetensors** checkpoint is [`Editable`](AccessBadge::Editable) — the in-place
 /// rename (`convert --map` / the `R` action) is the one path that modifies it;
-/// everything else (a remote `--ssh-read` read, an HDF5 file, plain exports) is
+/// everything else (a remote `--ssh-proxy` read, an HDF5 file, plain exports) is
 /// [`ReadOnly`](AccessBadge::ReadOnly), and browsing never modifies it either way.
 /// It is the rightmost [`Badge`] in the [`status bar`](UI::render_badge_bar).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2058,7 +2058,7 @@ impl UI {
             frame.buffer_mut(),
         );
 
-        // Metadata-only banner on the bottom row (remote `--ssh-read`) — the lower
+        // Metadata-only banner on the bottom row (remote `--ssh-proxy`) — the lower
         // part of the detail screen is otherwise blank, so it doesn't overlap.
         if crate::remote::is_remote_source(&tensor.source_path) {
             Paragraph::new(Line::from(Span::styled(
@@ -6676,7 +6676,7 @@ fn detail_field_lines(
                 spans.extend(detail_computing_spans(spinner, elapsed, progress));
                 spans
             }
-            // A remote (`--ssh-read`) source has no local bytes to scan, so don't
+            // A remote (`--ssh-proxy`) source has no local bytes to scan, so don't
             // offer the (non-working) `s` hint — say it's metadata-only instead.
             StatsView::Pending if crate::remote::is_remote_source(&tensor.source_path) => vec![
                 dim_span("Statistics: "),
