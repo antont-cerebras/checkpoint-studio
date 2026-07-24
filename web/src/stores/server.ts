@@ -63,32 +63,32 @@ const statsCache = new Map<string, Promise<StatsDto>>();
 const sampleCache = new Map<string, Promise<SampleDto>>();
 const histCache = new Map<string, Promise<HistogramDto>>();
 
-export function cachedStats(name: string, dtype?: string): Promise<StatsDto> {
-  const key = `${name}|${dtype ?? ''}`;
-  let p = statsCache.get(key);
+/** Memoize an in-flight/settled request, but **evict a rejection** — caching a failed
+ * promise makes the error sticky: every later view of that tensor (and every "retry")
+ * replays the original failure instead of asking the server again. Only successes are
+ * worth keeping. */
+function memo<T>(cache: Map<string, Promise<T>>, key: string, start: () => Promise<T>): Promise<T> {
+  let p = cache.get(key);
   if (!p) {
-    p = api.tensorStats(name, dtype);
-    statsCache.set(key, p);
+    p = start().catch((e) => {
+      cache.delete(key); // a transient 500 must not poison this key forever
+      throw e;
+    });
+    cache.set(key, p);
   }
   return p;
+}
+
+export function cachedStats(name: string, dtype?: string): Promise<StatsDto> {
+  return memo(statsCache, `${name}|${dtype ?? ''}`, () => api.tensorStats(name, dtype));
 }
 
 export function cachedSample(name: string, params: Parameters<typeof api.sample>[1]): Promise<SampleDto> {
-  const key = `${name}|${JSON.stringify(params)}`;
-  let p = sampleCache.get(key);
-  if (!p) {
-    p = api.sample(name, params);
-    sampleCache.set(key, p);
-  }
-  return p;
+  return memo(sampleCache, `${name}|${JSON.stringify(params)}`, () => api.sample(name, params));
 }
 
 export function cachedHistogram(name: string, bins?: number, dtype?: string): Promise<HistogramDto> {
-  const key = `${name}|${bins ?? ''}|${dtype ?? ''}`;
-  let p = histCache.get(key);
-  if (!p) {
-    p = api.histogram(name, bins, dtype);
-    histCache.set(key, p);
-  }
-  return p;
+  return memo(histCache, `${name}|${bins ?? ''}|${dtype ?? ''}`, () =>
+    api.histogram(name, bins, dtype),
+  );
 }

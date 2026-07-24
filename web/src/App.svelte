@@ -314,6 +314,9 @@
 <svelte:window on:keydown={onKeydown} />
 
 <div class="app">
+  <!-- The page had no <h1>. The visible title is a nav button, so give assistive tech
+       a real document heading naming the app + the open checkpoint. -->
+  <h1 class="visually-hidden">Checkpoint Studio — {$tree?.root ?? 'loading checkpoint'}</h1>
   <header>
     <button class="nav" on:click={back} title="Back (Backspace)" aria-label="Back">‹</button>
     <button class="nav" on:click={forward} title="Forward (\\)" aria-label="Forward">›</button>
@@ -321,7 +324,8 @@
       Checkpoint&nbsp;Studio
     </button>
     {#if $screen.kind !== 'tree'}
-      <span class="crumb dim">{crumb($screen)}</span>
+      <!-- Truncates at narrow widths, so carry the full text in a tooltip. -->
+      <span class="crumb dim" title={crumb($screen)}>{crumb($screen)}</span>
     {/if}
     <span class="root" title={$tree?.root ?? ''}>{$tree?.root ?? '…'}</span>
     {#if $searching && $screen.kind === 'tree'}

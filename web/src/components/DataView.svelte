@@ -106,6 +106,13 @@
     if (seq === reqSeq) loading = false;
   }
 
+  /** Re-request the current view after a failure. `cachedSample` drops rejected
+   * entries, so this really re-hits the server rather than replaying the error. */
+  function retry() {
+    err = '';
+    load(tensor, params);
+  }
+
   // Size the numeric grid to fill its pane: measure the rendered cell size and floor
   // to whole cells (a slight under-fill so a rounding overshoot can't trip a
   // scrollbar). Runs after each render while auto-fitting — converges in one step,
@@ -238,6 +245,25 @@
     return b === 'oct' ? big.toString(8).padStart(Math.ceil(w / 3), '0') : big.toString(2).padStart(w, '0');
   }
 
+  // Hovering a value cell shows its exact coordinates + full-precision value on the
+  // meta line — the same readout the heatmap has, so both views answer "what is this
+  // cell?". Delegated on the table (one listener, not one per cell).
+  function onCellHover(e: Event) {
+    const td = (e.target as HTMLElement)?.closest('td[data-i]') as HTMLElement | null;
+    if (!td || !data) {
+      hover = '';
+      return;
+    }
+    const i = Number(td.dataset.i);
+    const j = Number(td.dataset.j);
+    const v = data.values[i]?.[j];
+    if (v == null) {
+      hover = '';
+      return;
+    }
+    hover = `[${data.rows[i]}, ${data.cols[j]}] = ${v}`;
+  }
+
   function pan(dr: number, dc: number) {
     rowOff = Math.min(maxRow, Math.max(0, rowOff + dr * rows));
     colOff = Math.min(maxCol, Math.max(0, colOff + dc * cols));
@@ -329,13 +355,15 @@
       {/each}
     </div>
 
+    <!-- A wrapping <label> names only its FIRST input, so the number boxes need their
+         own aria-label (else they're unnamed to a screen reader). -->
     <label class="res">rows
-      <input type="range" min="8" max="256" bind:value={rows} on:input={onRows} />
-      <input type="number" min="1" bind:value={rows} on:input={onRows} />
+      <input type="range" min="8" max="256" bind:value={rows} on:input={onRows} aria-label="rows (slider)" />
+      <input type="number" min="1" bind:value={rows} on:input={onRows} aria-label="rows" />
     </label>
     <label class="res">cols
-      <input type="range" min="8" max="256" bind:value={cols} on:input={onCols} />
-      <input type="number" min="1" bind:value={cols} on:input={onCols} />
+      <input type="range" min="8" max="256" bind:value={cols} on:input={onCols} aria-label="cols (slider)" />
+      <input type="number" min="1" bind:value={cols} on:input={onCols} aria-label="cols" />
     </label>
     {#if kind === 'heatmap'}
       <button
@@ -438,22 +466,31 @@
     {:else}
       <!-- svelte-ignore a11y-no-static-element-interactions a11y-no-noninteractive-tabindex -->
       <div class="tablewrap" tabindex="0" use:grabFocus bind:this={tableWrap} on:wheel|nonpassive={onWheel} on:mousedown={focusPane}>
-        <table class="zebra-{zebra}" bind:this={tableEl}>
+        <!-- svelte-ignore a11y-mouse-events-have-key-events -->
+        <!-- (the keyboard equivalent is on:focusin — `focus` doesn't bubble to the
+             table, so the rule's suggested on:focus would never fire here) -->
+        <table
+          class="zebra-{zebra}"
+          bind:this={tableEl}
+          on:mouseover={onCellHover}
+          on:focusin={onCellHover}
+          on:mouseleave={() => (hover = '')}
+        >
           <thead>
             <tr>
               <th></th>
               {#each data.cols as c, j}
-                <th class="dim">{c}</th>
-                {#if j === colGap}<th class="sep" title="{colsSkipped.toLocaleString()} columns skipped">⋯</th>{/if}
+                <th class="dim" scope="col">{c}</th>
+                {#if j === colGap}<th class="sep" scope="col" title="{colsSkipped.toLocaleString()} columns skipped">⋯</th>{/if}
               {/each}
             </tr>
           </thead>
           <tbody>
             {#each data.values as row, i}
               <tr>
-                <th class="dim">{data.rows[i]}</th>
+                <th class="dim" scope="row">{data.rows[i]}</th>
                 {#each row as _, j}
-                  <td class="mono">{cellText(data, base, i, j)}</td>
+                  <td class="mono" data-i={i} data-j={j}>{cellText(data, base, i, j)}</td>
                   {#if j === colGap}<td class="sep">⋯</td>{/if}
                 {/each}
               </tr>
@@ -465,10 +502,25 @@
         </table>
       </div>
     {/if}
-  {:else if loading}
-    <Spinner label={kind === 'heatmap' ? 'sampling…' : 'reading…'} />
   {:else if err}
-    <p class="err">{err}</p>
+    <!-- Error before `loading`, and a catch-all `{:else}` below: a data view must
+         always render a terminal state. A silent blank pane is indistinguishable from
+         "empty tensor" or "still loading", and leaves no way to recover. -->
+    <div class="failed">
+      <p class="err">⚠ {err}</p>
+      <button on:click={retry}>Retry</button>
+    </div>
+  {:else if loading}
+    <Spinner
+      label={kind === 'heatmap'
+        ? 'sampling the tensor… (a multi-GB tensor can take a few seconds)'
+        : 'reading values…'}
+    />
+  {:else}
+    <div class="failed">
+      <p class="dim">No data returned for this view.</p>
+      <button on:click={retry}>Retry</button>
+    </div>
   {/if}
 </div>
 
@@ -648,5 +700,17 @@
   }
   .err {
     color: var(--danger);
+  }
+  /* Terminal failure state: never leave the pane blank — say what went wrong and
+     offer a way out. */
+  .failed {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 14px 0;
+  }
+  .failed .err {
+    margin: 0;
   }
 </style>
