@@ -812,9 +812,10 @@ fn main() -> Result<()> {
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
             // the `Result` convention `main` uses elsewhere, so exit explicitly.
-            // `--ssh-proxy` (or the config default): read each checkpoint's structure
-            // via cstorch on the remote (secrets stay there).
-            let remote = resolve_ssh_proxy(ssh_proxy, ssh_venv, &cfg)
+            // `--ssh-proxy` (or, for an s3:// pair, the config default): read each
+            // checkpoint's structure via cstorch on the remote (secrets stay there).
+            let src_s3 = is_s3_source(&old) || is_s3_source(&new);
+            let remote = resolve_ssh_proxy(ssh_proxy, ssh_venv, &cfg, src_s3)
                 .map(|(host, venv)| crate::remote::RemoteRead::new(host, venv));
             let filter = match build_tensor_filter(
                 &name,
@@ -907,8 +908,13 @@ fn main() -> Result<()> {
                     .map(|n| n.get())
                     .unwrap_or(4)
             });
-            let remote = resolve_ssh_proxy(ssh_proxy, ssh_venv, &cfg)
-                .map(|(host, venv)| crate::remote::RemoteRead::new(host, venv));
+            let remote = resolve_ssh_proxy(
+                ssh_proxy,
+                ssh_venv,
+                &cfg,
+                paths.iter().any(|p| is_s3_source(p)),
+            )
+            .map(|(host, venv)| crate::remote::RemoteRead::new(host, venv));
             std::process::exit(run_check(
                 &paths,
                 recursive,
@@ -929,23 +935,29 @@ fn main() -> Result<()> {
             no_health_check,
             ssh_proxy,
             ssh_venv,
-        }) => run_web(
-            &paths,
-            recursive,
-            no_health_check,
-            host,
-            port,
-            resolve_ssh_proxy(ssh_proxy, ssh_venv, &cfg),
-        ),
+        }) => {
+            let s3 = paths.iter().any(|p| is_s3_source(p));
+            run_web(
+                &paths,
+                recursive,
+                no_health_check,
+                host,
+                port,
+                resolve_ssh_proxy(ssh_proxy, ssh_venv, &cfg, s3),
+            )
+        }
         None => {
             // The default (no subcommand) is the interactive explorer. Fill the SSH
-            // proxy/venv from the config file when the flags weren't given.
+            // proxy/venv from the config file when the flags weren't given — but only
+            // for an s3:// source, so a configured default never routes a local path
+            // through SSH (an explicit --ssh-proxy still does).
             let mut args = cli.explore;
-            if args.ssh_proxy.is_none() {
-                args.ssh_proxy = cfg.ssh_proxy.clone();
-            }
-            if args.ssh_venv.is_none() {
-                args.ssh_venv = cfg.ssh_venv.clone();
+            let src_s3 = args.paths.iter().any(|p| is_s3_source(p));
+            if let Some((host, venv)) =
+                resolve_ssh_proxy(args.ssh_proxy.take(), args.ssh_venv.take(), &cfg, src_s3)
+            {
+                args.ssh_proxy = Some(host);
+                args.ssh_venv = Some(venv);
             }
             run_explore(args)
         }
@@ -1458,20 +1470,29 @@ fn is_aborted_err(e: &anyhow::Error) -> bool {
         .any(|c| c.to_string().contains(crate::sftp::RemoteSession::ABORTED))
 }
 
-/// Resolve the effective SSH proxy for a remote read: the `--ssh-proxy` flag if
-/// given, else the config file's `ssh_proxy` default. Returns `(host, venv)` with
-/// the venv likewise defaulting flag → config → `~/venv`; `None` when no proxy is
-/// configured at all (a local read).
+/// Resolve the effective SSH proxy for a read. An explicit `--ssh-proxy` flag wins
+/// and forces the proxy for *any* source. The config file's `ssh_proxy` default only
+/// engages when the source is `s3://` (which genuinely can't be read without a
+/// proxy) — so a configured default never hijacks a **local** path into an SSH read.
+/// Returns `(host, venv)` (venv: flag → config → `~/venv`), or `None` for a plain
+/// local read.
 fn resolve_ssh_proxy(
     proxy: Option<String>,
     venv: Option<String>,
     cfg: &cli_config::CliConfig,
+    source_is_s3: bool,
 ) -> Option<(String, String)> {
-    let host = proxy.or_else(|| cfg.ssh_proxy.clone())?;
+    let host = proxy.or_else(|| source_is_s3.then(|| cfg.ssh_proxy.clone()).flatten())?;
     let venv = venv
         .or_else(|| cfg.ssh_venv.clone())
         .unwrap_or_else(|| "~/venv".to_string());
     Some((host, venv))
+}
+
+/// Whether a path string names an `s3://` source — the case a configured default
+/// proxy applies to (a local path is never routed through the config proxy).
+fn is_s3_source(p: &Path) -> bool {
+    p.to_string_lossy().starts_with("s3://")
 }
 
 #[allow(clippy::too_many_arguments)] // a CLI entry point; each arg is a distinct flag
@@ -3638,6 +3659,32 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_millis(850)), "850ms");
         assert_eq!(format_elapsed(Duration::from_millis(1500)), "1.5s");
         assert_eq!(format_elapsed(Duration::from_secs(125)), "2m5s");
+    }
+
+    #[test]
+    fn config_default_proxy_only_for_s3_never_local() {
+        let cfg = cli_config::CliConfig {
+            ssh_proxy: Some("cfg@host".into()),
+            ssh_venv: None,
+        };
+        // Config default engages for an s3:// source …
+        assert_eq!(
+            resolve_ssh_proxy(None, None, &cfg, true),
+            Some(("cfg@host".to_string(), "~/venv".to_string()))
+        );
+        // … but NEVER hijacks a local path into an SSH read.
+        assert_eq!(resolve_ssh_proxy(None, None, &cfg, false), None);
+        // An explicit flag forces the proxy for any source (even a local path), and
+        // overrides the config host + venv.
+        assert_eq!(
+            resolve_ssh_proxy(Some("flag@h".into()), Some("/v".into()), &cfg, false),
+            Some(("flag@h".to_string(), "/v".to_string()))
+        );
+        // No flag, no config → a plain local read.
+        assert_eq!(
+            resolve_ssh_proxy(None, None, &cli_config::CliConfig::default(), true),
+            None
+        );
     }
 
     #[test]
