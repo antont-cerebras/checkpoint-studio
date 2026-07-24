@@ -18,6 +18,10 @@
   let cols = kind === 'heatmap' ? 128 : 16;
   let base: 'dec' | 'hex' | 'oct' | 'bin' = 'dec';
   let zebra: 'off' | 'rows' | 'cols' = 'rows';
+  // Heatmap: keep the sampled grid's aspect ~ the tensor's true shape, so a
+  // 151936×2048 tensor samples as a tall strip, not a misleading 256×128. On by
+  // default; the toggle frees the two dimensions.
+  let lockRatio = kind === 'heatmap';
 
   let data: SampleDto | null = null;
   let err = '';
@@ -81,6 +85,29 @@
     const c = Math.min(Math.max(0, colOff), maxCol);
     if (r !== rowOff) rowOff = r;
     if (c !== colOff) colOff = c;
+  }
+
+  // ---- aspect-ratio lock (heatmap) ----
+  // Source aspect = sampled rows-per-col we want to mirror; from the loaded 2-D dims
+  // (`null` until the first sample lands, and only meaningful for the heatmap).
+  $: aspect = kind === 'heatmap' && data && data.total_cols ? data.total_rows / data.total_cols : null;
+  const clampDim = (n: number) => Math.max(1, Math.min(4096, Math.round(n)));
+  // Snap both dims to the source ratio once per tensor: budget the long side to ~256
+  // cells, the short side proportional (>= 1). So an extreme shape reads as a strip.
+  let snappedFor = '';
+  $: if (lockRatio && aspect && tensor !== snappedFor) {
+    const b = 256;
+    if (aspect >= 1) { rows = clampDim(b); cols = clampDim(b / aspect); }
+    else { cols = clampDim(b); rows = clampDim(b * aspect); }
+    snappedFor = tensor;
+  }
+  // Editing one dimension recomputes the other from the source aspect (either drives
+  // the other). No-op when unlocked or for the numeric grid.
+  function onRows() { if (lockRatio && aspect) cols = clampDim(rows / aspect); }
+  function onCols() { if (lockRatio && aspect) rows = clampDim(cols * aspect); }
+  function toggleLock() {
+    lockRatio = !lockRatio;
+    if (lockRatio) onRows(); // re-apply the ratio, keeping the current row count
   }
 
   // ---- heatmap ----
@@ -185,13 +212,23 @@
     </div>
 
     <label class="res">rows
-      <input type="range" min="8" max="256" bind:value={rows} />
-      <input type="number" min="1" bind:value={rows} />
+      <input type="range" min="8" max="256" bind:value={rows} on:input={onRows} />
+      <input type="number" min="1" bind:value={rows} on:input={onRows} />
     </label>
     <label class="res">cols
-      <input type="range" min="8" max="256" bind:value={cols} />
-      <input type="number" min="1" bind:value={cols} />
+      <input type="range" min="8" max="256" bind:value={cols} on:input={onCols} />
+      <input type="number" min="1" bind:value={cols} on:input={onCols} />
     </label>
+    {#if kind === 'heatmap'}
+      <button
+        class="lock"
+        class:on={lockRatio}
+        on:click={toggleLock}
+        title={lockRatio
+          ? 'Aspect ratio locked to the tensor shape — editing rows or cols adjusts the other. Click to unlock.'
+          : 'Aspect ratio unlocked — set rows and cols freely. Click to lock to the tensor shape.'}
+      >{lockRatio ? '🔒' : '🔓'} ratio</button>
+    {/if}
 
     {#if mode === 'window'}
       <div class="grp pan">
@@ -212,7 +249,7 @@
       <label>slice <input type="number" min="0" max={nSlices - 1} bind:value={slice} /> / {nSlices - 1}</label>
     {/if}
 
-    <label>view
+    <label title="Reinterpret the raw bytes as another dtype before display (e.g. read a packed weight as u4). 'stored' uses the tensor's real dtype.">override&nbsp;dtype
       <select bind:value={dtype}>
         {#each DTYPES as d}<option value={d}>{d === '' ? 'stored' : d}</option>{/each}
       </select>
@@ -316,6 +353,14 @@
   .pan button:disabled {
     opacity: 0.4;
     cursor: default;
+  }
+  .lock {
+    white-space: nowrap;
+    font-size: 12px;
+  }
+  .lock.on {
+    background: var(--bg-sel);
+    border-color: var(--accent);
   }
   .pill {
     font-size: 10px;
