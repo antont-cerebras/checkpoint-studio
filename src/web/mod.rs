@@ -209,7 +209,9 @@ fn print_serve_banner(url: &str) {
     const RESET: &str = "\x1b[0m";
     // Blank line to break from the finished ✓ load bar above; the label dim, the URL
     // the one bright thing on the line so it wins the eye.
-    println!("\n  {DIM}checkpoint-studio web UI ▸{RESET}  {URL}{url}{RESET}\n  {DIM}Ctrl-C to stop{RESET}\n");
+    println!(
+        "\n  {DIM}checkpoint-studio web UI ▸{RESET}  {URL}{url}{RESET}\n  {DIM}Ctrl-C to stop{RESET}\n"
+    );
 }
 
 fn handle(state: &WebState, req: tiny_http::Request) {

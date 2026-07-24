@@ -102,7 +102,9 @@ fn match_dims(pats: &[DimPat], shape: &[usize]) -> bool {
 enum NameMatch {
     /// Case-insensitive substring (the default, and what a bare word uses).
     Substr(String),
-    Glob(glob::Pattern),
+    /// One or more globs — brace alternation `{a,b,c}` expands to several, matched
+    /// as alternatives (any).
+    Glob(Vec<glob::Pattern>),
     Regex(Regex),
 }
 
@@ -110,7 +112,7 @@ impl NameMatch {
     fn matches(&self, name: &str) -> bool {
         match self {
             NameMatch::Substr(s) => name.to_lowercase().contains(&s.to_lowercase()),
-            NameMatch::Glob(p) => p.matches(name),
+            NameMatch::Glob(ps) => ps.iter().any(|p| p.matches(name)),
             NameMatch::Regex(r) => r.is_match(name),
         }
     }
@@ -280,9 +282,12 @@ fn parse_facet(facet: &str, val: &str) -> Result<Predicate> {
             Some(("re", pat)) => {
                 NameMatch::Regex(Regex::new(pat).map_err(|e| anyhow!("bad name regex: {e}"))?)
             }
-            Some(("glob", pat)) => {
-                NameMatch::Glob(glob::Pattern::new(pat).map_err(|e| anyhow!("bad name glob: {e}"))?)
-            }
+            Some(("glob", pat)) => NameMatch::Glob(
+                crate::filter::expand_braces(pat)
+                    .iter()
+                    .map(|p| glob::Pattern::new(p).map_err(|e| anyhow!("bad name glob: {e}")))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
             _ => NameMatch::Substr(val.to_string()),
         }),
         other => {
