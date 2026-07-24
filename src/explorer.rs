@@ -10209,6 +10209,9 @@ impl Explorer {
 
     /// The command that reopens this data view with its current representation,
     /// layout, zebra striping and slice.
+    // Compares against the literal 0.5 default (exactly representable) to decide whether
+    // the edge split needs to appear in the emitted command.
+    #[allow(clippy::float_cmp)]
     fn command_for_data(&self, tensor: &TensorInfo, repr: Representation, slice: usize) -> String {
         let mut parts = self.command_base(tensor);
         parts.push(

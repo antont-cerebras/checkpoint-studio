@@ -11,6 +11,97 @@ description = "CLI utility to inspect and explore .safetensors, .gguf and HDF5 c
 members = ["crates/core"]
 resolver = "2"
 
+# --- Lints -------------------------------------------------------------------
+#
+# CI runs clippy with `-D warnings`, so everything enabled here is a hard gate.
+#
+# `pedantic` and `nursery` are ON as groups, which turns on several hundred lints the
+# codebase already satisfies — that is the point: they now catch REGRESSIONS. The
+# families below are the ones with pre-existing hits; each is allowed explicitly with
+# its count so the debt is visible and can be burned down one line at a time, rather
+# than hidden behind a blanket `allow`.
+#
+# Counts were measured with `--all-targets --features hdf5`.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Numeric casts. AUDITED (see the histogram/values fixes): every cast was triaged and
+# the real defects fixed — wide-integer histogram bins, the 64-bit value display, GGUF
+# sizes in f32, and two saturating-subtraction sites. What remains is provably safe:
+# Ratatui geometry bounded by the terminal size, bit-shift amounts, masked 3/4-bit
+# indices, pre-validated header lengths, and display/statistics maths. `u64 as usize`
+# is sound because both crates assert a 64-bit target (see lib.rs / main.rs).
+# `float_cmp` is deliberately NOT allowed — its existing sites carry per-function
+# justifications, so a new accidental float comparison still fails the build.
+cast_possible_truncation = "allow"  # 410
+cast_precision_loss = "allow"  # 145
+cast_possible_wrap = "allow"  # 45
+cast_lossless = "allow"  # 45
+cast_sign_loss = "allow"  # 42
+ptr_as_ptr = "allow"  # 24
+borrow_as_ptr = "allow"  # 4
+# Nursery lint whose fix would retype a byte COUNT as f64 just because every use
+# happens to be a ratio; keeping it an integer is the more correct type.
+needless_type_cast = "allow"  # 1
+
+# Documentation polish — worth doing, but it is prose, not correctness.
+too_long_first_doc_paragraph = "allow"  # 109
+missing_errors_doc = "allow"  # 57
+doc_markdown = "allow"  # 54
+missing_panics_doc = "allow"  # 3
+doc_link_code = "allow"  # 1
+
+# Performance/allocation nits. The best candidates to burn down next: each is a small,
+# local change and a few are genuine wasted allocations.
+suboptimal_flops = "allow"  # 5
+redundant_clone = "allow"  # 5
+needless_collect = "allow"  # 4
+needless_pass_by_ref_mut = "allow"  # 4
+assigning_clones = "allow"  # 3
+or_fun_call = "allow"  # 2
+branches_sharing_code = "allow"  # 2
+
+# Style and API-shape opinions. Large counts, no behavioural effect; several
+# (`use_self`, `must_use_candidate`, `missing_const_for_fn`) are near-mechanical if we
+# ever want them.
+use_self = "allow"  # 363
+must_use_candidate = "allow"  # 211
+missing_const_for_fn = "allow"  # 147
+option_if_let_else = "allow"  # 96
+map_unwrap_or = "allow"  # 73
+too_many_lines = "allow"  # 58
+unnested_or_patterns = "allow"  # 55
+semicolon_if_nothing_returned = "allow"  # 48
+redundant_closure_for_method_calls = "allow"  # 45
+format_push_string = "allow"  # 37
+match_same_arms = "allow"  # 33
+unused_self = "allow"  # 30
+items_after_statements = "allow"  # 21
+needless_pass_by_value = "allow"  # 19
+redundant_pub_crate = "allow"  # 14
+struct_excessive_bools = "allow"  # 13
+single_match_else = "allow"  # 11
+unnecessary_wraps = "allow"  # 9
+similar_names = "allow"  # 8
+if_not_else = "allow"  # 7
+manual_let_else = "allow"  # 6
+return_self_not_must_use = "allow"  # 4
+unreadable_literal = "allow"  # 3
+bool_to_int_with_if = "allow"  # 3
+match_wildcard_for_single_variants = "allow"  # 3
+case_sensitive_file_extension_comparisons = "allow"  # 2
+implicit_hasher = "allow"  # 2
+useless_let_if_seq = "allow"  # 2
+fn_params_excessive_bools = "allow"  # 2
+derive_partial_eq_without_eq = "allow"  # 1
+format_collect = "allow"  # 1
+elidable_lifetime_names = "allow"  # 1
+comparison_chain = "allow"  # 1
+
+# Remaining measured families.
+ref_option = "allow"  # 7
+
 [dependencies]
 # The frontend-free core: model + readers + views + reports. The TUI/CLI here
 # drive it and render its serializable outputs.
@@ -105,3 +196,6 @@ required-features = ["hdf5"]
 [[example]]
 name = "gen_hdf5_fixture"
 required-features = ["hdf5"]
+
+[lints]
+workspace = true

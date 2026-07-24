@@ -1435,6 +1435,9 @@ pub fn scan_values(
 /// classifying each tensor's stats into findings. `progress` is bumped per tensor
 /// and `cancel` short-circuits remaining tensors (and aborts mid-tensor via
 /// [`tensor_stats`]).
+// `min == max` is the intended exact test for a constant tensor: both sides are the
+// same computed extremes, so equality is exact when every element matches.
+#[allow(clippy::float_cmp)]
 fn scan_par(
     targets: &[&TensorInfo],
     schemas: &HashMap<String, PackingSchema>,

@@ -41,3 +41,6 @@ zstd = { version = "0.13", optional = true }
 
 [features]
 hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "dep:half", "dep:zstd"]
+
+[lints]
+workspace = true

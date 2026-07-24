@@ -259,6 +259,8 @@ mod tests {
     }
 
     #[test]
+    // 25/100 is exactly representable, so the fraction is compared exactly on purpose.
+    #[allow(clippy::float_cmp)]
     fn stats_dto_converts_duration_and_zero_fraction() {
         let stats = Stats {
             count: 100,

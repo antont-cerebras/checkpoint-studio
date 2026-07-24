@@ -40,7 +40,7 @@ pub fn register() {
             filter: Some(zstd_filter),
         };
         unsafe {
-            H5Zregister(&class as *const H5Z_class2_t as *const c_void);
+            H5Zregister(std::ptr::from_ref::<H5Z_class2_t>(&class).cast::<c_void>());
         }
     });
 }

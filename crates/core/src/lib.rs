@@ -6,6 +6,15 @@
 //! dependency. Frontends (the interactive terminal, and future web-server / MCP
 //! bins) drive it and render its serializable outputs.
 
+// This tool memory-maps multi-gigabyte checkpoints and converts 64-bit header offsets
+// and element counts to `usize` throughout. That is only sound on a 64-bit target, so
+// state it as a compile-time requirement instead of leaving it implied.
+const _: () = assert!(
+    usize::BITS >= 64,
+    "checkpoint-studio requires a 64-bit target: file offsets and element counts are \
+     converted to usize"
+);
+
 pub mod check;
 pub mod codec;
 pub mod config;

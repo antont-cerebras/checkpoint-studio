@@ -39,6 +39,9 @@ struct NumRange {
 }
 
 impl NumRange {
+    // The compared values are dims / byte sizes / element counts — integers below 2^53,
+    // so they are exact in f64 and an exclusive bound must test equality precisely.
+    #[allow(clippy::float_cmp)]
     fn contains(&self, x: f64) -> bool {
         if let Some(b) = self.lo
             && (x < b.value || (!b.inclusive && x == b.value))

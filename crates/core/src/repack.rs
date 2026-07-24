@@ -228,6 +228,9 @@ pub fn verify_local(
 /// Compare two weight tensors as plain stored-dtype values (decoded to f64) — the
 /// fallback when the sparse format check fails. Returns `elements`/`differing` and
 /// max/mean `|Δ|`, or a zeroed result (dtype only) if either side can't be read.
+// Repack verification demands BIT-exact equality — an approximate compare would
+// defeat the purpose of proving two packings hold the same weights.
+#[allow(clippy::float_cmp)]
 fn fallback_local(old_w: &TensorInfo, new_w: &TensorInfo) -> RepackFallback {
     let mut fb = RepackFallback {
         dtype: new_w.dtype.clone(),
@@ -263,6 +266,8 @@ fn fallback_local(old_w: &TensorInfo, new_w: &TensorInfo) -> RepackFallback {
 
 /// Value-diff a sibling float tensor (codebook / scale) locally, recording the names
 /// tried + whether each side was found (so a wrong-name inference is visible).
+// Exact equality on purpose: codebook/qscale siblings must match bit for bit.
+#[allow(clippy::float_cmp)]
 fn aux_local(
     old_name: &str,
     new_name: &str,

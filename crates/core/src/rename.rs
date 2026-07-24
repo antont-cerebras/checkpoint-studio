@@ -770,10 +770,13 @@ fn unique_token(base: &str, used: &[String]) -> String {
     if !used.iter().any(|t| t == base) {
         return base.to_string();
     }
-    (2..)
+    // Bounded: with `used.len()` names taken, one of `base2..=base{len+2}` is always
+    // free — so the search terminates and the `unwrap` can't panic. (An unbounded
+    // `(2..)` relied on that invariant implicitly.)
+    (2..=used.len() + 2)
         .map(|k| format!("{base}{k}"))
         .find(|c| !used.iter().any(|t| t == c))
-        .unwrap()
+        .expect("more candidates than taken names")
 }
 
 /// Build a `(pattern, replacement)` rename rule from a source and a new name, both

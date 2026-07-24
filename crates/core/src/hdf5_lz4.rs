@@ -58,7 +58,7 @@ pub fn register() {
         // H5Zregister copies the struct (but not the name string, hence the
         // 'static above). The cast matches its `*const c_void` signature.
         unsafe {
-            H5Zregister(&class as *const H5Z_class2_t as *const c_void);
+            H5Zregister(std::ptr::from_ref::<H5Z_class2_t>(&class).cast::<c_void>());
         }
     });
 }
