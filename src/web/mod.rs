@@ -165,7 +165,7 @@ pub fn serve_on(server: tiny_http::Server, state: Arc<WebState>, host: IpAddr) -
         host.to_string()
     };
     let url = format!("http://{display}:{bound}/");
-    println!("checkpoint-studio web UI: {url}  (Ctrl-C to stop)");
+    print_serve_banner(&url);
 
     // A small worker pool so a static-asset / metadata request stays responsive
     // while another worker is inside a multi-second tensor scan.
@@ -188,6 +188,28 @@ pub fn serve_on(server: tiny_http::Server, state: Arc<WebState>, host: IpAddr) -
         let _ = h.join();
     }
     Ok(())
+}
+
+/// Announce the running server with the **URL as the focal point** — bold,
+/// underlined, bright cyan on its own padded line — so it stands out even when a
+/// coloured load-progress bar was printed just above it. Plain (unstyled, one line)
+/// when stdout isn't a terminal or `NO_COLOR` is set, so a captured log stays clean.
+fn print_serve_banner(url: &str) {
+    use std::io::IsTerminal;
+    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    if !color {
+        println!("checkpoint-studio web UI: {url}  (Ctrl-C to stop)");
+        return;
+    }
+    // Raw ANSI via named consts + a terminal/NO_COLOR guard — the same convention
+    // the other one-shot CLI status lines use (e.g. `sftp`'s retry notice, the
+    // `diff: done` footer, `progress`'s bars). `yansi` is reserved for the TUI layer.
+    const DIM: &str = "\x1b[2m";
+    const URL: &str = "\x1b[1;4;96m"; // bold + underline + bright cyan (link-like)
+    const RESET: &str = "\x1b[0m";
+    // Blank line to break from the finished ✓ load bar above; the label dim, the URL
+    // the one bright thing on the line so it wins the eye.
+    println!("\n  {DIM}checkpoint-studio web UI ▸{RESET}  {URL}{url}{RESET}\n  {DIM}Ctrl-C to stop{RESET}\n");
 }
 
 fn handle(state: &WebState, req: tiny_http::Request) {
