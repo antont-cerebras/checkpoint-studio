@@ -10,7 +10,20 @@
     "isolatedModules": true,
     "moduleResolution": "bundler",
     "strict": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+
+    // Beyond `strict`. The one that matters most here is noUncheckedIndexedAccess:
+    // this UI indexes sampled tensor grids (`values[i][j]`, `rows[i]`) constantly, and
+    // a short/stale window silently yielding `undefined` is exactly how it ends up
+    // rendering something wrong instead of failing loudly.
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true
   },
   "include": ["src/**/*.ts", "src/**/*.svelte"]
 }

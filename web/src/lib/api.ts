@@ -23,15 +23,18 @@ async function getJson<T>(url: string): Promise<T> {
 
 const enc = encodeURIComponent;
 
+// `?: T | undefined` throughout: callers build this object with every key present and
+// leave the inapplicable ones `undefined` (`qs` drops those), which
+// `exactOptionalPropertyTypes` would otherwise reject.
 export interface SampleParams {
-  mode?: 'grid' | 'max' | 'window' | 'edges';
-  rows?: number;
-  cols?: number;
-  slice?: number;
-  dtype?: string;
-  row_off?: number;
-  col_off?: number;
-  raw?: number;
+  mode?: 'grid' | 'max' | 'window' | 'edges' | undefined;
+  rows?: number | undefined;
+  cols?: number | undefined;
+  slice?: number | undefined;
+  dtype?: string | undefined;
+  row_off?: number | undefined;
+  col_off?: number | undefined;
+  raw?: number | undefined;
 }
 
 function qs(params: Record<string, string | number | undefined>): string {

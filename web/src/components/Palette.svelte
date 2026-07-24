@@ -81,7 +81,8 @@
       sel = Math.max(0, sel - 1);
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      if (filtered[sel]) run(filtered[sel]);
+      const cmd = filtered[sel];
+      if (cmd) run(cmd);
     }
   }
 </script>

@@ -19,11 +19,14 @@ export type DataTab = 'info' | 'heatmap' | 'values' | 'histogram';
 export const DV_KEYS = ['mode', 'rows', 'cols', 'dtype', 'roff', 'coff', 'slice', 'base', 'zebra', 'lock'] as const;
 export type DvParams = Partial<Record<(typeof DV_KEYS)[number], string>>;
 
+// `?: T | undefined` (rather than plain `?: T`) because `exactOptionalPropertyTypes`
+// is on and these are set explicitly to `undefined` in places — "absent" and
+// "present but cleared" mean the same thing for a URL parameter.
 export type Screen =
   | { kind: 'tree' }
-  | { kind: 'detail'; tensor: string; tab: DataTab; dv?: DvParams }
+  | { kind: 'detail'; tensor: string; tab: DataTab; dv?: DvParams | undefined }
   | { kind: 'files' }
-  | { kind: 'layout'; file?: string }
+  | { kind: 'layout'; file?: string | undefined }
   | { kind: 'stats' }
   | { kind: 'health' }
   | { kind: 'preview'; path: string; name: string };
@@ -312,7 +315,9 @@ function restoreGlobals(): void {
   const sort = q.get('sort');
   if (sort) {
     const [k, d] = sort.split('.');
-    sortKey.set((['name', 'size', 'params', 'dtype', 'rank'].includes(k) ? k : 'none') as SortKey);
+    sortKey.set(
+      (['name', 'size', 'params', 'dtype', 'rank'].includes(k ?? '') ? k : 'none') as SortKey,
+    );
     sortDir.set(d === 'desc' ? 'desc' : 'asc');
   } else {
     sortKey.set('none');
@@ -406,9 +411,9 @@ function rowIndex(): number {
 
 function selectAt(i: number): void {
   const rows = get(visibleRows);
-  if (!rows.length) return;
   const clamped = Math.max(0, Math.min(rows.length - 1, i));
-  selectedId.set(rows[clamped].id);
+  const row = rows[clamped];
+  if (row) selectedId.set(row.id);
 }
 
 export function moveSelection(delta: number): void {
@@ -422,8 +427,9 @@ export function selectParent(): void {
   const depth = rows[i]?.depth ?? 0;
   if (depth === 0) return;
   for (let k = i - 1; k >= 0; k--) {
-    if (rows[k].depth < depth) {
-      selectedId.set(rows[k].id);
+    const row = rows[k];
+    if (row && row.depth < depth) {
+      selectedId.set(row.id);
       return;
     }
   }
@@ -456,9 +462,10 @@ export function selectSibling(forwardDir: boolean): void {
     ? Array.from({ length: rows.length - i - 1 }, (_, k) => i + 1 + k)
     : Array.from({ length: i }, (_, k) => i - 1 - k);
   for (const k of range) {
-    if (rows[k].depth < depth) break;
-    if (rows[k].depth === depth) {
-      selectedId.set(rows[k].id);
+    const row = rows[k];
+    if (!row || row.depth < depth) break;
+    if (row.depth === depth) {
+      selectedId.set(row.id);
       break;
     }
   }

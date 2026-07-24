@@ -51,13 +51,34 @@
     }
   });
 
-  const STATUS: Record<string, { icon: string; cls: string; label: string }> = {
+  interface StatusInfo {
+    icon: string;
+    cls: string;
+    label: string;
+  }
+  const NA: StatusInfo = { icon: '–', cls: 'na', label: 'n/a' };
+  const STATUS: Record<string, StatusInfo> = {
     pass: { icon: '✓', cls: 'ok', label: 'pass' },
     warn: { icon: '⚠', cls: 'warn', label: 'warning' },
     fail: { icon: '✗', cls: 'fail', label: 'fail' },
-    na: { icon: '–', cls: 'na', label: 'n/a' },
+    na: NA,
   };
   const SEV: Record<string, string> = { error: 'fail', warning: 'warn', info: 'na' };
+
+  /** Badge for a check status / finding severity, falling back to n/a for anything the
+   * server sends that we don't know — so an unrecognised value renders instead of
+   * blowing up on an undefined lookup. */
+  const statusOf = (s: string | undefined): StatusInfo => (s ? (STATUS[s] ?? NA) : NA);
+  const sevOf = (s: string): StatusInfo => statusOf(SEV[s]);
+
+  /** The four index-reconciliation lists for one shard, as typed tuples. */
+  type IdxList = [heading: string, items: string[], cls: string, refKind: 'file' | 'tensor'];
+  const idxLists = (h: Health): IdxList[] => [
+    ['Missing files', h.missing_files, 'fail', 'file'],
+    ['Extra files (on disk, not in index)', h.extra_files, 'warn', 'file'],
+    ['Missing tensors', h.missing_tensors, 'fail', 'tensor'],
+    ['Extra tensors', h.extra_tensors, 'warn', 'tensor'],
+  ];
 
   // Findings-first: checks with problems on top, then passing, then n/a.
   const rank = (s: string) => (s === 'fail' ? 0 : s === 'warn' ? 1 : s === 'pass' ? 2 : 3);
@@ -93,7 +114,7 @@
       <h3 title="Header-only checks (no tensor data read): each row explains what passing verifies — hover it.">Structural checks</h3>
       <ul class="checks">
         {#each checks as c}
-          {@const st = STATUS[c.status] ?? STATUS.na}
+          {@const st = statusOf(c.status)}
           <li>
             <div class="checkhead">
               <span class="badge {st.cls}" title={st.label}>{st.icon}</span>
@@ -105,7 +126,7 @@
               <ul class="findings">
                 {#each c.findings as f}
                   <li>
-                    <span class="badge sm {SEV[f.severity] ?? 'na'}">{(STATUS[SEV[f.severity]] ?? STATUS.na).icon}</span>
+                    <span class="badge sm {sevOf(f.severity).cls}">{sevOf(f.severity).icon}</span>
                     <Ref name={f.subject} />
                     <span class="fmsg dim">{f.message}</span>
                   </li>
@@ -127,18 +148,13 @@
         <p class="ok-line"><span class="badge ok">✓</span> Index matches the files on disk.</p>
       {:else}
         {#each health as h}
-          {@const lists = [
-            ['Missing files', h.missing_files, 'fail', 'file'],
-            ['Extra files (on disk, not in index)', h.extra_files, 'warn', 'file'],
-            ['Missing tensors', h.missing_tensors, 'fail', 'tensor'],
-            ['Extra tensors', h.extra_tensors, 'warn', 'tensor'],
-          ]}
+          {@const lists = idxLists(h)}
           {#each lists as [heading, items, cls, refKind]}
             {#if items.length}
               <div class="idxgroup">
                 <div class="idxhead"><span class="badge sm {cls}">{cls === 'fail' ? '✗' : '⚠'}</span> {heading} <span class="dim">({items.length})</span></div>
                 <ul class="idxlist">
-                  {#each items as it}<li class="mono"><Ref name={it} kind={refKind === 'file' ? 'file' : 'tensor'} /></li>{/each}
+                  {#each items as it}<li class="mono"><Ref name={it} kind={refKind} /></li>{/each}
                 </ul>
               </div>
             {/if}

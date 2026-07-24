@@ -182,7 +182,7 @@
   $: if (kind === 'heatmap' && data && canvas && wrapW && wrapH) draw(data);
   function draw(d: SampleDto) {
     const r = d.values.length;
-    const c = r ? d.values[0].length : 0;
+    const c = d.values[0]?.length ?? 0;
     if (!r || !c) return;
     // Largest square cell that fits the sampled grid into the container (minus the
     // 1px border each side), capped so a tiny grid doesn't balloon. The canvas is
@@ -197,8 +197,9 @@
     const range = d.max - d.min || 1;
     for (let i = 0; i < r; i++) {
       for (let j = 0; j < c; j++) {
-        const v = d.values[i][j];
-        ctx.fillStyle = Number.isFinite(v) ? viridis((v - d.min) / range) : '#000';
+        const v = d.values[i]?.[j];
+        ctx.fillStyle =
+          v != null && Number.isFinite(v) ? viridis((v - d.min) / range) : '#000';
         ctx.fillRect(j * cell, i * cell, cell, cell);
       }
     }
@@ -212,7 +213,7 @@
       hover = '';
       return;
     }
-    hover = `[${data.rows[i]}, ${data.cols[j]}] = ${num(row[j])}`;
+    hover = `[${data.rows[i]}, ${data.cols[j]}] = ${num(row[j] ?? Number.NaN)}`;
   }
 
   // Click an overview / abs-max cell to drop a window there — a discoverable seek
@@ -248,7 +249,7 @@
   function cellText(d: SampleDto, b: 'dec' | 'hex' | 'oct' | 'bin', i: number, j: number): string {
     if (b === 'dec') {
       const bits = d.integer ? d.raw?.[i]?.[j] : undefined;
-      return bits != null ? exactInt(bits, d.raw_width, d.signed) : num(d.values[i][j]);
+      return bits != null ? exactInt(bits, d.raw_width, d.signed) : num(d.values[i]?.[j] ?? Number.NaN);
     }
     const hex = d.raw?.[i]?.[j];
     if (hex == null) return '';
@@ -301,13 +302,15 @@
   // Edges mode skips a contiguous middle block; find where the row/col index jumps so
   // the table can show a "⋯ skipped ⋯" divider there (−1 = no gap / other modes).
   const gapAt = (idx: number[]): number => {
-    for (let i = 0; i + 1 < idx.length; i++) if (idx[i + 1] - idx[i] > 1) return i;
+    for (let i = 0; i + 1 < idx.length; i++) if ((idx[i + 1] ?? 0) - (idx[i] ?? 0) > 1) return i;
     return -1;
   };
   $: rowGap = mode === 'edges' && data ? gapAt(data.rows) : -1;
   $: colGap = mode === 'edges' && data ? gapAt(data.cols) : -1;
-  $: rowsSkipped = rowGap >= 0 && data ? data.rows[rowGap + 1] - data.rows[rowGap] - 1 : 0;
-  $: colsSkipped = colGap >= 0 && data ? data.cols[colGap + 1] - data.cols[colGap] - 1 : 0;
+  $: rowsSkipped =
+    rowGap >= 0 && data ? (data.rows[rowGap + 1] ?? 0) - (data.rows[rowGap] ?? 0) - 1 : 0;
+  $: colsSkipped =
+    colGap >= 0 && data ? (data.cols[colGap + 1] ?? 0) - (data.cols[colGap] ?? 0) - 1 : 0;
   // Total table columns for the skipped-rows divider's colspan: index header + data
   // cols + the skipped-cols divider column (when present).
   $: colspan = data ? 1 + data.cols.length + (colGap >= 0 ? 1 : 0) : 1;

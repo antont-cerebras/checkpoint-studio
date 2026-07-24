@@ -51,7 +51,7 @@
     const bw = (W - 2 * PAD) / n;
     ctx.fillStyle = barColor;
     for (let i = 0; i < d.counts.length; i++) {
-      const h = (d.counts[i] / max) * (H - 2 * PAD);
+      const h = ((d.counts[i] ?? 0) / max) * (H - 2 * PAD);
       ctx.fillRect(PAD + i * bw, H - PAD - h, Math.max(1, bw - 1), h);
     }
     ctx.strokeStyle = cssVar('--border');
@@ -75,7 +75,7 @@
       hover = '';
       return;
     }
-    hover = `bin ${i}: ${data.counts[i].toLocaleString()}`;
+    hover = `bin ${i}: ${(data.counts[i] ?? 0).toLocaleString()}`;
   }
 </script>
 

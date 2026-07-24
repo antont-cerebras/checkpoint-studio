@@ -25,7 +25,6 @@
     filterMatches,
     filterResolvedFor,
     searchTotal,
-    SEARCH_LIMIT,
     clearFilter,
     sortKey,
     sortDir,

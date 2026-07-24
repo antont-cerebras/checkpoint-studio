@@ -21,7 +21,7 @@
 
   $: shards = collect($tree?.tree ?? []);
   $: wanted = $screen.kind === 'layout' ? $screen.file : undefined;
-  $: if (shards.length && !shards.includes(selected)) selected = shards[0];
+  $: if (shards.length && !shards.includes(selected)) selected = shards[0] ?? '';
   $: if (wanted && shards.includes(wanted)) selected = wanted;
   $: if (selected) load(selected);
 
