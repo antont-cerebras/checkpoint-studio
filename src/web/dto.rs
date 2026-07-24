@@ -121,6 +121,12 @@ pub struct SampleDto {
     pub view: String,
     pub mode: String,
     pub overridable: bool,
+    /// Whether these values are integers, and if so whether they're signed. JSON
+    /// numbers are f64, which cannot carry a 64-bit integer exactly — so for an
+    /// integer view the client formats the decimal from `raw` via BigInt (as it
+    /// already does for hex/oct/bin) rather than from the lossy `values`.
+    pub integer: bool,
+    pub signed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_width: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,9 +134,15 @@ pub struct SampleDto {
 }
 
 impl SampleDto {
-    pub fn from_sample(s: &Sample, include_raw: bool) -> Self {
+    /// `dtype` is the tensor's stored dtype, needed to tell whether the values under
+    /// this view are integers (and signed) — see the `integer`/`signed` fields.
+    pub fn from_sample(s: &Sample, dtype: &str, include_raw: bool) -> Self {
+        let integer = s.view.is_integer(dtype);
+        let signed = s.view.is_signed_integer(dtype);
         let raw_width = s.raw.iter().flatten().next().map(|b| b.width);
-        let raw = include_raw.then(|| {
+        // Always ship the bits for an integer view: they're the only exact
+        // representation of a 64-bit value on a JSON wire.
+        let raw = (include_raw || integer).then(|| {
             s.raw
                 .iter()
                 .map(|row| {
@@ -157,6 +169,8 @@ impl SampleDto {
             view: view_label(s.view),
             mode: mode_label(&s.mode),
             overridable: s.overridable,
+            integer,
+            signed,
             raw_width,
             raw,
         }

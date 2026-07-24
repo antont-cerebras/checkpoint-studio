@@ -208,6 +208,17 @@ impl ViewDtype {
         }
     }
 
+    /// Whether those integers are **signed** — needed to print a value exactly from
+    /// its raw bits (see [`format_int_bits`]), which is the only way to show a wide
+    /// I64/U64 element correctly.
+    pub fn is_signed_integer(self, stored: &str) -> bool {
+        match self {
+            ViewDtype::Stored => dtype_is_signed_integer(stored),
+            ViewDtype::As(dt) => dtype_is_signed_integer(dt),
+            other => other.is_signed(),
+        }
+    }
+
     /// Bit width of one element under this view — 4 for the packed/nibble views,
     /// otherwise the byte width of the (possibly reinterpreted) dtype. Used to
     /// size and zero-pad hex/octal/binary cells, and matches [`RawBits::width`].
@@ -266,7 +277,11 @@ impl ViewDtype {
 
 /// Decimal width of an integer-valued `f64` (digit count plus a leading minus).
 fn int_digits(v: f64) -> usize {
-    (v as i64).to_string().len()
+    // Measured by formatting the f64, not via `as i64`: that cast saturates at 2^63,
+    // so a u64 range was measured one character too narrow and 20-digit values
+    // collided with the neighbouring cell. Capped at the widest 64-bit decimal
+    // ("18446744073709551615" / "-9223372036854775808" — both 20 chars).
+    format!("{v:.0}").len().min(20)
 }
 
 impl ViewDtype {
@@ -313,6 +328,34 @@ fn dtype_is_integer(dtype: &str) -> bool {
         dtype,
         "I8" | "U8" | "I16" | "U16" | "I32" | "U32" | "I64" | "U64" | "BOOL"
     )
+}
+
+fn dtype_is_signed_integer(dtype: &str) -> bool {
+    matches!(dtype, "I8" | "I16" | "I32" | "I64")
+}
+
+/// Format an integer element from its **exact** raw bits.
+///
+/// [`Sample::values`] holds `f64`, which cannot represent every 64-bit integer: past
+/// 2^53 the decode rounds, and casting the `f64` back to `i64` saturates at 2^63. So
+/// printing a wide I64/U64 tensor from `values` showed a wrong number — e.g. the U64
+/// 13816973012072644608 rendered as 9223372036854775807. The raw bits are exact, so
+/// the decimal display is derived from those instead. `width` is the element's bit
+/// width; a signed value is sign-extended from it.
+pub fn format_int_bits(raw: RawBits, signed: bool) -> String {
+    let w = u32::from(raw.width).clamp(1, 64);
+    let masked = if w >= 64 {
+        raw.bits
+    } else {
+        raw.bits & ((1u64 << w) - 1)
+    };
+    if signed {
+        // Sign-extend the w-bit two's-complement value into i64.
+        let shift = 64 - w;
+        (((masked << shift) as i64) >> shift).to_string()
+    } else {
+        masked.to_string()
+    }
 }
 
 /// The ordered list of views to choose from for a tensor of the given stored
@@ -3603,6 +3646,49 @@ mod tests {
     /// first index into the empty count vector panicked; a U64 span wrapped to 2^63,
     /// silently dumping everything above it into the last bucket. Reachable from the
     /// TUI, `/api/histogram`, and `diff --histogram`, so it must stay covered.
+    /// A 64-bit integer element must display EXACTLY. The decoded f64 rounds past 2^53
+    /// and `as i64` saturates at 2^63, so the decimal cell is printed from the raw bits
+    /// instead — otherwise a U64 of 13816973012072644608 showed 9223372036854775807.
+    #[test]
+    fn integers_format_exactly_from_raw_bits() {
+        let bits = |bits: u64, width: u8| RawBits { bits, width };
+        // Unsigned, above i64::MAX (used to saturate).
+        assert_eq!(
+            format_int_bits(bits(13_816_973_012_072_644_608, 64), false),
+            "13816973012072644608"
+        );
+        assert_eq!(
+            format_int_bits(bits(u64::MAX, 64), false),
+            "18446744073709551615"
+        );
+        // Signed extremes and a value above 2^53 (used to round).
+        assert_eq!(
+            format_int_bits(bits(i64::MIN as u64, 64), true),
+            "-9223372036854775808"
+        );
+        assert_eq!(
+            format_int_bits(bits(i64::MAX as u64, 64), true),
+            "9223372036854775807"
+        );
+        assert_eq!(
+            format_int_bits(bits(9_007_199_254_740_993, 64), true),
+            "9007199254740993"
+        );
+        assert_eq!(
+            format_int_bits(bits(-1_234_567_890_123_456_789_i64 as u64, 64), true),
+            "-1234567890123456789"
+        );
+        // Narrower widths sign-extend from their own width, not from 64.
+        assert_eq!(format_int_bits(bits(0xFF, 8), true), "-1");
+        assert_eq!(format_int_bits(bits(0xFF, 8), false), "255");
+        assert_eq!(format_int_bits(bits(0xF, 4), true), "-1");
+        assert_eq!(format_int_bits(bits(0x7, 4), true), "7");
+        // Cell sizing must fit the widest exact value (it used to measure via
+        // `as i64`, coming up a char short for u64 and colliding with the next cell).
+        assert_eq!(int_digits(u64::MAX as f64), 20);
+        assert_eq!(int_digits(i64::MIN as f64), 20);
+    }
+
     #[test]
     fn histogram_bins_survive_full_width_64bit_spans() {
         for (dtype, lo, hi) in [

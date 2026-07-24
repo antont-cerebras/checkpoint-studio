@@ -2580,6 +2580,7 @@ impl UI {
         }
 
         let integer = sample.view.is_integer(&tensor.dtype);
+        let signed = sample.view.is_signed_integer(&tensor.dtype);
         let band = |k: usize| {
             if k.is_multiple_of(2) {
                 palette::STRIPE_DARK
@@ -2604,7 +2605,21 @@ impl UI {
             let mut vcol = 0usize;
             for (j, &v) in row.iter().enumerate() {
                 let s = match base {
-                    NumBase::Decimal if integer => format!("{:>cw$}", v as i64),
+                    // Print integers from their EXACT raw bits, not the decoded f64:
+                    // past 2^53 the f64 rounds and `as i64` saturates at 2^63, so a
+                    // wide I64/U64 element displayed a wrong number (the hex/oct/bin
+                    // bases were always right because they read these same bits).
+                    NumBase::Decimal if integer => {
+                        let exact = sample
+                            .raw
+                            .get(i)
+                            .and_then(|r| r.get(j))
+                            .map(|&rb| crate::sample::format_int_bits(rb, signed));
+                        match exact {
+                            Some(s) => format!("{s:>cw$}"),
+                            None => format!("{:>cw$}", v as i64),
+                        }
+                    }
                     NumBase::Decimal => format!("{v:>cw$.3e}"),
                     _ => {
                         let rb = sample.raw[i][j];

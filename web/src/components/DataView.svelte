@@ -235,8 +235,21 @@
   // otherwise Svelte, seeing only `i`/`j` in the expression, would render each cell
   // once and never update its text on pan/seek/base-change (the header, bound to
   // `data.rows[i]`, would relabel while the values stayed frozen at the origin).
+  /** Exact decimal for an integer cell, decoded from its raw bits. `values` arrives as
+   * JSON numbers (f64), which round past 2^53 and can't represent a u64 above 2^63 at
+   * all — so a wide I64/U64 tensor would display the wrong number. */
+  function exactInt(hex: string, width: number | undefined, signed: boolean): string {
+    const w = BigInt(width ?? hex.length * 4);
+    let v = BigInt('0x' + hex);
+    if (signed && w > 0n && v >= 1n << (w - 1n)) v -= 1n << w; // two's complement
+    return v.toString();
+  }
+
   function cellText(d: SampleDto, b: 'dec' | 'hex' | 'oct' | 'bin', i: number, j: number): string {
-    if (b === 'dec') return num(d.values[i][j]);
+    if (b === 'dec') {
+      const bits = d.integer ? d.raw?.[i]?.[j] : undefined;
+      return bits != null ? exactInt(bits, d.raw_width, d.signed) : num(d.values[i][j]);
+    }
     const hex = d.raw?.[i]?.[j];
     if (hex == null) return '';
     if (b === 'hex') return hex;
@@ -261,7 +274,10 @@
       hover = '';
       return;
     }
-    hover = `[${data.rows[i]}, ${data.cols[j]}] = ${v}`;
+    // Exact for integers (see `exactInt`); full f64 precision otherwise.
+    const bits = data.integer ? data.raw?.[i]?.[j] : undefined;
+    const shown = bits != null ? exactInt(bits, data.raw_width, data.signed) : v;
+    hover = `[${data.rows[i]}, ${data.cols[j]}] = ${shown}`;
   }
 
   function pan(dr: number, dc: number) {

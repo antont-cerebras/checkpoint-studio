@@ -75,7 +75,13 @@ export interface SampleDto {
   view: string;
   mode: string;
   overridable: boolean;
-  /** Raw stored bits per cell as zero-padded hex (only when ?raw=1); width in `raw_width`. */
+  /** Whether the values are integers, and if so signed. JSON numbers are f64 and
+   * cannot carry a 64-bit integer exactly, so an integer view's decimal cells are
+   * formatted from `raw` via BigInt — `values` would round past 2^53. */
+  integer: boolean;
+  signed: boolean;
+  /** Raw stored bits per cell as zero-padded hex (always for an integer view, else
+   * only when ?raw=1); width in `raw_width`. */
   raw_width?: number;
   raw?: string[][];
 }
