@@ -1432,6 +1432,14 @@ type Loaded = (Vec<TensorInfo>, Vec<MetadataInfo>);
 /// S3 objects' metadata (`None` for a local / SFTP source).
 type SideLoad = (Loaded, Option<crate::remote::S3Meta>);
 
+/// Whether an error is the [`crate::sftp::RemoteSession::ABORTED`] marker — a read
+/// cut short because the *other* side of a parallel `diff` failed first (not a
+/// failure of this read itself).
+fn is_aborted_err(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.to_string().contains(crate::sftp::RemoteSession::ABORTED))
+}
+
 #[allow(clippy::too_many_arguments)] // a CLI entry point; each arg is a distinct flag
 fn run_diff(
     old: &Path,
@@ -1501,10 +1509,18 @@ fn run_diff(
                             Some(&abort),
                         )
                         .with_context(|| format!("reading {src}"));
+                    // A failure trips the abort so the sibling stops promptly.
                     if out.is_err() {
                         abort.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
-                    bars.finish(i, out.is_ok());
+                    // Distinguish an abort (this side was cut short — dim `⊘`) from a
+                    // real failure (`✗`), so a fine-but-cancelled read doesn't look
+                    // broken.
+                    match &out {
+                        Ok(_) => bars.finish(i, true),
+                        Err(e) if is_aborted_err(e) => bars.abort(i),
+                        Err(_) => bars.finish(i, false),
+                    }
                     // `diff` compares structure + (for s3://) S3 object metadata, not
                     // the on-disk footprint or health.
                     out.map(|rc| ((rc.tensors, rc.metadata), rc.s3))
@@ -1524,13 +1540,9 @@ fn run_diff(
                     // At least one side failed. Prefer the *real* failure over an
                     // abort-induced one (the sibling we cut short), so the reported
                     // error names the checkpoint that actually couldn't load.
-                    let is_abort = |e: &anyhow::Error| {
-                        e.chain()
-                            .any(|c| c.to_string().contains(crate::sftp::RemoteSession::ABORTED))
-                    };
                     Err(match (ra.err(), rb.err()) {
                         (Some(ea), Some(eb)) => {
-                            if is_abort(&ea) {
+                            if is_aborted_err(&ea) {
                                 eb
                             } else {
                                 ea

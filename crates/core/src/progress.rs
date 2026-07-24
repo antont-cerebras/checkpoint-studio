@@ -130,6 +130,9 @@ impl LoadProgress {
 const RUNNING: u8 = 0;
 const OK: u8 = 1;
 const ERR: u8 = 2;
+/// Cut short (not a failure of this read itself) — e.g. a parallel `diff` cancelled
+/// this side because the *other* checkpoint failed to load.
+const ABORTED: u8 = 3;
 
 /// A set of progress bars, one per labelled read. Create with [`Bars::start`],
 /// call [`Bars::finish`] as each read lands, and [`Bars::join`] once all are done.
@@ -180,6 +183,15 @@ impl Bars {
         }
         if let Some(s) = self.states.get(i) {
             s.store(if ok { OK } else { ERR }, Ordering::Release);
+        }
+    }
+
+    /// Mark read `i` **aborted** — cut short through no fault of its own (the other
+    /// side of a `diff` failed first). Rendered as a dim `⊘` + an "aborted" note, so
+    /// it doesn't read as a failure of this checkpoint.
+    pub fn abort(&self, i: usize) {
+        if let Some(s) = self.states.get(i) {
+            s.store(ABORTED, Ordering::Release);
         }
     }
 
@@ -275,6 +287,7 @@ fn spawn(
                 let (color, mark) = match st {
                     OK => (DONE, '✓'),
                     ERR => (FAIL, '✗'),
+                    ABORTED => (DIM, '⊘'), // cut short, not a failure — dim, not red
                     _ => (RUN, FRAMES[i % FRAMES.len()]),
                 };
                 let ms = if st == RUNNING {
@@ -287,7 +300,11 @@ fn spawn(
                 // remote dir is listed); until then just the spinner + timer.
                 let (done, total) = progress[k].snapshot();
                 let unit = progress[k].unit_label();
-                let bar = if total > 0 {
+                let bar = if st == ABORTED {
+                    // Aborted: the partial count/timer would read as "failed partway",
+                    // so replace them with a clear note (see the trailing timer too).
+                    format!("  {DIM}aborted — the other checkpoint failed to load{RESET}")
+                } else if total > 0 {
                     // Determinate: a thin bar in the TUI `LineGauge` style
                     // (`symbols::line::THICK`) — done part in the mark's colour, the
                     // rest dim — plus the `done/total` count (human sizes for a byte
@@ -331,10 +348,16 @@ fn spawn(
                 } else {
                     String::new() // finished with no known total: mark + timer only
                 };
+                // No timer on an aborted line — a partial time reads as a failure.
+                let timer = if st == ABORTED {
+                    String::new()
+                } else {
+                    format!(" {color}{secs:.1}s{RESET}")
+                };
                 // `\r` + text + clear-to-EOL (`\x1b[K` *after* the text, so there's
                 // no blank-then-fill flash) — overwrites the line in place.
                 frame.push_str(&format!(
-                    "\r  {color}{mark}{RESET} {DIM}{}{RESET}{bar} {color}{secs:.1}s{RESET}\x1b[K\n",
+                    "\r  {color}{mark}{RESET} {DIM}{}{RESET}{bar}{timer}\x1b[K\n",
                     labels[k]
                 ));
             }
