@@ -2,7 +2,7 @@
   import { tree, cachedStats } from '../stores/server';
   import { setTab, navigate, type DataTab } from '../stores/view';
   import type { StatsDto, TensorInfo, TreeNode } from '../lib/types';
-  import { humanCount, humanSize, num } from '../lib/format';
+  import { humanCount, humanSize, num, percent } from '../lib/format';
   import DataView from './DataView.svelte';
   import HistogramView from './HistogramView.svelte';
   import Dtype from './Dtype.svelte';
@@ -103,7 +103,7 @@
               <tbody>
                 <tr><th>min</th><td class="mono">{num(st.min)}</td><th>max</th><td class="mono">{num(st.max)}</td></tr>
                 <tr><th>mean</th><td class="mono">{num(st.mean)}</td><th>std</th><td class="mono">{num(st.std)}</td></tr>
-                <tr><th>zeros</th><td class="mono">{(st.zero_fraction * 100).toFixed(2)}%</td><th>non-finite</th><td class="mono">{st.nonfinite.toLocaleString()}</td></tr>
+                <tr><th>zeros</th><td class="mono">{percent(st.zero_fraction, st.zeros === 0)}</td><th>non-finite</th><td class="mono">{st.nonfinite.toLocaleString()}</td></tr>
               </tbody>
             </table>
             <span class="dim">scanned {st.count.toLocaleString()} elements in {st.elapsed_ms.toFixed(0)} ms</span>

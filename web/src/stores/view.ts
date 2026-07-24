@@ -109,13 +109,15 @@ export const search = writable<string>('');
 /** The tensor filter as a text query (the `tensorfilter` grammar), matched
  * server-side by the one shared matcher — so web and TUI filter identically.
  * `filterMatches` is the set of matching tensor names (null = inactive → show
- * all); `filterError` holds a parse error to show inline; `filterPending` is true
- * from the moment a query is edited until its result (or error) lands, so the UI
- * can show "filtering…" instead of the *previous* query's count. */
+ * all); `filterError` holds a parse error to show inline; `filterResolvedFor` is the
+ * (trimmed) query that `filterMatches`/`filterError` currently reflect. The UI
+ * derives "still filtering" as `query !== filterResolvedFor` — a pure reactive check
+ * off stores set in the async resolve, so it renders reliably (setting a flag
+ * synchronously inside this subscriber did not repaint the count in Svelte 4). */
 export const filterQuery = writable<string>('');
 export const filterMatches = writable<Set<string> | null>(null);
 export const filterError = writable<string | null>(null);
-export const filterPending = writable<boolean>(false);
+export const filterResolvedFor = writable<string>('');
 
 // Debounced fetch: whenever the query changes, ask the server which tensors pass.
 // `filterReq` is bumped on every edit (not just when the timer fires), so an
@@ -130,10 +132,9 @@ filterQuery.subscribe((q) => {
   if (!query) {
     filterMatches.set(null);
     filterError.set(null);
-    filterPending.set(false);
+    filterResolvedFor.set(''); // empty query is "resolved" (shows all) — no pending state
     return;
   }
-  filterPending.set(true); // mark pending immediately, before the debounce
   filterTimer = setTimeout(async () => {
     try {
       const res = await api.filter(query);
@@ -145,7 +146,9 @@ filterQuery.subscribe((q) => {
       filterError.set(e instanceof Error ? e.message : String(e));
       filterMatches.set(null); // don't leave the prior result behind the error
     } finally {
-      if (req === filterReq) filterPending.set(false);
+      // Mark THIS query resolved (drops "filtering…"); a newer edit already bumped
+      // `filterReq`, so a superseded response leaves the pending state in place.
+      if (req === filterReq) filterResolvedFor.set(query);
     }
   }, 200);
 });

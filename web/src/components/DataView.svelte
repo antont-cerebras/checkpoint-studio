@@ -312,7 +312,12 @@
   }
 </script>
 
-<svelte:window on:resize={fitToPane} />
+<!-- Pan keys are handled on BOTH the focusable pane (fires when the grid has focus)
+     and window (fires when focus sits elsewhere — a tab button, body). `onKey` calls
+     stopPropagation on keys it handles, so the pane handler pre-empts the window one
+     (no double-pan); DataView only mounts on the detail screen, so the window handler
+     can't shadow the tree's j/k nav. -->
+<svelte:window on:keydown={onKey} on:resize={fitToPane} />
 
 <div class="dv">
   <div class="controls">

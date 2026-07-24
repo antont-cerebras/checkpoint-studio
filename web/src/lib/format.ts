@@ -43,3 +43,13 @@ export function num(v: number): string {
   if (a >= 1e6 || a < 1e-4) return v.toExponential(3);
   return Number(v.toPrecision(6)).toString();
 }
+
+/** A fraction (0–1) as a percentage, the way the TUI shows it: an exact zero reads
+ * "0%", a tiny-but-nonzero fraction uses scientific notation (so it never shows a
+ * misleading "0.00%"), and the rest one decimal. Pass `isZero` from the true count so
+ * floating-point dust never masquerades as an exact zero. */
+export function percent(fraction: number, isZero: boolean): string {
+  if (isZero) return '0%';
+  const pct = fraction * 100;
+  return pct < 0.1 ? `${pct.toExponential(1)}%` : `${pct.toFixed(1)}%`;
+}

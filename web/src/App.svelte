@@ -23,7 +23,7 @@
     filterQuery,
     filterError,
     filterMatches,
-    filterPending,
+    filterResolvedFor,
     searchTotal,
     SEARCH_LIMIT,
     clearFilter,
@@ -59,6 +59,11 @@
   function onSortChange(e: Event) {
     setSort((e.currentTarget as HTMLSelectElement).value as SortKey);
   }
+
+  // "Still filtering" = a non-empty query whose result hasn't landed yet (its trimmed
+  // text differs from the query `filterMatches`/`filterError` reflect). Derived so it
+  // repaints reliably from the async-set stores — see `filterResolvedFor`.
+  $: filtering = $filterQuery.trim().length > 0 && $filterQuery.trim() !== $filterResolvedFor;
 
   function crumb(s: Screen): string {
     switch (s.kind) {
@@ -345,7 +350,7 @@
   {#if $screen.kind === 'tree'}
   <!-- The filter bar acts on the tensor tree, so it only shows on the tree screen
        (nothing to filter on detail / stats / health / layout / files). -->
-  <div class="filterbar" class:err={$filterError && !$filterPending}>
+  <div class="filterbar" class:err={$filterError && !filtering}>
     <button
       class="bld"
       class:on={builderOpen}
@@ -370,7 +375,7 @@
       bind:value={$filterQuery}
       on:keydown={filterKeydown}
     />
-    {#if $filterPending}
+    {#if filtering}
       <span class="dim">filtering…</span>
     {:else if $filterError}
       <span class="ferr" title={$filterError}>⚠ {$filterError}</span>
