@@ -35,6 +35,14 @@
     return null;
   }
 
+  // The source line adapts to where the tensor lives. An `s3://` cstorch checkpoint
+  // isn't a local file, so label it "Source", and only offer the byte-layout-map
+  // link when the tensor actually HAS a byte-range layout (safetensors) — for
+  // cstorch (no byte ranges) / HDF5 (chunked) that map doesn't exist, so the link
+  // would go nowhere.
+  $: isS3 = info?.source_path.startsWith('s3://') ?? false;
+  $: hasByteLayout = info ? offsets(info.layout) != null : false;
+
   // Whole-tensor statistics are shown on the Info tab, scanned on demand.
   let statsPromise: Promise<StatsDto> | null = null;
   $: if (tensor) statsPromise = null; // reset when the selected tensor changes
@@ -70,8 +78,14 @@
           <tr><th>Size</th><td class="mono">{humanSize(info.size_bytes)}</td></tr>
           {#if offsets(info.layout)}<tr><th>Data offsets</th><td class="mono">{offsets(info.layout)}</td></tr>{/if}
           <tr>
-            <th>File</th>
-            <td><button class="link src" title="Show this shard's byte-layout map" on:click={() => navigate({ kind: 'layout', file: baseName(info.source_path) })}>{info.source_path}</button></td>
+            <th>{isS3 ? 'Source' : 'File'}</th>
+            <td>
+              {#if hasByteLayout}
+                <button class="link src" title="Show this shard's byte-layout map" on:click={() => navigate({ kind: 'layout', file: baseName(info.source_path) })}>{info.source_path}</button>
+              {:else}
+                <span class="src mono">{info.source_path}</span>
+              {/if}
+            </td>
           </tr>
         </tbody>
       </table>

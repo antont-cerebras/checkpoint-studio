@@ -330,6 +330,9 @@
     </select>
   </header>
 
+  {#if $screen.kind === 'tree'}
+  <!-- The filter bar acts on the tensor tree, so it only shows on the tree screen
+       (nothing to filter on detail / stats / health / layout / files). -->
   <div class="filterbar" class:err={$filterError}>
     <button
       class="bld"
@@ -384,6 +387,7 @@
     {/if}
   </div>
   {#if builderOpen}<FilterBuilder />{/if}
+  {/if}
 
   <main>
     {#if $treeError}
