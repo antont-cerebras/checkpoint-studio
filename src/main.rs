@@ -2525,7 +2525,7 @@ fn render_auto_sparse(
     } else {
         ("", "", "", "", "")
     };
-    println!("\nsparse-packed expert indices (auto-detected via sibling codebook):");
+    println!("\npacked expert indices (auto-detected via sibling codebook):");
     let mut differs = false;
     let mut names: Vec<&String> = pairs.iter().map(|(_, n)| n).collect();
     names.sort();
@@ -2541,14 +2541,22 @@ fn render_auto_sparse(
             continue;
         }
         if let Some(fb) = &rr.fallback {
-            // Top bits set ⇒ not packed indices; show the plain value comparison.
+            // The one-index-per-word (sparse) decode didn't apply. A codebooked
+            // weight is packed indices regardless, so this just means it's packed
+            // *densely* (several indices per 16-bit word) — normal, not a problem;
+            // compare the raw words (equal words ⇒ identical packed data). The rare
+            // exception is a codebooked weight stored as plain floats.
             let (mark, col) = if fb.differing > 0 {
                 differs = true;
                 (yellow, "≠")
             } else {
                 (green, "✓")
             };
-            let verdict = if fb.differing > 0 {
+            let is_float = matches!(fb.dtype.as_str(), "F16" | "BF16" | "F32" | "F64");
+            let unit = if is_float { "values" } else { "16-bit words" };
+            let verdict = if fb.differing == 0 {
+                format!("{unit} identical")
+            } else if is_float {
                 format!(
                     "{} of {} values differ (max |Δ| {:.5}, mean {:.5})",
                     crate::utils::format_parameters(fb.differing as usize),
@@ -2557,13 +2565,22 @@ fn render_auto_sparse(
                     fb.mean_abs,
                 )
             } else {
-                "values identical".to_string()
+                format!(
+                    "{} of {} 16-bit words differ",
+                    crate::utils::format_parameters(fb.differing as usize),
+                    crate::utils::format_parameters(fb.elements as usize),
+                )
+            };
+            let how = if is_float {
+                format!("stored as {} (not packed indices)", fb.dtype)
+            } else {
+                format!(
+                    "dense-packed ({}-bit indices, several per 16-bit word)",
+                    rr.bits
+                )
             };
             println!(
-                "  {mark}{col}{reset} {name}  {dim}not sparse-packed ({} word(s) with bits above {}) — compared as {} values:{reset} {verdict}",
-                rr.sparse_bad + rr.dense_bad,
-                rr.bits,
-                fb.dtype,
+                "  {mark}{col}{reset} {name}  {dim}{how} — compared as raw {unit}:{reset} {verdict}"
             );
         } else {
             let counts = format!(
