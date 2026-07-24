@@ -333,8 +333,14 @@
           placeholder="fuzzy filter tensors…"
           bind:value={$search}
         />
+        <!-- The row count is shared with the filter: while a filter query is still
+             resolving, `visibleRows` is the UNFILTERED tree (3 rows when collapsed),
+             so printing it here reads as "3 matches" for a query that matches
+             thousands. Gate it on the same `filtering` flag as the filter bar. -->
         <span class="dim">
-          {#if $searchTotal > $visibleRows.length}showing {$visibleRows.length} of {$searchTotal.toLocaleString()}{:else}{$visibleRows.length} match{$visibleRows.length === 1 ? '' : 'es'}{/if}
+          {#if filtering}filtering…
+          {:else if $searchTotal > $visibleRows.length}showing {$visibleRows.length} of {$searchTotal.toLocaleString()}
+          {:else}{$visibleRows.length.toLocaleString()} match{$visibleRows.length === 1 ? '' : 'es'}{/if}
           · Esc to exit
         </span>
       </span>

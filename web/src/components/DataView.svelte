@@ -287,11 +287,12 @@
   }
 
   // Keyboard panning in window mode — mirrors the TUI's data view (arrows pan by a
-  // window, Home/End = col start/end, PageUp/PageDown = row start/end). Attached to
-  // the focusable pane (like `onWheel`), NOT to window: a window keydown handler
-  // competes with the app-global one and proved unreliable, whereas the pane's own
-  // element handler fires whenever the grid has focus (mount-grabbed, or click-to-
-  // focus). Unhandled keys fall through (no preventDefault) to the global shortcuts.
+  // window, Home/End = col start/end, PageUp/PageDown = row start/end). Bound in the
+  // capture phase on window (see the markup): the app-global nav handler binds window
+  // too and was consuming the arrows before the grid ever saw them, so the data view
+  // claims them first and stops propagation for the keys it handles. Keys typed into a
+  // control (the rows/cols/seek inputs) are left alone, and unhandled keys propagate
+  // normally to the global shortcuts.
   function onKey(e: KeyboardEvent) {
     if (mode !== 'window' || e.ctrlKey || e.metaKey || e.altKey) return;
     const tag = (e.target as HTMLElement)?.tagName;
@@ -312,12 +313,13 @@
   }
 </script>
 
-<!-- Pan keys are handled on BOTH the focusable pane (fires when the grid has focus)
-     and window (fires when focus sits elsewhere — a tab button, body). `onKey` calls
-     stopPropagation on keys it handles, so the pane handler pre-empts the window one
-     (no double-pan); DataView only mounts on the detail screen, so the window handler
-     can't shadow the tree's j/k nav. -->
-<svelte:window on:keydown={onKey} on:resize={fitToPane} />
+<!-- Pan keys are claimed in the CAPTURE phase on window, so they reach the grid before
+     ANY other keydown listener (the app-global nav handler also binds window and was
+     swallowing the arrows — capture runs before every bubble-phase listener, whatever
+     the attach order). `onKey` stops propagation only for keys it actually handles, so
+     everything else still reaches the global shortcuts. This component is mounted only
+     while a data view is on screen, so it can't shadow the tree's j/k nav. -->
+<svelte:window on:keydown|capture={onKey} on:resize={fitToPane} />
 
 <div class="dv">
   <div class="controls">
@@ -416,7 +418,6 @@
         bind:clientWidth={wrapW}
         bind:clientHeight={wrapH}
         on:wheel|nonpassive={onWheel}
-        on:keydown={onKey}
         on:mousedown={focusPane}
       >
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
@@ -436,7 +437,7 @@
       </div>
     {:else}
       <!-- svelte-ignore a11y-no-static-element-interactions a11y-no-noninteractive-tabindex -->
-      <div class="tablewrap" tabindex="0" use:grabFocus bind:this={tableWrap} on:wheel|nonpassive={onWheel} on:keydown={onKey} on:mousedown={focusPane}>
+      <div class="tablewrap" tabindex="0" use:grabFocus bind:this={tableWrap} on:wheel|nonpassive={onWheel} on:mousedown={focusPane}>
         <table class="zebra-{zebra}" bind:this={tableEl}>
           <thead>
             <tr>
