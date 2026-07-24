@@ -28,8 +28,24 @@ export function fuzzyScore(needle: string, hay: string): number {
   return score - h.length * 0.01; // gently prefer shorter (tighter) matches
 }
 
+/** How many tensors would match `query` before the row cap — so the UI can say
+ * "showing 1000 of N" instead of a truncated count that looks exact. */
+export const SEARCH_LIMIT = 1000;
+
+export function searchMatchCount(tree: TreeNode[], query: string): number {
+  let count = 0;
+  const walk = (nodes: TreeNode[]) => {
+    for (const node of nodes) {
+      if (node.kind === 'group') walk(node.children);
+      else if (fuzzyScore(query, node.info.name) >= 0) count++;
+    }
+  };
+  walk(tree);
+  return count;
+}
+
 /** Leaf (tensor/metadata) rows across the whole tree that match `query`, ranked. */
-export function searchRows(tree: TreeNode[], query: string, limit = 1000): Row[] {
+export function searchRows(tree: TreeNode[], query: string, limit = SEARCH_LIMIT): Row[] {
   const scored: { row: Row; score: number }[] = [];
   const walk = (nodes: TreeNode[], parentId: string) => {
     for (const node of nodes) {

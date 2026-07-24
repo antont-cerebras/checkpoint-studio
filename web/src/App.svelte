@@ -23,12 +23,17 @@
     filterQuery,
     filterError,
     filterMatches,
+    filterPending,
+    searchTotal,
+    SEARCH_LIMIT,
     clearFilter,
     sortKey,
     sortDir,
+    setSort,
     compact,
     paletteOpen,
   } from './stores/view';
+  import type { SortKey } from './stores/view';
   import TreeView from './components/TreeView.svelte';
   import Detail from './components/Detail.svelte';
   import FileBrowser from './components/FileBrowser.svelte';
@@ -50,6 +55,10 @@
   let builderOpen = false;
 
   onMount(ensureTree);
+
+  function onSortChange(e: Event) {
+    setSort((e.currentTarget as HTMLSelectElement).value as SortKey);
+  }
 
   function crumb(s: Screen): string {
     switch (s.kind) {
@@ -319,7 +328,10 @@
           placeholder="fuzzy filter tensors…"
           bind:value={$search}
         />
-        <span class="dim">{$visibleRows.length} matches · Esc to exit</span>
+        <span class="dim">
+          {#if $searchTotal > $visibleRows.length}showing {$visibleRows.length} of {$searchTotal.toLocaleString()}{:else}{$visibleRows.length} match{$visibleRows.length === 1 ? '' : 'es'}{/if}
+          · Esc to exit
+        </span>
       </span>
     {/if}
     <select class="theme" bind:value={$theme} title="Color theme" aria-label="Color theme">
@@ -333,7 +345,7 @@
   {#if $screen.kind === 'tree'}
   <!-- The filter bar acts on the tensor tree, so it only shows on the tree screen
        (nothing to filter on detail / stats / health / layout / files). -->
-  <div class="filterbar" class:err={$filterError}>
+  <div class="filterbar" class:err={$filterError && !$filterPending}>
     <button
       class="bld"
       class:on={builderOpen}
@@ -358,15 +370,17 @@
       bind:value={$filterQuery}
       on:keydown={filterKeydown}
     />
-    {#if $filterError}
+    {#if $filterPending}
+      <span class="dim">filtering…</span>
+    {:else if $filterError}
       <span class="ferr" title={$filterError}>⚠ {$filterError}</span>
     {:else if $filterMatches}
-      <span class="dim">{$visibleRows.length} match{$visibleRows.length === 1 ? '' : 'es'}</span>
+      <span class="dim">{$visibleRows.length.toLocaleString()} match{$visibleRows.length === 1 ? '' : 'es'}</span>
     {/if}
     {#if $filterMatches !== null || $searching}
       <span class="sort" title="Sort the tensor list">
         sort
-        <select bind:value={$sortKey} aria-label="Sort by">
+        <select value={$sortKey} on:change={onSortChange} aria-label="Sort by">
           <option value="none">—</option>
           <option value="name">name</option>
           <option value="size">size</option>

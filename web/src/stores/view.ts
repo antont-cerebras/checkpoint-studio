@@ -6,7 +6,7 @@
 import { derived, get, writable } from 'svelte/store';
 import { api } from '../lib/api';
 import { flatten, nodeId, type Row } from '../lib/flatten';
-import { searchRows } from '../lib/search';
+import { SEARCH_LIMIT, searchMatchCount, searchRows } from '../lib/search';
 import type { TreeNode } from '../lib/types';
 import { tree as treeData } from './server';
 
@@ -109,33 +109,43 @@ export const search = writable<string>('');
 /** The tensor filter as a text query (the `tensorfilter` grammar), matched
  * server-side by the one shared matcher — so web and TUI filter identically.
  * `filterMatches` is the set of matching tensor names (null = inactive → show
- * all); `filterError` holds a parse error to show inline. */
+ * all); `filterError` holds a parse error to show inline; `filterPending` is true
+ * from the moment a query is edited until its result (or error) lands, so the UI
+ * can show "filtering…" instead of the *previous* query's count. */
 export const filterQuery = writable<string>('');
 export const filterMatches = writable<Set<string> | null>(null);
 export const filterError = writable<string | null>(null);
+export const filterPending = writable<boolean>(false);
 
 // Debounced fetch: whenever the query changes, ask the server which tensors pass.
-// A sequence guard drops stale responses so fast typing can't desync the view.
+// `filterReq` is bumped on every edit (not just when the timer fires), so an
+// in-flight response for a superseded query — even one still in the debounce
+// window — is dropped and can't desync the count/rows.
 let filterTimer: ReturnType<typeof setTimeout> | undefined;
-let filterSeq = 0;
+let filterReq = 0;
 filterQuery.subscribe((q) => {
   clearTimeout(filterTimer);
   const query = q.trim();
+  const req = ++filterReq;
   if (!query) {
     filterMatches.set(null);
     filterError.set(null);
+    filterPending.set(false);
     return;
   }
+  filterPending.set(true); // mark pending immediately, before the debounce
   filterTimer = setTimeout(async () => {
-    const seq = ++filterSeq;
     try {
       const res = await api.filter(query);
-      if (seq !== filterSeq) return; // superseded by a newer query
+      if (req !== filterReq) return; // superseded by a newer edit
       filterMatches.set(res.active ? new Set(res.names ?? []) : null);
       filterError.set(null);
     } catch (e) {
-      if (seq !== filterSeq) return;
+      if (req !== filterReq) return;
       filterError.set(e instanceof Error ? e.message : String(e));
+      filterMatches.set(null); // don't leave the prior result behind the error
+    } finally {
+      if (req === filterReq) filterPending.set(false);
     }
   }, 200);
 });
@@ -149,6 +159,15 @@ export const paletteOpen = writable<boolean>(false);
 export type SortKey = 'none' | 'name' | 'size' | 'params' | 'dtype' | 'rank';
 export const sortKey = writable<SortKey>('none');
 export const sortDir = writable<'asc' | 'desc'>('asc');
+
+/** Pick a sort facet, defaulting its direction sensibly: size / params read
+ * biggest-first (what you want when eyeballing "the heavy tensors"), the rest
+ * ascending. Still toggleable afterwards via the direction button. Restoring a
+ * shared link sets the stores directly and bypasses this default. */
+export function setSort(k: SortKey): void {
+  sortKey.set(k);
+  sortDir.set(k === 'size' || k === 'params' ? 'desc' : 'asc');
+}
 
 /** Compact per-family view toggle (the `≡` button) — a view mode, so it's in the URL. */
 export const compact = writable<boolean>(false);
@@ -168,6 +187,14 @@ export const visibleRows = derived(
     else return flatten($t.tree, $exp); // hierarchical view is never reordered
     return $sk === 'none' ? rows : sortRows(rows, $sk, $sd);
   },
+);
+
+/** Total tensors matching the current fuzzy search, untruncated — so the search
+ * label can be honest when the row list is capped ("showing 1000 of N"). Only
+ * the fuzzy path is capped; the server-side filter returns every match. */
+export { SEARCH_LIMIT };
+export const searchTotal = derived([treeData, search, searching], ([$t, $q, $searching]) =>
+  $t && $searching && $q.trim() ? searchMatchCount($t.tree, $q.trim()) : 0,
 );
 
 /** Sort a flat tensor-row list by a facet, ascending or descending. */
