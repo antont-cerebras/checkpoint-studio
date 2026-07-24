@@ -81,6 +81,9 @@ cargo install --git https://github.com/antont-cerebras/checkpoint-studio
 
 ### Prerequisites
 - Rust 1.88 or later (the crate uses edition 2024 and let-chains)
+- **Node 20+ only if you change the web UI** (`web/`). Building or installing
+  `checkpoint-studio` itself needs no Node at all — `web/dist` is committed and
+  embedded at compile time. See [Rebuilding the UI](#web-ui-web).
 
 ### Build from source
 ```bash
@@ -180,10 +183,22 @@ and whole-tensor statistics that scan tensor bytes only when you open them. Loca
 checkpoints only for now. The UI is a Svelte single-page app **embedded in the
 binary**, so a released `checkpoint-studio` needs nothing extra to serve it.
 
-Rebuilding the UI (only needed when changing `web/`): `cd web && npm ci && npm run
-build` regenerates `web/dist`, which is committed and embedded at compile time. In
-development, `npm run dev` runs Vite with hot-reload and proxies `/api` to a
-running `web` instance.
+**Rebuilding the UI** — only needed when changing `web/`. Requires **Node 20**
+(pinned in `web/.nvmrc` / `web/.node-version`; `engine-strict` makes npm enforce it,
+and the `pre*` scripts refuse to run on an older Node):
+```bash
+cd web
+nvm use          # or: fnm use
+npm ci
+npm run check    # svelte-check (types)
+npm run lint     # eslint — type-aware, incl. Svelte templates
+npm run build    # regenerates web/dist
+```
+`web/dist` is **committed** and embedded at compile time, and CI rebuilds it on the
+`.nvmrc` Node and fails if the result differs — so commit the regenerated `dist`
+alongside your `web/src` change, built on Node 20. (Why 20: Node 16 is EOL and ESLint
+10 won't run on it.) For development, `npm run dev` runs Vite with hot-reload and
+proxies `/api` to a running `web` instance.
 
 ### Remote checkpoints over SSH (`--ssh-proxy`)
 Browse a checkpoint that lives only on a remote host — either behind credentials

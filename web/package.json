@@ -12,7 +12,10 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "prebuild": "node scripts/require-node.mjs",
+    "prelint": "node scripts/require-node.mjs",
+    "precheck": "node scripts/require-node.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

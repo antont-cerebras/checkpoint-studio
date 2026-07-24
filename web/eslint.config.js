@@ -13,7 +13,9 @@ import svelte from 'eslint-plugin-svelte';
 import globals from 'globals';
 
 export default ts.config(
-  { ignores: ['dist/', 'node_modules/', '*.config.js', '*.config.ts'] },
+  // Build output, deps, and tooling that isn't part of the typed app project
+  // (`scripts/` is plain Node ESM run by npm, not compiled by tsconfig).
+  { ignores: ['dist/', 'node_modules/', 'scripts/', '*.config.js', '*.config.ts'] },
   js.configs.recommended,
   ...ts.configs.recommendedTypeChecked,
   ...svelte.configs['flat/recommended'],
