@@ -1,4 +1,4 @@
-name: Rust CI
+name: CI
 
 # Run on every push and pull request
 on:
@@ -7,14 +7,15 @@ on:
   pull_request:
 
 jobs:
-  build:
-    # Use the latest Ubuntu runner
+  # ---------------------------------------------------------------- Rust ------
+  rust:
+    name: Rust (fmt, clippy, build, test)
     runs-on: ubuntu-latest
 
     steps:
       # Check out repository code
       - name: Checkout source
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       # Install the Rust toolchain (stable) and common components
       - name: Install toolchain
@@ -60,3 +61,88 @@ jobs:
           # the local test gate (the binary does the same at startup).
           HDF5_USE_FILE_LOCKING: "FALSE"
         run: cargo test --workspace --all-features --verbose
+
+  # ---------------------------------------------------------------- Web -------
+  # The Svelte UI is embedded into the binary from the COMMITTED `web/dist`, so it
+  # can break in two ways CI previously couldn't see: a type/compile error, or a
+  # `dist` that no longer matches `src` (a source change that was never rebuilt —
+  # which ships a silently stale UI).
+  web:
+    name: Web (svelte-check, build, dist freshness)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # Match `web/.nvmrc` (and the toolchain the committed dist was built with):
+      # the freshness check below compares build output byte-for-byte, so the Node
+      # major must be the same one developers use.
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: web/.nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # `npm ci` (not `install`) so the committed lockfile is authoritative.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck (svelte-check)
+        run: npm run check
+
+      - name: Build
+        run: npm run build
+
+      # Fail if rebuilding changed anything: it means the committed `dist` was not
+      # regenerated after a `src` change, so the embedded UI is stale.
+      - name: Verify the committed dist is up to date
+        run: |
+          if ! git diff --exit-code --stat -- dist; then
+            echo "::error::web/dist is stale — run 'cd web && npm ci && npm run build' and commit the result."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------- Python ----
+  # The remote reader/compare scripts run on the ssh proxy against S3/cstorch, so a
+  # typo there fails in front of a user minutes into a job rather than at build
+  # time. Lint and type-check them like first-class source.
+  python:
+    name: Python (ruff, pyright)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # 3.9 is the floor we target (see pyproject.toml): the proxy's cstorch venv
+      # interpreter is not ours to choose, so check against the oldest we support
+      # rather than the newest available.
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install tools
+        run: pip install ruff pyright
+
+      # Config for both lives in pyproject.toml.
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Typecheck (pyright)
+        run: pyright
+
+      # Cheap syntax gate on the interpreter version we claim to support.
+      - name: Byte-compile the remote scripts
+        run: python -m compileall -q crates/core/src/python
+
+      # NOTE: `ruff format --check` is deliberately not a gate yet. These scripts are
+      # hand-formatted for density (they cross an ssh link as one payload) and have
+      # never been through a formatter; enable it after a one-time `ruff format` pass
+      # so the first run doesn't fail on pre-existing style.

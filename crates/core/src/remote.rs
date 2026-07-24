@@ -835,6 +835,19 @@ fn compare_status(v: &serde_json::Value) -> CompareStatus {
     }
 }
 
+/// Embed a script's parameters as JSON into its single `__PARAMS__` slot.
+///
+/// The scripts live as real `.py` files under `src/python/` — so ruff and pyright
+/// check them like any other source — and take every parameter through this one
+/// placeholder rather than a dozen textual substitutions. JSON-escaping the params
+/// *text* yields a body that is valid inside the `"…"` the Python file already has,
+/// so a URI or tensor name containing a quote or backslash cannot break the script.
+fn with_params(template: &str, params: &serde_json::Value) -> String {
+    let json = params.to_string();
+    let lit = serde_json::to_string(&json).unwrap_or_else(|_| "\"{}\"".into());
+    template.replace("__PARAMS__", &lit[1..lit.len() - 1])
+}
+
 /// The cstorch dump script for an `s3://…` checkpoint: `cstorch.load` (lazy — no
 /// tensor data) and emit each tensor's name/dtype/shape/itemsize as a
 /// sentinel-tagged JSON line. The URI is embedded as a JSON string literal (valid
@@ -845,141 +858,15 @@ fn compare_status(v: &serde_json::Value) -> CompareStatus {
 /// stdout — it never opens a file for writing, calls `cstorch.save`/`torch.save`,
 /// or otherwise mutates the checkpoint. The remote checkpoint is never modified.
 fn dump_script(src: &str, want_s3: bool) -> String {
-    let src_lit = serde_json::to_string(src).unwrap_or_else(|_| "\"\"".into());
-    const TEMPLATE: &str = r#"
-import sys, json
-SRC = __URI__
-WANT_S3 = __WANT_S3__
-S = "__SENTINEL__"
-P = "__PROGRESS__"
-def emit(obj):
-    sys.stdout.write(S + json.dumps(obj) + "\n")
-    sys.stdout.flush()
-def prog(done, total, unit=None):
-    tail = ("/" + unit) if unit else ""
-    sys.stdout.write("%s%d/%d%s\n" % (P, done, total, tail))
-    sys.stdout.flush()
-def probe_s3(src):
-    # Best-effort, LIST-ONLY diagnosis of a load failure: enumerate the objects
-    # under the prefix and report how many are empty (0 bytes) plus whether the
-    # cstorch metadata object itself is empty, so the caller can explain *why*
-    # cstorch.load failed (empty checkpoint / missing metadata / wrong prefix)
-    # instead of surfacing only the raw dill traceback. Read-only; never mutates.
-    if not src.startswith("s3://"):
-        return {}
-    try:
-        import boto3
-        from urllib.parse import urlparse
-        u = urlparse(src)
-        bucket, prefix = u.netloc, u.path.lstrip("/")
-        cli = boto3.client("s3")
-        total = empty = nbytes = 0
-        meta_key = None; meta_empty = False; sample = []; tok = None
-        while True:
-            kw = {"Bucket": bucket, "Prefix": prefix}
-            if tok: kw["ContinuationToken"] = tok
-            resp = cli.list_objects_v2(**kw)
-            for it in resp.get("Contents", []):
-                k = it["Key"]; sz = int(it.get("Size", 0))
-                rel = k[len(prefix):].lstrip("/") if k.startswith(prefix) else k
-                if not rel:
-                    continue
-                total += 1; nbytes += sz
-                if sz == 0: empty += 1
-                if rel.rsplit("/", 1)[-1] == "__METADATA__":
-                    meta_key = rel; meta_empty = (sz == 0)
-                if len(sample) < 12: sample.append([rel, sz])
-            if resp.get("IsTruncated"): tok = resp.get("NextContinuationToken")
-            else: break
-        return {"s3_probe": {"prefix": prefix, "total": total, "empty": empty,
-                             "bytes": nbytes, "metadata_key": meta_key,
-                             "metadata_empty": meta_empty, "sample": sample}}
-    except Exception as e:
-        return {"s3_probe_error": "%r" % (e,)}
-try:
-    import cerebras.pytorch as cstorch
-except Exception as e:
-    emit({"error": "import cerebras.pytorch failed: %r" % (e,)}); sys.exit(0)
-try:
-    sd = cstorch.load(SRC, map_location=None)   # lazy: metadata only, no data
-except Exception as e:
-    emit(dict({"error": "cstorch.load failed: %r" % (e,)}, **probe_s3(SRC))); sys.exit(0)
-keys = list(sd.keys())
-total = len(keys)
-prog(0, total)                                  # total known → bar goes determinate
-step = max(1, total // 100)                     # ~100 updates, not one per tensor
-tensors = []
-for i, name in enumerate(keys):
-    try:
-        t = sd[name]
-        it = int(t.element_size()) if hasattr(t, "element_size") else 0
-        tensors.append({"name": str(name), "dtype": str(getattr(t, "dtype", "")), "shape": [int(d) for d in t.shape], "itemsize": it})
-    except Exception:
-        pass
-    if (i + 1) % step == 0 or i + 1 == total:
-        prog(i + 1, total)
-# S3 object metadata (best-effort, read-only): list the objects under the prefix
-# and HEAD each for size/etag/checksum/last-modified/user-metadata; tags need a
-# separate (often ungranted) permission, so they're tried per object and a single
-# warning is emitted if denied. Any failure degrades to fewer objects + a warning.
-s3_objects = []
-s3_warnings = []
-if WANT_S3:
-    try:
-        import boto3
-        from urllib.parse import urlparse
-        u = urlparse(SRC)
-        bucket, prefix = u.netloc, u.path.lstrip("/")
-        cli = boto3.client("s3")
-        keys, tok = [], None
-        while True:
-            kw = {"Bucket": bucket, "Prefix": prefix}
-            if tok: kw["ContinuationToken"] = tok
-            resp = cli.list_objects_v2(**kw)
-            keys.extend(it["Key"] for it in resp.get("Contents", []))
-            if resp.get("IsTruncated"): tok = resp.get("NextContinuationToken")
-            else: break
-        # Second progress phase: HEADing each object is the slow part, so drive the
-        # bar off it (relabelled "S3 objects") instead of sitting at 100% tensors.
-        nkeys = len(keys)
-        s3_step = max(1, nkeys // 100)
-        prog(0, nkeys, "s3")
-        tags_denied = False
-        for i, k in enumerate(keys):
-            if i % s3_step == 0:
-                prog(i, nkeys, "s3")
-            try:
-                h = cli.head_object(Bucket=bucket, Key=k, ChecksumMode="ENABLED")
-            except Exception as e:
-                s3_warnings.append("head_object failed for %s: %r" % (k, e)); continue
-            rel = k[len(prefix):].lstrip("/") if k.startswith(prefix) else k
-            lm = h.get("LastModified")
-            obj = {"key": rel, "size": int(h.get("ContentLength", 0)),
-                   "etag": str(h.get("ETag", "")).strip('"'),
-                   "last_modified": lm.isoformat() if lm else "",
-                   "metadata": {mk: str(mv) for mk, mv in (h.get("Metadata") or {}).items()}}
-            for algo in ("CRC32", "CRC32C", "SHA1", "SHA256"):
-                cv = h.get("Checksum" + algo)
-                if cv:
-                    obj["checksum"] = [algo.lower(), str(cv)]; break
-            try:
-                tg = cli.get_object_tagging(Bucket=bucket, Key=k)
-                obj["tags"] = {t["Key"]: t["Value"] for t in tg.get("TagSet", [])}
-            except Exception as e:
-                if not tags_denied:
-                    s3_warnings.append("tags unavailable (needs s3:GetObjectTagging): %r" % (e,))
-                    tags_denied = True
-            s3_objects.append(obj)
-        prog(nkeys, nkeys, "s3")
-    except Exception as e:
-        s3_warnings.append("s3 metadata unavailable: %r" % (e,))
-emit({"tensors": tensors, "metadata": [], "s3_objects": s3_objects, "s3_warnings": s3_warnings})
-"#;
-    TEMPLATE
-        .replace("__URI__", &src_lit)
-        .replace("__WANT_S3__", if want_s3 { "True" } else { "False" })
-        .replace("__SENTINEL__", SENTINEL)
-        .replace("__PROGRESS__", PROGRESS_TAG)
+    with_params(
+        include_str!("python/dump.py"),
+        &serde_json::json!({
+            "uri": src,
+            "want_s3": want_s3,
+            "sentinel": SENTINEL,
+            "progress": PROGRESS_TAG,
+        }),
+    )
 }
 
 /// The value-comparison script for two `s3://` cstorch checkpoints: load both,
@@ -1004,233 +891,21 @@ fn value_diff_script(
     pairs: &[(String, String)],
     opts: &RemoteValueOpts,
 ) -> String {
-    let old_lit = serde_json::to_string(old_uri).unwrap_or_else(|_| "\"\"".into());
-    let new_lit = serde_json::to_string(new_uri).unwrap_or_else(|_| "\"\"".into());
-    let pairs_lit = serde_json::to_string(pairs).unwrap_or_else(|_| "[]".into());
-    let bins_lit = opts
-        .bins
-        .map(|b| b.to_string())
-        .unwrap_or_else(|| "None".into());
-    let b = |x: bool| if x { "True" } else { "False" };
-    let jobs_lit = opts.jobs.max(1).to_string();
-    const TEMPLATE: &str = r#"
-import sys, json, time, threading
-from concurrent.futures import ThreadPoolExecutor
-OLD = __OLD__
-NEW = __NEW__
-PAIRS = __PAIRS__
-WANT_VALUES = __WANT_VALUES__
-WANT_HIST = __WANT_HIST__
-FULL_HIST = __FULL_HIST__
-BINS = __BINS__
-JOBS = __JOBS__
-CHUNK = 4000000
-DL = 16 << 20        # S3 download chunk
-EMIT = 64 << 20      # byte-progress emit granularity
-S = "__SENTINEL__"
-ST = "__STATUS__"
-_lock = threading.Lock()
-def emit(o):
-    with _lock:
-        sys.stdout.write(S + json.dumps(o) + "\n"); sys.stdout.flush()
-def stat(s):
-    with _lock:
-        sys.stdout.write(ST + s + "\n"); sys.stdout.flush()
-try:
-    import cerebras.pytorch as cstorch
-except Exception as e:
-    emit({"error": "import cerebras.pytorch failed: %r" % (e,)}); sys.exit(0)
-try:
-    import numpy as np
-    import torch
-    import zstandard
-except Exception as e:
-    emit({"error": "import numpy/torch/zstandard failed (needed to compare values): %r" % (e,)}); sys.exit(0)
-try:
-    stat("load\told")
-    old_sd = cstorch.load(OLD, map_location=None)
-    stat("load\tnew")
-    new_sd = cstorch.load(NEW, map_location=None)
-except Exception as e:
-    emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
-def to_f64(rt, i, j):
-    sl = rt if i is None else rt[i:j]
-    return sl.to(torch.float64).numpy().reshape(-1)
-# Map a numpy dtype name (from an object's __NUMPY__ metadata) to a torch dtype, so
-# we can stream the S3 object ourselves (chunked, with progress) rather than letting
-# cstorch materialise it in one shot with no progress. Comparison stays on the proxy.
-NP2T = {}
-for _n in ("float16","float32","float64","bfloat16","uint8","int8","int16","uint16","int32","uint32","int64","uint64","bool"):
-    _t = getattr(torch, _n, None)
-    if _t is not None: NP2T[_n] = _t
-def prep(dt):
-    do = getattr(dt, "deferred", None)
-    if do is None: return None
-    r = do._reader
-    key = "%s/%s" % (r.key, do._key)
-    try:
-        head = r.s3_client.head_object(Bucket=r.bucket, Key=key)
-        md = head.get("Metadata") or {}
-        meta = json.loads(md.get("metadata") or md.get("Metadata") or "{}")
-    except Exception:
-        return None
-    nm = meta.get("__NUMPY__")
-    td = NP2T.get(nm.get("dtype")) if nm else None
-    if td is None: return None
-    return (r.s3_client, r.bucket, key, int(head.get("ContentLength", 0)), bool(meta.get("compressed")), td, [int(x) for x in nm["shape"]])
-def stream_raw(p, on):
-    # Just the network read (with byte progress). Decompression + reshape is deferred
-    # (see decode_tensor) so the bar reaches 100% before the slow decode, not during it.
-    client, bucket, key, total, comp, td, shape = p
-    body = client.get_object(Bucket=bucket, Key=key)["Body"]
-    buf = bytearray()
-    while True:
-        c = body.read(DL)
-        if not c: break
-        buf += c; on(len(buf))
-    return buf
-def decode_tensor(buf, p):
-    client, bucket, key, total, comp, td, shape = p
-    raw = zstandard.decompress(bytes(buf)) if comp else buf
-    return torch.frombuffer(bytearray(raw), dtype=td).reshape(shape)
-total = len(PAIRS)
-t0 = time.time()
-read_bytes = 0
-compared = 0
-def work(idx):
-    oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
-    stat("start\t%d\t%d\t%s" % (idx + 1, total, nname))
-    res = {"name": nname}
-    tb = 0
-    try:
-        a = old_sd[oname]; b = new_sd[nname]
-        ashape = [int(d) for d in a.shape]; bshape = [int(d) for d in b.shape]
-        if ashape != bshape:
-            res["error"] = "shapes differ"; emit(res); return 0
-        # Stream each side's S3 object on the proxy (chunked, with byte progress); the
-        # per-chunk float64 conversions below work off the in-memory copy. Values are
-        # compared here — only progress + the small result cross ssh. Fall back to
-        # cstorch materialise (no byte progress) for a non-numpy-stored tensor.
-        pa = prep(a); pb = prep(b)
-        streamed = None   # (raw_a, raw_b) when read over the network
-        if pa is not None and pb is not None:
-            osz = pa[3]; nsz = pb[3]
-            stat("size\t%s\t%d\t%d" % (nname, osz, nsz))
-            od = [0]; nd = [0]; last = [0]
-            def bump():
-                s = od[0] + nd[0]
-                if s - last[0] >= EMIT:
-                    last[0] = s; stat("bytes\t%s\t%d\t%d" % (nname, od[0], nd[0]))
-            rawa = stream_raw(pa, lambda n: (od.__setitem__(0, n), bump()))
-            rawb = stream_raw(pb, lambda n: (nd.__setitem__(0, n), bump()))
-            stat("bytes\t%s\t%d\t%d" % (nname, osz, nsz))
-            streamed = (rawa, rawb)
-            tb = osz + nsz
-        else:
-            ra = a.to("cpu"); rb = b.to("cpu")
-            tb = ra.element_size() * ra.nelement() + rb.element_size() * rb.nelement()
-            stat("size\t%s\t%d\t%d" % (nname, int(ra.element_size() * ra.nelement()), int(rb.element_size() * rb.nelement())))
-        # Bytes are all read (bar at 100%); decompress + decode below is the slow part,
-        # so flag "comparing" now — not after it.
-        stat("phase\t%s\tcomparing" % (nname,))
-        if streamed is not None:
-            ra = decode_tensor(streamed[0], pa); rb = decode_tensor(streamed[1], pb)
-        res["bytes"] = int(tb)
-        scalar = (len(ashape) == 0)
-        d0 = 0 if scalar else ashape[0]
-        inner = 1
-        for d in ashape[1:]: inner *= d
-        rows = max(1, CHUNK // max(1, inner))
-        spans = [(None, None)] if scalar else [(i, min(i + rows, d0)) for i in range(0, d0, rows)]
-        if not spans: spans = [(None, None)]
-        elements = 0; differing = 0; nfm = 0; max_abs = 0.0; sum_abs = 0.0
-        omin = omax = nmin = nmax = None
-        for (i, j) in spans:
-            av = to_f64(ra, i, j); bv = to_f64(rb, i, j)
-            if WANT_VALUES:
-                both_nan = np.isnan(av) & np.isnan(bv)
-                dmask = ~((av == bv) | both_nan)
-                elements += int(av.size)
-                differing += int(np.count_nonzero(dmask))
-                bothfin = np.isfinite(av) & np.isfinite(bv)
-                fdm = dmask & bothfin
-                if bool(np.any(fdm)):
-                    dd = np.abs(av[fdm] - bv[fdm])
-                    m = float(dd.max())
-                    if m > max_abs: max_abs = m
-                    sum_abs += float(dd.sum())
-                nfm += int(np.count_nonzero(dmask & ~bothfin))
-            if WANT_HIST:
-                af = av[np.isfinite(av)]; bf = bv[np.isfinite(bv)]
-                if af.size:
-                    lo = float(af.min()); hi = float(af.max())
-                    omin = lo if omin is None else min(omin, lo)
-                    omax = hi if omax is None else max(omax, hi)
-                if bf.size:
-                    lo = float(bf.min()); hi = float(bf.max())
-                    nmin = lo if nmin is None else min(nmin, lo)
-                    nmax = hi if nmax is None else max(nmax, hi)
-        if WANT_VALUES:
-            mean_abs = (sum_abs / elements) if elements > 0 else 0.0
-            res["values"] = {"elements": elements, "differing": differing, "max_abs": max_abs, "mean_abs": mean_abs, "nonfinite_mismatch": nfm}
-        if WANT_HIST:
-            mins = [x for x in (omin, nmin) if x is not None]
-            maxs = [x for x in (omax, nmax) if x is not None]
-            n = BINS if BINS else 40
-            lo_c = min(mins) if mins else 0.0
-            hi_c = max(maxs) if maxs else 0.0
-            if hi_c <= lo_c: n = 1
-            oc = np.zeros(n, dtype=np.int64); nc = np.zeros(n, dtype=np.int64)
-            onf = 0; nnf = 0
-            for (i, j) in spans:
-                av = to_f64(ra, i, j); bv = to_f64(rb, i, j)
-                afin = np.isfinite(av); bfin = np.isfinite(bv)
-                onf += int(av.size) - int(np.count_nonzero(afin))
-                nnf += int(bv.size) - int(np.count_nonzero(bfin))
-                af = av[afin]; bf = bv[bfin]
-                if hi_c <= lo_c:
-                    oc[0] += int(af.size); nc[0] += int(bf.size)
-                else:
-                    hc, _ = np.histogram(af, bins=n, range=(lo_c, hi_c)); oc += hc.astype(np.int64)
-                    hc, _ = np.histogram(bf, bins=n, range=(lo_c, hi_c)); nc += hc.astype(np.int64)
-            ot = int(oc.sum()); nt = int(nc.sum())
-            if ot == 0 and nt == 0: tvd = 0.0
-            elif ot == 0 or nt == 0: tvd = 1.0
-            else: tvd = 0.5 * float(np.abs(oc.astype(np.float64) / ot - nc.astype(np.float64) / nt).sum())
-            h = {"tvd": tvd, "n": int(n)}
-            if FULL_HIST:
-                h["lo"] = lo_c; h["hi"] = hi_c
-                h["old"] = [int(x) for x in oc.tolist()]; h["new"] = [int(x) for x in nc.tolist()]
-                h["old_total"] = ot; h["new_total"] = nt; h["old_nonfinite"] = onf; h["new_nonfinite"] = nnf
-            res["histogram"] = h
-    except Exception as e:
-        res["error"] = "%r" % (e,)
-    emit(res)
-    return tb
-# Reading each tensor's S3 object is latency-bound, so overlap JOBS of them; results
-# are order-independent. JOBS<=1 stays sequential (the safe fallback). Byte + count
-# tallies happen in this main thread as results land, so no locking is needed there.
-if JOBS <= 1:
-    tbs = (work(i) for i in range(total))
-else:
-    ex = ThreadPoolExecutor(max_workers=JOBS)
-    tbs = ex.map(work, range(total))
-for tb in tbs:
-    if tb > 0:
-        read_bytes += tb; compared += 1
-emit({"summary": {"tensors": total, "compared": compared, "bytes": int(read_bytes), "elapsed_s": time.time() - t0}})
-"#;
-    TEMPLATE
-        .replace("__OLD__", &old_lit)
-        .replace("__NEW__", &new_lit)
-        .replace("__PAIRS__", &pairs_lit)
-        .replace("__WANT_VALUES__", b(opts.values))
-        .replace("__WANT_HIST__", b(opts.histogram))
-        .replace("__FULL_HIST__", b(opts.full_hist))
-        .replace("__BINS__", &bins_lit)
-        .replace("__JOBS__", &jobs_lit)
-        .replace("__SENTINEL__", SENTINEL)
-        .replace("__STATUS__", STATUS_TAG)
+    with_params(
+        include_str!("python/value_diff.py"),
+        &serde_json::json!({
+            "old": old_uri,
+            "new": new_uri,
+            "pairs": pairs,
+            "want_values": opts.values,
+            "want_hist": opts.histogram,
+            "full_hist": opts.full_hist,
+            "bins": opts.bins,
+            "jobs": opts.jobs.max(1),
+            "sentinel": SENTINEL,
+            "status": STATUS_TAG,
+        }),
+    )
 }
 
 /// The repack-equivalence script for two `s3://` cstorch checkpoints: for each
@@ -1250,324 +925,19 @@ fn repack_verify_script(
     bits: usize,
     auto_sparse: bool,
 ) -> String {
-    let old_lit = serde_json::to_string(old_uri).unwrap_or_else(|_| "\"\"".into());
-    let new_lit = serde_json::to_string(new_uri).unwrap_or_else(|_| "\"\"".into());
-    let pairs_lit = serde_json::to_string(pairs).unwrap_or_else(|_| "[]".into());
-    let bits_lit = bits.max(1).to_string();
-    let jobs_lit = pairs.len().clamp(1, 4).to_string();
-    let auto_lit = if auto_sparse { "True" } else { "False" };
-    const TEMPLATE: &str = r#"
-import sys, json, time, threading
-from concurrent.futures import ThreadPoolExecutor
-OLD = __OLD__
-NEW = __NEW__
-PAIRS = __PAIRS__
-BITS = __BITS__
-JOBS = __JOBS__
-AUTO = __AUTO__      # sparse<->sparse auto (--values): same shape both sides, fold 1
-DL = 16 << 20        # S3 download chunk
-CMP = 4000000        # compare column block
-EMIT = 64 << 20      # byte-progress emit granularity
-S = "__SENTINEL__"
-ST = "__STATUS__"
-_lock = threading.Lock()
-def emit(o):
-    with _lock:
-        sys.stdout.write(S + json.dumps(o) + "\n"); sys.stdout.flush()
-def stat(s):
-    with _lock:
-        sys.stdout.write(ST + s + "\n"); sys.stdout.flush()
-try:
-    import cerebras.pytorch as cstorch
-except Exception as e:
-    emit({"error": "import cerebras.pytorch failed: %r" % (e,)}); sys.exit(0)
-try:
-    import numpy as np
-    import torch
-    import zstandard
-except Exception as e:
-    emit({"error": "import numpy/torch/zstandard failed: %r" % (e,)}); sys.exit(0)
-try:
-    stat("load\told")
-    old_sd = cstorch.load(OLD, map_location=None)
-    stat("load\tnew")
-    new_sd = cstorch.load(NEW, map_location=None)
-except Exception as e:
-    emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
-mask = np.uint16((1 << BITS) - 1)
-# Resolve a lazy tensor to its backing S3 object (thread-safe client + key) so we
-# can stream it ourselves with progress, rather than cstorch's one-shot read.
-def resolve(dt):
-    do = getattr(dt, "deferred", None)
-    if do is None:
-        return None
-    r = do._reader
-    return (r.s3_client, r.bucket, "%s/%s" % (r.key, do._key))
-def head(loc):
-    client, bucket, key = loc
-    h = client.head_object(Bucket=bucket, Key=key)
-    md = h.get("Metadata") or {}
-    try:
-        meta = json.loads(md.get("metadata") or md.get("Metadata") or "{}")
-    except Exception:
-        meta = {}
-    return int(h.get("ContentLength", 0)), bool(meta.get("compressed")), ("__NUMPY__" in meta)
-def download_raw(loc, on):
-    # Just the network read (with byte progress). Decompression is deferred so the
-    # bar reaches 100% before the slow decode, not during it.
-    client, bucket, key = loc
-    body = client.get_object(Bucket=bucket, Key=key)["Body"]
-    buf = bytearray()
-    while True:
-        c = body.read(DL)
-        if not c:
-            break
-        buf += c
-        on(len(buf))
-    return buf
-def decode_u16(buf, compressed):
-    if compressed:
-        return np.frombuffer(zstandard.decompress(bytes(buf)), dtype=np.uint16)
-    return np.frombuffer(buf, dtype=np.uint16)     # raw 16-bit words, zero-copy
-def to_u16(dt):   # fallback via cstorch (no byte progress)
-    return dt.to("cpu").contiguous().view(torch.int16).numpy().view(np.uint16)
-NPF = {"float16": np.float16, "float32": np.float32, "float64": np.float64}
-def aux_meta(loc):
-    # (compressed, numpy_dtype, shape, size) for a numpy-float-stored sibling, else None.
-    client, bucket, key = loc
-    h = client.head_object(Bucket=bucket, Key=key)
-    md = h.get("Metadata") or {}
-    try:
-        meta = json.loads(md.get("metadata") or md.get("Metadata") or "{}")
-    except Exception:
-        return None
-    nm = meta.get("__NUMPY__")
-    if not nm or nm.get("dtype") not in NPF:
-        return None
-    return (bool(meta.get("compressed")), NPF[nm["dtype"]], [int(x) for x in nm["shape"]], int(h.get("ContentLength", 0)))
-def stream_aux(sd, name, on_side):
-    # Read a sibling float tensor (codebook / scale) over S3 with byte progress → f64.
-    # Falls back to cstorch materialise (no progress) if it isn't numpy-float-stored.
-    dt = sd[name]
-    loc = resolve(dt)
-    am = aux_meta(loc) if loc is not None else None
-    if loc is None or am is None:
-        on_side(0)
-        return dt.to("cpu").to(torch.float64).numpy(), 0
-    comp, npdt, shape, size = am
-    buf = download_raw(loc, on_side)
-    raw = zstandard.decompress(bytes(buf)) if comp else buf
-    return np.frombuffer(raw, dtype=npdt).reshape(shape).astype(np.float64), size
-def aux_size(sd, name):
-    # (old_or_new) S3 byte size of a sibling float tensor, 0 if not resolvable — used
-    # to size its bar UP FRONT (before it streams), so it never shows an unsized bar.
-    if name not in sd:
-        return 0
-    loc = resolve(sd[name])
-    am = aux_meta(loc) if loc is not None else None
-    return am[3] if am else 0
-def cmp_aux(oname_a, nname_a, osz, nsz):
-    # Streams both sides over S3 into this sibling's own bar (keyed by the new name,
-    # already sized by the caller), records the NAMES tried, and — like the weight —
-    # flags a `comparing` phase before the compare and finishes the bar after it.
-    out = {"old_name": oname_a, "new_name": nname_a,
-           "old_present": oname_a in old_sd, "new_present": nname_a in new_sd}
-    if not out["old_present"] or not out["new_present"]:
-        return out
-    od = [0]; nd = [0]; last = [0]
-    def bump():
-        s = od[0] + nd[0]
-        if s - last[0] >= EMIT:
-            last[0] = s; stat("bytes\t%s\t%d\t%d" % (nname_a, od[0], nd[0]))
-    a, _ = stream_aux(old_sd, oname_a, lambda x: (od.__setitem__(0, x), bump()))
-    b, _ = stream_aux(new_sd, nname_a, lambda x: (nd.__setitem__(0, x), bump()))
-    stat("bytes\t%s\t%d\t%d" % (nname_a, osz, nsz))
-    stat("phase\t%s\tcomparing" % (nname_a,))   # decode + compare below
-    with agg_lock:
-        read_bytes[0] += osz + nsz
-    out["shape_old"] = [int(x) for x in a.shape]; out["shape_new"] = [int(x) for x in b.shape]
-    if list(a.shape) == list(b.shape):
-        d = np.abs(a - b)
-        out.update({"elements": int(a.size), "differing": int(np.count_nonzero(a != b)),
-                    "max_abs": float(d.max()) if d.size else 0.0, "mean_abs": float(d.mean()) if d.size else 0.0})
-    stat("done\t%s" % (nname_a,))   # finish this bar (✓) after the compare
-    return out
-total = len(PAIRS)
-t0 = time.time()
-agg_lock = threading.Lock()
-read_bytes = [0]
-compared = [0]
-def work(idx):
-    oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
-    stat("start\t%d\t%d\t%s" % (idx + 1, total, nname))
-    res = {"name": nname}
-    # Size the sibling codebook/qscale UP FRONT — before the weight even streams — so
-    # their bars show `0/size` immediately instead of an unsized sweep while the (big)
-    # weight downloads. Reused by cmp_aux below (no second HEAD).
-    aux_sz = {}   # new sibling name -> (old_size, new_size)
-    if oname.endswith(".weight") and nname.endswith(".weight"):
-        op = oname[:-7]; npx = nname[:-7]
-        for kind in ("codebook", "qscale"):
-            oa = op + "." + kind; na = npx + "." + kind
-            if oa in old_sd and na in new_sd:
-                osz = aux_size(old_sd, oa); nsz = aux_size(new_sd, na)
-                aux_sz[na] = (osz, nsz)
-                stat("size\t%s\t%d\t%d" % (na, osz, nsz))
-    try:
-        da = old_sd[oname]; db = new_sd[nname]
-        ashape = [int(x) for x in da.shape]; bshape = [int(x) for x in db.shape]
-        E = ashape[0] if ashape else 0
-        W = bshape[0] if bshape else 0
-        if AUTO:
-            # Sparse<->sparse: same shape both sides, one index per word (fold 1).
-            if not ashape or ashape != bshape:
-                res["error"] = "sparse compare needs equal shapes (%r vs %r)" % (ashape, bshape); emit(res); return
-            fold = 1
-        else:
-            if not ashape or not bshape or ashape[1:] != bshape[1:] or W <= 0 or E <= W:
-                res["error"] = "not a fold pair (shapes %r vs %r)" % (ashape, bshape); emit(res); return
-            fold = (E + W - 1) // W
-            if W != (E + fold - 1) // fold:
-                res["error"] = "fold mismatch (E=%d W=%d -> fold=%d)" % (E, W, fold); emit(res); return
-        if fold * BITS > 16:
-            res["error"] = "fold*bits=%d exceeds the 16-bit word" % (fold * BITS); emit(res); return
-        lo = resolve(da); ln = resolve(db)
-        odone = [0]; ndone = [0]; last = [0]
-        def bump():
-            s = odone[0] + ndone[0]
-            if s - last[0] >= EMIT:
-                last[0] = s
-                stat("bytes\t%s\t%d\t%d" % (nname, odone[0], ndone[0]))
-        streamed = None   # (raw_a, comp_a, raw_b, comp_b) when read over the network
-        if lo is not None and ln is not None:
-            osz, ocomp, onp = head(lo); nsz, ncomp, nnp = head(ln)
-            stat("size\t%s\t%d\t%d" % (nname, osz, nsz))
-            if onp and nnp:
-                def oon(n): odone[0] = n; bump()
-                def non(n): ndone[0] = n; bump()
-                ra = download_raw(lo, oon)
-                rb = download_raw(ln, non)
-                stat("bytes\t%s\t%d\t%d" % (nname, osz, nsz))
-                streamed = (ra, ocomp, rb, ncomp)
-                tb = osz + nsz
-            else:
-                ao = to_u16(da); bo = to_u16(db)   # not numpy-stored: no byte progress
-                tb = int(ao.nbytes) + int(bo.nbytes)
-        else:
-            ao = to_u16(da); bo = to_u16(db)
-            tb = int(ao.nbytes) + int(bo.nbytes)
-            stat("size\t%s\t%d\t%d" % (nname, int(ao.nbytes), int(bo.nbytes)))
-        # Bytes are all read (bar at 100%); the decompress + decode below is the slow
-        # part, so flag "comparing" now — not after it.
-        stat("phase\t%s\tcomparing" % (nname,))
-        if streamed is not None:
-            ao = decode_u16(streamed[0], streamed[1]); bo = decode_u16(streamed[2], streamed[3])
-        ao = ao.reshape(E, -1); bo = bo.reshape(W, -1)
-        N = ao.shape[1]
-        we = (np.arange(E) // fold)
-        se = ((np.arange(E) % fold) * BITS).astype(np.uint16)
-        # Format checks: old words' bits above BITS, new words' bits above fold*BITS,
-        # must all be zero (else the packing assumption is wrong). When fold*BITS==16
-        # (e.g. 4-bit ×4) there are no unused high bits — and shifting a uint16 by 16
-        # is undefined — so skip the dense check.
-        sparse_bad = int(np.count_nonzero(ao >> np.uint16(BITS)))
-        dshift = fold * BITS
-        dense_bad = 0 if dshift >= 16 else int(np.count_nonzero(bo >> np.uint16(dshift)))
-        differing = 0; first = None; maxdelta = 0; big = 0
-        sum_abs = 0; sum_old = 0; sum_new = 0; zeros = 0
-        blk = max(1, CMP // max(1, E))
-        for n0 in range(0, N, blk):
-            n1 = min(n0 + blk, N)
-            o = ao[:, n0:n1] & mask
-            nd = (bo[we, n0:n1] >> se[:, None]) & mask
-            # Aggregate |Δ| and per-side sums (for mean |Δ|/parameter + mean index).
-            dd = o.astype(np.int64) - nd.astype(np.int64)
-            ad = np.abs(dd)
-            sum_abs += int(ad.sum())
-            sum_old += int(o.sum(dtype=np.uint64))
-            sum_new += int(nd.sum(dtype=np.uint64))
-            zeros += int(np.count_nonzero(o == 0)) + int(np.count_nonzero(nd == 0))  # both sides
-            ne = o != nd
-            cnt = int(np.count_nonzero(ne))
-            differing += cnt
-            if cnt:
-                m = int(ad.max())
-                if m > maxdelta: maxdelta = m
-                big += int(np.count_nonzero(ad > 1))   # differ by more than ±1
-            if first is None and cnt:
-                p = np.argwhere(ne)[0]; e = int(p[0]); col = n0 + int(p[1])
-                first = [e, col, int(o[p[0], p[1]]), int(nd[p[0], p[1]])]
-        elems = E * N
-        res.update({"elements": elems, "differing": differing, "sparse_bad": sparse_bad, "dense_bad": dense_bad, "fold": fold, "bits": BITS, "bytes": tb, "maxdelta": maxdelta, "big": big,
-                    "sum_abs": int(sum_abs),
-                    "mean_abs": (sum_abs / elems) if elems else 0.0,
-                    "mean_old": (sum_old / elems) if elems else 0.0,
-                    "mean_new": (sum_new / elems) if elems else 0.0,
-                    "zero_frac": (zeros / (2.0 * elems)) if elems else 0.0})
-        # Auto (--values) fallback: the top-bits check failed, so these aren't packed
-        # indices — compare the raw words as stored floats instead (same bytes, viewed
-        # as float16), so a mis-detected tensor is still meaningfully diffed.
-        if AUTO and (sparse_bad > 0 or dense_bad > 0):
-            dts = str(db.dtype).replace("torch.", "")
-            # Compare in the real stored dtype: F16 words as floats, otherwise the
-            # raw 16-bit integers (dense-packed U16, etc.).
-            if dts == "float16":
-                fa = ao.view(np.float16).astype(np.float64); fb = bo.view(np.float16).astype(np.float64)
-            else:
-                fa = ao.astype(np.float64); fb = bo.astype(np.float64)
-            fd = np.abs(fa - fb)
-            fin = np.isfinite(fd)   # F16 bits can be NaN/Inf → JSON-unsafe; mask them
-            label = {"float16": "F16", "bfloat16": "BF16", "uint16": "U16", "int16": "I16"}.get(dts, dts.upper())
-            res["fallback"] = {"dtype": label,
-                               "elements": int(ao.size),
-                               # Exact bit inequality (NaN-safe; identical bits ⇒ 0).
-                               "differing": int(np.count_nonzero(ao != bo)),
-                               "max_abs": float(fd[fin].max()) if bool(fin.any()) else 0.0,
-                               "mean_abs": float(fd[fin].mean()) if bool(fin.any()) else 0.0}
-        if first is not None:
-            res["first"] = first
-        # A decoded window (experts × inner-offset), centred on the first mismatch
-        # (or the top-left corner), so the caller can SHOW old vs new and see
-        # where/how they diverge.
-        se0 = max(0, first[0] - 6) if first else 0
-        so0 = max(0, first[1] - 16) if first else 0
-        se1 = min(E, se0 + 16); so1 = min(N, so0 + 48)
-        ew = np.arange(se0, se1)
-        sold = (ao[se0:se1, so0:so1] & mask).astype(np.uint16).tolist()
-        snew = ((bo[ew // fold][:, so0:so1] >> ((ew % fold) * BITS).astype(np.uint16)[:, None]) & mask).astype(np.uint16).tolist()
-        res["sample"] = {"e0": int(se0), "off0": int(so0), "cols": int(so1 - so0), "old": sold, "new": snew}
-        # Also diff the sibling codebook + scale tensors (float centroids/scales),
-        # since these have the same shape/dtype on both sides and so don't show up in
-        # the structural diff — but a codebook difference explains index differences
-        # (the same weights quantised against a different codebook).
-        if oname.endswith(".weight") and nname.endswith(".weight"):
-            op = oname[:-7]; npx = nname[:-7]
-            for kind in ("codebook", "qscale"):
-                na = npx + "." + kind
-                osz, nsz = aux_sz.get(na, (0, 0))
-                res[kind] = cmp_aux(op + "." + kind, na, osz, nsz)
-        with agg_lock:
-            read_bytes[0] += tb; compared[0] += 1
-    except Exception as e:
-        res["error"] = "%r" % (e,)
-    emit(res)
-if JOBS <= 1:
-    for i in range(total):
-        work(i)
-else:
-    with ThreadPoolExecutor(max_workers=JOBS) as ex:
-        list(ex.map(work, range(total)))
-emit({"summary": {"tensors": total, "compared": compared[0], "bytes": int(read_bytes[0]), "elapsed_s": time.time() - t0}})
-"#;
-    TEMPLATE
-        .replace("__OLD__", &old_lit)
-        .replace("__NEW__", &new_lit)
-        .replace("__PAIRS__", &pairs_lit)
-        .replace("__BITS__", &bits_lit)
-        .replace("__JOBS__", &jobs_lit)
-        .replace("__AUTO__", auto_lit)
-        .replace("__SENTINEL__", SENTINEL)
-        .replace("__STATUS__", STATUS_TAG)
+    with_params(
+        include_str!("python/repack_verify.py"),
+        &serde_json::json!({
+            "old": old_uri,
+            "new": new_uri,
+            "pairs": pairs,
+            "bits": bits.max(1),
+            "jobs": pairs.len().clamp(1, 4),
+            "auto": auto_sparse,
+            "sentinel": SENTINEL,
+            "status": STATUS_TAG,
+        }),
+    )
 }
 
 /// The boto3 object-listing script for an `s3://…` checkpoint: a single paginated
@@ -1579,41 +949,10 @@ emit({"summary": {"tensors": total, "compared": compared[0], "bytes": int(read_b
 ///
 /// **Read-only:** `list_objects_v2` is a read; the script never writes.
 fn list_script(uri: &str) -> String {
-    let src_lit = serde_json::to_string(uri).unwrap_or_else(|_| "\"\"".into());
-    const TEMPLATE: &str = r#"
-import sys, json
-SRC = __URI__
-S = "__SENTINEL__"
-def emit(obj):
-    sys.stdout.write(S + json.dumps(obj) + "\n"); sys.stdout.flush()
-try:
-    import boto3
-    from urllib.parse import urlparse
-except Exception as e:
-    emit({"error": "import boto3 failed: %r" % (e,)}); sys.exit(0)
-try:
-    u = urlparse(SRC)
-    bucket, prefix = u.netloc, u.path.lstrip("/")
-    cli = boto3.client("s3")
-    objects, tok = [], None
-    while True:
-        kw = {"Bucket": bucket, "Prefix": prefix}
-        if tok: kw["ContinuationToken"] = tok
-        resp = cli.list_objects_v2(**kw)
-        for it in resp.get("Contents", []):
-            k = it["Key"]
-            rel = k[len(prefix):].lstrip("/") if k.startswith(prefix) else k
-            if rel:
-                objects.append([rel, int(it.get("Size", 0))])
-        if resp.get("IsTruncated"): tok = resp.get("NextContinuationToken")
-        else: break
-except Exception as e:
-    emit({"error": "s3 list failed: %r" % (e,)}); sys.exit(0)
-emit({"objects": objects})
-"#;
-    TEMPLATE
-        .replace("__URI__", &src_lit)
-        .replace("__SENTINEL__", SENTINEL)
+    with_params(
+        include_str!("python/list_objects.py"),
+        &serde_json::json!({ "uri": uri, "sentinel": SENTINEL }),
+    )
 }
 
 /// Parse the object-listing JSON (`{objects:[[key,size],…]}` or `{error:…}`) into
@@ -2245,12 +1584,43 @@ fn merge_shards(mut shards: Vec<ShardParse>) -> (Vec<TensorInfo>, Vec<MetadataIn
 mod tests {
     use super::*;
 
+    /// Read a generated script's parameters back out — the exact values the remote
+    /// Python will see. Stronger than substring-matching the script text: it proves
+    /// the JSON round-trips through Python string escaping, so a URI or tensor name
+    /// containing a quote or backslash is verified rather than assumed.
+    fn script_params(script: &str) -> serde_json::Value {
+        let line = script
+            .lines()
+            .find(|l| l.starts_with("PARAMS = json.loads("))
+            .expect("every script takes its parameters through the __PARAMS__ slot");
+        let lit = line
+            .trim_start_matches("PARAMS = json.loads(")
+            .trim_end_matches(')');
+        // The literal is a JSON-escaped string (valid Python too) holding the params.
+        let json: String = serde_json::from_str(lit).expect("params literal is a valid string");
+        serde_json::from_str(&json).expect("params payload is valid JSON")
+    }
+
     #[test]
     fn cstorch_script_embeds_source_safely() {
         let s = dump_script("s3://b/k", false);
-        assert!(s.contains("SRC = \"s3://b/k\""));
+        assert_eq!(script_params(&s)["uri"], "s3://b/k");
         assert!(s.contains("import cerebras.pytorch"));
         assert!(s.contains(SENTINEL));
+    }
+
+    /// A URI or tensor name containing characters that would break naive string
+    /// splicing must survive intact — the reason parameters go through JSON now
+    /// instead of a dozen raw textual substitutions.
+    #[test]
+    fn script_params_survive_quotes_and_backslashes() {
+        let nasty = r#"s3://b/we"ird\path'/#k"#;
+        assert_eq!(script_params(&dump_script(nasty, true))["uri"], nasty);
+        assert_eq!(script_params(&list_script(nasty))["uri"], nasty);
+        let pairs = vec![(nasty.to_string(), "n\"2".to_string())];
+        let s = repack_verify_script("s3://b/o", "s3://b/n", &pairs, 3, false);
+        assert_eq!(script_params(&s)["pairs"][0][0], nasty);
+        assert_eq!(script_params(&s)["pairs"][0][1], "n\"2");
     }
 
     #[test]
@@ -2276,10 +1646,10 @@ mod tests {
     fn cstorch_script_fetches_s3_metadata_only_when_wanted() {
         // Not wanted (interactive browse / check) → no boto3 work.
         let off = dump_script("s3://b/ckpt", false);
-        assert!(off.contains("WANT_S3 = False"), "{off}");
+        assert_eq!(script_params(&off)["want_s3"], false);
 
         let s = dump_script("s3://b/ckpt", true);
-        assert!(s.contains("WANT_S3 = True"), "{s}");
+        assert_eq!(script_params(&s)["want_s3"], true);
         // Fetches object metadata via boto3, read-only calls only.
         assert!(s.contains("boto3.client(\"s3\")"));
         assert!(s.contains("list_objects_v2"));
@@ -2308,7 +1678,7 @@ mod tests {
     #[test]
     fn list_script_is_read_only_list_and_embeds_uri() {
         let s = list_script("s3://bucket/ckpt");
-        assert!(s.contains("SRC = \"s3://bucket/ckpt\""));
+        assert_eq!(script_params(&s)["uri"], "s3://bucket/ckpt");
         assert!(s.contains("boto3.client(\"s3\")"));
         assert!(s.contains("list_objects_v2"));
         assert!(s.contains(SENTINEL));
@@ -2342,13 +1712,17 @@ mod tests {
             jobs: 8,
         };
         let s = value_diff_script("s3://b/old", "s3://b/new", &pairs, &opts);
-        assert!(s.contains(r#"OLD = "s3://b/old""#), "{s}");
-        assert!(s.contains(r#"NEW = "s3://b/new""#));
-        assert!(s.contains(r#"[["old.w","new.w"],["x","x"]]"#), "{s}");
-        assert!(s.contains("WANT_VALUES = True"));
-        assert!(s.contains("WANT_HIST = True"));
-        assert!(s.contains("FULL_HIST = False"));
-        assert!(s.contains("BINS = 32"));
+        let p = script_params(&s);
+        assert_eq!(p["old"], "s3://b/old");
+        assert_eq!(p["new"], "s3://b/new");
+        assert_eq!(
+            p["pairs"],
+            serde_json::json!([["old.w", "new.w"], ["x", "x"]])
+        );
+        assert_eq!(p["want_values"], true);
+        assert_eq!(p["want_hist"], true);
+        assert_eq!(p["full_hist"], false);
+        assert_eq!(p["bins"], 32);
         assert!(s.contains("import cerebras.pytorch"));
         assert!(s.contains("np.histogram"));
         assert!(s.contains(SENTINEL));
@@ -2358,7 +1732,7 @@ mod tests {
         assert!(s.contains("stat(\"start\\t"), "{s}");
         assert!(s.contains("res[\"bytes\"]"), "{s}");
         // Parallel reads driven by JOBS via a thread pool.
-        assert!(s.contains("JOBS = 8"), "{s}");
+        assert_eq!(p["jobs"], 8);
         assert!(s.contains("ThreadPoolExecutor"), "{s}");
         // Read-only: it loads + reads to compare, never saves/writes/uploads/deletes.
         for forbidden in [
@@ -2389,9 +1763,11 @@ mod tests {
                 jobs: 1,
             },
         );
-        assert!(vonly.contains("WANT_HIST = False"), "{vonly}");
-        assert!(vonly.contains("BINS = None"), "{vonly}");
-        assert!(vonly.contains("JOBS = 1"), "{vonly}");
+        let vp = script_params(&vonly);
+        assert_eq!(vp["want_hist"], false);
+        // No bin count requested → JSON null, which Python reads as `None`.
+        assert!(vp["bins"].is_null(), "{vp}");
+        assert_eq!(vp["jobs"], 1);
     }
 
     #[test]
@@ -2485,9 +1861,10 @@ mod tests {
     fn repack_verify_script_embeds_inputs_and_checks_format() {
         let pairs = vec![("w.down".to_string(), "w.down".to_string())];
         let s = repack_verify_script("s3://b/old", "s3://b/new", &pairs, 3, false);
-        assert!(s.contains(r#"OLD = "s3://b/old""#), "{s}");
-        assert!(s.contains(r#"[["w.down","w.down"]]"#), "{s}");
-        assert!(s.contains("BITS = 3"), "{s}");
+        let p = script_params(&s);
+        assert_eq!(p["old"], "s3://b/old");
+        assert_eq!(p["pairs"], serde_json::json!([["w.down", "w.down"]]));
+        assert_eq!(p["bits"], 3);
         // Derives the fold, decodes, and runs BOTH format checks.
         assert!(s.contains("fold = (E + W - 1) // W"), "{s}");
         assert!(s.contains("sparse_bad"), "{s}");

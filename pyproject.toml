@@ -1,0 +1,53 @@
+# Python tooling config. There is no Python *package* here — this file exists so
+# ruff and pyright have one source of truth for the Python we ship:
+#
+#   crates/core/src/python/*.py   the remote reader/compare scripts, embedded into
+#                                 the binary with include_str! and executed on the
+#                                 ssh proxy (see crates/core/src/remote.rs)
+#   gen_demo.py, record_demo.py   local dev utilities for the README demo
+#
+# The remote scripts run under whatever interpreter the proxy's cstorch venv has,
+# which we don't control — so target the oldest we're willing to support (3.9) and
+# let pyupgrade rules keep us inside it, rather than suggesting 3.10+ syntax that
+# would crash on an older cluster.
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+extend-exclude = ["target", "web"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes — undefined names, unused imports (the class that breaks a run)
+  "W",   # pycodestyle warnings
+  "B",   # flake8-bugbear — likely bugs (mutable defaults, broad raise, loop vars)
+  "C4",  # comprehensions
+  "SIM", # simplifications
+  "UP",  # pyupgrade, bounded by target-version above
+  "RET", # return-path consistency
+  "PIE", # misc lints
+  "RUF", # ruff's own
+]
+ignore = [
+  # The remote scripts are deliberately dense (they cross an ssh boundary as one
+  # payload); wrapping them for line length hurts more than it helps.
+  "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The remote scripts talk to cstorch/S3 over a network on a machine we can't debug
+# interactively: a broad `except Exception` that reports the failure as structured
+# JSON is the intended design, not a smell.
+"crates/core/src/python/*.py" = ["BLE001"]
+
+[tool.pyright]
+include = ["crates/core/src/python", "gen_demo.py", "record_demo.py"]
+exclude = ["target", "web", "**/node_modules"]
+pythonVersion = "3.9"
+typeCheckingMode = "basic"
+# cerebras.pytorch only exists inside the cluster venv, and numpy/boto3 aren't
+# installed in CI — so don't fail on the imports themselves. Everything else
+# (undefined names, bad arity, unreachable code) is still checked.
+reportMissingImports = false
+reportMissingModuleSource = false
