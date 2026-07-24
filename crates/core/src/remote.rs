@@ -1358,20 +1358,22 @@ def stream_aux(sd, name, on_side):
     buf = download_raw(loc, on_side)
     raw = zstandard.decompress(bytes(buf)) if comp else buf
     return np.frombuffer(raw, dtype=npdt).reshape(shape).astype(np.float64), size
-def cmp_aux(oname_a, nname_a):
-    # Streams both sides over S3 (its own progress bar, keyed by the new name) and
-    # records the NAMES tried, so the caller shows exactly what was compared.
+def aux_size(sd, name):
+    # (old_or_new) S3 byte size of a sibling float tensor, 0 if not resolvable — used
+    # to size its bar UP FRONT (before it streams), so it never shows an unsized bar.
+    if name not in sd:
+        return 0
+    loc = resolve(sd[name])
+    am = aux_meta(loc) if loc is not None else None
+    return am[3] if am else 0
+def cmp_aux(oname_a, nname_a, osz, nsz):
+    # Streams both sides over S3 into this sibling's own bar (keyed by the new name,
+    # already sized by the caller), records the NAMES tried, and — like the weight —
+    # flags a `comparing` phase before the compare and finishes the bar after it.
     out = {"old_name": oname_a, "new_name": nname_a,
            "old_present": oname_a in old_sd, "new_present": nname_a in new_sd}
     if not out["old_present"] or not out["new_present"]:
         return out
-    osz = 0; nsz = 0
-    olo = resolve(old_sd[oname_a]); nlo = resolve(new_sd[nname_a])
-    oam = aux_meta(olo) if olo is not None else None
-    nam = aux_meta(nlo) if nlo is not None else None
-    if oam: osz = oam[3]
-    if nam: nsz = nam[3]
-    stat("size\t%s\t%d\t%d" % (nname_a, osz, nsz))
     od = [0]; nd = [0]; last = [0]
     def bump():
         s = od[0] + nd[0]
@@ -1380,15 +1382,15 @@ def cmp_aux(oname_a, nname_a):
     a, _ = stream_aux(old_sd, oname_a, lambda x: (od.__setitem__(0, x), bump()))
     b, _ = stream_aux(new_sd, nname_a, lambda x: (nd.__setitem__(0, x), bump()))
     stat("bytes\t%s\t%d\t%d" % (nname_a, osz, nsz))
-    stat("done\t%s" % (nname_a,))
+    stat("phase\t%s\tcomparing" % (nname_a,))   # decode + compare below
     with agg_lock:
         read_bytes[0] += osz + nsz
     out["shape_old"] = [int(x) for x in a.shape]; out["shape_new"] = [int(x) for x in b.shape]
-    if list(a.shape) != list(b.shape):
-        return out
-    d = np.abs(a - b)
-    out.update({"elements": int(a.size), "differing": int(np.count_nonzero(a != b)),
-                "max_abs": float(d.max()) if d.size else 0.0, "mean_abs": float(d.mean()) if d.size else 0.0})
+    if list(a.shape) == list(b.shape):
+        d = np.abs(a - b)
+        out.update({"elements": int(a.size), "differing": int(np.count_nonzero(a != b)),
+                    "max_abs": float(d.max()) if d.size else 0.0, "mean_abs": float(d.mean()) if d.size else 0.0})
+    stat("done\t%s" % (nname_a,))   # finish this bar (✓) after the compare
     return out
 total = len(PAIRS)
 t0 = time.time()
@@ -1399,6 +1401,18 @@ def work(idx):
     oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
     stat("start\t%d\t%d\t%s" % (idx + 1, total, nname))
     res = {"name": nname}
+    # Size the sibling codebook/qscale UP FRONT — before the weight even streams — so
+    # their bars show `0/size` immediately instead of an unsized sweep while the (big)
+    # weight downloads. Reused by cmp_aux below (no second HEAD).
+    aux_sz = {}   # new sibling name -> (old_size, new_size)
+    if oname.endswith(".weight") and nname.endswith(".weight"):
+        op = oname[:-7]; npx = nname[:-7]
+        for kind in ("codebook", "qscale"):
+            oa = op + "." + kind; na = npx + "." + kind
+            if oa in old_sd and na in new_sd:
+                osz = aux_size(old_sd, oa); nsz = aux_size(new_sd, na)
+                aux_sz[na] = (osz, nsz)
+                stat("size\t%s\t%d\t%d" % (na, osz, nsz))
     try:
         da = old_sd[oname]; db = new_sd[nname]
         ashape = [int(x) for x in da.shape]; bshape = [int(x) for x in db.shape]
@@ -1528,8 +1542,10 @@ def work(idx):
         # (the same weights quantised against a different codebook).
         if oname.endswith(".weight") and nname.endswith(".weight"):
             op = oname[:-7]; npx = nname[:-7]
-            res["codebook"] = cmp_aux(op + ".codebook", npx + ".codebook")
-            res["qscale"] = cmp_aux(op + ".qscale", npx + ".qscale")
+            for kind in ("codebook", "qscale"):
+                na = npx + "." + kind
+                osz, nsz = aux_sz.get(na, (0, 0))
+                res[kind] = cmp_aux(op + "." + kind, na, osz, nsz)
         with agg_lock:
             read_bytes[0] += tb; compared[0] += 1
     except Exception as e:
@@ -2483,9 +2499,10 @@ mod tests {
         assert!(s.contains("stat(\"size"), "{s}");
         assert!(s.contains("stat(\"bytes"), "{s}");
         assert!(s.contains("res[\"sample\"]"), "{s}");
-        // Also diffs the sibling codebook + scale tensors.
+        // Also diffs the sibling codebook + scale tensors (their bars are sized up
+        // front, then streamed by cmp_aux).
         assert!(
-            s.contains("cmp_aux") && s.contains(".codebook") && s.contains(".qscale"),
+            s.contains("cmp_aux") && s.contains("codebook") && s.contains("qscale"),
             "{s}"
         );
         assert!(s.contains(STATUS_TAG) && s.contains(SENTINEL));
