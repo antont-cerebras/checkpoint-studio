@@ -1935,22 +1935,48 @@ pub fn histogram_bins(
             ));
         }
         let (min, max) = range?;
-        let (lo, hi) = (min.floor() as i64, max.ceil() as i64);
-        if hi < lo {
-            return Some((HistBins::IntBins { start: lo, step: 1 }, 1));
+        // Integer bins are an i64 lattice (`start + i*step`), which cannot represent a
+        // full-width 64-bit span — so only take this path when the range genuinely
+        // fits, and fall back to float bins otherwise. Getting this wrong was a real
+        // bug three ways: u64 values above i64::MAX saturate the casts below, so the
+        // edge labels understated the data and everything above 2^63 piled silently
+        // into the last bucket; `hi - lo + 1` overflowed i64 (debug panic) or wrapped
+        // to 0, giving an empty count vector that panicked on first index; and the
+        // renderer's `start + i*step` overflowed while drawing the labels. At this
+        // magnitude a single bin already spans ~1e17 values, so exact integer edges
+        // buy nothing anyway.
+        if min >= i64::MIN as f64 && max <= i64::MAX as f64 {
+            let (lo, hi) = (min.floor() as i64, max.ceil() as i64);
+            if hi < lo {
+                return Some((HistBins::IntBins { start: lo, step: 1 }, 1));
+            }
+            // i128 so the span itself can't overflow while we measure it.
+            let distinct: u128 = (hi as i128 - lo as i128 + 1) as u128;
+            // One bin per value when few enough — capped by any requested count.
+            let per_value_cap = u128::from(bins.unwrap_or(MAX_VALUE_BINS).max(1) as u64);
+            if distinct <= per_value_cap {
+                return Some((HistBins::IntBins { start: lo, step: 1 }, distinct as usize));
+            }
+            // Otherwise group into ~`target` whole-number-width buckets, so the
+            // edges stay integers rather than the fractional ones a float range
+            // would produce.
+            let step_span = distinct.div_ceil(u128::from(target)).max(1);
+            let n = distinct.div_ceil(step_span).max(1) as usize;
+            // Take the lattice only if its TOP edge is representable too, since every
+            // consumer computes `start + i*step` in i64.
+            let usable = i64::try_from(step_span).ok().filter(|&step| {
+                i64::try_from(n)
+                    .ok()
+                    .and_then(|n| n.checked_mul(step))
+                    .and_then(|span| lo.checked_add(span))
+                    .is_some()
+            });
+            if let Some(step) = usable {
+                return Some((HistBins::IntBins { start: lo, step }, n));
+            }
         }
-        let distinct = (hi - lo + 1) as u64;
-        // One bin per value when few enough — capped by any requested count.
-        let per_value_cap = bins.unwrap_or(MAX_VALUE_BINS).max(1) as u64;
-        if distinct <= per_value_cap {
-            return Some((HistBins::IntBins { start: lo, step: 1 }, distinct as usize));
-        }
-        // Otherwise group into ~`target` whole-number-width buckets, so the
-        // edges stay integers rather than the fractional ones a float range
-        // would produce.
-        let step = distinct.div_ceil(target) as i64;
-        let n = distinct.div_ceil(step as u64) as usize;
-        return Some((HistBins::IntBins { start: lo, step }, n));
+        // Span too wide for the integer lattice — fall through to float bins, whose
+        // edges can express the true range.
     }
     match range? {
         (min, max) if min < max => Some((HistBins::Range { lo: min, hi: max }, target as usize)),
@@ -1963,7 +1989,12 @@ fn bin_index(bins: HistBins, n: usize, v: f64) -> usize {
     let last = n.saturating_sub(1) as i64;
     match bins {
         HistBins::IntBins { start, step } => {
-            ((v.round() as i64 - start).div_euclid(step.max(1))).clamp(0, last) as usize
+            // i128 for the same reason as the bin layout: `v - start` spans the whole
+            // i64 range for a wide integer tensor, which overflows i64.
+            let offset = i128::from(v.round() as i64) - i128::from(start);
+            offset
+                .div_euclid(i128::from(step.max(1)))
+                .clamp(0, i128::from(last)) as usize
         }
         HistBins::Range { lo, hi } => {
             if hi <= lo {
@@ -3564,6 +3595,56 @@ mod tests {
         assert!(n <= RANGE_BINS, "no more than {RANGE_BINS} bins");
         // The bins must cover the whole span.
         assert!(start + (n as i64) * step > 65_535);
+    }
+
+    /// A 64-bit integer tensor whose values exceed 2^63 used to break the bin layout:
+    /// the f64->i64 casts saturate, and the span arithmetic then overflowed i64 (debug
+    /// panic) or wrapped (release). A full-width I64 span wrapped to 0 bins, and the
+    /// first index into the empty count vector panicked; a U64 span wrapped to 2^63,
+    /// silently dumping everything above it into the last bucket. Reachable from the
+    /// TUI, `/api/histogram`, and `diff --histogram`, so it must stay covered.
+    #[test]
+    fn histogram_bins_survive_full_width_64bit_spans() {
+        for (dtype, lo, hi) in [
+            ("U64", 0.0, 13_816_973_012_072_644_608.0_f64),
+            ("U64", 0.0, u64::MAX as f64),
+            ("I64", i64::MIN as f64, i64::MAX as f64),
+        ] {
+            let (bins, n) = histogram_bins(ViewDtype::Stored, dtype, Some((lo, hi)), None)
+                .unwrap_or_else(|| panic!("{dtype} span {lo}..{hi} should produce bins"));
+            assert!(n > 0, "{dtype}: bin count must never be 0 (was {n})");
+            assert!(n <= RANGE_BINS, "{dtype}: {n} bins exceeds {RANGE_BINS}");
+            // Every value in the span must land inside the bins — including the
+            // extremes, which is what used to index out of bounds.
+            for v in [lo, hi, (lo / 2.0) + (hi / 2.0)] {
+                let i = bin_index(bins, n, v);
+                assert!(i < n, "{dtype}: value {v} binned to {i} of {n} ({bins:?})");
+            }
+            // The bins must COVER the data, and every edge must be computable without
+            // overflowing i64 — the integer lattice can't do either at this width, so
+            // a float range is expected rather than saturated integer edges that
+            // understate the true maximum.
+            match bins {
+                HistBins::Range { lo: blo, hi: bhi } => {
+                    assert!(
+                        blo <= lo && bhi >= hi,
+                        "{dtype}: bins {blo}..{bhi} must cover {lo}..{hi}"
+                    );
+                }
+                HistBins::IntBins { start, step } => {
+                    let top = i64::try_from(n)
+                        .ok()
+                        .and_then(|n| n.checked_mul(step))
+                        .and_then(|s| start.checked_add(s));
+                    let top = top
+                        .unwrap_or_else(|| panic!("{dtype}: top edge start+n*step overflows i64"));
+                    assert!(
+                        top as f64 >= hi,
+                        "{dtype}: bins stop at {top}, below the max {hi}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
