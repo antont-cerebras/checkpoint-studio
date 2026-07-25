@@ -6,7 +6,7 @@
 import { derived, get, writable } from 'svelte/store';
 import { api } from '../lib/api';
 import { flatten, nodeId, type Row } from '../lib/flatten';
-import { SEARCH_LIMIT, searchMatchCount, searchRows } from '../lib/search';
+import { SEARCH_LIMIT, searchTree } from '../lib/search';
 import type { TreeNode } from '../lib/types';
 import { tree as treeData } from './server';
 
@@ -182,13 +182,20 @@ export const compact = writable<boolean>(false);
  * Shared by TreeView (render) and the key handler (cursor movement). A filter
  * (server-matched) takes precedence over an in-progress fuzzy search; a flat list
  * is optionally sorted. */
+/** The fuzzy-search result — rows AND the untruncated total — computed ONCE per
+ * keystroke. `visibleRows` and `searchTotal` both read from this, because computing
+ * them independently meant two full walks of the tree scoring every tensor twice. */
+const searchResult = derived([treeData, search, searching], ([$t, $q, $searching]) =>
+  $t && $searching && $q.trim() ? searchTree($t.tree, $q.trim()) : null,
+);
+
 export const visibleRows = derived(
-  [treeData, expanded, search, searching, filterMatches, sortKey, sortDir],
-  ([$t, $exp, $q, $searching, $matches, $sk, $sd]) => {
+  [treeData, expanded, searchResult, filterMatches, sortKey, sortDir],
+  ([$t, $exp, $found, $matches, $sk, $sd]) => {
     if (!$t) return [] as Row[];
     // An in-progress fuzzy search wins; otherwise a set filter; otherwise the tree.
     let rows: Row[];
-    if ($searching && $q.trim()) rows = searchRows($t.tree, $q.trim());
+    if ($found) rows = $found.rows;
     else if ($matches) rows = matchRows($t.tree, $matches);
     else return flatten($t.tree, $exp); // hierarchical view is never reordered
     return $sk === 'none' ? rows : sortRows(rows, $sk, $sd);
@@ -199,9 +206,7 @@ export const visibleRows = derived(
  * label can be honest when the row list is capped ("showing 1000 of N"). Only
  * the fuzzy path is capped; the server-side filter returns every match. */
 export { SEARCH_LIMIT };
-export const searchTotal = derived([treeData, search, searching], ([$t, $q, $searching]) =>
-  $t && $searching && $q.trim() ? searchMatchCount($t.tree, $q.trim()) : 0,
-);
+export const searchTotal = derived(searchResult, ($found) => $found?.total ?? 0);
 
 /** Sort a flat tensor-row list by a facet, ascending or descending. */
 function sortRows(rows: Row[], key: Exclude<SortKey, 'none'>, dir: 'asc' | 'desc'): Row[] {
