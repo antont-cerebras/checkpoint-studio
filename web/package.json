@@ -15,12 +15,16 @@
     "lint": "eslint .",
     "prebuild": "node scripts/require-node.mjs",
     "prelint": "node scripts/require-node.mjs",
-    "precheck": "node scripts/require-node.mjs"
+    "precheck": "node scripts/require-node.mjs",
+    "test": "vitest run",
+    "pretest": "node scripts/require-node.mjs",
+    "coverage": "vitest run --coverage"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@sveltejs/vite-plugin-svelte": "^2.5.3",
     "@tsconfig/svelte": "^5.0.2",
+    "@vitest/coverage-v8": "^3.2.7",
     "eslint": "^10.7.0",
     "eslint-plugin-svelte": "^3.22.0",
     "globals": "^17.7.0",
@@ -29,6 +33,7 @@
     "tslib": "^2.6.3",
     "typescript": "^5.4.5",
     "typescript-eslint": "^8.65.0",
-    "vite": "^4.5.5"
+    "vite": "^4.5.5",
+    "vitest": "^3.2.7"
   }
 }
