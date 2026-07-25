@@ -881,6 +881,28 @@ fn record_transcript(label: &str, out: &str) {
 /// placeholder rather than a dozen textual substitutions. JSON-escaping the params
 /// *text* yields a body that is valid inside the `"…"` the Python file already has,
 /// so a URI or tensor name containing a quote or backslash cannot break the script.
+/// Prepended to every script that calls `cstorch.load`: a best-effort patch that
+/// memoizes cstorch's S3 reader `stats` property. Without it, `cstorch.load` issues one
+/// sequential `head_object` **per tensor** — all for the same `__METADATA__` key — so
+/// opening a 1155-tensor checkpoint spent 4.97s of its 7.3s doing nothing but repeating
+/// one HEAD 1155 times. See `python/cstorch_fast.py` for the details and the safety
+/// argument. The scripts never reference it by name: it patches at exec time.
+fn cstorch_prelude(script: &str) -> String {
+    // Spliced in right after the script's `from __future__` line, not prepended:
+    // Python rejects a future import that isn't at the top of the file, and every
+    // script here has one. Everything else in a script comes after, so the patch is
+    // in place well before any `cstorch.load`.
+    const FUTURE: &str = "from __future__ import annotations\n";
+    let prelude = include_str!("python/cstorch_fast.py");
+    match script.find(FUTURE) {
+        Some(i) => {
+            let cut = i + FUTURE.len();
+            format!("{}\n{}\n{}", &script[..cut], prelude, &script[cut..])
+        }
+        None => format!("{prelude}\n{script}"),
+    }
+}
+
 fn with_params(template: &str, params: &serde_json::Value) -> String {
     let json = params.to_string();
     let lit = serde_json::to_string(&json).unwrap_or_else(|_| "\"{}\"".into());
@@ -898,7 +920,7 @@ fn with_params(template: &str, params: &serde_json::Value) -> String {
 /// or otherwise mutates the checkpoint. The remote checkpoint is never modified.
 fn dump_script(src: &str, want_s3: bool) -> String {
     with_params(
-        include_str!("python/dump.py"),
+        &cstorch_prelude(include_str!("python/dump.py")),
         &serde_json::json!({
             "uri": src,
             "want_s3": want_s3,
@@ -931,7 +953,7 @@ fn value_diff_script(
     opts: &RemoteValueOpts,
 ) -> String {
     with_params(
-        include_str!("python/value_diff.py"),
+        &cstorch_prelude(include_str!("python/value_diff.py")),
         &serde_json::json!({
             "old": old_uri,
             "new": new_uri,
@@ -965,7 +987,7 @@ fn repack_verify_script(
     auto_sparse: bool,
 ) -> String {
     with_params(
-        include_str!("python/repack_verify.py"),
+        &cstorch_prelude(include_str!("python/repack_verify.py")),
         &serde_json::json!({
             "old": old_uri,
             "new": new_uri,
@@ -1646,6 +1668,90 @@ mod tests {
     /// else: rename a key on either side and every gate stays green while the script
     /// dies with a `KeyError` on the cluster, minutes into a user's job. Reading the
     /// keys straight out of the shipped `.py` files keeps the two in lockstep.
+    /// The prelude is spliced *after* the host script's `from __future__` line, not
+    /// prepended — Python rejects a future import that isn't at the top of the file,
+    /// and prepending produced a hard `SyntaxError` that failed every s3 read.
+    #[test]
+    fn the_cstorch_prelude_is_spliced_after_the_future_import() {
+        const FUTURE: &str = "from __future__ import annotations";
+        for (name, script) in [
+            ("dump", dump_script("s3://b/k", true)),
+            (
+                "value_diff",
+                value_diff_script(
+                    "s3://b/o",
+                    "s3://b/n",
+                    &[],
+                    &RemoteValueOpts {
+                        values: true,
+                        histogram: false,
+                        bins: None,
+                        full_hist: false,
+                        jobs: 1,
+                    },
+                ),
+            ),
+            (
+                "repack_verify",
+                repack_verify_script("s3://b/o", "s3://b/n", &[], 3, true),
+            ),
+        ] {
+            // Statement position only — the prelude's docstring *mentions* the future
+            // import, and prose can't break the parser.
+            let future_lines: Vec<usize> = script
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| l.trim_start().starts_with(FUTURE))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                future_lines.len(),
+                1,
+                "{name}: exactly one future import must survive the splice, found {future_lines:?}"
+            );
+            let future_line = future_lines[0];
+            let line_of = |needle: &str| {
+                script
+                    .lines()
+                    .position(|l| l.contains(needle))
+                    .unwrap_or_else(|| panic!("{name}: expected to find `{needle}`"))
+            };
+            let patch_line = line_of("_memoize_s3_reader_stats()");
+            // The call, not the prelude docstring's mention of it.
+            let load_line = line_of("cstorch.load(");
+            assert!(
+                future_line < patch_line,
+                "{name}: the future import must stay ahead of the prelude"
+            );
+            assert!(
+                patch_line < load_line,
+                "{name}: the patch must be in place before any cstorch.load"
+            );
+            // Nothing but the module docstring and comments may precede a future
+            // import, or Python refuses the file.
+            let head: String = script
+                .lines()
+                .take(future_line)
+                .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                head.matches("\"\"\"").count(),
+                2,
+                "{name}: only a docstring may precede the future import, got:\n{head}"
+            );
+        }
+    }
+
+    /// The listing script needs no cstorch at all, so it must not carry the prelude
+    /// (which would import the cerebras package and cost ~1.4s for nothing).
+    #[test]
+    fn the_listing_script_stays_free_of_the_cstorch_prelude() {
+        let script = list_script("s3://b/k");
+        assert!(!script.contains("_memoize_s3_reader_stats"));
+        assert!(!script.contains("cerebras"));
+    }
+
     #[test]
     fn every_param_the_scripts_read_is_supplied() {
         /// Scan a script for the `PARAMS["key"]` lookups it performs.

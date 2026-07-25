@@ -13,7 +13,14 @@ from __future__ import annotations
 
 import sys
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+
+# Concurrency for the per-object S3 metadata phase (`want_s3`, i.e. `diff`). Every
+# request there is latency, not work, so a modest pool turns ~2300 serial round trips
+# into ~2300/16. Kept small deliberately: this runs on a shared login node.
+S3_WORKERS = 16
 
 # Parameters from the Rust caller: the single `__PARAMS__` slot is replaced with a
 # JSON object (see `remote.rs::with_params`). One substitution point keeps the rest
@@ -98,10 +105,13 @@ s3_warnings = []
 if WANT_S3:
     try:
         import boto3
+        from botocore.config import Config
         from urllib.parse import urlparse
         u = urlparse(SRC)
         bucket, prefix = u.netloc, u.path.lstrip("/")
-        cli = boto3.client("s3")
+        # botocore pools 10 connections by default; below that, the workers would just
+        # queue on the pool instead of overlapping their round trips.
+        cli = boto3.client("s3", config=Config(max_pool_connections=S3_WORKERS + 4))
         keys, tok = [], None
         while True:
             kw = {"Bucket": bucket, "Prefix": prefix}
@@ -110,19 +120,30 @@ if WANT_S3:
             keys.extend(it["Key"] for it in resp.get("Contents", []))
             if resp.get("IsTruncated"): tok = resp.get("NextContinuationToken")
             else: break
-        # Second progress phase: HEADing each object is the slow part, so drive the
-        # bar off it (relabelled "S3 objects") instead of sitting at 100% tensors.
+        # Second progress phase: the per-object requests are the slow part, so drive
+        # the bar off them (relabelled "S3 objects") instead of sitting at 100%
+        # tensors. Each object costs a HEAD plus a tagging call, and both are pure
+        # latency — a 1155-object checkpoint is ~2300 round trips. They're independent,
+        # so run them on a small pool: order is preserved by `map`, so the emitted
+        # listing stays in LIST order, and the pool is sized to the connection pool
+        # below (botocore's default of 10 would otherwise throttle the workers).
         nkeys = len(keys)
         s3_step = max(1, nkeys // 100)
         prog(0, nkeys, "s3")
-        tags_denied = False
-        for i, k in enumerate(keys):
-            if i % s3_step == 0:
-                prog(i, nkeys, "s3")
+
+        # `s3:GetObjectTagging` is granted per bucket, not per object, so the first
+        # denial settles it for the rest: stop asking instead of spending another
+        # ~1100 round trips to be told the same thing. Objects after that carry no
+        # `tags` key, which the reader already reads as "not available".
+        denied_flag = threading.Event()
+
+        def describe(k: str) -> tuple[dict[str, Any] | None, str | None, bool]:
+            """`(object, warning, tags_denied)` for one key. Never raises: a failed
+            HEAD drops the object with a warning, missing tags drop just the tags."""
             try:
                 h = cli.head_object(Bucket=bucket, Key=k, ChecksumMode="ENABLED")
             except Exception as e:
-                s3_warnings.append("head_object failed for %s: %r" % (k, e)); continue
+                return None, "head_object failed for %s: %r" % (k, e), False
             rel = k[len(prefix):].lstrip("/") if k.startswith(prefix) else k
             lm = h.get("LastModified")
             obj = {"key": rel, "size": int(h.get("ContentLength", 0)),
@@ -133,14 +154,27 @@ if WANT_S3:
                 cv = h.get("Checksum" + algo)
                 if cv:
                     obj["checksum"] = [algo.lower(), str(cv)]; break
-            try:
-                tg = cli.get_object_tagging(Bucket=bucket, Key=k)
-                obj["tags"] = {t["Key"]: t["Value"] for t in tg.get("TagSet", [])}
-            except Exception as e:
-                if not tags_denied:
-                    s3_warnings.append("tags unavailable (needs s3:GetObjectTagging): %r" % (e,))
+            if not denied_flag.is_set():
+                try:
+                    tg = cli.get_object_tagging(Bucket=bucket, Key=k)
+                    obj["tags"] = {t["Key"]: t["Value"] for t in tg.get("TagSet", [])}
+                except Exception as e:
+                    denied_flag.set()
+                    return obj, "tags unavailable (needs s3:GetObjectTagging): %r" % (e,), True
+            return obj, None, False
+
+        tags_denied = False
+        with ThreadPoolExecutor(max_workers=S3_WORKERS) as pool:
+            for i, (obj, warn, denied) in enumerate(pool.map(describe, keys)):
+                if i % s3_step == 0:
+                    prog(i, nkeys, "s3")
+                # The tagging permission is per bucket, not per object: warn once.
+                if warn and not (denied and tags_denied):
+                    s3_warnings.append(warn)
+                if denied:
                     tags_denied = True
-            s3_objects.append(obj)
+                if obj is not None:
+                    s3_objects.append(obj)
         prog(nkeys, nkeys, "s3")
     except Exception as e:
         s3_warnings.append("s3 metadata unavailable: %r" % (e,))
