@@ -38,7 +38,24 @@ pub struct WebState {
     schemas: HashMap<String, sample::PackingSchema>,
     /// Per-`(tensor, view)` whole-tensor stats, memoized (also feeds histogram range).
     stats_cache: Mutex<HashMap<(String, String), dto::StatsDto>>,
+    /// Fully-encoded bodies for the endpoints whose content is fixed for the process
+    /// lifetime, keyed by `(endpoint, gzipped)`.
+    ///
+    /// The checkpoint is read once, so these never change — yet `/api/tree` (14 MB of
+    /// JSON for a 31k-tensor checkpoint) was rebuilt AND re-gzipped on every request:
+    /// ~310 ms of CPU and ~250 MB of transient allocation each time. Freed arenas
+    /// aren't returned to the OS, so resident memory climbed ~250 MB per page load
+    /// (measured: 110 MB after startup, 2.08 GB after eight loads). Encoding once
+    /// makes repeat loads essentially free and keeps memory flat.
+    static_bodies: StaticBodies,
 }
+
+/// Endpoints derived purely from the read-once model, so their encoded body can be
+/// cached. Everything else takes query parameters or reads tensor bytes on demand.
+const STATIC_ENDPOINTS: &[&str] = &["tree", "files", "stats", "health", "check", "model"];
+
+/// `(endpoint, gzipped)` -> the fully-encoded response body.
+type StaticBodies = Mutex<HashMap<(&'static str, bool), Arc<Vec<u8>>>>;
 
 impl WebState {
     /// Build the shared state from a local checkpoint read. `files`/`index_specs`
@@ -117,10 +134,53 @@ impl WebState {
             tensor_index,
             schemas,
             stats_cache: Mutex::new(HashMap::new()),
+            static_bodies: Mutex::new(HashMap::new()),
         }
     }
-}
 
+    /// The encoded body for a fixed-content endpoint, building (and caching) it on
+    /// first use. `None` for endpoints that aren't cacheable.
+    fn cached_body(&self, api: &str, gzipped: bool) -> Option<Arc<Vec<u8>>> {
+        let name = STATIC_ENDPOINTS.iter().copied().find(|&e| e == api)?;
+        // Bind the lookup to a local so the guard is dropped before the build below,
+        // rather than living to the end of an `if let`.
+        let hit = self
+            .static_bodies
+            .lock()
+            .ok()?
+            .get(&(name, gzipped))
+            .map(Arc::clone);
+        if let Some(body) = hit {
+            return Some(body);
+        }
+        // Build with the lock RELEASED: encoding `/api/tree` takes ~150 ms and holding
+        // the mutex across it would stall every other request behind it. Two racing
+        // first-requests may both build; the loser's copy is just dropped.
+        let (status, json) = match name {
+            "tree" => handlers::tree(self),
+            "files" => handlers::files(self),
+            "stats" => handlers::stats(self),
+            "health" => handlers::health(self),
+            "check" => handlers::check(self),
+            "model" => handlers::model(self),
+            _ => return None,
+        };
+        if status != 200 {
+            return None; // don't cache an error; let the normal path report it
+        }
+        let body = if gzipped {
+            gzip_bytes(&json).ok()?
+        } else {
+            json
+        };
+        let body = Arc::new(body);
+        self.static_bodies
+            .lock()
+            .ok()?
+            .insert((name, gzipped), Arc::clone(&body));
+        Some(body)
+    }
+}
 /// Reserve the server socket **up front**, before any slow work (e.g. a 5–10 s
 /// remote read), so a port clash is reported in milliseconds rather than after the
 /// wait. `host` is the bind address (default `0.0.0.0`). If a *specific* requested
@@ -220,10 +280,24 @@ fn handle(state: &WebState, req: tiny_http::Request) {
     let gzip = accepts_gzip(&req);
     if let Some(api) = path.strip_prefix("/api/") {
         let q = parse_query(query_str);
-        let (status, body) = route_api(state, api, &q);
-        let data = serde_json::to_vec(&body).unwrap_or_default();
         // The API reflects one read-once checkpoint; a browser must never reuse a
-        // response from a prior server run (a different checkpoint on the same port).
+        // response from a prior server run (a different checkpoint on the same port) —
+        // hence `no-store` — but we can reuse it SERVER-side: a fixed-content endpoint
+        // is encoded once and then handed out as bytes (see `cached_body`).
+        if q.is_empty()
+            && let Some(body) = state.cached_body(api, gzip)
+        {
+            send_encoded(
+                req,
+                200,
+                &body,
+                "application/json; charset=utf-8",
+                gzip,
+                Some("no-store"),
+            );
+            return;
+        }
+        let (status, data) = route_api(state, api, &q);
         send(
             req,
             status,
@@ -315,21 +389,35 @@ fn send(
     gzip: bool,
     cache_control: Option<&str>,
 ) {
+    let (body, gzipped) = if gzip && data.len() > 1024 {
+        match gzip_bytes(&data) {
+            Ok(compressed) => (compressed, true),
+            Err(_) => (data, false),
+        }
+    } else {
+        (data, false)
+    };
+    send_encoded(req, status, &body, content_type, gzipped, cache_control);
+}
+
+/// Send a body that is ALREADY in its final encoding — used for the cached
+/// fixed-content responses, which are stored pre-gzipped so a repeat request costs
+/// neither a re-serialise nor a re-compress.
+fn send_encoded(
+    req: tiny_http::Request,
+    status: u16,
+    body: &[u8],
+    content_type: &str,
+    gzipped: bool,
+    cache_control: Option<&str>,
+) {
     let mut headers = vec![header("Content-Type", content_type)];
     if let Some(cc) = cache_control {
         headers.push(header("Cache-Control", cc));
     }
-    let body = if gzip && data.len() > 1024 {
-        match gzip_bytes(&data) {
-            Ok(compressed) => {
-                headers.push(header("Content-Encoding", "gzip"));
-                compressed
-            }
-            Err(_) => data,
-        }
-    } else {
-        data
-    };
+    if gzipped {
+        headers.push(header("Content-Encoding", "gzip"));
+    }
     let mut resp = tiny_http::Response::from_data(body).with_status_code(status);
     for h in headers {
         resp = resp.with_header(h);

@@ -15,14 +15,28 @@ use crate::tree::TensorInfo;
 use crate::web::dto::{self, HistogramDto, SampleDto, StatsDto};
 
 pub type Query = HashMap<String, String>;
-pub type Reply = (u16, Value);
+/// An HTTP status plus the response body ALREADY serialised to JSON bytes (not a
+/// `serde_json::Value`) — see `ok`.
+pub type Reply = (u16, Vec<u8>);
 
 fn ok<T: Serialize>(v: T) -> Reply {
-    (200, serde_json::to_value(v).unwrap_or(Value::Null))
+    // Serialise STRAIGHT to bytes. Going via `serde_json::to_value` first materialised
+    // the whole response as a `Value` tree — for `/api/tree` on a 31k-tensor checkpoint
+    // that was ~250 MB of transient allocation and a second full pass over the data,
+    // every request.
+    (
+        200,
+        serde_json::to_vec(&v).unwrap_or_else(|_| b"null".to_vec()),
+    )
 }
 
 pub fn err(status: u16, msg: impl Into<String>) -> Reply {
-    (status, json!({ "error": msg.into() }))
+    let body = json!({ "error": msg.into() });
+    (
+        status,
+        serde_json::to_vec(&body)
+            .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec()),
+    )
 }
 
 /// Data-value views need the tensor bytes locally; a remote (`--ssh-proxy`) source
@@ -120,7 +134,7 @@ pub fn health(s: &WebState) -> Reply {
 
 pub fn check(s: &WebState) -> Reply {
     match &s.check {
-        Some(report) => (200, report.to_json(false)),
+        Some(report) => ok(report.to_json(false)),
         None => ok(Value::Null),
     }
 }
