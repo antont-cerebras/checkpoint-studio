@@ -248,6 +248,14 @@ An explicit `--ssh-proxy` / `--ssh-venv` on the command line always overrides th
 config, and a missing or malformed config file is simply ignored. (`--ssh-read` still
 works as an alias for `--ssh-proxy`, so older commands keep running.)
 
+**Recording a remote transcript.** Set `CHECKPOINT_STUDIO_RECORD_REMOTE=<dir>` and the
+stdout of each remote script is saved to `<dir>/{dump,value_diff,repack_verify,list_objects}.txt`.
+Only what already crossed the ssh link is written — metadata and results, never tensor
+data. Useful twice over: it's the fastest way to report a remote problem (send the
+transcript rather than describe it), and the checked-in fixtures under
+`crates/core/tests/fixtures/remote/` are recordings replayed through the parsers in tests,
+so the protocol is pinned to what the cluster really emits rather than to what we assumed.
+
 > **Read-only, guaranteed.** `--ssh-proxy` never modifies the remote checkpoint.
 > Files are opened strictly read-only (`OpenFlags::READ` — no create/write/
 > truncate), the tool issues no `mkdir`/`remove`/`rename`/`chmod`, and the `s3://`

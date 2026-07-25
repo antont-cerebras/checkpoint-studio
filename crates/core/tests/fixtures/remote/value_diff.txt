@@ -1,0 +1,12 @@
+# Recorded from a real cstorch proxy (see remote.rs::record_transcript, enabled with
+# CHECKPOINT_STUDIO_RECORD_REMOTE). Non-sentinel lines like this one are ignored by the
+# parsers, which is itself part of what these fixtures verify.
+CKPT_EXPLORER_STAT:load	old
+CKPT_EXPLORER_STAT:load	new
+CKPT_EXPLORER_STAT:start	1	1	model.layers.1.block_sparse_moe.experts.down_proj.qscale
+CKPT_EXPLORER_STAT:size	model.layers.1.block_sparse_moe.experts.down_proj.qscale	60555264	60555264
+CKPT_EXPLORER_STAT:bytes	model.layers.1.block_sparse_moe.experts.down_proj.qscale	60555264	16777216
+CKPT_EXPLORER_STAT:bytes	model.layers.1.block_sparse_moe.experts.down_proj.qscale	60555264	60555264
+CKPT_EXPLORER_STAT:phase	model.layers.1.block_sparse_moe.experts.down_proj.qscale	comparing
+CKPT_EXPLORER_META:{"name": "model.layers.1.block_sparse_moe.experts.down_proj.qscale", "bytes": 121110528, "values": {"elements": 30277632, "differing": 0, "max_abs": 0.0, "mean_abs": 0.0, "nonfinite_mismatch": 0}, "histogram": {"tvd": 0.0, "n": 40}}
+CKPT_EXPLORER_META:{"summary": {"tensors": 1, "compared": 1, "bytes": 121110528, "elapsed_s": 1.2461624145507812}}

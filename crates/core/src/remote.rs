@@ -410,6 +410,7 @@ impl RemoteRead {
         let script = list_script(uri);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
         let out = session.exec_capture(&command, &script, |_| {})?;
+        record_transcript("list_objects", &out);
         let json = out
             .lines()
             .rev()
@@ -648,6 +649,7 @@ impl RemoteRead {
                 }
             }
         })?;
+        record_transcript("dump", &out);
         let json = out
             .lines()
             .rev()
@@ -693,6 +695,7 @@ impl RemoteRead {
         let out = session.exec_capture(&command, &script, |line| {
             dispatch_stream_line(line, &compare_status, &mut on_event);
         })?;
+        record_transcript("value_diff", &out);
         parse_value_diff(&out, &self.host)
     }
 
@@ -720,6 +723,7 @@ impl RemoteRead {
         let out = session.exec_capture(&command, &script, |line| {
             dispatch_stream_line(line, &repack_status, &mut on_event);
         })?;
+        record_transcript("repack_verify", &out);
         parse_repack(&out, &self.host)
     }
 }
@@ -832,6 +836,41 @@ fn compare_status(v: &serde_json::Value) -> CompareStatus {
         CompareStatus::Changed
     } else {
         CompareStatus::Identical
+    }
+}
+
+/// The environment variable that turns on transcript recording.
+pub const RECORD_ENV: &str = "CHECKPOINT_STUDIO_RECORD_REMOTE";
+
+/// Tee a remote script's stdout to `$CHECKPOINT_STUDIO_RECORD_REMOTE/<label>.txt`.
+///
+/// The parsers below are unit-tested against hand-written sentinel strings, which by
+/// construction cannot catch "the cluster emitted something we didn't expect" — and that
+/// is exactly how two bugs shipped: a NaN inside a JSON payload made a result line
+/// silently unparseable, and an aux size emitted after its result left a progress bar
+/// unfinished. Recording real transcripts turns those cases into fixtures.
+///
+/// It doubles as a support tool: a user hitting a remote problem can send the transcript
+/// instead of describing it. Nothing is recorded unless the variable is set, and the file
+/// holds only what already crossed the ssh link (metadata and results, never tensor
+/// data).
+fn record_transcript(label: &str, out: &str) {
+    let Some(dir) = std::env::var_os(RECORD_ENV) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let path = dir.join(format!("{label}.txt"));
+    let wrote = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, out));
+    match wrote {
+        Ok(()) => eprintln!(
+            "checkpoint-studio: recorded the {label} transcript ({} lines) to {}",
+            out.lines().count(),
+            path.display()
+        ),
+        Err(e) => eprintln!(
+            "checkpoint-studio: could not record {label} to {}: {e}",
+            path.display()
+        ),
     }
 }
 
@@ -2264,5 +2303,107 @@ mod tests {
         assert_eq!(names, ["a", "b", "c"]); // shard order, `b` deduped
         assert_eq!(m.len(), 1); // duplicate `fmt` metadata collapsed
         assert_eq!(m[0].name, "fmt");
+    }
+}
+
+/// Replay of transcripts **recorded from a real cstorch proxy** through the parsers.
+///
+/// The other parser tests in this file build their input by hand, which pins the shapes we
+/// *expect*. These pin the shapes the cluster actually *emits* — a distinction that has
+/// cost us twice: a NaN inside a result payload made `json.dumps` produce output our
+/// parser silently skipped (reported as "verified 1 tensor" with no result), and an aux
+/// size emitted after its result left a progress bar unfinished. Neither was reachable
+/// from a hand-written fixture.
+///
+/// Re-record with `CHECKPOINT_STUDIO_RECORD_REMOTE=<dir>` against a live proxy; the files
+/// carry a header noting where the payload was trimmed (only the arrays, never the
+/// structure). Non-sentinel lines in them — a urllib3 warning, the trim banner — are real
+/// noise the parsers must tolerate.
+#[cfg(test)]
+mod replay {
+    use super::*;
+
+    /// Extract the payload the production code passes to the parser: the LAST
+    /// sentinel-tagged line, ignoring everything else on the stream.
+    fn last_payload(transcript: &str) -> &str {
+        transcript
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix(SENTINEL))
+            .expect("a recorded transcript ends with a sentinel-tagged payload")
+    }
+
+    #[test]
+    fn recorded_dump_parses_into_tensors_and_s3_metadata() {
+        let out = include_str!("../tests/fixtures/remote/dump.txt");
+        // Progress lines are interleaved with the payload and must not confuse it.
+        assert!(out.lines().any(|l| l.starts_with(PROGRESS_TAG)));
+        let (tensors, _meta, s3) =
+            parse_dump(last_payload(out), "s3://bucket/ckpt").expect("recorded dump parses");
+        assert_eq!(tensors.len(), 6, "the trimmed fixture carries six tensors");
+        let first = &tensors[0];
+        assert!(!first.name.is_empty());
+        assert!(
+            !first.dtype.is_empty(),
+            "dtype survives the torch.* mapping"
+        );
+        assert!(first.num_elements > 0 && first.size_bytes > 0);
+        assert!(
+            first.source_path.starts_with("s3://"),
+            "an s3 source is stamped verbatim, got {}",
+            first.source_path
+        );
+        assert!(
+            !s3.objects.is_empty(),
+            "the recording asked for S3 object metadata, so objects come back too"
+        );
+    }
+
+    #[test]
+    fn recorded_value_diff_parses_results_and_summary() {
+        let out = include_str!("../tests/fixtures/remote/value_diff.txt");
+        // The real stream carries live status events alongside the results.
+        assert!(out.lines().any(|l| l.starts_with(STATUS_TAG)));
+        let (results, stats) = parse_value_diff(out, "host").expect("recorded value diff parses");
+        assert_eq!(results.len(), 1, "one tensor was compared");
+        let diff = results.values().next().expect("a result");
+        assert!(diff.values.is_some(), "--values was requested");
+        assert!(diff.hist_shift.is_some(), "--histogram was requested");
+        let stats = stats.expect("the summary line parses");
+        assert_eq!(stats.tensors, 1);
+        assert!(stats.bytes > 0 && stats.elapsed_s > 0.0);
+    }
+
+    #[test]
+    fn recorded_repack_verify_parses_verdict_and_siblings() {
+        let out = include_str!("../tests/fixtures/remote/repack_verify.txt");
+        let (results, _stats) = parse_repack(out, "host").expect("recorded repack parses");
+        assert_eq!(results.len(), 1);
+        let r = results.values().next().expect("a result");
+        assert!(r.elements > 0, "element count survives");
+        // This is the dense-packed case, so the auto fallback reports instead of the
+        // sparse index compare — the exact path that used to emit unparseable NaNs.
+        assert!(
+            r.fallback.is_some() || r.differing == 0,
+            "either the fallback verdict or a clean index compare"
+        );
+        assert!(
+            r.codebook.is_some() && r.qscale.is_some(),
+            "both sibling tensors are compared alongside the weight"
+        );
+    }
+
+    #[test]
+    fn recorded_list_objects_parses_through_real_stderr_noise() {
+        let out = include_str!("../tests/fixtures/remote/list_objects.txt");
+        assert!(
+            out.contains("InsecureRequestWarning"),
+            "the fixture keeps the real urllib3 warning: noise the parser must skip"
+        );
+        let objects = parse_list(last_payload(out)).expect("recorded listing parses");
+        assert_eq!(objects.len(), 8);
+        let (key, size) = &objects[0];
+        assert!(!key.starts_with('/'), "keys are prefix-relative, got {key}");
+        assert!(*size > 0);
     }
 }
