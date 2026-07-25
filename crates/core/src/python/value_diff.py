@@ -62,6 +62,24 @@ except Exception as e:
 def to_f64(rt: Any, i: int | None, j: int | None) -> Any:
     sl = rt if i is None else rt[i:j]
     return sl.to(torch.float64).numpy().reshape(-1)
+def span_range(rt: Any, i: int | None, j: int | None) -> tuple[float, float] | None:
+    """Finite min/max of one span WITHOUT widening it to float64.
+
+    The histogram needs the global range before it can bin, which used to cost a whole
+    extra float64 pass over the data. Reducing in the stored dtype is ~4x less memory
+    traffic for f16, and exact: f16/bf16 min-max convert to f64 losslessly, and an
+    integer min/max rounds to f64 identically either way. `None` if nothing is finite.
+    """
+    sl = rt if i is None else rt[i:j]
+    if not sl.is_floating_point():
+        return float(sl.min()), float(sl.max())     # integers are always finite
+    fin = torch.isfinite(sl)
+    if bool(fin.all()):
+        return float(sl.min()), float(sl.max())     # common case: no copy at all
+    if not bool(fin.any()):
+        return None
+    v = torch.masked_select(sl, fin)                # native dtype, not float64
+    return float(v.min()), float(v.max())
 # Map a numpy dtype name (from an object's __NUMPY__ metadata) to a torch dtype, so
 # we can stream the S3 object ourselves (chunked, with progress) rather than letting
 # cstorch materialise it in one shot with no progress. Comparison stays on the proxy.
@@ -159,7 +177,21 @@ def work(idx: int) -> int:
         spans = [(None, None)] if scalar else [(i, min(i + rows, d0)) for i in range(0, d0, rows)]
         if not spans: spans = [(None, None)]
         elements = 0; differing = 0; nfm = 0; max_abs = 0.0; sum_abs = 0.0
-        omin = omax = nmin = nmax = None
+        # The bin range is taken from a cheap native-dtype scan (see span_range) so the
+        # single float64 pass below can do BOTH the value diff and the binning. It used
+        # to be two float64 passes over the whole tensor: one to diff and find the
+        # range, another to bin — twice the widening and twice the memory traffic on
+        # every `--values --histogram` run.
+        n = BINS if BINS else 40
+        lo_c = hi_c = 0.0
+        oc = nc = None
+        onf = nnf = 0
+        if WANT_HIST:
+            bounds = [r for rt in (ra, rb) for r in (span_range(rt, i, j) for (i, j) in spans) if r]
+            if bounds:
+                lo_c = min(b[0] for b in bounds); hi_c = max(b[1] for b in bounds)
+            if hi_c <= lo_c: n = 1
+            oc = np.zeros(n, dtype=np.int64); nc = np.zeros(n, dtype=np.int64)
         for (i, j) in spans:
             av = to_f64(ra, i, j); bv = to_f64(rb, i, j)
             if WANT_VALUES:
@@ -175,30 +207,7 @@ def work(idx: int) -> int:
                     if m > max_abs: max_abs = m
                     sum_abs += float(dd.sum())
                 nfm += int(np.count_nonzero(dmask & ~bothfin))
-            if WANT_HIST:
-                af = av[np.isfinite(av)]; bf = bv[np.isfinite(bv)]
-                if af.size:
-                    lo = float(af.min()); hi = float(af.max())
-                    omin = lo if omin is None else min(omin, lo)
-                    omax = hi if omax is None else max(omax, hi)
-                if bf.size:
-                    lo = float(bf.min()); hi = float(bf.max())
-                    nmin = lo if nmin is None else min(nmin, lo)
-                    nmax = hi if nmax is None else max(nmax, hi)
-        if WANT_VALUES:
-            mean_abs = (sum_abs / elements) if elements > 0 else 0.0
-            res["values"] = {"elements": elements, "differing": differing, "max_abs": max_abs, "mean_abs": mean_abs, "nonfinite_mismatch": nfm}
-        if WANT_HIST:
-            mins = [x for x in (omin, nmin) if x is not None]
-            maxs = [x for x in (omax, nmax) if x is not None]
-            n = BINS if BINS else 40
-            lo_c = min(mins) if mins else 0.0
-            hi_c = max(maxs) if maxs else 0.0
-            if hi_c <= lo_c: n = 1
-            oc = np.zeros(n, dtype=np.int64); nc = np.zeros(n, dtype=np.int64)
-            onf = 0; nnf = 0
-            for (i, j) in spans:
-                av = to_f64(ra, i, j); bv = to_f64(rb, i, j)
+            if WANT_HIST and oc is not None and nc is not None:
                 afin = np.isfinite(av); bfin = np.isfinite(bv)
                 onf += int(av.size) - int(np.count_nonzero(afin))
                 nnf += int(bv.size) - int(np.count_nonzero(bfin))
@@ -208,6 +217,10 @@ def work(idx: int) -> int:
                 else:
                     hc, _ = np.histogram(af, bins=n, range=(lo_c, hi_c)); oc += hc.astype(np.int64)
                     hc, _ = np.histogram(bf, bins=n, range=(lo_c, hi_c)); nc += hc.astype(np.int64)
+        if WANT_VALUES:
+            mean_abs = (sum_abs / elements) if elements > 0 else 0.0
+            res["values"] = {"elements": elements, "differing": differing, "max_abs": max_abs, "mean_abs": mean_abs, "nonfinite_mismatch": nfm}
+        if WANT_HIST and oc is not None and nc is not None:
             ot = int(oc.sum()); nt = int(nc.sum())
             if ot == 0 and nt == 0: tvd = 0.0
             elif ot == 0 or nt == 0: tvd = 1.0
