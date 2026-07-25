@@ -1601,6 +1601,77 @@ mod tests {
         serde_json::from_str(&json).expect("params payload is valid JSON")
     }
 
+    /// Every `PARAMS["…"]` the Python reads must be supplied by the Rust caller.
+    ///
+    /// This is the ONE interface between the two languages, and it is checked by nothing
+    /// else: rename a key on either side and every gate stays green while the script
+    /// dies with a `KeyError` on the cluster, minutes into a user's job. Reading the
+    /// keys straight out of the shipped `.py` files keeps the two in lockstep.
+    #[test]
+    fn every_param_the_scripts_read_is_supplied() {
+        /// Scan a script for the `PARAMS["key"]` lookups it performs.
+        fn keys_read(src: &str) -> std::collections::BTreeSet<String> {
+            let mut found = std::collections::BTreeSet::new();
+            let mut rest = src;
+            while let Some(at) = rest.find("PARAMS[\"") {
+                rest = &rest[at + "PARAMS[\"".len()..];
+                if let Some(end) = rest.find('"') {
+                    found.insert(rest[..end].to_string());
+                    rest = &rest[end..];
+                }
+            }
+            found
+        }
+
+        let pairs = vec![("old.w".to_string(), "new.w".to_string())];
+        let opts = RemoteValueOpts {
+            values: true,
+            histogram: true,
+            bins: Some(32),
+            full_hist: true,
+            jobs: 4,
+        };
+        for (name, src, generated) in [
+            (
+                "dump.py",
+                include_str!("python/dump.py"),
+                dump_script("s3://b/k", true),
+            ),
+            (
+                "list_objects.py",
+                include_str!("python/list_objects.py"),
+                list_script("s3://b/k"),
+            ),
+            (
+                "value_diff.py",
+                include_str!("python/value_diff.py"),
+                value_diff_script("s3://b/o", "s3://b/n", &pairs, &opts),
+            ),
+            (
+                "repack_verify.py",
+                include_str!("python/repack_verify.py"),
+                repack_verify_script("s3://b/o", "s3://b/n", &pairs, 3, true),
+            ),
+        ] {
+            let wanted = keys_read(src);
+            assert!(
+                !wanted.is_empty(),
+                "{name}: found no PARAMS[...] lookups — has the interface changed?"
+            );
+            let supplied = script_params(&generated);
+            let obj = supplied
+                .as_object()
+                .unwrap_or_else(|| panic!("{name}: params must be a JSON object"));
+            let missing: Vec<&String> = wanted.iter().filter(|k| !obj.contains_key(*k)).collect();
+            assert!(
+                missing.is_empty(),
+                "{name} reads {missing:?} from PARAMS, but the Rust caller doesn't send it. \
+                 Sent: {:?}",
+                obj.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn cstorch_script_embeds_source_safely() {
         let s = dump_script("s3://b/k", false);
