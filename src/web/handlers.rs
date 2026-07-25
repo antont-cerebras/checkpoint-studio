@@ -289,7 +289,16 @@ pub fn tensor_histogram(s: &WebState, q: &Query) -> Reply {
 /// Compute (or fetch the cached) whole-tensor stats for `(name, view)`.
 fn scan_stats(s: &WebState, t: &TensorInfo, view: ViewDtype) -> Result<StatsDto, Reply> {
     let key = (t.name.clone(), dto::view_label(view));
-    if let Some(hit) = s.stats_cache.lock().unwrap().get(&key) {
+    // `unwrap_or_else(into_inner)`: this is a pure memo, so a mutex poisoned by an
+    // unrelated panic carries no broken invariant — but `.unwrap()` would turn that into
+    // a permanent 500 for this endpoint for the rest of the process's life.
+    let hit = s
+        .stats_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned();
+    if let Some(hit) = hit {
         return Ok(hit.clone());
     }
     let (cancel, pause) = (AtomicBool::new(false), AtomicBool::new(false));
@@ -297,7 +306,10 @@ fn scan_stats(s: &WebState, t: &TensorInfo, view: ViewDtype) -> Result<StatsDto,
     let stats =
         sample::tensor_stats(t, view, schema, &cancel, &pause, None).map_err(|e| err(500, e))?;
     let dto = StatsDto::from(&stats);
-    s.stats_cache.lock().unwrap().insert(key, dto.clone());
+    s.stats_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, dto.clone());
     Ok(dto)
 }
 
@@ -331,4 +343,190 @@ fn fnum(q: &Query, key: &str, default: f32) -> f32 {
 
 fn basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Build the shared state from a checked-in fixture, exactly as `run_web` does.
+    /// These handlers had no automated coverage at all despite being the layer that
+    /// changes most often, so this exercises every endpoint's success shape, its error
+    /// path, and the fixed-content cache.
+    fn state() -> crate::web::WebState {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.safetensors");
+        let files = vec![fixture];
+        let model = crate::readers::read_local(&files).expect("fixture reads");
+        crate::web::WebState::build(model, &files, &[])
+    }
+
+    /// Parse a reply body back into JSON so tests assert on the values a client sees.
+    fn json(reply: &Reply) -> serde_json::Value {
+        serde_json::from_slice(&reply.1).unwrap_or_else(|e| {
+            panic!(
+                "reply body is not JSON ({e}): {}",
+                String::from_utf8_lossy(&reply.1)
+            )
+        })
+    }
+
+    fn query(pairs: &[(&str, &str)]) -> Query {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    const TENSOR: &str = "model.layers.0.mlp.down_proj.weight";
+
+    #[test]
+    fn every_endpoint_answers_200_with_the_documented_shape() {
+        let s = state();
+
+        let tree = json(&tree(&s));
+        assert!(tree["root"].is_string(), "tree exposes the checkpoint root");
+        assert!(tree["tree"].is_array(), "tree exposes the node array");
+
+        assert!(json(&files(&s))["kind"].is_string(), "files is an FsNode");
+        let st = json(&stats(&s));
+        assert_eq!(st["files"]["count"], 1, "one fixture shard");
+        assert!(
+            st["tensors"].is_object() || st["dtypes"].is_array(),
+            "stats reports tensor facets: {st}"
+        );
+        assert!(json(&health(&s)).is_array(), "health is a list of reports");
+        assert!(json(&check(&s))["summary"].is_object());
+        assert!(json(&model(&s))["root"].is_string());
+
+        // The whole point of `/api/tensor`: one tensor's metadata by exact name.
+        let t = json(&tensor(&s, &query(&[("name", TENSOR)])));
+        assert_eq!(t["name"], TENSOR);
+        assert_eq!(t["dtype"], "U16");
+        assert_eq!(t["shape"], serde_json::json!([3, 4, 5]));
+
+        // Filtering is server-side so the web and TUI agree; check it actually filters.
+        let f = json(&filter(&s, &query(&[("q", "dtype:F32")])));
+        assert_eq!(f["active"], true);
+        let names: Vec<&str> = f["names"]
+            .as_array()
+            .expect("names")
+            .iter()
+            .map(|n| n.as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            names,
+            ["model.layers.0.input_layernorm.weight", "model.norm.weight"]
+        );
+
+        // An empty query is "inactive" (show everything), not "match nothing".
+        assert_eq!(json(&filter(&s, &query(&[("q", "")])))["active"], false);
+
+        assert!(json(&schema(&s, &query(&[("q", "")])))["families"].is_array());
+    }
+
+    #[test]
+    fn data_view_endpoints_return_the_requested_window() {
+        let s = state();
+        let sample = json(&tensor_sample(
+            &s,
+            &query(&[
+                ("name", TENSOR),
+                ("mode", "window"),
+                ("rows", "2"),
+                ("cols", "3"),
+            ]),
+        ));
+        assert_eq!(sample["values"].as_array().map(Vec::len), Some(2));
+        assert_eq!(sample["values"][0].as_array().map(Vec::len), Some(3));
+        // U16 is an integer view, so the client is told to format from the raw bits.
+        assert_eq!(sample["integer"], true);
+        assert_eq!(sample["signed"], false);
+        assert!(
+            sample["raw"].is_array(),
+            "integer views always ship raw bits"
+        );
+
+        let st = json(&tensor_stats(&s, &query(&[("name", TENSOR)])));
+        assert_eq!(st["count"], 60); // 3*4*5
+        assert!(st["min"].is_number() && st["max"].is_number());
+
+        let h = json(&tensor_histogram(
+            &s,
+            &query(&[("name", TENSOR), ("bins", "8")]),
+        ));
+        assert!(h["counts"].as_array().is_some_and(|c| !c.is_empty()));
+
+        let l = json(&layout(&s, &query(&[("file", "tiny.safetensors")])));
+        assert!(l["segments"].is_array(), "byte-layout segments");
+    }
+
+    #[test]
+    fn bad_input_is_a_4xx_with_a_message_never_a_panic() {
+        let s = state();
+        for (label, reply) in [
+            ("unknown tensor", tensor(&s, &query(&[("name", "nope")]))),
+            ("missing name", tensor(&s, &query(&[]))),
+            (
+                "unknown layout file",
+                layout(&s, &query(&[("file", "nope.safetensors")])),
+            ),
+            ("missing file param", layout(&s, &query(&[]))),
+            ("unknown file", file(&s, &query(&[("path", "nope.txt")]))),
+            (
+                "sample of unknown tensor",
+                tensor_sample(&s, &query(&[("name", "nope")])),
+            ),
+            (
+                "stats of unknown tensor",
+                tensor_stats(&s, &query(&[("name", "nope")])),
+            ),
+            ("bad filter facet", filter(&s, &query(&[("q", "bogus:1")]))),
+            (
+                "bad filter number",
+                filter(&s, &query(&[("q", "size:abc")])),
+            ),
+        ] {
+            assert!(
+                (400..500).contains(&reply.0),
+                "{label}: expected a 4xx, got {}",
+                reply.0
+            );
+            let msg = json(&reply)["error"].as_str().unwrap_or("").to_string();
+            assert!(!msg.is_empty(), "{label}: a 4xx must explain itself");
+        }
+    }
+
+    /// A dtype override must reinterpret the SAME bytes, not re-read the tensor: the
+    /// packed 4-bit view yields more values than the stored U16 one.
+    #[test]
+    fn dtype_override_reinterprets_the_same_bytes() {
+        let s = state();
+        let stored = json(&tensor_sample(
+            &s,
+            &query(&[
+                ("name", TENSOR),
+                ("mode", "window"),
+                ("rows", "1"),
+                ("cols", "40"),
+            ]),
+        ));
+        let as_u4 = json(&tensor_sample(
+            &s,
+            &query(&[
+                ("name", TENSOR),
+                ("dtype", "u4"),
+                ("mode", "window"),
+                ("rows", "1"),
+                ("cols", "40"),
+            ]),
+        ));
+        assert_eq!(stored["view"], "stored");
+        assert_eq!(as_u4["view"], "u4");
+        assert!(
+            as_u4["total_cols"].as_u64() > stored["total_cols"].as_u64(),
+            "unpacking 4-bit nibbles must widen the logical row"
+        );
+    }
 }

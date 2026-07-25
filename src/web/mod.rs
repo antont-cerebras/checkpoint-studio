@@ -144,10 +144,13 @@ impl WebState {
         let name = STATIC_ENDPOINTS.iter().copied().find(|&e| e == api)?;
         // Bind the lookup to a local so the guard is dropped before the build below,
         // rather than living to the end of an `if let`.
+        // Poison-tolerant: this is a pure memo of immutable data, and `.ok()?` would
+        // silently disable the cache for the rest of the process — reintroducing the
+        // 250 MB-per-request rebuild this cache exists to prevent.
         let hit = self
             .static_bodies
             .lock()
-            .ok()?
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(name, gzipped))
             .map(Arc::clone);
         if let Some(body) = hit {
@@ -176,7 +179,7 @@ impl WebState {
         let body = Arc::new(body);
         self.static_bodies
             .lock()
-            .ok()?
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert((name, gzipped), Arc::clone(&body));
         Some(body)
     }
@@ -274,40 +277,105 @@ fn print_serve_banner(url: &str) {
     );
 }
 
+const JSON_CT: &str = "application/json; charset=utf-8";
+
+/// A response body, either freshly built or shared from the fixed-content cache. Shared
+/// so a repeat `/api/tree` hands out an `Arc` instead of copying 14 MB.
+enum Body {
+    Owned(Vec<u8>),
+    Shared(Arc<Vec<u8>>),
+}
+
+impl Body {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Body::Owned(v) => v,
+            Body::Shared(a) => a,
+        }
+    }
+}
+
+/// A fully-resolved response, computed before anything is written to the socket — which
+/// is what lets the computation run inside a panic boundary (see `handle`).
+struct Prepared {
+    status: u16,
+    body: Body,
+    content_type: &'static str,
+    gzipped: bool,
+    cache_control: Option<&'static str>,
+}
+
 fn handle(state: &WebState, req: tiny_http::Request) {
     let url = req.url().to_string();
-    let (path, query_str) = url.split_once('?').unwrap_or((url.as_str(), ""));
     let gzip = accepts_gzip(&req);
-    if let Some(api) = path.strip_prefix("/api/") {
-        let q = parse_query(query_str);
-        // The API reflects one read-once checkpoint; a browser must never reuse a
-        // response from a prior server run (a different checkpoint on the same port) —
-        // hence `no-store` — but we can reuse it SERVER-side: a fixed-content endpoint
-        // is encoded once and then handed out as bytes (see `cached_body`).
-        if q.is_empty()
-            && let Some(body) = state.cached_body(api, gzip)
-        {
-            send_encoded(
-                req,
-                200,
-                &body,
-                "application/json; charset=utf-8",
-                gzip,
-                Some("no-store"),
-            );
-            return;
-        }
-        let (status, data) = route_api(state, api, &q);
-        send(
-            req,
-            status,
-            data,
-            "application/json; charset=utf-8",
-            gzip,
-            Some("no-store"),
+    // Contain a panic. The worker pool is small (2-8 threads) and each worker loops on
+    // `server.recv()`, so an unwinding handler would kill that worker permanently —
+    // after a handful of bad requests the process would still accept connections and
+    // answer none: alive, but silently hung. (We shipped exactly such a handler
+    // earlier: a histogram bin-count overflow that indexed an empty vector.) Resolving
+    // the response before touching the socket means a panic costs one 500, not a
+    // worker.
+    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (path, query_str) = url.split_once('?').unwrap_or((url.as_str(), ""));
+        prepare(state, path, query_str, gzip)
+    }))
+    .unwrap_or_else(|_| {
+        // The default panic hook has already printed the message and location; add the
+        // request that triggered it, which the hook doesn't know.
+        eprintln!(
+            "checkpoint-studio web: panic while serving {url} — replied 500; the server is still running"
         );
-    } else {
-        respond_asset(req, path, gzip);
+        Prepared {
+            status: 500,
+            body: Body::Owned(
+                br#"{"error":"internal error handling this request (see the server log)"}"#
+                    .to_vec(),
+            ),
+            content_type: JSON_CT,
+            gzipped: false,
+            cache_control: Some("no-store"),
+        }
+    });
+    send_encoded(
+        req,
+        prepared.status,
+        prepared.body.as_slice(),
+        prepared.content_type,
+        prepared.gzipped,
+        prepared.cache_control,
+    );
+}
+
+/// Resolve a request to bytes. Pure: touches no socket, so it is safe to run inside the
+/// panic boundary above.
+fn prepare(state: &WebState, path: &str, query_str: &str, gzip: bool) -> Prepared {
+    let Some(api) = path.strip_prefix("/api/") else {
+        return prepare_asset(path, gzip);
+    };
+    let q = parse_query(query_str);
+    // The API reflects one read-once checkpoint; a browser must never reuse a response
+    // from a prior server run (a different checkpoint on the same port) — hence
+    // `no-store` — but we can reuse it SERVER-side: a fixed-content endpoint is encoded
+    // once and then handed out as bytes (see `cached_body`).
+    if q.is_empty()
+        && let Some(body) = state.cached_body(api, gzip)
+    {
+        return Prepared {
+            status: 200,
+            body: Body::Shared(body),
+            content_type: JSON_CT,
+            gzipped: gzip,
+            cache_control: Some("no-store"),
+        };
+    }
+    let (status, data) = route_api(state, api, &q);
+    let (body, gzipped) = maybe_gzip(data, gzip);
+    Prepared {
+        status,
+        body: Body::Owned(body),
+        content_type: JSON_CT,
+        gzipped,
+        cache_control: Some("no-store"),
     }
 }
 
@@ -345,7 +413,7 @@ fn parse_query(qs: &str) -> Query {
     map
 }
 
-fn respond_asset(req: tiny_http::Request, path: &str, gzip: bool) {
+fn prepare_asset(path: &str, gzip: bool) -> Prepared {
     let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
     // Serve the asset, else fall back to index.html (client-side routing). Vite
@@ -367,37 +435,40 @@ fn respond_asset(req: tiny_http::Request, path: &str, gzip: bool) {
                 "no-cache",
             ),
             None => {
-                let resp = tiny_http::Response::from_string(
-                    "web UI not built — run `cd web && npm ci && npm run build`",
-                )
-                .with_status_code(404);
-                let _ = req.respond(resp);
-                return;
+                return Prepared {
+                    status: 404,
+                    body: Body::Owned(
+                        b"web UI not built \xe2\x80\x94 run `cd web && npm ci && npm run build`"
+                            .to_vec(),
+                    ),
+                    content_type: "text/plain; charset=utf-8",
+                    gzipped: false,
+                    cache_control: Some("no-cache"),
+                };
             }
         },
     };
-    send(req, 200, data, ctype, gzip, Some(cache));
+    let (body, gzipped) = maybe_gzip(data, gzip);
+    Prepared {
+        status: 200,
+        body: Body::Owned(body),
+        content_type: ctype,
+        gzipped,
+        cache_control: Some(cache),
+    }
 }
 
-/// Send a response, gzip-compressing the body when the client accepts it and the
-/// payload is large enough to be worth it (the tensor-tree JSON is tens of MB).
-fn send(
-    req: tiny_http::Request,
-    status: u16,
-    data: Vec<u8>,
-    content_type: &str,
-    gzip: bool,
-    cache_control: Option<&str>,
-) {
-    let (body, gzipped) = if gzip && data.len() > 1024 {
+/// gzip the body when the client accepts it and the payload is big enough to be worth
+/// it (the tensor-tree JSON is tens of MB). Returns the body and whether it's encoded.
+fn maybe_gzip(data: Vec<u8>, gzip: bool) -> (Vec<u8>, bool) {
+    if gzip && data.len() > 1024 {
         match gzip_bytes(&data) {
             Ok(compressed) => (compressed, true),
             Err(_) => (data, false),
         }
     } else {
         (data, false)
-    };
-    send_encoded(req, status, &body, content_type, gzipped, cache_control);
+    }
 }
 
 /// Send a body that is ALREADY in its final encoding — used for the cached
