@@ -6,17 +6,53 @@
 //! and the `residual` screen it restores to). The persistent selection/scroll state
 //! stays on [`Explorer`]; these hold only what the old per-screen loops kept as locals.
 
-// A child module of the one it was split out of, so it needs its parent's private
-// vocabulary: the `Explorer` internals, the `Mode`/`Outcome`/`Screen` machinery, the
-// per-screen command enums and the shared scroll constants. Enumerating them is ~80
-// names that would churn on every edit, and the lint is aimed at wildcards across
-// module boundaries you don't own — not at a submodule importing its own parent.
-//
-// The size of that list is itself the finding: these modes reach deep into `Explorer`.
-// Narrowing that surface (so each mode takes only what it needs) is the next step, and
-// this import is where the coupling will show up as it shrinks.
-#[allow(clippy::wildcard_imports)]
-use super::*;
+// Imports are explicit, and external types are taken from their real source instead of
+// being laundered through the parent. What remains below is an honest measure of what
+// these screens need from `Explorer`: 50 names, where the wildcard's expansion was ~80.
+
+use anyhow::Result;
+
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::text::{Line, Span};
+
+use crate::sample::{SampleMode, Stats};
+use crate::tree::{TensorInfo, TreeNode};
+use crate::ui::{Legend, Overlay, StatsView, UI};
+
+// The mode framework and the vocabulary these screens share with the driver.
+use super::{
+    Explorer, HelpCtx, Mode, ModeSpec, Nav, Outcome, PaletteResult, PopupBackdrop, Screen,
+};
+
+// Input handling and scroll tuning, shared with the parent's own loops.
+use super::{
+    DOUBLE_CLICK, FILES_FOOTER_ROWS, Interaction, MouseOutcome, SCROLL_PAGE, WHEEL_STEP,
+    accel_step_page, accel_step_row, slice_step,
+};
+
+// Per-screen commands. A keystroke is translated into one of these HERE and dispatched by
+// `Explorer` THERE, which is why they stay in the parent: it references them 20-30 times
+// each (dispatch, palette, legend) against once or twice here, so moving them next to
+// each screen would invert the dependency rather than remove it.
+use super::{
+    Cmd, DataCmd, DetailCmd, FileCmd, LayoutCmd, RenameCmd, StatsCmd, available_data_commands,
+    available_detail_commands, available_rename_commands, available_stats_commands, data_cmd_key,
+    detail_cmd_key, file_command_for_key, layout_command_for_key, stats_cmd_key,
+    tree_command_for_key,
+};
+
+// Per-screen state and small helpers owned by the parent.
+use super::{
+    Bg, BinsChoice, DtypePreview, RenameMode, RenamePair, Representation, ReshapeChoice,
+    STATS_SPINNER, ScanJob, StatsStart, copy_to_clipboard, draw_rename_frame, dtype_overridable,
+    is_ctrl_c, quit_immediately,
+};
 
 /// The file browser ([`Screen::Files`]) as a [`Mode`]: lists the checkpoint's
 /// directory (fold with `←`/`→`, `Enter` opens a checkpoint / previews a sidecar),
