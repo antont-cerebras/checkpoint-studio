@@ -345,16 +345,16 @@ fn basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+/// Fixture + JSON helpers shared by the handler and contract test modules.
 #[cfg(test)]
-mod tests {
+mod tests_support {
     use super::*;
     use std::path::PathBuf;
 
+    pub const TENSOR: &str = "model.layers.0.mlp.down_proj.weight";
+
     /// Build the shared state from a checked-in fixture, exactly as `run_web` does.
-    /// These handlers had no automated coverage at all despite being the layer that
-    /// changes most often, so this exercises every endpoint's success shape, its error
-    /// path, and the fixed-content cache.
-    fn state() -> crate::web::WebState {
+    pub fn state() -> crate::web::WebState {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.safetensors");
         let files = vec![fixture];
@@ -363,7 +363,7 @@ mod tests {
     }
 
     /// Parse a reply body back into JSON so tests assert on the values a client sees.
-    fn json(reply: &Reply) -> serde_json::Value {
+    pub fn json(reply: &Reply) -> serde_json::Value {
         serde_json::from_slice(&reply.1).unwrap_or_else(|e| {
             panic!(
                 "reply body is not JSON ({e}): {}",
@@ -372,14 +372,18 @@ mod tests {
         })
     }
 
-    fn query(pairs: &[(&str, &str)]) -> Query {
+    pub fn query(pairs: &[(&str, &str)]) -> Query {
         pairs
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
     }
+}
 
-    const TENSOR: &str = "model.layers.0.mlp.down_proj.weight";
+#[cfg(test)]
+mod tests {
+    use super::tests_support::*;
+    use super::*;
 
     #[test]
     fn every_endpoint_answers_200_with_the_documented_shape() {
@@ -527,6 +531,189 @@ mod tests {
         assert!(
             as_u4["total_cols"].as_u64() > stored["total_cols"].as_u64(),
             "unpacking 4-bit nibbles must widen the logical row"
+        );
+    }
+}
+
+/// Contract tests: the JSON keys `web/src/lib/types.ts` declares must actually exist in
+/// what the server sends.
+///
+/// This is the gap that nothing else covers. `svelte-check` validates the UI against
+/// `types.ts`, and Rust validates the DTO structs — but the two are hand-mirrored, with
+/// no schema or codegen in between. Rename a Rust field and every gate stays green while
+/// the UI silently renders `undefined`. Listing the keys the client actually reads makes
+/// that a build failure instead.
+#[cfg(test)]
+mod contract {
+    use super::tests_support::*;
+    use serde_json::Value;
+
+    /// Assert `value` is an object carrying every one of `keys`.
+    fn has_keys(what: &str, value: &Value, keys: &[&str]) {
+        let obj = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{what}: expected a JSON object, got {value}"));
+        let missing: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| !obj.contains_key(*k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{what}: web/src/lib/types.ts expects {missing:?}, which the server no longer sends. \
+             Present: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tree_response_and_nodes_match_types_ts() {
+        let s = state();
+        let tree = json(&super::tree(&s));
+        has_keys("TreeResponse", &tree, &["root", "tensor_count", "tree"]);
+
+        // Walk to one group and one tensor node — both variants are consumed by the UI.
+        let nodes = tree["tree"].as_array().expect("tree array");
+        let mut group = None;
+        let mut tensor = None;
+        let mut stack: Vec<&Value> = nodes.iter().collect();
+        while let Some(n) = stack.pop() {
+            match n["kind"].as_str() {
+                Some("group") => {
+                    if group.is_none() {
+                        group = Some(n);
+                    }
+                    if let Some(kids) = n["children"].as_array() {
+                        stack.extend(kids.iter());
+                    }
+                }
+                Some("tensor") if tensor.is_none() => tensor = Some(n),
+                _ => {}
+            }
+        }
+        has_keys(
+            "TreeNode::group",
+            group.expect("a group node"),
+            &[
+                "kind",
+                "name",
+                "children",
+                "expanded",
+                "tensor_count",
+                "params",
+                "total_size",
+                "stored_size",
+            ],
+        );
+        let tensor = tensor.expect("a tensor node");
+        has_keys("TreeNode::tensor", tensor, &["kind", "info"]);
+        has_keys(
+            "TensorInfo",
+            &tensor["info"],
+            &[
+                "name",
+                "dtype",
+                "shape",
+                "size_bytes",
+                "num_elements",
+                "storage",
+                "source_path",
+                "layout",
+            ],
+        );
+    }
+
+    #[test]
+    fn file_node_matches_types_ts() {
+        let s = state();
+        let root = json(&super::files(&s));
+        has_keys(
+            "FileNode::dir",
+            &root,
+            &["kind", "name", "path", "size", "files", "children"],
+        );
+        let file = root["children"]
+            .as_array()
+            .and_then(|c| c.iter().find(|n| n["kind"] == "file"))
+            .expect("a file child");
+        has_keys(
+            "FileNode::file",
+            file,
+            &["kind", "name", "path", "size", "file_kind"],
+        );
+    }
+
+    #[test]
+    fn sample_and_stats_dtos_match_types_ts() {
+        let s = state();
+        let sample = json(&super::tensor_sample(
+            &s,
+            &query(&[
+                ("name", TENSOR),
+                ("mode", "window"),
+                ("rows", "2"),
+                ("cols", "2"),
+            ]),
+        ));
+        has_keys(
+            "SampleDto",
+            &sample,
+            &[
+                "rows",
+                "cols",
+                "values",
+                "min",
+                "max",
+                "total_rows",
+                "total_cols",
+                "slices",
+                "slice",
+                "display_shape",
+                "view",
+                "mode",
+                "overridable",
+                "integer",
+                "signed",
+            ],
+        );
+        has_keys(
+            "StatsDto",
+            &json(&super::tensor_stats(&s, &query(&[("name", TENSOR)]))),
+            &[
+                "count",
+                "min",
+                "max",
+                "mean",
+                "std",
+                "zeros",
+                "nonfinite",
+                "zero_fraction",
+                "elapsed_ms",
+            ],
+        );
+    }
+
+    #[test]
+    fn health_view_keys_match_the_component() {
+        let s = state();
+        // HealthView.svelte reads `format` + per-check `note`, both added late; a rename
+        // would silently blank the explanations and the format-specific sections.
+        let check = json(&super::check(&s));
+        has_keys(
+            "CheckReport",
+            &check,
+            &["format", "summary", "checks", "healthy"],
+        );
+        has_keys(
+            "CheckReport.summary",
+            &check["summary"],
+            &["files", "tensors", "params", "errors", "warnings"],
+        );
+        let first = &check["checks"].as_array().expect("checks")[0];
+        has_keys(
+            "CheckReport.checks[]",
+            first,
+            &["id", "title", "note", "status", "findings"],
         );
     }
 }
