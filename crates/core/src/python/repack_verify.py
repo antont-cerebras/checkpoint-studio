@@ -286,21 +286,42 @@ def work(idx: int) -> None:
         # as float16), so a mis-detected tensor is still meaningfully diffed.
         if AUTO and (sparse_bad > 0 or dense_bad > 0):
             dts = str(db.dtype).replace("torch.", "")
-            # Compare in the real stored dtype: F16 words as floats, otherwise the
-            # raw 16-bit integers (dense-packed U16, etc.).
-            if dts == "float16":
-                fa = ao.view(np.float16).astype(np.float64); fb = bo.view(np.float16).astype(np.float64)
-            else:
-                fa = ao.astype(np.float64); fb = bo.astype(np.float64)
-            fd = np.abs(fa - fb)
-            fin = np.isfinite(fd)   # F16 bits can be NaN/Inf → JSON-unsafe; mask them
             label = {"float16": "F16", "bfloat16": "BF16", "uint16": "U16", "int16": "I16"}.get(dts, dts.upper())
+            as_float = (dts == "float16")
+            # Chunked, like the index compare above. Doing this whole-tensor allocated
+            # SIX arrays the size of the data at once (both sides widened, their
+            # difference, its magnitude, a boolean mask, and the fancy-indexed copies
+            # `fd[fin]` taken twice for max and mean). At float64 that is ~2.3 GB each
+            # for a 577 MiB tensor and drove peak RSS on the proxy to ~10.8 GB; the
+            # aggregates are accumulated per block instead, so only one small block is
+            # live at a time. float32 is used rather than float64 because it represents
+            # both f16 values and u16 indices (< 2^24) — and their differences —
+            # exactly, so the reported numbers are unchanged.
+            fdiffering = 0
+            fmax = 0.0
+            fsum = 0.0
+            fcount = 0
+            for n0 in range(0, N, blk):
+                n1 = min(n0 + blk, N)
+                wa = ao[:, n0:n1]; wb = bo[:, n0:n1]
+                # Exact bit inequality (NaN-safe; identical bits ⇒ 0).
+                fdiffering += int(np.count_nonzero(wa != wb))
+                if as_float:
+                    ca = wa.view(np.float16).astype(np.float32); cb = wb.view(np.float16).astype(np.float32)
+                else:
+                    ca = wa.astype(np.float32); cb = wb.astype(np.float32)
+                d = np.abs(ca - cb)
+                fin = np.isfinite(d)   # F16 bits can be NaN/Inf → JSON-unsafe; mask them
+                vals = d if bool(fin.all()) else d[fin]
+                if vals.size:
+                    m = float(vals.max())
+                    if m > fmax: fmax = m
+                    fsum += float(vals.sum(dtype=np.float64)); fcount += int(vals.size)
             res["fallback"] = {"dtype": label,
                                "elements": int(ao.size),
-                               # Exact bit inequality (NaN-safe; identical bits ⇒ 0).
-                               "differing": int(np.count_nonzero(ao != bo)),
-                               "max_abs": float(fd[fin].max()) if bool(fin.any()) else 0.0,
-                               "mean_abs": float(fd[fin].mean()) if bool(fin.any()) else 0.0}
+                               "differing": fdiffering,
+                               "max_abs": fmax,
+                               "mean_abs": (fsum / fcount) if fcount else 0.0}
         if first is not None:
             res["first"] = first
         # A decoded window (experts × inner-offset), centred on the first mismatch
