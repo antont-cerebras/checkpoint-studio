@@ -2,104 +2,48 @@
 // active screen at a time, a browser-style history stack (Backspace / \), and the
 // persistent tree fold/selection/search state. Navigation + tree-cursor helpers
 // live here so the global key handler (App.svelte) and the views share them.
+//
+// This module is the wiring: the stores, the `location.hash` / `history` plumbing and
+// the debounced filter request. The logic it wires up is pure and lives next door —
+// `lib/hash.ts` (URL ↔ view state) and `lib/rows.ts` (row shaping + cursor rules) —
+// so both can be tested without a DOM.
 
 import { derived, get, writable } from 'svelte/store';
 import { api } from '../lib/api';
 import { flatten, nodeId, type Row } from '../lib/flatten';
+import {
+  DV_KEYS,
+  hashFor,
+  parseGlobals,
+  parseScreen,
+  type DataTab,
+  type DvParams,
+  type Globals,
+  type Screen,
+  type SortKey,
+} from '../lib/hash';
+import {
+  clampIndex,
+  firstChildIndex,
+  matchRows,
+  parentIndex,
+  rowIndexOf,
+  siblingIndex,
+  sortRows,
+} from '../lib/rows';
 import { SEARCH_LIMIT, searchTree } from '../lib/search';
-import type { TreeNode } from '../lib/types';
 import { tree as treeData } from './server';
 
-export type DataTab = 'info' | 'heatmap' | 'values' | 'histogram';
-
-/** Data-view (heatmap / numeric grid) params carried in the detail hash so a
- * specific view — mode, sample size, dtype override, window offsets, base/zebra,
- * ratio lock — is reproducible from a shared/bookmarked URL and across back/forward.
- * Raw strings; `DataView` owns the semantics + defaults. */
-export const DV_KEYS = ['mode', 'rows', 'cols', 'dtype', 'roff', 'coff', 'slice', 'base', 'zebra', 'lock'] as const;
-export type DvParams = Partial<Record<(typeof DV_KEYS)[number], string>>;
-
-// `?: T | undefined` (rather than plain `?: T`) because `exactOptionalPropertyTypes`
-// is on and these are set explicitly to `undefined` in places — "absent" and
-// "present but cleared" mean the same thing for a URL parameter.
-export type Screen =
-  | { kind: 'tree' }
-  | { kind: 'detail'; tensor: string; tab: DataTab; dv?: DvParams | undefined }
-  | { kind: 'files' }
-  | { kind: 'layout'; file?: string | undefined }
-  | { kind: 'stats' }
-  | { kind: 'health' }
-  | { kind: 'preview'; path: string; name: string };
+export { DV_KEYS };
+export type { DataTab, DvParams, Screen, SortKey };
 
 // The current screen is driven by the URL hash, so the browser's back/forward
 // buttons work natively and every screen+mode has a shareable link.
-export const screen = writable<Screen>(parseHash());
-
-function screenToHash(s: Screen): string {
-  const enc = encodeURIComponent;
-  switch (s.kind) {
-    case 'tree':
-      return 'tree';
-    case 'detail': {
-      let h = `detail?t=${enc(s.tensor)}&tab=${s.tab}`;
-      for (const k of DV_KEYS) {
-        const v = s.dv?.[k];
-        if (v != null) h += `&${k}=${enc(v)}`;
-      }
-      return h;
-    }
-    case 'files':
-      return 'files';
-    case 'layout':
-      return s.file ? `layout?file=${enc(s.file)}` : 'layout';
-    case 'stats':
-      return 'stats';
-    case 'health':
-      return 'health';
-    case 'preview':
-      return `preview?path=${enc(s.path)}&name=${enc(s.name)}`;
-  }
-}
-
-function parseHash(): Screen {
-  const raw = location.hash.replace(/^#/, '');
-  const [kind, queryStr] = raw.split('?');
-  const q = new URLSearchParams(queryStr ?? '');
-  switch (kind) {
-    case 'detail': {
-      const t = q.get('t');
-      const raw = q.get('tab') ?? 'info';
-      const tab = (['info', 'heatmap', 'values', 'histogram'].includes(raw) ? raw : 'info') as DataTab;
-      if (t) {
-        const dv: DvParams = {};
-        for (const k of DV_KEYS) {
-          const v = q.get(k);
-          if (v != null) dv[k] = v;
-        }
-        return { kind: 'detail', tensor: t, tab, dv: Object.keys(dv).length ? dv : undefined };
-      }
-      break;
-    }
-    case 'files':
-      return { kind: 'files' };
-    case 'layout':
-      return { kind: 'layout', file: q.get('file') ?? undefined };
-    case 'stats':
-      return { kind: 'stats' };
-    case 'health':
-      return { kind: 'health' };
-    case 'preview': {
-      const path = q.get('path');
-      if (path) return { kind: 'preview', path, name: q.get('name') ?? path };
-      break;
-    }
-  }
-  return { kind: 'tree' };
-}
+export const screen = writable<Screen>(parseScreen(location.hash));
 
 // Keep the stores in sync with the URL (covers browser back/forward + shared links).
 window.addEventListener('hashchange', () => {
-  screen.set(parseHash());
+  screen.set(parseScreen(location.hash));
   restoreGlobals();
 });
 
@@ -159,10 +103,6 @@ filterQuery.subscribe((q) => {
 /** Command palette (Space / `:`) open state. */
 export const paletteOpen = writable<boolean>(false);
 
-/** Sorting for the flat (filter / search) tensor list. `none` keeps the natural
- * order (fuzzy-score for search, tree order for a filter); the tree view is never
- * reordered. */
-export type SortKey = 'none' | 'name' | 'size' | 'params' | 'dtype' | 'rank';
 export const sortKey = writable<SortKey>('none');
 export const sortDir = writable<'asc' | 'desc'>('asc');
 
@@ -208,45 +148,6 @@ export const visibleRows = derived(
 export { SEARCH_LIMIT };
 export const searchTotal = derived(searchResult, ($found) => $found?.total ?? 0);
 
-/** Sort a flat tensor-row list by a facet, ascending or descending. */
-function sortRows(rows: Row[], key: Exclude<SortKey, 'none'>, dir: 'asc' | 'desc'): Row[] {
-  const info = (r: Row) => (r.node.kind === 'tensor' ? r.node.info : null);
-  const cmp = (a: Row, b: Row): number => {
-    const ia = info(a);
-    const ib = info(b);
-    if (!ia || !ib) return 0;
-    switch (key) {
-      case 'name':
-        return ia.name.localeCompare(ib.name, undefined, { numeric: true });
-      case 'size':
-        return ia.size_bytes - ib.size_bytes;
-      case 'params':
-        return ia.num_elements - ib.num_elements;
-      case 'rank':
-        return ia.shape.length - ib.shape.length;
-      case 'dtype':
-        return ia.dtype.localeCompare(ib.dtype);
-    }
-  };
-  const sorted = [...rows].sort(cmp);
-  return dir === 'asc' ? sorted : sorted.reverse();
-}
-
-/** Flat list of the tensor rows whose names the server said pass the filter. */
-function matchRows(nodes: TreeNode[], matches: Set<string>): Row[] {
-  const out: Row[] = [];
-  const walk = (ns: TreeNode[], parentId: string) => {
-    for (const n of ns) {
-      const id = nodeId(n, parentId);
-      if (n.kind === 'group') walk(n.children, id);
-      else if (n.kind === 'tensor' && matches.has(n.info.name))
-        out.push({ id, node: n, depth: 0, hasChildren: false });
-    }
-  };
-  walk(nodes, '');
-  return out;
-}
-
 /** Append one or more filter terms (badge click / builder), space-joined + deduped. */
 export function addFilterTerms(terms: string[]): void {
   const add = terms.map((t) => t.trim()).filter(Boolean);
@@ -289,25 +190,16 @@ treeData.subscribe((t) => {
 // ---- navigation + URL state (the hash is the single source of truth; a shared
 // link and browser back/forward both restore the full view state) ----
 
-/** The screen-independent view state carried in every hash: filter query, sort,
- * the compact toggle, and search. So any state is reproducible from the URL. */
-function globalQuery(): string {
-  const p = new URLSearchParams();
-  const f = get(filterQuery).trim();
-  if (f) p.set('filter', f);
-  const sk = get(sortKey);
-  if (sk !== 'none') p.set('sort', `${sk}.${get(sortDir)}`);
-  if (get(compact)) p.set('compact', '1');
-  if (get(searching)) p.set('q', get(search)); // presence ⇒ search mode (empty ok)
-  return p.toString();
-}
-
-/** A screen's own hash plus the global state. */
-function hashFor(s: Screen): string {
-  const base = screenToHash(s);
-  const g = globalQuery();
-  if (!g) return base;
-  return base.includes('?') ? `${base}&${g}` : `${base}?${g}`;
+/** The screen-independent view state, read off the stores for `globalQuery`. */
+function globals(): Globals {
+  return {
+    filter: get(filterQuery),
+    sortKey: get(sortKey),
+    sortDir: get(sortDir),
+    compact: get(compact),
+    searching: get(searching),
+    search: get(search),
+  };
 }
 
 let restoring = false;
@@ -315,22 +207,13 @@ let restoring = false;
 /** Restore the global stores from the current hash (initial load + back/forward). */
 function restoreGlobals(): void {
   restoring = true;
-  const q = new URLSearchParams(location.hash.replace(/^#/, '').split('?')[1] ?? '');
-  filterQuery.set(q.get('filter') ?? '');
-  const sort = q.get('sort');
-  if (sort) {
-    const [k, d] = sort.split('.');
-    sortKey.set(
-      (['name', 'size', 'params', 'dtype', 'rank'].includes(k ?? '') ? k : 'none') as SortKey,
-    );
-    sortDir.set(d === 'desc' ? 'desc' : 'asc');
-  } else {
-    sortKey.set('none');
-  }
-  compact.set(q.get('compact') === '1');
-  const qs = q.get('q');
-  searching.set(qs !== null);
-  search.set(qs ?? '');
+  const g = parseGlobals(location.hash);
+  filterQuery.set(g.filter);
+  sortKey.set(g.sortKey);
+  sortDir.set(g.sortDir);
+  compact.set(g.compact);
+  searching.set(g.searching);
+  search.set(g.search);
   restoring = false;
 }
 
@@ -338,12 +221,12 @@ function restoreGlobals(): void {
  * entry (replaceState doesn't fire hashchange, so this can't loop). */
 function syncHash(): void {
   if (restoring) return;
-  const h = `#${hashFor(get(screen))}`;
+  const h = `#${hashFor(get(screen), globals())}`;
   if (location.hash !== h) history.replaceState(history.state, '', h);
 }
 
 export function navigate(s: Screen, replace = false): void {
-  const h = `#${hashFor(s)}`;
+  const h = `#${hashFor(s, globals())}`;
   if (replace) {
     // Replace the current entry (no new history) — for view-state changes within a
     // screen (e.g. a detail tab) so Back/Esc leaves the screen in one step.
@@ -408,16 +291,13 @@ export function setDataView(dv: DvParams): void {
 // ---- tree cursor movement (mirrors kernel::TreeState nav) ----
 
 function rowIndex(): number {
-  const rows = get(visibleRows);
-  const id = get(selectedId);
-  const i = rows.findIndex((r) => r.id === id);
-  return i < 0 ? 0 : i;
+  return rowIndexOf(get(visibleRows), get(selectedId));
 }
 
-function selectAt(i: number): void {
+function selectAt(i: number | null): void {
+  if (i === null) return;
   const rows = get(visibleRows);
-  const clamped = Math.max(0, Math.min(rows.length - 1, i));
-  const row = rows[clamped];
+  const row = rows[clampIndex(rows, i)];
   if (row) selectedId.set(row.id);
 }
 
@@ -427,53 +307,22 @@ export function moveSelection(delta: number): void {
 
 /** ← : jump to the parent group (nearest preceding shallower row). */
 export function selectParent(): void {
-  const rows = get(visibleRows);
-  const i = rowIndex();
-  const depth = rows[i]?.depth ?? 0;
-  if (depth === 0) return;
-  for (let k = i - 1; k >= 0; k--) {
-    const row = rows[k];
-    if (row && row.depth < depth) {
-      selectedId.set(row.id);
-      return;
-    }
-  }
+  selectAt(parentIndex(get(visibleRows), rowIndex()));
 }
 
 /** → : enter the selected group (expand if needed) and move to its first child. */
 export function enterChild(): void {
-  const rows = get(visibleRows);
   const i = rowIndex();
-  const row = rows[i];
+  const row = get(visibleRows)[i];
   if (!row || !row.hasChildren) return;
-  const exp = get(expanded);
-  if (!exp.has(row.id)) {
-    toggle(row.id);
-    // first child is the next row once re-flattened
-    const next = get(visibleRows)[i + 1];
-    if (next && next.depth === row.depth + 1) selectedId.set(next.id);
-  } else {
-    const next = rows[i + 1];
-    if (next && next.depth === row.depth + 1) selectedId.set(next.id);
-  }
+  // Expanding re-flattens the list, so ask for the child index afterwards.
+  if (!get(expanded).has(row.id)) toggle(row.id);
+  selectAt(firstChildIndex(get(visibleRows), i));
 }
 
 /** Shift+↑/↓ : previous/next sibling (same depth, without leaving the parent). */
 export function selectSibling(forwardDir: boolean): void {
-  const rows = get(visibleRows);
-  const i = rowIndex();
-  const depth = rows[i]?.depth ?? 0;
-  const range = forwardDir
-    ? Array.from({ length: rows.length - i - 1 }, (_, k) => i + 1 + k)
-    : Array.from({ length: i }, (_, k) => i - 1 - k);
-  for (const k of range) {
-    const row = rows[k];
-    if (!row || row.depth < depth) break;
-    if (row.depth === depth) {
-      selectedId.set(row.id);
-      break;
-    }
-  }
+  selectAt(siblingIndex(get(visibleRows), rowIndex(), forwardDir));
 }
 
 /** Enter : expand/collapse a group, or open a tensor's detail. */

@@ -18,6 +18,7 @@
     "precheck": "node scripts/require-node.mjs",
     "test": "vitest run",
     "pretest": "node scripts/require-node.mjs",
+    "precoverage": "node scripts/require-node.mjs",
     "coverage": "vitest run --coverage"
   },
   "devDependencies": {
