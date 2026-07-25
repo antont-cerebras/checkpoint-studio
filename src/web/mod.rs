@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
-use crate::{check, filetree, filter, health, kernel, model, safelayout, sample, stats, tree};
+use crate::{
+    check, filetree, filter, health, kernel, model, remote, safelayout, sample, stats, tree,
+};
 use handlers::{Query, Reply};
 
 /// Everything the API serves, computed once from a local read. Shared read-only.
@@ -76,7 +78,12 @@ impl WebState {
         let metadata: Vec<tree::MetadataInfo> = session.metadata().to_vec();
         let config = session.config().cloned();
         let tree = session.build_tree();
-        let checkpoint_stats = session.stats_with_disk(disk).clone();
+        // The S3 section too, for an `s3://` model — the same projection the TUI uses,
+        // so the browser's stats screen isn't missing a section the terminal shows.
+        let checkpoint_stats = session
+            .stats_with_disk(disk)
+            .clone()
+            .with_s3(checkpoint.s3.as_ref().map(remote::S3Meta::to_stats));
 
         let tensor_index = tensors
             .iter()
@@ -88,10 +95,17 @@ impl WebState {
         let file_tree =
             dto::WebFileNode::from_node(&filetree::build(Path::new(&root), 8), Path::new(&root));
 
-        let health: Vec<health::HealthReport> = index_specs
+        let mut health: Vec<health::HealthReport> = index_specs
             .iter()
             .map(|spec| health::check_loaded(spec, &tensors))
             .collect();
+        // An `s3://` source has no index.json to reconcile, but it does describe every
+        // tensor twice — in the checkpoint index and in each object's own metadata — so
+        // cross-check those, exactly as the TUI does. Derived from the model we were
+        // handed, so any caller that has the object metadata gets the check.
+        if let Some(s3) = &checkpoint.s3 {
+            health.push(health::check_s3_correspondence(&root, &tensors, s3));
+        }
 
         // Structural check only (values = false → no byte scan at startup).
         let all = filter::NameFilter::parse(&[]).expect("empty NameFilter is valid");

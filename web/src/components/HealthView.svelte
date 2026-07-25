@@ -32,6 +32,11 @@
     extra_files: string[];
     missing_tensors: string[];
     extra_tensors: string[];
+    /** `s3://` only: the checkpoint index and the tensor's own object metadata
+     * describe the same tensor and disagree. Absent on an older server. */
+    mismatched_tensors?: string[];
+    /** `s3://` only: tensors the cross-check could not verify either way. */
+    unverified_tensors?: string[];
   }
 
   let check: CheckReport | null = null;
@@ -78,15 +83,14 @@
     ['Extra files (on disk, not in index)', h.extra_files, 'warn', 'file'],
     ['Missing tensors', h.missing_tensors, 'fail', 'tensor'],
     ['Extra tensors', h.extra_tensors, 'warn', 'tensor'],
+    ['Index disagrees with the object metadata', h.mismatched_tensors ?? [], 'fail', 'tensor'],
+    ['Not cross-checked against the object metadata', h.unverified_tensors ?? [], 'warn', 'tensor'],
   ];
 
   // Findings-first: checks with problems on top, then passing, then n/a.
   const rank = (s: string) => (s === 'fail' ? 0 : s === 'warn' ? 1 : s === 'pass' ? 2 : 3);
   $: checks = check ? [...check.checks].sort((a, b) => rank(a.status) - rank(b.status)) : [];
-  $: indexIssues = health.filter(
-    (h) =>
-      h.missing_files.length || h.extra_files.length || h.missing_tensors.length || h.extra_tensors.length,
-  );
+  $: indexIssues = health.filter((h) => idxLists(h).some(([, items]) => items.length));
 </script>
 
 <div class="health">

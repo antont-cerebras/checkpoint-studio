@@ -85,6 +85,50 @@ pub struct S3Meta {
     pub warnings: Vec<String>,
 }
 
+impl S3Meta {
+    /// Project into the stats module's own view for the stats screen's S3 section.
+    /// Lives here so `stats` needn't know about remote reads — and so the TUI and the
+    /// web server share one conversion instead of each writing their own.
+    pub fn to_stats(&self) -> crate::stats::S3Stats {
+        crate::stats::S3Stats {
+            objects: self
+                .objects
+                .iter()
+                .map(|o| crate::stats::S3ObjectStat {
+                    key: o.key.clone(),
+                    size: o.size,
+                    etag: o.etag.clone(),
+                    checksum: o.checksum.clone(),
+                    last_modified: o.last_modified.clone(),
+                    tags: o.tags.as_ref().map(std::collections::BTreeMap::len),
+                    user_meta: o.user_meta.len(),
+                })
+                .collect(),
+            warnings: self.warnings.clone(),
+        }
+    }
+}
+
+/// Whether a remote read should also fetch each S3 object's metadata — an extra HEAD
+/// (plus a tagging call) per object, so it's opt-in.
+///
+/// Two things need it: the stats screen's S3 section, and the index-vs-object
+/// cross-check ([`crate::health::check_s3_correspondence`]) that `check` reports. A
+/// read that only wants tensor names/shapes skips it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectMeta {
+    /// HEAD every object: sizes, ETags, checksums, dates, tags — and the cross-check.
+    Fetch,
+    /// Tensor metadata only.
+    Skip,
+}
+
+impl ObjectMeta {
+    fn wanted(self) -> bool {
+        self == ObjectMeta::Fetch
+    }
+}
+
 /// What a remote value comparison ([`RemoteRead::value_diff`]) computes per tensor.
 #[derive(Clone, Debug)]
 pub struct RemoteValueOpts {
@@ -360,9 +404,16 @@ impl RemoteRead {
         eprintln!("checkpoint-studio: reading tensor metadata over ssh …");
         let bars = crate::progress::Bars::start(vec![src.to_string()]);
         let progress = bars.progress(0);
-        // Interactive browse doesn't use S3 object metadata (that's a `diff`-only
-        // comparison), so skip the extra per-object HEADs here.
-        let out = self.read(&session, src, &password, progress.as_deref(), false, None);
+        // A structure-only read (`--print-model`, the diff's local-side helper): no
+        // S3 section to fill and no cross-check to report, so skip the per-object HEADs.
+        let out = self.read(
+            &session,
+            src,
+            &password,
+            progress.as_deref(),
+            ObjectMeta::Skip,
+            None,
+        );
         bars.finish(0, out.is_ok());
         bars.join();
         let rc = out?;
@@ -380,10 +431,31 @@ impl RemoteRead {
     /// views are unavailable — the structure, tree, layout, and per-tensor info are).
     /// Tensors are grouped by their stamped shard path: one shard for an `s3://`
     /// cstorch checkpoint, one per file for a remote safetensors directory.
-    pub fn read_checkpoint(&self, src: &str) -> Result<crate::model::Checkpoint> {
-        let (tensors, metadata, config, _disk, _health) = self.fetch_with_config(src)?;
+    /// `objects` decides whether each S3 object's metadata comes too: the web server
+    /// wants it (it fills the stats screen's S3 section and the index-vs-object
+    /// cross-check, matching the TUI), `--print-model` doesn't.
+    pub fn read_checkpoint(
+        &self,
+        src: &str,
+        objects: ObjectMeta,
+    ) -> Result<crate::model::Checkpoint> {
+        let mut password = None;
+        let session = self.open_with(&mut password)?;
+        eprintln!("checkpoint-studio: reading tensor metadata over ssh …");
+        let bars = crate::progress::Bars::start(vec![src.to_string()]);
+        let progress = bars.progress(0);
+        let out = self.read(&session, src, &password, progress.as_deref(), objects, None);
+        bars.finish(0, out.is_ok());
+        bars.join();
+        let rc = out?;
+        let config = self.read_config(&session, src);
         Ok(assemble_remote_checkpoint(
-            &self.host, src, tensors, metadata, config,
+            &self.host,
+            src,
+            rc.tensors,
+            rc.metadata,
+            config,
+            rc.s3,
         ))
     }
 
@@ -444,7 +516,7 @@ impl RemoteRead {
         src: &str,
         password: &Option<String>,
         progress: Option<&LoadProgress>,
-        want_s3: bool,
+        objects: ObjectMeta,
         abort: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<RemoteCheckpoint> {
         if src.starts_with("s3://") {
@@ -455,13 +527,23 @@ impl RemoteRead {
             // a parallel `diff` cut this (slow) scan short if the *other* side has
             // already failed to load.
             let (tensors, metadata, s3) =
-                self.read_cstorch(session, src, progress, want_s3, abort)?;
+                self.read_cstorch(session, src, progress, objects, abort)?;
+            // With the object metadata in hand, cross-check it against the checkpoint
+            // index: cstorch records every tensor's dtype/shape in both, so they have
+            // to agree. Free (no extra requests) and it's the only health signal an
+            // `s3://` source has — there's no index.json to reconcile. Computed here
+            // rather than in a caller so `check`, `diff` and the explorer all get it.
+            let health = if objects.wanted() {
+                vec![crate::health::check_s3_correspondence(src, &tensors, &s3)]
+            } else {
+                Vec::new()
+            };
             Ok(RemoteCheckpoint {
                 tensors,
                 metadata,
                 disk: None,
-                health: Vec::new(),
-                s3: want_s3.then_some(s3),
+                health,
+                s3: objects.wanted().then_some(s3),
             })
         } else {
             self.read_dir(session, src, password, progress)
@@ -628,10 +710,10 @@ impl RemoteRead {
         session: &RemoteSession,
         src: &str,
         progress: Option<&LoadProgress>,
-        want_s3: bool,
+        objects: ObjectMeta,
         abort: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>, S3Meta)> {
-        let script = dump_script(src, want_s3);
+        let script = dump_script(src, objects.wanted());
         let command = format!("source {}/bin/activate && python3 -", self.venv);
         // Until the first tensor is counted, the remote is starting python, importing
         // cstorch and opening the checkpoint — a second or two with nothing to count,
@@ -1564,6 +1646,7 @@ fn assemble_remote_checkpoint(
     tensors: Vec<TensorInfo>,
     mut metadata: Vec<MetadataInfo>,
     config: Option<crate::config::ModelConfig>,
+    s3: Option<S3Meta>,
 ) -> crate::model::Checkpoint {
     use crate::model::{Checkpoint, ShardHeader, Source};
     let source = if src.starts_with("s3://") {
@@ -1607,13 +1690,18 @@ fn assemble_remote_checkpoint(
         shards,
         config,
         index: Vec::new(),
-        s3: None,
+        s3,
     }
 }
 
 /// Map a torch dtype string (`torch.float16`) to the display name used elsewhere
 /// (`F16`); unknown types pass through uppercased.
-fn map_dtype(torch: &str) -> String {
+///
+/// `pub(crate)` because the s3 cross-check
+/// ([`crate::health::check_s3_correspondence`]) has to put the object metadata's raw
+/// torch spelling through the same mapping before comparing it with a tensor's dtype —
+/// otherwise every tensor looks like a mismatch.
+pub(crate) fn map_dtype(torch: &str) -> String {
     let s = torch.strip_prefix("torch.").unwrap_or(torch);
     match s {
         "float16" => "F16",
@@ -2285,6 +2373,7 @@ mod tests {
             ts,
             vec![meta("format")],
             None,
+            None, // no object metadata was requested for this read
         );
         assert!(matches!(ck.source, crate::model::Source::S3 { .. }));
         assert_eq!(ck.root, "s3://bucket/ckpt");
@@ -2310,7 +2399,7 @@ mod tests {
             mk("b", "host:/ckpt/shard-1.safetensors"),
             mk("c", "host:/ckpt/shard-0.safetensors"),
         ];
-        let ck = assemble_remote_checkpoint("host", "/ckpt", ts, vec![meta("format")], None);
+        let ck = assemble_remote_checkpoint("host", "/ckpt", ts, vec![meta("format")], None, None);
         assert!(matches!(ck.source, crate::model::Source::Sftp { .. }));
         assert_eq!(ck.shards.len(), 2);
         assert_eq!(ck.shards[0].path, "host:/ckpt/shard-0.safetensors");

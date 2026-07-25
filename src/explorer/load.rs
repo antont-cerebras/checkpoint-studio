@@ -369,7 +369,14 @@ impl Explorer {
             // /ETags/tags — a HEAD per object), so the stats report's S3 section is
             // ready; `want_s3` is a no-op for an SFTP source.
             let pw = self.remote.as_ref().unwrap().password.borrow().clone();
-            let out = r.read(&session, &as_str, &pw, progress.as_deref(), true, None);
+            let out = r.read(
+                &session,
+                &as_str,
+                &pw,
+                progress.as_deref(),
+                crate::remote::ObjectMeta::Fetch,
+                None,
+            );
             bars.finish(0, out.is_ok());
             bars.join();
             let rc = out?;
@@ -378,6 +385,9 @@ impl Explorer {
             if let Some(d) = rc.disk {
                 disk_shards.extend(d.shards);
             }
+            // `rc.health` carries the s3 index-vs-object cross-check for an `s3://`
+            // source (built by the reader, which has both halves) and the
+            // index-vs-files report for a remote safetensors directory.
             health.extend(rc.health);
             if let Some(s3) = rc.s3 {
                 s3_meta = Some(s3); // one `s3://` source per run

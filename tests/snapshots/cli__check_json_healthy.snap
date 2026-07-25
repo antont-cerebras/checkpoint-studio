@@ -48,6 +48,13 @@ expression: out
       "note": "index matches files on disk, shard numbering complete",
       "status": "na",
       "findings": []
+    },
+    {
+      "id": "s3_metadata",
+      "title": "S3 object metadata",
+      "note": "every tensor's dtype/shape matches its own object's metadata, and each object holds the bytes it declares",
+      "status": "na",
+      "findings": []
     }
   ],
   "healthy": true,

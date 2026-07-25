@@ -623,6 +623,7 @@ pub fn run(
         check_shapes_dtypes(tensors),
         check_config(tensors, config),
         check_files(tensors, files, health),
+        check_s3_metadata(tensors, health),
     ];
     if values {
         results.push(check_values(tensors, metadata, filter, jobs));
@@ -1262,6 +1263,69 @@ fn check_config(
 /// numbering check reads the shard filenames from both the on-disk file list and
 /// the tensors' `source_path`s, so it works for a **remote** checkpoint too (a
 /// missing shard shows up as a gap in the present shards' shared `-of-<N>`).
+/// `s3://` only: does the checkpoint index agree with what each object says about
+/// itself? cstorch writes every tensor's dtype and shape twice — once into the
+/// checkpoint's `__METADATA__` index, once into the tensor's own object metadata — so
+/// the two must match, and an object must hold as many bytes as its own header
+/// declares. Built by [`crate::health::check_s3_correspondence`] during the read; this
+/// only turns it into findings.
+///
+/// `n/a` for any source without that second description (every local checkpoint).
+fn check_s3_metadata(tensors: &[TensorInfo], health: &[HealthReport]) -> CheckResult {
+    const ID: &str = "s3_metadata";
+    const TITLE: &str = "S3 object metadata";
+    const NOTE: &str = "every tensor's dtype/shape matches its own object's metadata, \
+                        and each object holds the bytes it declares";
+
+    let reports: Vec<&HealthReport> = health
+        .iter()
+        .filter(|r| r.kind == crate::health::HealthKind::S3Correspondence)
+        .collect();
+    if reports.is_empty() {
+        return CheckResult::na(ID, TITLE, NOTE);
+    }
+
+    let mut findings = Vec::new();
+    let mut unverified = 0usize;
+    for report in &reports {
+        for t in &report.mismatched_tensors {
+            findings.push(Finding::error(
+                Some(t.clone()),
+                "the checkpoint index and the object's own metadata disagree".into(),
+            ));
+        }
+        for t in &report.missing_files {
+            findings.push(Finding::error(
+                Some(t.clone()),
+                "in the checkpoint index but absent from the bucket".into(),
+            ));
+        }
+        for t in &report.extra_files {
+            findings.push(Finding::warning(
+                Some(t.clone()),
+                "in the bucket but not in the checkpoint index".into(),
+            ));
+        }
+        for t in &report.unverified_tensors {
+            unverified += 1;
+            findings.push(Finding::warning(
+                Some(t.clone()),
+                "could not be cross-checked against its object".into(),
+            ));
+        }
+    }
+    let mut result = CheckResult::done(ID, TITLE, NOTE, findings);
+    // Say how much was actually verified: a pass here means "N tensors checked", not
+    // merely "nothing looked wrong", and the difference matters for a checkpoint whose
+    // objects carry no metadata to check against.
+    let verified = tensors.len().saturating_sub(unverified);
+    result.set_summary(format!(
+        "{verified} of {} tensors cross-checked against their own object metadata",
+        tensors.len()
+    ));
+    result
+}
+
 fn check_files(
     tensors: &[TensorInfo],
     files: &[std::path::PathBuf],
@@ -1274,8 +1338,12 @@ fn check_files(
     let mut findings = Vec::new();
     let mut applicable = false;
 
-    // Index correspondence (only present when an index.json was found).
-    for report in health {
+    // Index correspondence (only present when an index.json was found). The s3
+    // cross-check is reported separately by `check_s3_metadata`.
+    for report in health
+        .iter()
+        .filter(|r| r.kind == crate::health::HealthKind::IndexVsFiles)
+    {
         applicable = true;
         for f in &report.missing_files {
             findings.push(Finding::error(
@@ -1742,7 +1810,10 @@ mod tests {
         // A remote index/file mismatch arrives as a HealthReport (built by the
         // remote read); Files & sharding folds it in and fails, just as for local.
         let report = crate::health::HealthReport {
+            kind: crate::health::HealthKind::IndexVsFiles,
             index_path: "host:/ckpt/model.safetensors.index.json".into(),
+            mismatched_tensors: Vec::new(),
+            unverified_tensors: Vec::new(),
             missing_files: vec!["model-00000-of-00014.safetensors".into()],
             extra_files: vec!["model-00001-of-00073.safetensors".into()],
             missing_tensors: Vec::new(),

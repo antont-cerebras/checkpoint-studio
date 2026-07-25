@@ -9,5 +9,6 @@ checkpoint-studio check: [FIXTURE]
   ✓ Shape / dtype sanity  — no duplicate names, no empty tensors, dtype uniform within each role
   ⊘ Config consistency    — n/a for this checkpoint
   ⊘ Files & sharding      — n/a for this checkpoint
+  ⊘ S3 object metadata    — n/a for this checkpoint
   · Value scan            — skipped (pass --values to scan tensor data)
   OK — no metadata issues found

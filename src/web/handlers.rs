@@ -715,5 +715,34 @@ mod contract {
             first,
             &["id", "title", "note", "status", "findings"],
         );
+
+        // The per-shard reconciliation lists HealthView renders. The fixture has no
+        // index.json, so pin the serialised shape directly — a renamed field would
+        // otherwise blank a whole section in the browser with nothing failing here.
+        let report = serde_json::to_value(crate::health::HealthReport {
+            kind: crate::health::HealthKind::IndexVsFiles,
+            index_path: "idx".into(),
+            missing_files: Vec::new(),
+            extra_files: Vec::new(),
+            missing_tensors: Vec::new(),
+            extra_tensors: Vec::new(),
+            mismatched_tensors: Vec::new(),
+            unverified_tensors: Vec::new(),
+        })
+        .expect("a health report serialises");
+        has_keys(
+            "HealthReport",
+            &report,
+            &[
+                "kind",
+                "index_path",
+                "missing_files",
+                "extra_files",
+                "missing_tensors",
+                "extra_tensors",
+                "mismatched_tensors",
+                "unverified_tensors",
+            ],
+        );
     }
 }

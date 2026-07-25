@@ -1027,8 +1027,18 @@ fn run_check(
             eprintln!("checkpoint-studio check: reading tensor metadata over ssh …");
             let bars = progress::Bars::start(vec![src.clone()]);
             let progress = bars.progress(0);
+            // `check` fetches the S3 object metadata (an extra HEAD per object) on
+            // purpose: cross-checking it against the checkpoint index is one of the
+            // checks reported below, and verifying is what this command is for.
             let out = r
-                .read(&session, &src, &password, progress.as_deref(), false, None)
+                .read(
+                    &session,
+                    &src,
+                    &password,
+                    progress.as_deref(),
+                    remote::ObjectMeta::Fetch,
+                    None,
+                )
                 .with_context(|| format!("reading {src}"));
             bars.finish(0, out.is_ok());
             bars.join();
@@ -1670,7 +1680,7 @@ fn run_diff(
                             src,
                             &password,
                             progress.as_deref(),
-                            true,
+                            remote::ObjectMeta::Fetch,
                             Some(&abort),
                         )
                         .with_context(|| format!("reading {src}"));
@@ -3270,7 +3280,9 @@ fn run_web(
         // hold it while the read runs — so the wait is never wasted.
         let server = web::bind(host, port)?;
         let remote = crate::remote::RemoteRead::new(rhost, venv);
-        let model = remote.read_checkpoint(&src)?;
+        // Fetch the S3 object metadata: the browser shows the same stats S3 section
+        // and health cross-check the TUI does, and this is a one-off at server start.
+        let model = remote.read_checkpoint(&src, remote::ObjectMeta::Fetch)?;
         let state = std::sync::Arc::new(web::WebState::build(model, &[], &[]));
         return web::serve_on(server, state, host);
     }
@@ -3491,8 +3503,10 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
                 .ssh_venv
                 .clone()
                 .unwrap_or_else(|| "~/venv".to_string());
+            // `--print-model` dumps the structure; the per-object S3 metadata would
+            // add a HEAD per object for data it doesn't print.
             crate::remote::RemoteRead::new(host.clone(), venv)
-                .read_checkpoint(&files[0].to_string_lossy())?
+                .read_checkpoint(&files[0].to_string_lossy(), remote::ObjectMeta::Skip)?
         } else {
             readers::read_local(&files)?
         };

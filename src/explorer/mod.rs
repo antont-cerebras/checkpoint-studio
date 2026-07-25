@@ -5705,24 +5705,7 @@ impl Explorer {
     /// [`crate::stats::S3Stats`] (so `stats` stays free of a remote dependency).
     /// `None` for a local / SFTP checkpoint.
     fn s3_stats(&self) -> Option<crate::stats::S3Stats> {
-        let meta = self.remote_s3_meta()?;
-        let objects = meta
-            .objects
-            .iter()
-            .map(|o| crate::stats::S3ObjectStat {
-                key: o.key.clone(),
-                size: o.size,
-                etag: o.etag.clone(),
-                checksum: o.checksum.clone(),
-                last_modified: o.last_modified.clone(),
-                tags: o.tags.as_ref().map(|t| t.len()),
-                user_meta: o.user_meta.len(),
-            })
-            .collect();
-        Some(crate::stats::S3Stats {
-            objects,
-            warnings: meta.warnings.clone(),
-        })
+        self.remote_s3_meta().map(crate::remote::S3Meta::to_stats)
     }
 
     /// The cached checkpoint model (owned by the kernel session), when loaded.

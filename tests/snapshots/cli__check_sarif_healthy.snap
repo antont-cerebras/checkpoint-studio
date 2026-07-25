@@ -47,6 +47,13 @@ expression: out
               "shortDescription": {
                 "text": "index matches files on disk, shard numbering complete"
               }
+            },
+            {
+              "id": "s3_metadata",
+              "name": "S3 object metadata",
+              "shortDescription": {
+                "text": "every tensor's dtype/shape matches its own object's metadata, and each object holds the bytes it declares"
+              }
             }
           ]
         }
