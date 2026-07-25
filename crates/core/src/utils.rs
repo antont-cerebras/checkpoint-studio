@@ -50,6 +50,13 @@ pub fn term_width(fallback: usize) -> usize {
         .unwrap_or(fallback)
 }
 
+// The display formatters below are duplicated in the web client
+// (`web/src/lib/format.ts`), because a browser can't call into this crate. Their
+// agreement is not left to comments: `tests/parity.rs` generates
+// `shared/parity/format.json` from the functions here and the web's `parity.test.ts`
+// asserts the TypeScript produces the same strings, so drift fails CI on both sides.
+// Change one, regenerate, and the other side's test tells you what to change.
+
 pub fn format_shape(shape: &[usize]) -> String {
     format!(
         "({})",
@@ -62,8 +69,9 @@ pub fn format_shape(shape: &[usize]) -> String {
 }
 
 pub fn format_size(bytes: usize) -> String {
-    // Sizes are scaled by 1024, so use the binary (IEC) unit labels.
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
+    // Sizes are scaled by 1024, so use the binary (IEC) unit labels. Up to PiB: a
+    // fleet-sized total shouldn't read as "5120.0 GiB".
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut size = bytes as f64;
     let mut unit_idx = 0;
 
@@ -86,7 +94,28 @@ pub fn format_parameters(params: usize) -> String {
         format!("{:.1}K", params as f64 / 1_000.0)
     } else if params < 1_000_000_000 {
         format!("{:.1}M", params as f64 / 1_000_000.0)
-    } else {
+    } else if params < 1_000_000_000_000 {
         format!("{:.1}B", params as f64 / 1_000_000_000.0)
+    } else {
+        // Trillions: frontier checkpoints are already here, and "1500.0B" reads worse.
+        format!("{:.1}T", params as f64 / 1_000_000_000_000.0)
+    }
+}
+
+/// A fraction (0.0–1.0) as a percentage for display. An exact zero reads `0%`; a
+/// tiny-but-nonzero fraction switches to scientific notation, so a checkpoint with a
+/// handful of zeros among billions of values never displays a misleading `0.0%`.
+///
+/// `is_zero` comes from the true count rather than the fraction, so floating-point
+/// dust can't masquerade as an exact zero.
+pub fn format_percent(fraction: f64, is_zero: bool) -> String {
+    if is_zero {
+        return "0%".to_string();
+    }
+    let pct = fraction * 100.0;
+    if pct < 0.1 {
+        format!("{pct:.1e}%")
+    } else {
+        format!("{pct:.1}%")
     }
 }

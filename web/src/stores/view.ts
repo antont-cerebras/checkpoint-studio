@@ -82,27 +82,35 @@ filterQuery.subscribe((q) => {
     filterResolvedFor.set(''); // empty query is "resolved" (shows all) — no pending state
     return;
   }
-  filterTimer = setTimeout(async () => {
-    try {
-      const res = await api.filter(query);
-      if (req !== filterReq) return; // superseded by a newer edit
-      filterMatches.set(res.active ? new Set(res.names ?? []) : null);
-      filterError.set(null);
-    } catch (e) {
-      if (req !== filterReq) return;
-      filterError.set(e instanceof Error ? e.message : String(e));
-      filterMatches.set(null); // don't leave the prior result behind the error
-    } finally {
-      // Mark THIS query resolved (drops "filtering…"); a newer edit already bumped
-      // `filterReq`, so a superseded response leaves the pending state in place.
-      if (req === filterReq) filterResolvedFor.set(query);
-    }
-  }, 200);
+  // `void`: the request handles its own errors, and a timer callback has nowhere to
+  // return a promise to.
+  filterTimer = setTimeout(() => void resolveFilter(query, req), 200);
 });
+
+/** Ask the server which tensors pass `query` and publish the result — unless a newer
+ * edit has already superseded this request. */
+async function resolveFilter(query: string, req: number): Promise<void> {
+  try {
+    const res = await api.filter(query);
+    if (req !== filterReq) return; // superseded by a newer edit
+    filterMatches.set(res.active ? new Set(res.names ?? []) : null);
+    filterError.set(null);
+  } catch (e) {
+    if (req !== filterReq) return;
+    filterError.set(e instanceof Error ? e.message : String(e));
+    filterMatches.set(null); // don't leave the prior result behind the error
+  } finally {
+    // Mark THIS query resolved (drops "filtering…"); a newer edit already bumped
+    // `filterReq`, so a superseded response leaves the pending state in place.
+    if (req === filterReq) filterResolvedFor.set(query);
+  }
+}
 
 /** Command palette (Space / `:`) open state. */
 export const paletteOpen = writable<boolean>(false);
 
+/** Sort facet and direction for the flat (filter / search) list; `none` keeps the
+ * natural order and the hierarchical tree is never reordered. See `lib/hash.ts`. */
 export const sortKey = writable<SortKey>('none');
 export const sortDir = writable<'asc' | 'desc'>('asc');
 

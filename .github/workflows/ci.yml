@@ -101,6 +101,13 @@ jobs:
       - name: Lint (eslint)
         run: npm run lint
 
+      # The unit tests over `src/lib` — including `parity.test.ts`, the TypeScript half
+      # of the TUI↔web display contract in shared/parity (the Rust half runs in the
+      # rust job's `cargo test`). Without this step that contract only ever held on
+      # one side.
+      - name: Test (vitest)
+        run: npm test
+
       - name: Build
         run: npm run build
 

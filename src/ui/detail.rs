@@ -12,7 +12,7 @@ use ratatui::widgets::{LineGauge, Paragraph, Widget};
 
 use crate::sample::{Histogram, PackingSchema, Stats, ViewDtype};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo};
-use crate::utils::{format_parameters, format_shape, format_size};
+use crate::utils::{format_parameters, format_percent, format_shape, format_size};
 
 use super::data::render_histogram;
 use super::hints::{ChipHit, Seg, chip_regions, close_button, hint_key, wrap_hint_items};
@@ -261,17 +261,9 @@ pub(super) fn detail_stats_summary_spans(s: &Stats) -> Vec<Span<'static>> {
         Span::raw(format!("{:.4}", s.std)),
         dim_span(" · zeros "),
     ];
-    // Distinguish "no zeros" from "a tiny fraction" (which would round to a
-    // misleading `0.0%`), matching the raw line.
-    let pct = s.zero_fraction() * 100.0;
-    let zeros = if s.zeros == 0 {
-        "0%".to_string()
-    } else if pct < 0.1 {
-        format!("{pct:.1e}%")
-    } else {
-        format!("{pct:.1}%")
-    };
-    spans.push(Span::raw(zeros));
+    // Distinguishing "no zeros" from "a tiny fraction" (which would round to a
+    // misleading `0.0%`) is a shared rule — the web shows the same string.
+    spans.push(Span::raw(format_percent(s.zero_fraction(), s.zeros == 0)));
     if s.nonfinite > 0 {
         spans.push(Span::styled(
             format!(" · {} non-finite", s.nonfinite),

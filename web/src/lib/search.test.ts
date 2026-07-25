@@ -45,8 +45,16 @@ describe('fuzzyScore', () => {
   it('matches a subsequence, not just a substring', () => {
     expect(fuzzyScore('qpw', 'q_proj.weight')).toBeGreaterThanOrEqual(0);
   });
-  it('is case-insensitive', () => {
-    expect(fuzzyScore('QPROJ', 'q_proj')).toBeGreaterThanOrEqual(0);
+  // Smart case, the rule the TUI's matcher uses: a lowercase query ignores case, but a
+  // query carrying uppercase is matched literally. Pinned across both UIs by
+  // parity.test.ts.
+  it('ignores case for a lowercase query', () => {
+    expect(fuzzyScore('qproj', 'Q_PROJ')).toBeGreaterThanOrEqual(0);
+    expect(fuzzyScore('upper', 'MODEL.UPPER.weight')).toBeGreaterThanOrEqual(0);
+  });
+  it('matches literally once the query carries uppercase', () => {
+    expect(fuzzyScore('QPROJ', 'q_proj')).toBe(-1);
+    expect(fuzzyScore('UPPER', 'MODEL.UPPER.weight')).toBeGreaterThanOrEqual(0);
   });
   it('rejects a non-subsequence with -1', () => {
     expect(fuzzyScore('zzz', 'q_proj')).toBe(-1);

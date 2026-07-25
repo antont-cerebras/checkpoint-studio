@@ -41,17 +41,26 @@ function scoreLower(n: string, h: string): number {
   return score - h.length * 0.01; // gently prefer shorter (tighter) matches
 }
 
-/** Case-insensitive subsequence score. Kept for callers with raw strings (and tests);
- * the search path uses the pre-lowercased index below. */
-export function fuzzyScore(needle: string, hay: string): number {
-  return scoreLower(needle.toLowerCase(), hay.toLowerCase());
+/** Whether a query is "cased" — has at least one uppercase letter, which under smart
+ * case makes the whole match case-sensitive. */
+function hasUpper(s: string): boolean {
+  return s !== s.toLowerCase();
 }
 
-/** The searchable leaves of one tree, flattened once with their row ids and lowercased
- * names. Rebuilt only when the tree itself changes — not per keystroke. */
+/** Subsequence score with smart case: case-insensitive unless the needle itself carries
+ * uppercase. Kept for callers with raw strings (and tests); the search path uses the
+ * pre-lowercased index below. */
+export function fuzzyScore(needle: string, hay: string): number {
+  return hasUpper(needle) ? scoreLower(needle, hay) : scoreLower(needle.toLowerCase(), hay.toLowerCase());
+}
+
+/** The searchable leaves of one tree, flattened once with their row ids and both the
+ * original and lowercased names (smart case needs the original). Rebuilt only when the
+ * tree itself changes — not per keystroke. */
 interface SearchIndex {
   rows: Row[];
   lower: string[];
+  original: string[];
 }
 const indexCache = new WeakMap<TreeNode[], SearchIndex>();
 
@@ -60,6 +69,7 @@ function searchIndex(tree: TreeNode[]): SearchIndex {
   if (hit) return hit;
   const rows: Row[] = [];
   const lower: string[] = [];
+  const original: string[] = [];
   const walk = (nodes: TreeNode[], parentId: string) => {
     for (const node of nodes) {
       const id = nodeId(node, parentId);
@@ -67,12 +77,13 @@ function searchIndex(tree: TreeNode[]): SearchIndex {
         walk(node.children, id);
       } else {
         rows.push({ id, node, depth: 0, hasChildren: false });
+        original.push(node.info.name);
         lower.push(node.info.name.toLowerCase());
       }
     }
   };
   walk(tree, '');
-  const built = { rows, lower };
+  const built = { rows, lower, original };
   indexCache.set(tree, built);
   return built;
 }
@@ -84,11 +95,17 @@ export function searchTree(
   query: string,
   limit = SEARCH_LIMIT,
 ): { rows: Row[]; total: number } {
-  const { rows, lower } = searchIndex(tree);
-  const needle = query.toLowerCase();
+  const { rows, lower, original } = searchIndex(tree);
+  // Smart case, the same rule the TUI's matcher uses: an all-lowercase query ignores
+  // case, a query with any uppercase is matched literally. So `norm` finds
+  // `LayerNorm` while `Norm` finds only the capitalised one. Pinned by
+  // shared/parity/format.json.
+  const cased = hasUpper(query);
+  const hay = cased ? original : lower;
+  const needle = cased ? query : query.toLowerCase();
   const scored: { row: Row; score: number }[] = [];
   for (let i = 0; i < rows.length; i++) {
-    const score = scoreLower(needle, lower[i] ?? '');
+    const score = scoreLower(needle, hay[i] ?? '');
     if (score >= 0) scored.push({ row: rows[i]!, score });
   }
   const total = scored.length;

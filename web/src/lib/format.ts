@@ -1,27 +1,50 @@
-// Human-readable formatting helpers, mirroring the Rust side's byte/param display.
+// Human-readable formatting helpers. `humanSize`, `humanCount` and `percent` must
+// produce byte-identical strings to the Rust side's `format_size`, `format_parameters`
+// and `format_percent` (crates/core/src/utils.rs) — the same tensor has to report the
+// same size in the TUI and in the browser. That's enforced, not hoped for:
+// `shared/parity/format.json` is generated from the Rust functions and `parity.test.ts`
+// checks these against it. See shared/parity/README.md.
 
+/** One decimal place, rounded the way Rust's `{:.1}` rounds.
+ *
+ * `toFixed` already rounds the exact binary value, so it agrees with Rust everywhere
+ * except on an exact tie — a value like `1.25`, which is representable exactly.
+ * There `toFixed` rounds away from zero (`1.3`) while Rust rounds to even (`1.2`).
+ * Ties are not exotic here: every size is a power-of-two division, so `1280 B` is
+ * exactly `1.25 KiB`. An exact tie at one decimal is an odd multiple of 0.25. */
+function fixed1(v: number): string {
+  if (Number.isInteger(v * 4) && !Number.isInteger(v * 2)) {
+    const truncated = Math.trunc(v * 10); // toward zero, e.g. 12 for 1.25
+    const towardZero = truncated / 10;
+    const even = truncated % 2 === 0 ? towardZero : towardZero + Math.sign(v) * 0.1;
+    return even.toFixed(1);
+  }
+  return v.toFixed(1);
+}
+
+/** Byte size with IEC units, e.g. `593.5 MiB`. Bytes stay whole; anything larger gets
+ * one decimal. Mirrors Rust `format_size`. */
 export function humanSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ['KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
-  let v = bytes / 1024;
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+  let v = bytes;
   let i = 0;
   while (v >= 1024 && i < units.length - 1) {
     v /= 1024;
     i++;
   }
-  return `${v.toFixed(v < 10 ? 2 : 1)} ${units[i]}`;
+  return i === 0 ? `${bytes} B` : `${fixed1(v)} ${units[i]}`;
 }
 
+/** Parameter count in decimal units, e.g. `30.9B`. Mirrors Rust `format_parameters`. */
 export function humanCount(n: number): string {
-  if (n < 1000) return String(n);
-  const units = ['K', 'M', 'B', 'T'];
-  let v = n / 1000;
+  const units = ['', 'K', 'M', 'B', 'T'];
+  let v = n;
   let i = 0;
   while (v >= 1000 && i < units.length - 1) {
     v /= 1000;
     i++;
   }
-  return `${v.toFixed(v < 10 ? 2 : 1)}${units[i]}`;
+  return i === 0 ? String(n) : `${fixed1(v)}${units[i]}`;
 }
 
 export function shape(dims: number[]): string {

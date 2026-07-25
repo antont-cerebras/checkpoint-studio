@@ -2,24 +2,33 @@ import { describe, expect, it } from 'vitest';
 import { humanCount, humanSize, num, percent, pyShape, shape } from './format';
 
 // These formatters exist on BOTH sides of the app: the TUI formats in Rust
-// (`utils::format_size`, the stats/zeros display), the web UI formats here. Nothing
-// makes them agree automatically, so pin the observable output — including the boundary
-// cases where the two implementations could plausibly drift (unit thresholds, the
-// <10 -> 2 decimals switch, exact zero vs a tiny fraction).
+// (`utils::format_size`, `format_parameters`, `format_percent`), the web UI formats
+// here. What makes them agree is `parity.test.ts`, which checks these against a fixture
+// generated from the Rust functions — see shared/parity/README.md. The cases below are
+// the local, behavioural ones: unit thresholds, saturation, exact zero vs a tiny
+// fraction, and the display-vs-copy split for shapes.
 describe('humanSize', () => {
   it('stays in bytes below 1 KiB', () => {
     expect(humanSize(0)).toBe('0 B');
     expect(humanSize(1023)).toBe('1023 B');
   });
   it('switches unit exactly at each 1024 boundary', () => {
-    expect(humanSize(1024)).toBe('1.00 KiB');
-    expect(humanSize(1024 * 1024)).toBe('1.00 MiB');
-    expect(humanSize(1024 ** 3)).toBe('1.00 GiB');
-    expect(humanSize(1024 ** 4)).toBe('1.00 TiB');
+    expect(humanSize(1024)).toBe('1.0 KiB');
+    expect(humanSize(1024 * 1024)).toBe('1.0 MiB');
+    expect(humanSize(1024 ** 3)).toBe('1.0 GiB');
+    expect(humanSize(1024 ** 4)).toBe('1.0 TiB');
   });
-  it('uses 2 decimals below 10 and 1 above', () => {
-    expect(humanSize(9.5 * 1024)).toBe('9.50 KiB');
+  // One decimal at every magnitude, like the TUI. (This used to be two decimals below
+  // 10, which is where the two UIs disagreed: `1.50 KiB` vs `1.5 KiB`.)
+  it('uses one decimal above the byte range', () => {
+    expect(humanSize(9.5 * 1024)).toBe('9.5 KiB');
     expect(humanSize(10 * 1024)).toBe('10.0 KiB');
+  });
+  // Sizes are power-of-two divisions, so exact ties are common: 1280 B is exactly
+  // 1.25 KiB. Rust rounds ties to even, and so must this.
+  it('rounds an exact tie to even, as Rust does', () => {
+    expect(humanSize(1280)).toBe('1.2 KiB');
+    expect(humanSize(1792)).toBe('1.8 KiB');
   });
   it('saturates at the largest unit rather than inventing one', () => {
     expect(humanSize(1024 ** 6)).toMatch(/PiB$/);
@@ -32,10 +41,10 @@ describe('humanCount', () => {
     expect(humanCount(999)).toBe('999');
   });
   it('uses decimal (not binary) steps — 1000, not 1024', () => {
-    expect(humanCount(1000)).toBe('1.00K');
-    expect(humanCount(1_000_000)).toBe('1.00M');
-    expect(humanCount(1_000_000_000)).toBe('1.00B');
-    expect(humanCount(1_000_000_000_000)).toBe('1.00T');
+    expect(humanCount(1000)).toBe('1.0K');
+    expect(humanCount(1_000_000)).toBe('1.0M');
+    expect(humanCount(1_000_000_000)).toBe('1.0B');
+    expect(humanCount(1_000_000_000_000)).toBe('1.0T');
   });
   it('formats a realistic parameter count', () => {
     expect(humanCount(30_900_000_000)).toBe('30.9B');

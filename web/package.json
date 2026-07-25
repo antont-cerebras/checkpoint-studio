@@ -25,6 +25,7 @@
     "@eslint/js": "^10.0.1",
     "@sveltejs/vite-plugin-svelte": "^2.5.3",
     "@tsconfig/svelte": "^5.0.2",
+    "@types/node": "^20.19.43",
     "@vitest/coverage-v8": "^3.2.7",
     "eslint": "^10.7.0",
     "eslint-plugin-svelte": "^3.22.0",
