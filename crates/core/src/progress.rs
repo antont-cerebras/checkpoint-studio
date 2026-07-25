@@ -25,6 +25,8 @@ pub struct LoadProgress {
     /// A trailing activity note (0 = none) for a bar whose count has maxed out but
     /// whose work continues — see [`Phase`].
     phase: AtomicU8,
+    /// Which step of the read is running (0 = unknown) — see [`Stage`].
+    stage: AtomicU8,
 }
 
 /// What a [`LoadProgress`] count measures — shown after the `done/total` on the
@@ -51,6 +53,77 @@ pub enum Unit {
 pub enum Phase {
     /// Bytes all read; the proxy is now decoding + comparing the tensor.
     Comparing,
+}
+
+/// Which step of a read is currently running, shown dimmed after the timer so a bar
+/// that sits still for a second or two says *why*. A count alone can't: opening an
+/// `s3://` checkpoint spends its first ~1.5s starting the remote reader before the
+/// first tensor is counted, and then counts twice — once for tensors, once for the
+/// S3 objects behind the stats screen's S3 section.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stage {
+    /// Remote python is starting and `cstorch.load` is opening the checkpoint —
+    /// before any tensor can be counted.
+    Index,
+    /// Listing the checkpoint's shards over SFTP (the count isn't known yet).
+    Listing,
+    /// Reading each shard's safetensors header.
+    Shards,
+    /// Reading the tensor metadata out of the opened checkpoint.
+    Tensors,
+    /// HEADing each S3 object for the stats screen's S3 section.
+    S3Objects,
+}
+
+impl Stage {
+    /// The dimmed text shown after the timer.
+    const fn label(self) -> &'static str {
+        match self {
+            Stage::Index => "loading the checkpoint index",
+            Stage::Listing => "listing the checkpoint files",
+            Stage::Shards => "reading shard headers",
+            Stage::Tensors => "reading tensor metadata",
+            Stage::S3Objects => "reading S3 object metadata",
+        }
+    }
+
+    /// A terse form for a narrow terminal, where the full phrase wouldn't fit.
+    ///
+    /// Empty where the `done/total` count already names the thing being read — on a
+    /// tight line, `1155/1155 tensors … tensors` is worse than nothing. The two steps
+    /// that keep a short form are the ones with no count at all, which are exactly the
+    /// ones where a bar otherwise looks stuck.
+    const fn short(self) -> &'static str {
+        match self {
+            Stage::Index => "index",
+            Stage::Listing => "listing files",
+            Stage::Shards | Stage::Tensors | Stage::S3Objects => "",
+        }
+    }
+
+    /// Every stage, so the tests can check the labels are distinct and complete.
+    #[cfg(test)]
+    const ALL: [Stage; 5] = [
+        Stage::Index,
+        Stage::Listing,
+        Stage::Shards,
+        Stage::Tensors,
+        Stage::S3Objects,
+    ];
+}
+
+/// Pick the widest stage text that fits in `room` columns (including the two leading
+/// spaces): the full phrase, else the terse one, else nothing. The path label keeps
+/// its own budget, so on a narrow terminal the stage is what gives way — never the
+/// line's width, since a wrapped line breaks the in-place redraw.
+fn fit_stage(room: usize, long: &'static str, short: &'static str) -> &'static str {
+    if room >= long.chars().count() + 2 {
+        long
+    } else if !short.is_empty() && room >= short.chars().count() + 2 {
+        short
+    } else {
+        ""
+    }
 }
 
 impl LoadProgress {
@@ -104,6 +177,30 @@ impl LoadProgress {
         match self.phase.load(Ordering::Relaxed) {
             1 => " · comparing…",
             _ => "",
+        }
+    }
+
+    /// Say which step is running now (shown dimmed after the timer).
+    pub fn set_stage(&self, stage: Stage) {
+        let code = match stage {
+            Stage::Index => 1,
+            Stage::Listing => 2,
+            Stage::Shards => 3,
+            Stage::Tensors => 4,
+            Stage::S3Objects => 5,
+        };
+        self.stage.store(code, Ordering::Relaxed);
+    }
+
+    /// The step running now, or `None` until one is set.
+    pub fn stage(&self) -> Option<Stage> {
+        match self.stage.load(Ordering::Relaxed) {
+            1 => Some(Stage::Index),
+            2 => Some(Stage::Listing),
+            3 => Some(Stage::Shards),
+            4 => Some(Stage::Tensors),
+            5 => Some(Stage::S3Objects),
+            _ => None,
         }
     }
 
@@ -259,6 +356,8 @@ fn spawn(
     // Reserve room for the widest possible tail so the line can't wrap: the bar
     // itself + a byte count (`999.9 MiB/999.9 MiB`) + the `· comparing…` note +
     // the timer + separators — "  ⠋ <label>  [bar] 999.9 MiB/999.9 MiB · comparing…  12.3s".
+    // The stage text appended after the timer takes whatever is left over (see
+    // `fit_stage`), so it never costs the path any columns.
     let budget = cols.saturating_sub(BAR_COLS + 48).max(20);
     let labels: Vec<String> = labels.iter().map(|l| truncate_middle(l, budget)).collect();
     std::thread::spawn(move || {
@@ -300,10 +399,14 @@ fn spawn(
                 // remote dir is listed); until then just the spinner + timer.
                 let (done, total) = progress[k].snapshot();
                 let unit = progress[k].unit_label();
-                let bar = if st == ABORTED {
+                // Each branch returns the drawn segment plus how many columns it
+                // actually occupies (escape codes are zero-width), so the stage text
+                // below knows how much room is left on the line.
+                let (bar, bar_cols) = if st == ABORTED {
                     // Aborted: the partial count/timer would read as "failed partway",
                     // so replace them with a clear note (see the trailing timer too).
-                    format!("  {DIM}aborted — the other checkpoint failed to load{RESET}")
+                    const NOTE: &str = "aborted — the other checkpoint failed to load";
+                    (format!("  {DIM}{NOTE}{RESET}"), 2 + NOTE.chars().count())
                 } else if total > 0 {
                     // Determinate: a thin bar in the TUI `LineGauge` style
                     // (`symbols::line::THICK`) — done part in the mark's colour, the
@@ -327,10 +430,13 @@ fn spawn(
                     } else {
                         ""
                     };
-                    format!(
-                        "  {color}{}{RESET}{DIM}{}{RESET} {count}{DIM}{note}{RESET}",
-                        "━".repeat(filled),
-                        "━".repeat(BAR_COLS - filled),
+                    (
+                        format!(
+                            "  {color}{}{RESET}{DIM}{}{RESET} {count}{DIM}{note}{RESET}",
+                            "━".repeat(filled),
+                            "━".repeat(BAR_COLS - filled),
+                        ),
+                        2 + BAR_COLS + 1 + count.chars().count() + note.chars().count(),
                     )
                 } else if st == RUNNING {
                     // Total not known yet (still connecting / listing the dir) or an
@@ -339,25 +445,44 @@ fn spawn(
                     // start instead of a bare spinner.
                     let win = 3.min(BAR_COLS);
                     let pos = sweep_pos(i, BAR_COLS, win);
-                    format!(
-                        "  {DIM}{}{RESET}{color}{}{RESET}{DIM}{}{RESET}",
-                        "━".repeat(pos),
-                        "━".repeat(win),
-                        "━".repeat(BAR_COLS - pos - win),
+                    (
+                        format!(
+                            "  {DIM}{}{RESET}{color}{}{RESET}{DIM}{}{RESET}",
+                            "━".repeat(pos),
+                            "━".repeat(win),
+                            "━".repeat(BAR_COLS - pos - win),
+                        ),
+                        2 + BAR_COLS,
                     )
                 } else {
-                    String::new() // finished with no known total: mark + timer only
+                    (String::new(), 0) // finished with no known total: mark + timer only
                 };
                 // No timer on an aborted line — a partial time reads as a failure.
-                let timer = if st == ABORTED {
-                    String::new()
+                let (timer, timer_cols) = if st == ABORTED {
+                    (String::new(), 0)
                 } else {
-                    format!(" {color}{secs:.1}s{RESET}")
+                    let text = format!("{secs:.1}s");
+                    let cols = 1 + text.chars().count();
+                    (format!(" {color}{text}{RESET}"), cols)
+                };
+                // Which step is running, dimmed, after the timer — so a bar that sits
+                // at a steady count still says what it's doing. Only while running: a
+                // finished `✓` line shouldn't claim to still be reading. Sized to the
+                // columns left over, so it never pushes the line into wrapping.
+                let stage = match progress[k].stage().filter(|_| st == RUNNING) {
+                    None => String::new(),
+                    Some(s) => {
+                        let used = 4 + labels[k].chars().count() + bar_cols + timer_cols;
+                        match fit_stage(cols.saturating_sub(used), s.label(), s.short()) {
+                            "" => String::new(),
+                            text => format!("  {DIM}{text}{RESET}"),
+                        }
+                    }
                 };
                 // `\r` + text + clear-to-EOL (`\x1b[K` *after* the text, so there's
                 // no blank-then-fill flash) — overwrites the line in place.
                 frame.push_str(&format!(
-                    "\r  {color}{mark}{RESET} {DIM}{}{RESET}{bar}{timer}\x1b[K\n",
+                    "\r  {color}{mark}{RESET} {DIM}{}{RESET}{bar}{timer}{stage}\x1b[K\n",
                     labels[k]
                 ));
             }
@@ -374,7 +499,9 @@ fn spawn(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadProgress, Phase, Unit, filled_cols, sweep_pos, truncate_middle};
+    use super::{
+        LoadProgress, Phase, Stage, Unit, filled_cols, fit_stage, sweep_pos, truncate_middle,
+    };
 
     #[test]
     fn load_progress_tracks_done_and_total() {
@@ -387,6 +514,56 @@ mod tests {
         p.advance();
         assert_eq!(p.snapshot(), (2, 48));
         assert_eq!(p.unit_label(), " shards");
+    }
+
+    #[test]
+    fn stage_is_unset_until_told_and_round_trips() {
+        let p = LoadProgress::new();
+        assert!(p.stage().is_none(), "no stage until the reader names one");
+        for s in Stage::ALL {
+            p.set_stage(s);
+            assert_eq!(p.stage(), Some(s));
+        }
+    }
+
+    #[test]
+    fn every_stage_has_its_own_label() {
+        let mut seen: Vec<&str> = Vec::new();
+        for s in Stage::ALL {
+            let l = s.label();
+            assert!(!l.is_empty(), "{s:?} has no label");
+            assert!(!seen.contains(&l), "{s:?} duplicates the label {l:?}");
+            seen.push(l);
+        }
+    }
+
+    /// A terse form exists only for the steps with no `done/total` count. Where the
+    /// count already names the unit, a short stage would just repeat it.
+    #[test]
+    fn only_the_countless_stages_have_a_short_form() {
+        assert_eq!(Stage::Index.short(), "index");
+        assert_eq!(Stage::Listing.short(), "listing files");
+        for s in [Stage::Shards, Stage::Tensors, Stage::S3Objects] {
+            assert_eq!(s.short(), "", "{s:?} should fall back to nothing");
+        }
+    }
+
+    #[test]
+    fn fit_stage_gives_way_before_the_line_wraps() {
+        let (long, short) = (Stage::Index.label(), Stage::Index.short());
+        // Exactly enough room (text + the two leading spaces) keeps the long form.
+        assert_eq!(fit_stage(long.len() + 2, long, short), long);
+        assert_eq!(fit_stage(long.len() + 1, long, short), short);
+        assert_eq!(fit_stage(short.len() + 2, long, short), short);
+        assert_eq!(fit_stage(short.len() + 1, long, short), "");
+        assert_eq!(fit_stage(0, long, short), "");
+        // With no short form, the long one is all-or-nothing.
+        let t = Stage::Tensors;
+        assert_eq!(
+            fit_stage(t.label().len() + 2, t.label(), t.short()),
+            t.label()
+        );
+        assert_eq!(fit_stage(t.label().len() + 1, t.label(), t.short()), "");
     }
 
     #[test]

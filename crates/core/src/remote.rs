@@ -491,6 +491,9 @@ impl RemoteRead {
 
         // One pass over the directory: the shard read order plus the index +
         // listing the health check needs (read once, shared below).
+        if let Some(p) = progress {
+            p.set_stage(crate::progress::Stage::Listing);
+        }
         let crate::sftp::ShardListing {
             files,
             index_path,
@@ -504,6 +507,7 @@ impl RemoteRead {
         if let Some(p) = progress {
             p.set_total(files.len());
             p.set_unit(crate::progress::Unit::Shards);
+            p.set_stage(crate::progress::Stage::Shards);
         }
         // Stamp each tensor with *its own* shard's scp-style path (not the dir), so
         // the status line / `f` shows the exact file and it's usable with scp.
@@ -629,6 +633,12 @@ impl RemoteRead {
     ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>, S3Meta)> {
         let script = dump_script(src, want_s3);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
+        // Until the first tensor is counted, the remote is starting python, importing
+        // cstorch and opening the checkpoint — a second or two with nothing to count,
+        // so name the step instead of showing a bare sweeping bar.
+        if let Some(p) = progress {
+            p.set_stage(crate::progress::Stage::Index);
+        }
         // Feed the streamed `PROG:done/total` lines into the load bar as they land.
         let out = session.exec_capture_abortable(&command, &script, abort, |line| {
             // `PROG:done/total[/unit]` — the optional unit switches the bar's label
@@ -639,13 +649,20 @@ impl RemoteRead {
                     && let (Ok(done), Ok(total)) = (d.trim().parse(), t.trim().parse())
                     && let Some(p) = progress
                 {
-                    let unit = match parts.next().map(str::trim) {
-                        Some("s3") => crate::progress::Unit::S3Objects,
-                        _ => crate::progress::Unit::Tensors,
+                    let (unit, stage) = match parts.next().map(str::trim) {
+                        Some("s3") => (
+                            crate::progress::Unit::S3Objects,
+                            crate::progress::Stage::S3Objects,
+                        ),
+                        _ => (
+                            crate::progress::Unit::Tensors,
+                            crate::progress::Stage::Tensors,
+                        ),
                     };
                     p.set_total(total);
                     p.set_done(done);
                     p.set_unit(unit);
+                    p.set_stage(stage);
                 }
             }
         })?;
