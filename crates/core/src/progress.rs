@@ -71,7 +71,10 @@ pub enum Stage {
     Shards,
     /// Reading the tensor metadata out of the opened checkpoint.
     Tensors,
-    /// HEADing each S3 object for the stats screen's S3 section.
+    /// HEADing each S3 object for its *storage* facts — size on S3, ETag, checksum,
+    /// date, tags — which the checkpoint index doesn't carry. Not a second read of the
+    /// tensor metadata: that came from the one `__METADATA__` object during
+    /// [`Stage::Index`].
     S3Objects,
 }
 
@@ -83,7 +86,7 @@ impl Stage {
             Stage::Listing => "listing the checkpoint files",
             Stage::Shards => "reading shard headers",
             Stage::Tensors => "reading tensor metadata",
-            Stage::S3Objects => "reading S3 object metadata",
+            Stage::S3Objects => "reading S3 storage metadata",
         }
     }
 
