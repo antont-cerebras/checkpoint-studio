@@ -15,7 +15,7 @@ use crate::sample::{HistBins, Histogram, Sample, SampleMode, Stats, ViewDtype};
 /// client flattens/folds this the way `filetree::flatten` does.
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WebFileNode {
+pub(crate) enum WebFileNode {
     Dir {
         name: String,
         path: String,
@@ -34,7 +34,7 @@ pub enum WebFileNode {
 impl WebFileNode {
     /// Project a local `FileNode` tree into the web shape, making each `path`
     /// relative to `root`.
-    pub fn from_node(node: &FileNode, root: &Path) -> Self {
+    pub(crate) fn from_node(node: &FileNode, root: &Path) -> Self {
         match node {
             FileNode::Dir {
                 name,
@@ -74,7 +74,7 @@ fn rel(path: &Path, root: &Path) -> String {
 
 /// Whole-tensor statistics (`sample::Stats`) with `Duration` → `elapsed_ms`.
 #[derive(Serialize, Clone)]
-pub struct StatsDto {
+pub(crate) struct StatsDto {
     pub count: u64,
     pub min: f64,
     pub max: f64,
@@ -107,7 +107,7 @@ impl From<&Stats> for StatsDto {
 /// cell as a zero-padded hex string of `raw_width` bits, so the client can reformat
 /// to any base via BigInt without u64 precision loss.
 #[derive(Serialize)]
-pub struct SampleDto {
+pub(crate) struct SampleDto {
     pub rows: Vec<usize>,
     pub cols: Vec<usize>,
     pub values: Vec<Vec<f64>>,
@@ -136,7 +136,7 @@ pub struct SampleDto {
 impl SampleDto {
     /// `dtype` is the tensor's stored dtype, needed to tell whether the values under
     /// this view are integers (and signed) — see the `integer`/`signed` fields.
-    pub fn from_sample(s: &Sample, dtype: &str, include_raw: bool) -> Self {
+    pub(crate) fn from_sample(s: &Sample, dtype: &str, include_raw: bool) -> Self {
         let integer = s.view.is_integer(dtype);
         let signed = s.view.is_signed_integer(dtype);
         let raw_width = s.raw.iter().flatten().next().map(|b| b.width);
@@ -179,7 +179,7 @@ impl SampleDto {
 
 /// A value histogram (`sample::Histogram`) with `Duration` → `elapsed_ms`.
 #[derive(Serialize)]
-pub struct HistogramDto {
+pub(crate) struct HistogramDto {
     pub bins: HistBinsDto,
     pub counts: Vec<u64>,
     pub total: u64,
@@ -189,7 +189,7 @@ pub struct HistogramDto {
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum HistBinsDto {
+pub(crate) enum HistBinsDto {
     /// Integer bins: bin `i` covers `[start + i*step, start + (i+1)*step)`.
     Int { start: i64, step: i64 },
     /// Equal-width bins spanning `[lo, hi]`.
@@ -212,7 +212,7 @@ impl From<&Histogram> for HistogramDto {
 }
 
 /// The `?dtype=` value that re-selects a view (`stored` when using the real dtype).
-pub fn view_label(v: ViewDtype) -> String {
+pub(crate) fn view_label(v: ViewDtype) -> String {
     v.label().unwrap_or("stored").to_string()
 }
 
@@ -235,7 +235,7 @@ fn mode_label(m: &SampleMode) -> String {
 /// what it's given. Per-object rows come from `footprint.S3.objects`, which the stats
 /// payload already carries.
 #[derive(serde::Serialize)]
-pub struct S3SummaryDto {
+pub(crate) struct S3SummaryDto {
     pub count: usize,
     pub total_bytes: u64,
     /// Stored-checksum coverage, e.g. `SHA256 on 126 of 1155` or `none`.
@@ -257,7 +257,7 @@ pub struct S3SummaryDto {
 
 impl S3SummaryDto {
     /// Build from the stats module's S3 view, or `None` for a checkpoint without one.
-    pub fn from_stats(stats: &crate::stats::CheckpointStats) -> Option<Self> {
+    pub(crate) fn from_stats(stats: &crate::stats::CheckpointStats) -> Option<Self> {
         let s3 = stats.s3()?;
         Some(S3SummaryDto {
             count: s3.count(),
@@ -380,7 +380,7 @@ mod tests {
 
     #[test]
     fn histogram_dto_tags_bin_kind() {
-        let hist = crate::sample::Histogram {
+        let hist = Histogram {
             bins: HistBins::Range { lo: 0.0, hi: 1.0 },
             counts: vec![3, 5],
             total: 8,

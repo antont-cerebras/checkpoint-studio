@@ -6,10 +6,10 @@ use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
 #[folder = "web/dist"]
-pub struct WebAssets;
+pub(super) struct WebAssets;
 
 /// Content-type for a served asset path, by extension (covers the SPA's outputs).
-pub fn content_type(path: &str) -> &'static str {
+pub(super) fn content_type(path: &str) -> &'static str {
     match path.rsplit('.').next() {
         Some("html") => "text/html; charset=utf-8",
         Some("js") | Some("mjs") => "text/javascript; charset=utf-8",

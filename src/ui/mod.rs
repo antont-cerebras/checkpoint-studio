@@ -29,7 +29,7 @@ use crate::tree::TreeNode;
 // The numeric-grid presentation enums live in core (frontend-free, so the kernel
 // can own them); re-exported here so the `crate::ui::{StripeMode,NumBase,…}` paths
 // the renderers use keep resolving.
-pub use crate::viewstate::{NumBase, StripeMode, parse_num_base, parse_stripe_mode};
+pub(crate) use crate::viewstate::{NumBase, StripeMode, parse_num_base, parse_stripe_mode};
 
 mod badge;
 mod check;
@@ -55,16 +55,16 @@ mod tree;
 
 // What the rest of the app addresses as `ui::…`: the screens' inputs and the
 // row/line builders the plain-text and clipboard exports reuse.
-pub use badge::{AccessBadge, Badge, HealthAlert, status_badges};
-pub use check::CheckPopup;
-pub use hints::{HelpCtx, data_view_footer_lines, region_at, region_hit, shortcut_help};
-pub use json::{highlight_json_lines, highlight_json_lines_inline, plain_json_lines_inline};
-pub use legend::Legend;
-pub use popup::render_shortcut_bubble;
-pub use rename::{RenameCompletion, RenameRuleView, RenameView};
-pub use scroll::VScrollbar;
-pub use theme::{dim_span, success_span};
-pub use tree::{tensor_list_line, tree_row_line, tree_row_text};
+pub(crate) use badge::{AccessBadge, Badge, HealthAlert, status_badges};
+pub(crate) use check::CheckPopup;
+pub(crate) use hints::{HelpCtx, data_view_footer_lines, region_at, region_hit, shortcut_help};
+pub(crate) use json::{highlight_json_lines, highlight_json_lines_inline, plain_json_lines_inline};
+pub(crate) use legend::Legend;
+pub(crate) use popup::render_shortcut_bubble;
+pub(crate) use rename::{RenameCompletion, RenameRuleView, RenameView};
+pub(crate) use scroll::VScrollbar;
+pub(crate) use theme::{dim_span, success_span};
+pub(crate) use tree::{tensor_list_line, tree_row_line, tree_row_text};
 // The footer builders are `ui` internals — the screens above call them directly.
 // They're re-exported for tests only, where the explorer's mode tests assert that
 // every mode's footer advertises that mode's command keys.
@@ -96,9 +96,9 @@ pub(crate) fn fit_rows(area: Rect, y: u16, height: u16) -> Rect {
 
 /// A still-forming scan's progress indicator: a spinner glyph, the elapsed time,
 /// and an optional completed fraction (`None` when the total isn't known).
-pub type ScanProgress = (char, std::time::Duration, Option<f64>);
+pub(crate) type ScanProgress = (char, Duration, Option<f64>);
 
-pub struct DrawConfig<'a> {
+pub(crate) struct DrawConfig<'a> {
     pub tree: &'a [(TreeNode, usize)],
     pub current_file: &'a str,
     pub file_idx: usize,
@@ -152,7 +152,7 @@ pub struct DrawConfig<'a> {
 /// matches many tensors, so it is never a link). Recorded per screen and dispatched
 /// by [`Explorer::open_link`](crate::explorer). See the `links` field on `Explorer`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Link {
+pub(crate) enum Link {
     /// Open the byte-layout view of this safetensors file (its full path).
     Layout(String),
     /// Reveal this concrete tensor in the tree.
@@ -160,14 +160,14 @@ pub enum Link {
 }
 
 /// A frame's footer-chip click regions — each replays a [`KeyEvent`].
-pub type ChipRegions = Vec<(Rect, KeyEvent)>;
+pub(crate) type ChipRegions = Vec<(Rect, KeyEvent)>;
 /// A frame's navigation-link regions — each opens another view via a [`Link`].
-pub type LinkRegions = Vec<(Rect, Link)>;
+pub(crate) type LinkRegions = Vec<(Rect, Link)>;
 
 /// How a screen should render the statistics area: not computed yet, a scan in
 /// progress (with a spinner + running timer), or the finished `Stats`.
 #[derive(Clone, Copy)]
-pub enum StatsView<'a> {
+pub(crate) enum StatsView<'a> {
     Pending,
     Computing {
         spinner: char,
@@ -182,7 +182,7 @@ pub enum StatsView<'a> {
 impl StatsView<'_> {
     /// The exact whole-tensor value range, available only once the scan has
     /// finished. Used to size numeric cells to the data actually present.
-    pub fn value_range(&self) -> Option<(f64, f64)> {
+    pub(crate) fn value_range(&self) -> Option<(f64, f64)> {
         match self {
             StatsView::Ready(s) => Some((s.min, s.max)),
             _ => None,
@@ -194,7 +194,7 @@ impl StatsView<'_> {
 /// the last layer of [`UI::render_detail`] so the screen behind it keeps
 /// redrawing (a running scan's progress animates) while it's up. Dismissed by
 /// any key. Composited via [`UI::render_legend_band`] / [`UI::render_command_band`].
-pub enum Overlay {
+pub(crate) enum Overlay {
     /// The context-sensitive glyph legend (`l`).
     Legend(Legend),
     /// The copied CLI command box (`y`); holds the command to display.
@@ -204,7 +204,7 @@ pub enum Overlay {
     Notice(String),
 }
 
-pub struct UI;
+pub(crate) struct UI;
 
 #[cfg(test)]
 mod tests {
@@ -296,7 +296,7 @@ mod small_terminal {
     #[test]
     fn the_tree_screen_fits_any_terminal() {
         let nodes = vec![(
-            crate::tree::TreeNode::Tensor {
+            TreeNode::Tensor {
                 info: tensor("model.layers.0.weight"),
                 label: None,
             },
@@ -304,7 +304,7 @@ mod small_terminal {
         )];
         let unindexed = HashSet::new();
         let schemas = HashMap::new();
-        let badges = crate::ui::status_badges(AccessBadge::ReadOnly, None, false);
+        let badges = status_badges(AccessBadge::ReadOnly, None, false);
         let config = DrawConfig {
             tree: &nodes,
             current_file: "/ckpt/model.safetensors",
@@ -375,7 +375,7 @@ mod small_terminal {
                 kind: crate::filetree::FileKind::Checkpoint,
             },
         }];
-        let badges = crate::ui::status_badges(AccessBadge::ReadOnly, None, false);
+        let badges = status_badges(AccessBadge::ReadOnly, None, false);
         draw("the file browser", |f| {
             UI::render_files(f, "/ckpt", &rows, 0, 0, None, true, &badges, None);
         });

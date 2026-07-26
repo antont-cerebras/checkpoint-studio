@@ -20,7 +20,7 @@ impl UI {
     /// [`render_titled_bar`] (label + copied confirmation ride the top border) with
     /// the wrapped command flush at column 0 so it stays cleanly selectable, then a
     /// dismiss hint.
-    pub fn render_command_band(frame: &mut Frame, command: &str) {
+    pub(crate) fn render_command_band(frame: &mut Frame, command: &str) {
         let term_w = frame.area().width as usize;
         let title = Line::from(vec![
             Span::styled(
@@ -53,7 +53,7 @@ impl UI {
     /// header, a spinner on the row where the tree's first node will land, and the
     /// cancel hint pinned to the bottom — so the chrome is up immediately and the
     /// tree fills into the same frame once the read finishes.
-    pub fn render_loading(
+    pub(crate) fn render_loading(
         frame: &mut Frame,
         file: &str,
         total_files: usize,
@@ -112,7 +112,7 @@ impl UI {
     /// with a 40-cell bar, a `done/total` count and a detail line (e.g. the
     /// dataset currently being written).
     #[cfg(feature = "hdf5")]
-    pub fn render_progress(
+    pub(crate) fn render_progress(
         frame: &mut Frame,
         title: &str,
         done: usize,
@@ -161,7 +161,7 @@ impl UI {
 
     /// The Ratatui port of [`Self::draw_message`]: a simple full-screen message
     /// (title, underline rule, body, footer) over the pop-up panel surface.
-    pub fn render_message(frame: &mut Frame, title: &str, message: &str) {
+    pub(crate) fn render_message(frame: &mut Frame, title: &str, message: &str) {
         render_popup_box(
             frame,
             title,
@@ -178,7 +178,7 @@ impl UI {
     /// A metadata-only / unavailable notice **floated over** the live frame (the
     /// screen behind stays visible — unlike [`Self::render_message`]), dismissed by
     /// any key. Used for [`Overlay::Notice`].
-    pub fn render_notice_box(frame: &mut Frame, message: &str) {
+    pub(crate) fn render_notice_box(frame: &mut Frame, message: &str) {
         render_popup_box(
             frame,
             "Metadata-only",
@@ -197,7 +197,7 @@ impl UI {
     /// and shows it on its own full-width line(s) at column 0 (so a long path
     /// stays selectable even past the terminal width). Mirrors
     /// [`Self::render_command_band`].
-    pub fn render_export_band(frame: &mut Frame, command: &str) {
+    pub(crate) fn render_export_band(frame: &mut Frame, command: &str) {
         let term_w = (frame.area().width as usize).max(1);
         let title = Line::from(vec![
             Span::styled(
@@ -245,7 +245,7 @@ impl UI {
     /// confirmation composited over the frame's bottom row (clamped to the width
     /// so it never wraps and scrolls). Drawn last, over the live detail/data
     /// frame, so the content above it stays put.
-    pub fn render_copied_flash(frame: &mut Frame, what: &str) {
+    pub(crate) fn render_copied_flash(frame: &mut Frame, what: &str) {
         let area = frame.area();
         let width = area.width as usize;
         // The caller supplies the whole message (not just clipboard copies) — e.g.
@@ -279,7 +279,7 @@ impl UI {
     /// Flash a transient warning `msg` on the bottom line (over whatever the view
     /// drew there), until the next redraw clears it — e.g. the wrong-keyboard-layout
     /// hint. Bold yellow, clamped to the width so it never wraps.
-    pub fn render_notice(frame: &mut Frame, msg: &str) {
+    pub(crate) fn render_notice(frame: &mut Frame, msg: &str) {
         let area = frame.area();
         let width = area.width as usize;
         let text: String = if msg.chars().count() > width {

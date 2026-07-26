@@ -288,7 +288,7 @@ pub struct TensorFamily {
 /// params / bytes, and the dtype + shape when uniform. First-appearance order
 /// (alphabetical when the input is sorted). A compact "what's in here, per layer /
 /// per expert" summary, mirroring how `diff` collapses its entries.
-pub fn tensor_families(tensors: &[crate::tree::TensorInfo]) -> Vec<TensorFamily> {
+pub fn tensor_families(tensors: &[TensorInfo]) -> Vec<TensorFamily> {
     use std::collections::HashMap;
     struct Agg {
         template: String,

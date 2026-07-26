@@ -10,10 +10,10 @@ Read-only: loads and compares; never writes to either checkpoint.
 # cluster's interpreter, and modern syntax works on our 3.9 floor.
 from __future__ import annotations
 
-import sys
 import json
-import time
+import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, NamedTuple
 

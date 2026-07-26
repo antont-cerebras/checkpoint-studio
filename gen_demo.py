@@ -10,11 +10,11 @@ Stdlib only (no numpy) — writes valid `.safetensors` files into /tmp/ckpt-demo
   new.safetensors     added/removed tensor, and metadata — for the `diff` demo
 """
 
-from collections.abc import Sequence
 import json
 import os
 import random
 import struct
+from collections.abc import Sequence
 
 random.seed(7)
 OUT = "/tmp/ckpt-demo"

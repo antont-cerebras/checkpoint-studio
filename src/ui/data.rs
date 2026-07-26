@@ -30,7 +30,7 @@ impl UI {
     /// and the footer match the numeric grid; the layout is top-aligned so a small
     /// sample leaves the lower screen blank, exactly like the raw renderer (which
     /// wrote sequentially and cleared below).
-    pub fn render_heatmap(
+    pub(crate) fn render_heatmap(
         frame: &mut Frame,
         tensor: &TensorInfo,
         sample: &Sample,
@@ -183,7 +183,7 @@ impl UI {
     /// (right-aligned, optional zebra-stripe background, dimmed gap markers) built
     /// the same way [`write_grid_cell`] writes one. Top-aligned, like the raw
     /// renderer.
-    pub fn render_values(
+    pub(crate) fn render_values(
         frame: &mut Frame,
         tensor: &TensorInfo,
         sample: &Sample,

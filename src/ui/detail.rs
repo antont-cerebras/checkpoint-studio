@@ -35,7 +35,7 @@ impl UI {
     /// Without a histogram the header is immediately followed by the footer,
     /// top-aligned.
     #[allow(clippy::too_many_arguments)] // a screen renderer; the params are all distinct
-    pub fn render_detail(
+    pub(crate) fn render_detail(
         frame: &mut Frame,
         tensor: &TensorInfo,
         shape: &[usize],
@@ -173,7 +173,7 @@ impl UI {
     /// ANSI form via `ansi-to-tui` (so the same `colored_json` palette shows
     /// through), or the raw text lines for a non-JSON value — with the same
     /// line-budget elision and footer.
-    pub fn render_metadata_detail(frame: &mut Frame, metadata: &MetadataInfo) {
+    pub(crate) fn render_metadata_detail(frame: &mut Frame, metadata: &MetadataInfo) {
         let area = frame.area();
         let rows = area.height as usize;
 
@@ -728,9 +728,9 @@ mod small_terminal {
             shape: vec![64, 64],
             size_bytes: 16384,
             num_elements: 4096,
-            storage: crate::tree::Storage::Raw,
+            storage: Storage::Raw,
             source_path: "/ckpt/model.safetensors".into(),
-            layout: crate::tree::Layout::None,
+            layout: Layout::None,
         }
     }
 
@@ -791,7 +791,7 @@ mod small_terminal {
                     ViewDtype::Stored,
                     true,
                     false,
-                    StatsView::Ready(&crate::sample::Stats {
+                    StatsView::Ready(&Stats {
                         count: 4096,
                         min: -1.5,
                         max: 1.5,
@@ -799,7 +799,7 @@ mod small_terminal {
                         std: 0.4,
                         zeros: 0,
                         nonfinite: 0,
-                        elapsed: std::time::Duration::from_millis(3),
+                        elapsed: Duration::from_millis(3),
                     }),
                     None,
                     None,

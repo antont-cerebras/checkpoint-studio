@@ -29,6 +29,20 @@ select = [
   "PIE", # misc lints
   "ANN", # every function must be type-annotated (see ANN401 below)
   "RUF", # ruff's own
+  # Added in the strictness pass. Each was measured to be clean (or one autofix away)
+  # on this tree, so they are here to catch regressions rather than to log debt:
+  "I",     # import sorting — deterministic, autofixable
+  "S",     # bandit: shell injection, `exec`, hardcoded temp paths, weak randomness
+  "PERF",  # obvious performance mistakes (needless list building, try-except in loops)
+  "FURB",  # modernizations refurb would suggest
+  "PLE",   # pylint errors — real bugs, not style
+  "PLW",   # pylint warnings
+  "DTZ",   # naive datetimes (the S3 timestamps are tz-aware; keep it that way)
+  "LOG",   # logging misuse
+  "ICN",   # conventional import aliases
+  "TID",   # tidy imports (no relative-import surprises across the ssh boundary)
+  "ASYNC", # async pitfalls, in case any of this ever grows an event loop
+  "C90",   # mccabe complexity, capped below
 ]
 ignore = [
   # These are scripts, not a library: they're written in a deliberately compact style
@@ -49,11 +63,36 @@ ignore = [
   "RUF003",
 ]
 
+[tool.ruff.lint.mccabe]
+# The scripts are linear pipelines; the S3 metadata pass is the most branching thing
+# here. This is a ceiling to stop a new one growing unnoticed, not a target.
+max-complexity = 15
+
 [tool.ruff.lint.per-file-ignores]
 # The remote scripts talk to cstorch/S3 over a network on a machine we can't debug
 # interactively: a broad `except Exception` that reports the failure as structured
 # JSON is the intended design, not a smell.
-"crates/core/src/python/*.py" = ["BLE001"]
+"crates/core/src/python/*.py" = [
+  "BLE001",
+  # The scripts import inside `try` blocks on purpose: a missing torch/boto3 has to be
+  # reported as structured JSON, not crash the interpreter at import time.
+  "PLC0415",
+  # One `try/except/pass`: the S3 *probe* is best-effort diagnosis of an already-failed
+  # load, and there is nowhere to log — its whole output is the JSON line it returns.
+  "S110",
+  # `value_diff.work` / `repack_verify.work` are the chunked compare loops: branching on
+  # dtype, rank, packing and cancellation in one pass over the tensor. Splitting them
+  # would mean threading a dozen locals through helpers on code that runs on a cluster
+  # we cannot step through. The complexity ceiling still applies to everything else.
+  "C901",
+]
+# The test harness deliberately does the things bandit flags: `exec` is how it runs the
+# scripts under test, `assert` is how a test asserts, and a temp path is where a fixture
+# goes. Flagging them here would be noise, not security.
+"crates/core/tests/python/*.py" = ["S101", "S102", "S301", "S108"]
+# The demo recorders shell out to the terminal recorder and write to a fixed temp path;
+# that is what they are for.
+"{gen_demo,record_demo}.py" = ["S101", "S311", "S603", "S606", "S607", "S110", "S108"]
 
 [tool.pyright]
 include = [
@@ -77,3 +116,36 @@ reportMissingModuleSource = false
 # cerebras.pytorch only exists in the cluster venv; torch / numpy / boto3 / zstandard
 # aren't installed in CI either. Same stance as pyright's reportMissingImports.
 unresolved-import = "ignore"
+
+# --- coverage.py -------------------------------------------------------------
+#
+# The remote scripts are the thing worth measuring: they run on a cluster we can't
+# debug interactively. `crates/core/tests/python/test_remote_scripts.py` execs them
+# under their real paths (so these lines are attributable) with cstorch/boto3 stubbed.
+#
+# `value_diff.py` / `repack_verify.py` are omitted on purpose: their bodies are
+# numpy/torch array arithmetic, and a fake numpy convincing enough to exercise them
+# would itself be the least trustworthy thing in the suite. They are covered instead by
+# the recorded-transcript replay tests in `crates/core/src/remote.rs`. Counting them
+# here would make the floor a fiction.
+#
+# Enforced by scripts/coverage.sh against coverage-floors.json.
+[tool.coverage.run]
+source = ["crates/core/src/python"]
+omit = [
+  "crates/core/src/python/value_diff.py",
+  "crates/core/src/python/repack_verify.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+# The offline half of the ratchet (Codecov compares against the parent commit; this
+# catches a drop in a fork or on a laptop). Raise it when coverage rises.
+fail_under = 90
+exclude_lines = [
+  "pragma: no cover",
+  # The scripts' broad `except Exception` blocks report a cluster failure as JSON; the
+  # ones that need a real cstorch/boto3 error to trigger aren't reachable from a stub.
+  "except Exception as e:  # unreachable under stubs",
+]

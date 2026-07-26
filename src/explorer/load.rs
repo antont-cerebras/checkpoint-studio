@@ -91,7 +91,7 @@ impl Explorer {
         term: &mut crate::tui::LiveTerminal,
         tensor: &TensorInfo,
         view: ViewDtype,
-        render: impl Fn(&mut ratatui::Frame, StatsView),
+        render: impl Fn(&mut ratatui::Frame, StatsView<'_>),
     ) -> ScanOutcome {
         if self.cached_stats(tensor, view).is_some() {
             return ScanOutcome::Completed;
@@ -175,7 +175,7 @@ impl Explorer {
     /// Read `s3://…` sources' metadata over SSH via cstorch on `host` (activating
     /// the venv at `venv`), instead of directly — so credentials stay on the
     /// remote (`--ssh-proxy` / `--ssh-venv`).
-    pub fn set_remote_read(&mut self, host: String, venv: String) {
+    pub(crate) fn set_remote_read(&mut self, host: String, venv: String) {
         // The file browser adapts to the remote source kind, derived from the raw
         // `--ssh-proxy` argument: an `s3://…` URI browses s3-natively; any other
         // path is the SFTP directory to browse (or, for a single shard, its

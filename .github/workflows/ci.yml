@@ -52,7 +52,32 @@ jobs:
       - name: Build (all features)
         run: cargo build --workspace --release --all-features --verbose
 
-      # Run tests (the HDF5 reader's tests require its feature)
+      # Coverage with cargo-llvm-cov, which is also the test run: instrumenting once and
+      # reusing the result is cheaper than testing twice, and `--fail-under-lines` is the
+      # offline half of the ratchet (Codecov below compares against the parent commit).
+      # Raise the floor when coverage rises; lowering it needs a reason in the commit.
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Test with coverage
+        env:
+          HDF5_USE_FILE_LOCKING: "FALSE"
+        run: |
+          cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info \
+            --fail-under-lines 78
+
+      - name: Upload coverage (rust)
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          flags: rust
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      # Also run the suite uninstrumented: `cfg(coverage)` and the instrumented build
+      # differ enough that a test can pass under one and not the other, and this is the
+      # configuration users get.
       - name: Run tests
         env:
           # libhdf5 takes an flock() on every file it opens; CI runners' overlay
@@ -105,8 +130,20 @@ jobs:
       # of the TUI↔web display contract in shared/parity (the Rust half runs in the
       # rust job's `cargo test`). Without this step that contract only ever held on
       # one side.
-      - name: Test (vitest)
-        run: npm test
+      # `npm run coverage` is `npm test` plus instrumentation: the thresholds in
+      # vitest.config.ts fail the run if coverage drops, and the lcov goes to Codecov.
+      - name: Test with coverage (vitest)
+        run: npm run coverage
+
+      - name: Upload coverage (web)
+        uses: codecov/codecov-action@v4
+        with:
+          files: web/coverage/lcov.info
+          flags: web
+          fail_ci_if_error: false
+          working-directory: ${{ github.workspace }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Build
         run: npm run build
@@ -144,7 +181,9 @@ jobs:
       # usefully: ty caught wrong return annotations that pyright's inference accepted,
       # and ruff enforces that the annotations exist in the first place.
       - name: Install tools
-        run: pip install ruff pyright ty
+        # `coverage[toml]` because the config lives in pyproject.toml and 3.9 has no
+        # tomllib.
+        run: pip install ruff pyright ty "coverage[toml]"
 
       - name: Lint (ruff)
         run: ruff check .
@@ -163,8 +202,21 @@ jobs:
       # print, the progress phases, the parallel S3 metadata pass, pagination and the
       # error paths. Needs no cluster and no torch — see the module docstring for what
       # is deliberately left to the recorded-transcript replay tests instead.
-      - name: Test the remote scripts
-        run: python -m unittest discover -s crates/core/tests/python -t crates/core/tests/python
+      - name: Test the remote scripts with coverage
+        run: |
+          python -m coverage run -m unittest discover \
+            -s crates/core/tests/python -t crates/core/tests/python
+          python -m coverage report        # honours fail_under from pyproject.toml
+          python -m coverage xml
+
+      - name: Upload coverage (python)
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          flags: python
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       # NOTE: `ruff format --check` is deliberately not a gate yet. These scripts are
       # hand-formatted for density (they cross an ssh link as one payload) and have

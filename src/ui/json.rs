@@ -65,7 +65,7 @@ fn highlight_json(raw: &str, inline_arrays: bool) -> Option<Vec<String>> {
 /// lines. Far cheaper than the highlighted path (no `colored_json` ANSI + no
 /// `ansi-to-tui` parse), so a huge safetensors header renders instantly. Returns
 /// `None` for non-JSON.
-pub fn plain_json_lines_inline(raw: &str) -> Option<Vec<Line<'static>>> {
+pub(crate) fn plain_json_lines_inline(raw: &str) -> Option<Vec<Line<'static>>> {
     let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
     if !value.is_object() && !value.is_array() {
         return None;
@@ -88,13 +88,13 @@ pub fn plain_json_lines_inline(raw: &str) -> Option<Vec<Line<'static>>> {
 /// [`highlight_json`] parsed back into styled Ratatui lines (via `ansi-to-tui`),
 /// or `None` for non-JSON. Shared by the metadata detail view and the copy-menu
 /// preview so both show the same `colored_json` palette.
-pub fn highlight_json_lines(raw: &str) -> Option<Vec<Line<'static>>> {
+pub(crate) fn highlight_json_lines(raw: &str) -> Option<Vec<Line<'static>>> {
     json_to_lines(raw, false)
 }
 
 /// Like [`highlight_json_lines`], but flat scalar arrays stay on one line — for
 /// the safetensors header preview (`shape` / `data_offsets` read as `[a, b]`).
-pub fn highlight_json_lines_inline(raw: &str) -> Option<Vec<Line<'static>>> {
+pub(crate) fn highlight_json_lines_inline(raw: &str) -> Option<Vec<Line<'static>>> {
     json_to_lines(raw, true)
 }
 

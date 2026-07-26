@@ -28,11 +28,11 @@ use ratatui::text::{Line, Span};
 // The data-view layout enum lives in core (frontend-free, so the kernel's
 // data-view state can own it); re-exported here so `crate::explorer::DataLayout`
 // keeps resolving for the renderers and the CLI.
-pub use crate::viewstate::DataLayout;
+pub(crate) use crate::viewstate::DataLayout;
 // The CLI-facing open-request types (see `open.rs`); re-exported so
 // `crate::explorer::OpenRequest` and friends keep resolving for `main.rs`.
 mod open;
-pub use open::*;
+pub(crate) use open::*;
 // Parent-only helpers from `open.rs` (the export menu's table): `pub use` can't
 // re-export a `pub(super)` item, so import them by name.
 use open::{EXPORT_CHOICES, ExportChoice, MENU_PREVIEW_LINES};
@@ -110,7 +110,7 @@ impl SelectionView {
 /// The selected node's distinct source files, cached with its key — the
 /// selection index, tree length, and search mode (see
 /// [`Explorer::selected_source_files`]).
-type GroupFilesCache = Option<(usize, usize, bool, std::collections::BTreeSet<String>)>;
+type GroupFilesCache = Option<(usize, usize, bool, BTreeSet<String>)>;
 
 /// Rows the tree viewport scrolls per mouse-wheel notch (independent of the
 /// selection, like a normal scrollable list).
@@ -963,7 +963,7 @@ struct RemoteContext {
     s3_meta: Option<crate::remote::S3Meta>,
 }
 
-pub struct Explorer {
+pub(crate) struct Explorer {
     /// The input path list (CLI args / globbed shard paths) — what to read. Not
     /// the same as the model's walked `FileEntry` list; this is the frontend's
     /// idea of "what the user asked to open".
@@ -1097,7 +1097,7 @@ pub struct Explorer {
 }
 
 impl Explorer {
-    pub fn new(
+    pub(crate) fn new(
         files: Vec<PathBuf>,
         index_specs: Vec<crate::health::IndexSpec>,
         open: Option<OpenRequest>,
@@ -1391,7 +1391,7 @@ impl Explorer {
     /// to text (see [`crate::tui::headless_render`]), so the output is deterministic
     /// regardless of the ambient terminal and matches the interactive screen. For
     /// piping, `grep`, and end-to-end tests.
-    pub fn render_plain(&mut self, emit_command: bool) -> Result<()> {
+    pub(crate) fn render_plain(&mut self, emit_command: bool) -> Result<()> {
         self.load_quiet()?;
 
         // `--histogram`/`--bins` and `--compute-stats` are scanned synchronously
@@ -1853,7 +1853,7 @@ impl Explorer {
         Some(hist)
     }
 
-    pub fn run(&mut self) -> Result<()> {
+    pub(crate) fn run(&mut self) -> Result<()> {
         if self.files.is_empty() {
             return Ok(());
         }
@@ -2184,7 +2184,7 @@ impl Explorer {
     /// Load the checkpoint and print the grouped tree to stdout, then return —
     /// `--print-tree`. Text is the fully-expanded browser tree; JSON is the
     /// `model.safetensors.index.json` shape (see [`TreeFormat`]).
-    pub fn print_tree(
+    pub(crate) fn print_tree(
         &mut self,
         format: TreeFormat,
         detail: TreeDetail,
@@ -2202,7 +2202,7 @@ impl Explorer {
 
     /// Load the checkpoint and print a flat list of every tensor to stdout, then
     /// return — `--print-tensors`.
-    pub fn print_tensors(
+    pub(crate) fn print_tensors(
         &mut self,
         format: TreeFormat,
         detail: TreeDetail,
@@ -2223,7 +2223,7 @@ impl Explorer {
     /// This is the kernel's frontend-agnostic output contract exercised headlessly:
     /// exactly what a web server or MCP tool would serve for the tree screen,
     /// projected from the same live `tree_state` the interactive TUI renders.
-    pub fn print_view(&mut self, filter: &crate::filter::NameFilter) -> Result<()> {
+    pub(crate) fn print_view(&mut self, filter: &crate::filter::NameFilter) -> Result<()> {
         self.load_quiet()?;
         self.apply_name_filter(filter);
         self.apply_tensor_filter();
@@ -2245,7 +2245,7 @@ impl Explorer {
     }
 
     /// Set the rich tensor filter (`--filter`), applied by [`Self::apply_tensor_filter`].
-    pub fn set_tensor_filter(&mut self, filter: crate::tensorfilter::TensorFilter) {
+    pub(crate) fn set_tensor_filter(&mut self, filter: crate::tensorfilter::TensorFilter) {
         self.tensor_filter = Some(filter);
     }
 
@@ -5550,7 +5550,7 @@ impl Explorer {
             let can_scan = self.remote_read().is_none() && !report.values;
             let state = CheckPopup::Idle { copied, can_scan };
             let hint = layout_hint;
-            let max_cell = std::cell::Cell::new(0usize);
+            let max_cell = Cell::new(0usize);
             if term
                 .draw(|f| {
                     self.render_tree_frame(f, true);
@@ -6676,7 +6676,7 @@ fn parse_shape_input(input: &str, elements: usize) -> Result<Vec<usize>, String>
 /// bytes we read ourselves (safetensors, NumPy, HDF5).
 fn dtype_overridable(tensor: &TensorInfo) -> bool {
     matches!(
-        std::path::Path::new(&tensor.source_path)
+        Path::new(&tensor.source_path)
             .extension()
             .and_then(|e| e.to_str()),
         Some("safetensors" | "h5" | "hdf5" | "npy" | "npz")
@@ -6767,7 +6767,7 @@ fn quit_immediately() -> ! {
     // pre-launch primary buffer + shell prompt, so nothing lingers underneath.
     let _ = execute!(
         stdout,
-        crossterm::event::DisableMouseCapture,
+        event::DisableMouseCapture,
         terminal::LeaveAlternateScreen,
         cursor::Show
     );
@@ -7414,12 +7414,12 @@ mod tests {
         let data_chips = {
             let state = |heatmap: bool| {
                 crate::ui::data_view_footer_wrapped_lines(
-                    crate::sample::SampleMode::Grid,
+                    SampleMode::Grid,
                     1,
                     true,
                     heatmap,
-                    crate::ui::StripeMode::Rows,
-                    crate::ui::NumBase::Decimal,
+                    StripeMode::Rows,
+                    NumBase::Decimal,
                     200,
                 )
                 .1

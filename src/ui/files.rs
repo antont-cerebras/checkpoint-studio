@@ -27,20 +27,20 @@ impl UI {
     /// (title + separator rule; the key hints are a bottom-pinned footer now).
     /// Shared with the mouse handler so a click at row `r >= this` maps to file row
     /// `scroll + (r - this)`.
-    pub fn files_header_rows(_width: u16) -> usize {
+    pub(crate) fn files_header_rows(_width: u16) -> usize {
         2 // title + rule
     }
 
     /// Rows the bottom-pinned key-hint footer occupies (above the one-line status
     /// bar). Kept in sync with [`Self::render_files`] so scroll / hit-testing align.
-    pub fn files_hint_rows(width: u16) -> usize {
+    pub(crate) fn files_hint_rows(width: u16) -> usize {
         files_hint_lines(width).0.len()
     }
 
     /// Body rows visible in the file browser at the given size (header + the
     /// bottom-pinned hint footer + the one-line status bar), so the scroll offset
     /// stays consistent with [`Self::render_files`]'s layout.
-    pub fn files_visible_rows(width: u16, height: u16) -> usize {
+    pub(crate) fn files_visible_rows(width: u16, height: u16) -> usize {
         (height as usize)
             .saturating_sub(
                 Self::files_header_rows(width) + Self::files_hint_rows(width) + FILES_FOOTER_HEIGHT,
@@ -49,13 +49,13 @@ impl UI {
     }
 
     /// How many file rows fit one screenful — used to size a PageUp/PageDown jump.
-    pub fn visible_file_rows(width: u16, height: u16) -> usize {
+    pub(crate) fn visible_file_rows(width: u16, height: u16) -> usize {
         Self::files_visible_rows(width, height)
     }
 
     /// The file browser's scroll-bar geometry (reusing [`VScrollbar`]) for this
     /// size and a listing of `total` rows at `offset`, or `None` when it all fits.
-    pub fn files_scrollbar(
+    pub(crate) fn files_scrollbar(
         width: u16,
         height: u16,
         total: usize,
@@ -82,7 +82,7 @@ impl UI {
     // A flat render signature (frame + view state) — a config struct would just
     // move the same fields behind one more indirection for no clarity.
     #[allow(clippy::too_many_arguments)]
-    pub fn render_files(
+    pub(crate) fn render_files(
         frame: &mut Frame,
         root: &str,
         rows: &[crate::filetree::FileRow],
@@ -192,7 +192,7 @@ impl UI {
     /// the file's contents (JSON syntax-highlighted, other text plain) or an info
     /// line for a binary. Reuses the scroll-pop-up chrome; returns its max scroll
     /// and clickable regions so the caller can clamp/handle them.
-    pub fn render_file_preview(
+    pub(crate) fn render_file_preview(
         frame: &mut Frame,
         title: &str,
         body: &[Line<'static>],

@@ -1620,7 +1620,7 @@ fn write_sharded(dir: &Path) {
                 (0..bytes).map(|i| (i % 251) as u8).collect()
             })
             .collect();
-        let views: Vec<(String, TensorView)> = specs
+        let views: Vec<(String, TensorView<'_>)> = specs
             .iter()
             .zip(&buffers)
             .map(|((name, dt, shape), buf)| {

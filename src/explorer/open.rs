@@ -9,7 +9,7 @@ use super::{DataLayout, NumBase, Result, StripeMode, ViewDtype};
 
 /// Which screen to jump straight to for a `--tensor` opened from the CLI.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum OpenView {
+pub(crate) enum OpenView {
     /// The tensor detail screen.
     Detail,
     /// The numeric values grid (`v`).
@@ -24,14 +24,14 @@ pub enum OpenView {
 /// A bulk expansion state for the tree browser (`--tree-state`, the `E` / `C`
 /// keys). Absent leaves the natural default (root expanded, layers collapsed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TreeState {
+pub(crate) enum TreeState {
     Expanded,
     Collapsed,
 }
 
 impl TreeState {
     /// The `--tree-state` value that names this state.
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             TreeState::Expanded => "expanded",
             TreeState::Collapsed => "collapsed",
@@ -40,7 +40,7 @@ impl TreeState {
 }
 
 /// Parse a `--tree-state` value.
-pub fn parse_tree_state(s: &str) -> Result<TreeState, String> {
+pub(crate) fn parse_tree_state(s: &str) -> Result<TreeState, String> {
     match s.to_ascii_lowercase().as_str() {
         "expanded" => Ok(TreeState::Expanded),
         "collapsed" => Ok(TreeState::Collapsed),
@@ -52,7 +52,7 @@ pub fn parse_tree_state(s: &str) -> Result<TreeState, String> {
 
 /// Output format for `--print-tree`. (The `t` copy shortcut always uses `Text`.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum TreeFormat {
+pub(crate) enum TreeFormat {
     /// The grouped tree as text — one row per node, fully expanded, in the same
     /// layout the browser shows (no viewport limit, no header/footer chrome).
     #[default]
@@ -65,7 +65,7 @@ pub enum TreeFormat {
 
 /// How much per-tensor detail the tree export includes; raised by repeating `-v`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TreeDetail {
+pub(crate) enum TreeDetail {
     /// Text: names + the browser's own fields. JSON: the bare index.json shape.
     Compact,
     /// Text: each tensor row also names its source file. JSON: adds a `tensors`
@@ -75,7 +75,7 @@ pub enum TreeDetail {
 
 impl TreeDetail {
     /// Map a repeated-`-v` count to a detail level (0 → compact, ≥1 → full).
-    pub fn from_verbosity(count: u8) -> Self {
+    pub(crate) fn from_verbosity(count: u8) -> Self {
         if count == 0 {
             TreeDetail::Compact
         } else {
@@ -166,7 +166,7 @@ pub(super) const MENU_PREVIEW_LINES: usize = 14;
 /// What a `--tensor` / `--metadata` open targets — mutually exclusive by
 /// construction (both-set was representable with two `Option`s), with "neither"
 /// meaning the sole tensor of a single-tensor checkpoint.
-pub enum OpenTarget {
+pub(crate) enum OpenTarget {
     /// No `--tensor`/`--metadata`: the sole tensor (a single-tensor file — always
     /// the case for `.npy` — needs no flag); ambiguous when there's more than one.
     SoleTensor,
@@ -179,14 +179,14 @@ pub enum OpenTarget {
 
 impl OpenTarget {
     /// The explicit tensor name, if `--tensor` named one.
-    pub fn tensor(&self) -> Option<&str> {
+    pub(crate) fn tensor(&self) -> Option<&str> {
         match self {
             OpenTarget::Tensor(n) => Some(n),
             _ => None,
         }
     }
     /// The metadata entry name, if `--metadata` named one.
-    pub fn metadata(&self) -> Option<&str> {
+    pub(crate) fn metadata(&self) -> Option<&str> {
         match self {
             OpenTarget::Metadata(n) => Some(n),
             _ => None,
@@ -197,7 +197,7 @@ impl OpenTarget {
 /// The histogram request (`--histogram` / `--bins N`): a bucket count implies
 /// showing the histogram, so it's one enum, not a bool + an `Option` that could
 /// disagree (bins set but histogram off).
-pub enum HistogramReq {
+pub(crate) enum HistogramReq {
     Off,
     /// Show it, buckets chosen automatically.
     Auto,
@@ -206,10 +206,10 @@ pub enum HistogramReq {
 }
 
 impl HistogramReq {
-    pub fn on(&self) -> bool {
+    pub(crate) fn on(&self) -> bool {
         !matches!(self, HistogramReq::Off)
     }
-    pub fn bins(&self) -> Option<usize> {
+    pub(crate) fn bins(&self) -> Option<usize> {
         match self {
             HistogramReq::Bins(n) => Some(*n),
             _ => None,
@@ -220,40 +220,40 @@ impl HistogramReq {
 /// The health-popup request (`--health` / `--health-findings`): the findings
 /// detail implies opening the popup, so one 3-state enum, not two bools where
 /// `findings` could be set without `health`.
-pub enum HealthReq {
+pub(crate) enum HealthReq {
     Off,
     Summary,
     Findings,
 }
 
 impl HealthReq {
-    pub fn wants(&self) -> bool {
+    pub(crate) fn wants(&self) -> bool {
         !matches!(self, HealthReq::Off)
     }
-    pub fn findings(&self) -> bool {
+    pub(crate) fn findings(&self) -> bool {
         matches!(self, HealthReq::Findings)
     }
 }
 
 /// The stats-view request (`--stats` / `--stats-shards`): the shard breakdown
 /// implies opening the view — one enum, not two bools.
-pub enum StatsReq {
+pub(crate) enum StatsReq {
     Off,
     Summary,
     Shards,
 }
 
 impl StatsReq {
-    pub fn wants(&self) -> bool {
+    pub(crate) fn wants(&self) -> bool {
         !matches!(self, StatsReq::Off)
     }
-    pub fn shards(&self) -> bool {
+    pub(crate) fn shards(&self) -> bool {
         matches!(self, StatsReq::Shards)
     }
 }
 
 /// A tensor + view to open on startup, from the CLI flags.
-pub struct OpenRequest {
+pub(crate) struct OpenRequest {
     /// What to open (tensor / metadata / the sole tensor).
     pub target: OpenTarget,
     /// Which screen to show.

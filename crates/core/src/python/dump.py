@@ -11,8 +11,8 @@ for writing, calls `cstorch.save`/`torch.save`, or otherwise mutates the checkpo
 # cluster's interpreter, and modern syntax works on our 3.9 floor.
 from __future__ import annotations
 
-import sys
 import json
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -46,8 +46,9 @@ def probe_s3(src: str) -> dict[str, Any]:
     if not src.startswith("s3://"):
         return {}
     try:
-        import boto3
         from urllib.parse import urlparse
+
+        import boto3
         u = urlparse(src)
         bucket, prefix = u.netloc, u.path.lstrip("/")
         cli = boto3.client("s3")
@@ -104,9 +105,10 @@ s3_objects = []
 s3_warnings = []
 if WANT_S3:
     try:
+        from urllib.parse import urlparse
+
         import boto3
         from botocore.config import Config
-        from urllib.parse import urlparse
         u = urlparse(SRC)
         bucket, prefix = u.netloc, u.path.lstrip("/")
         # botocore pools 10 connections by default; below that, the workers would just

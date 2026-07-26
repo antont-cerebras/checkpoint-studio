@@ -19,7 +19,7 @@ impl UI {
     /// footer. While scanning, the "Value scan" row becomes an animated spinner.
     /// Render the health-check popup, its body scrolled by `scroll` rows (the
     /// footer stays pinned). Returns the max valid scroll so the caller can clamp.
-    pub fn render_check_report(
+    pub(crate) fn render_check_report(
         frame: &mut Frame,
         report: &crate::check::CheckReport,
         state: CheckPopup,
@@ -210,7 +210,7 @@ impl UI {
 
 /// The state of the health-check popup ([`UI::render_check_report`]).
 #[derive(Clone, Copy)]
-pub enum CheckPopup {
+pub(crate) enum CheckPopup {
     /// Showing the report. `copied` briefly flashes what was just copied
     /// (`"command"` / `"report"` / `"screen"`); `can_scan` offers the `v` value
     /// scan (off for a remote source or once it has run).

@@ -879,7 +879,7 @@ pub(super) struct RenameMode2 {
     pub(super) synth_err: Option<String>,
     pub(super) cli: Option<String>,
     pub(super) dirty: bool,
-    pub(super) scroll_max: std::cell::Cell<usize>,
+    pub(super) scroll_max: Cell<usize>,
     /// Set once a rename is applied — the rules are spent, so `residual` clears them.
     pub(super) applied: bool,
 }
@@ -903,7 +903,7 @@ impl RenameMode2 {
             synth_err: None,
             cli: None,
             dirty: true,
-            scroll_max: std::cell::Cell::new(0),
+            scroll_max: Cell::new(0),
             applied: false,
         }
     }
@@ -1464,7 +1464,7 @@ pub(super) struct DetailMode {
     pub(super) remote: bool,
     pub(super) warm: bool,
     pub(super) scan: Option<ScanJob>,
-    pub(super) spin: std::cell::Cell<usize>,
+    pub(super) spin: Cell<usize>,
     pub(super) overlay: Option<Overlay>,
 }
 
@@ -1486,7 +1486,7 @@ impl DetailMode {
             remote: false,
             warm: false,
             scan: None,
-            spin: std::cell::Cell::new(0),
+            spin: Cell::new(0),
             overlay: None,
         }
     }
@@ -1950,7 +1950,7 @@ pub(super) struct StatsMode {
     pub(super) scroll: usize,
     /// The last render's maximum scroll (render is `&self`), so the key / wheel
     /// handlers can clamp downward scrolling to the content.
-    pub(super) scroll_max: std::cell::Cell<usize>,
+    pub(super) scroll_max: Cell<usize>,
     pub(super) overlay: Option<Overlay>,
 }
 
@@ -1959,7 +1959,7 @@ impl StatsMode {
         Self {
             shards_expanded,
             scroll,
-            scroll_max: std::cell::Cell::new(0),
+            scroll_max: Cell::new(0),
             overlay: None,
         }
     }
@@ -2143,14 +2143,14 @@ impl Mode for StatsMode {
 pub(super) struct DataMode {
     pub(super) tensor_name: String,
     pub(super) repr: Representation,
-    pub(super) slice: std::cell::Cell<usize>,
+    pub(super) slice: Cell<usize>,
     pub(super) interaction: Interaction,
     pub(super) tensor: Option<TensorInfo>,
     pub(super) scan: Option<ScanJob>,
-    pub(super) spin: std::cell::Cell<usize>,
+    pub(super) spin: Cell<usize>,
     pub(super) overlay: Option<Overlay>,
-    pub(super) slices: std::cell::Cell<usize>,
-    pub(super) overridable: std::cell::Cell<bool>,
+    pub(super) slices: Cell<usize>,
+    pub(super) overridable: Cell<bool>,
 }
 
 impl DataMode {
@@ -2163,14 +2163,14 @@ impl DataMode {
         Self {
             tensor_name,
             repr,
-            slice: std::cell::Cell::new(slice),
+            slice: Cell::new(slice),
             interaction,
             tensor: None,
             scan: None,
-            spin: std::cell::Cell::new(0),
+            spin: Cell::new(0),
             overlay: None,
-            slices: std::cell::Cell::new(1),
-            overridable: std::cell::Cell::new(false),
+            slices: Cell::new(1),
+            overridable: Cell::new(false),
         }
     }
 
@@ -3123,7 +3123,7 @@ mod tests {
         assert!(!matches.is_empty(), "`weight` should match the fixture");
         // Every row shown is a match, not a group.
         for (node, _) in matches {
-            if let crate::tree::TreeNode::Tensor { info, .. } = node {
+            if let TreeNode::Tensor { info, .. } = node {
                 assert!(
                     info.name.to_lowercase().contains('w'),
                     "{} isn't a match for `weight`",

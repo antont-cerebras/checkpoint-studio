@@ -14,7 +14,7 @@ use super::palette;
 /// tree/files wrappers); the `run_mode` engine draws it ([`UI::render_vscrollbar`])
 /// and drag-scrubs it, so every mode gets a bar the same way.
 #[derive(Clone, Copy)]
-pub struct VScrollbar {
+pub(crate) struct VScrollbar {
     /// Rightmost column of the body, reserved for the bar.
     pub col: u16,
     /// First body row (the terminal row just below the header).
@@ -31,7 +31,7 @@ impl VScrollbar {
     /// The bar for a scrollable `body` region showing `total` rows starting at
     /// `offset`, or `None` when it all fits (or there's no room for a bar +
     /// content). The bar rides `body`'s rightmost column.
-    pub fn for_body(body: Rect, total: usize, offset: usize) -> Option<VScrollbar> {
+    pub(crate) fn for_body(body: Rect, total: usize, offset: usize) -> Option<VScrollbar> {
         let rows = body.height as usize;
         if body.width < 2 || rows == 0 || total <= rows {
             return None;
@@ -49,7 +49,7 @@ impl VScrollbar {
     /// The scroll offset a pointer at terminal `row` scrubs to: the top of the
     /// track maps to offset 0 and the bottom to `max_offset`, proportionally
     /// (rows above/below the track clamp to the ends).
-    pub fn offset_at(&self, row: u16) -> usize {
+    pub(crate) fn offset_at(&self, row: u16) -> usize {
         if self.rows <= 1 {
             return 0;
         }
@@ -59,7 +59,7 @@ impl VScrollbar {
     }
 
     /// Whether the terminal cell `(col, row)` lands on the scroll bar.
-    pub fn hit(&self, col: u16, row: u16) -> bool {
+    pub(crate) fn hit(&self, col: u16, row: u16) -> bool {
         col == self.col && row >= self.top && row < self.top + self.rows
     }
 }
@@ -68,7 +68,7 @@ impl UI {
     /// Draw a vertical scroll bar over its reserved column (the ratatui `Scrollbar`
     /// widget — dim `│` track, accent `█` thumb). The `run_mode` engine calls this
     /// for every mode that reports a [`VScrollbar`], so no mode draws its own.
-    pub fn render_vscrollbar(frame: &mut Frame, sb: &VScrollbar) {
+    pub(crate) fn render_vscrollbar(frame: &mut Frame, sb: &VScrollbar) {
         // The geometry comes from the body rect its screen computed, which on a pane
         // shorter than that screen's chrome can start or end past the frame. Clamp here
         // — the one place every screen's bar is drawn — because a widget rect outside

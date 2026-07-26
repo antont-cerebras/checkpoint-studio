@@ -15,9 +15,46 @@ import globals from 'globals';
 export default ts.config(
   // Build output, deps, and tooling that isn't part of the typed app project
   // (`scripts/` is plain Node ESM run by npm, not compiled by tsconfig).
-  { ignores: ['dist/', 'node_modules/', 'scripts/', '*.config.js', '*.config.ts'] },
+  // `coverage/` holds the generated lcov HTML report (its own vendored JS).
+  {
+    ignores: [
+      'dist/',
+      'node_modules/',
+      'coverage/',
+      'scripts/',
+      '*.config.js',
+      '*.config.ts',
+    ],
+  },
   js.configs.recommended,
-  ...ts.configs.recommendedTypeChecked,
+  ...ts.configs.strictTypeChecked,
+  // `strictTypeChecked` (upgraded from `recommendedTypeChecked`) is on. Four of its
+  // rules are relaxed by OPTION rather than switched off, because the default is
+  // stricter than this codebase's deliberate style, and one is off with a reason:
+  {
+    rules: {
+      // Svelte handlers are `on:click={() => store.set(x)}` — arrow shorthand around a
+      // void call is the idiom, not a mistake.
+      '@typescript-eslint/no-confusing-void-expression': [
+        'error',
+        { ignoreArrowShorthand: true },
+      ],
+      // Interpolating a number into a template is fine and pervasive here (sizes,
+      // counts, indices); the rest of the rule's protection stays.
+      '@typescript-eslint/restrict-template-expressions': [
+        'error',
+        { allowNumber: true },
+      ],
+      // `noUncheckedIndexedAccess` makes every indexed read `T | undefined`, so the
+      // non-null assertions that follow a bounds check are the price of that flag —
+      // and worth paying. They are individually commented where non-obvious.
+      '@typescript-eslint/no-non-null-assertion': 'off',
+      // OFF for now, not clean: 19 sites, nearly all the same interaction with
+      // `noUncheckedIndexedAccess` (a value the checker can prove non-null that the
+      // author still guards). Worth revisiting as a warning once those are refactored.
+      '@typescript-eslint/no-unnecessary-condition': 'off',
+    },
+  },
   ...svelte.configs['flat/recommended'],
   {
     languageOptions: {

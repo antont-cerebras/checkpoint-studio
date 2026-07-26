@@ -14,10 +14,10 @@ use crate::sample::{self, SampleMode, ViewDtype};
 use crate::tree::TensorInfo;
 use crate::web::dto::{self, HistogramDto, SampleDto, StatsDto};
 
-pub type Query = HashMap<String, String>;
+pub(crate) type Query = HashMap<String, String>;
 /// An HTTP status plus the response body ALREADY serialised to JSON bytes (not a
 /// `serde_json::Value`) — see `ok`.
-pub type Reply = (u16, Vec<u8>);
+pub(crate) type Reply = (u16, Vec<u8>);
 
 fn ok<T: Serialize>(v: T) -> Reply {
     // Serialise STRAIGHT to bytes. Going via `serde_json::to_value` first materialised
@@ -30,7 +30,7 @@ fn ok<T: Serialize>(v: T) -> Reply {
     )
 }
 
-pub fn err(status: u16, msg: impl Into<String>) -> Reply {
+pub(crate) fn err(status: u16, msg: impl Into<String>) -> Reply {
     let body = json!({ "error": msg.into() });
     (
         status,
@@ -55,7 +55,7 @@ fn require_local(t: &TensorInfo) -> Option<Reply> {
 
 // ---- metadata / derived-view routes (served from precomputed state) ----
 
-pub fn tree(s: &WebState) -> Reply {
+pub(crate) fn tree(s: &WebState) -> Reply {
     // Wrap the forest in a single root node summarising the whole checkpoint, the
     // way the TUI's tree does (`▾ <name> (▦ N, P params, S)`), with the metadata
     // group (when present) among its children.
@@ -75,7 +75,7 @@ pub fn tree(s: &WebState) -> Reply {
     }))
 }
 
-pub fn files(s: &WebState) -> Reply {
+pub(crate) fn files(s: &WebState) -> Reply {
     ok(&s.file_tree)
 }
 
@@ -83,7 +83,7 @@ pub fn files(s: &WebState) -> Reply {
 /// with the shared matcher and return the names of the tensors that pass, so the
 /// client masks its tree to them. `active:false` for an empty query (show all); a
 /// malformed query is a `400` whose message the filter bar shows inline.
-pub fn filter(s: &WebState, q: &Query) -> Reply {
+pub(crate) fn filter(s: &WebState, q: &Query) -> Reply {
     let query = q.get("q").map(String::as_str).unwrap_or("");
     match crate::tensorfilter::TensorFilter::parse(query) {
         Ok(f) if !f.is_active() => ok(json!({ "active": false })),
@@ -104,14 +104,14 @@ pub fn filter(s: &WebState, q: &Query) -> Reply {
 /// index-templated families (`model.layers.{0-47}.…experts.{0-3}.down_proj.weight`)
 /// with per-family count + uniform dtype/shape + total params/bytes — a "what's in
 /// here, per layer / per expert" summary (same collapsing as `diff`).
-pub fn schema(s: &WebState, q: &Query) -> Reply {
+pub(crate) fn schema(s: &WebState, q: &Query) -> Reply {
     let query = q.get("q").map(String::as_str).unwrap_or("");
     let filter = match crate::tensorfilter::TensorFilter::parse(query) {
         Ok(f) => f,
         Err(e) => return err(400, e.to_string()),
     };
     let families = if filter.is_active() {
-        let matched: Vec<crate::tree::TensorInfo> = s
+        let matched: Vec<TensorInfo> = s
             .tensors
             .iter()
             .filter(|t| filter.matches(t))
@@ -127,7 +127,7 @@ pub fn schema(s: &WebState, q: &Query) -> Reply {
 /// The checkpoint statistics, plus the S3 section's ready-made phrases for an
 /// `s3://` source (see [`dto::S3SummaryDto`]). Flattened, so every existing key keeps
 /// its place and `s3_summary` is simply absent for a local checkpoint.
-pub fn stats(s: &WebState) -> Reply {
+pub(crate) fn stats(s: &WebState) -> Reply {
     #[derive(serde::Serialize)]
     struct StatsResponse<'a> {
         #[serde(flatten)]
@@ -141,22 +141,22 @@ pub fn stats(s: &WebState) -> Reply {
     })
 }
 
-pub fn health(s: &WebState) -> Reply {
+pub(crate) fn health(s: &WebState) -> Reply {
     ok(&s.health)
 }
 
-pub fn check(s: &WebState) -> Reply {
+pub(crate) fn check(s: &WebState) -> Reply {
     match &s.check {
         Some(report) => ok(report.to_json(false)),
         None => ok(Value::Null),
     }
 }
 
-pub fn model(s: &WebState) -> Reply {
+pub(crate) fn model(s: &WebState) -> Reply {
     ok(&s.checkpoint)
 }
 
-pub fn tensor(s: &WebState, q: &Query) -> Reply {
+pub(crate) fn tensor(s: &WebState, q: &Query) -> Reply {
     match lookup(s, q) {
         Ok(t) => ok(t),
         Err(e) => e,
@@ -165,7 +165,7 @@ pub fn tensor(s: &WebState, q: &Query) -> Reply {
 
 /// Read a text/JSON file's content (capped) for the file browser's preview. Only
 /// serves paths that are in the checkpoint's own file list — no path traversal.
-pub fn file(s: &WebState, q: &Query) -> Reply {
+pub(crate) fn file(s: &WebState, q: &Query) -> Reply {
     let Some(rel) = q.get("path") else {
         return err(400, "missing ?path=");
     };
@@ -195,7 +195,7 @@ pub fn file(s: &WebState, q: &Query) -> Reply {
     }
 }
 
-pub fn layout(s: &WebState, q: &Query) -> Reply {
+pub(crate) fn layout(s: &WebState, q: &Query) -> Reply {
     let Some(file) = q.get("file") else {
         return err(400, "missing ?file=");
     };
@@ -211,7 +211,7 @@ pub fn layout(s: &WebState, q: &Query) -> Reply {
 
 // ---- on-demand tensor-data routes (read bytes; local only) ----
 
-pub fn tensor_stats(s: &WebState, q: &Query) -> Reply {
+pub(crate) fn tensor_stats(s: &WebState, q: &Query) -> Reply {
     let t = match lookup(s, q) {
         Ok(t) => t,
         Err(e) => return e,
@@ -229,7 +229,7 @@ pub fn tensor_stats(s: &WebState, q: &Query) -> Reply {
     }
 }
 
-pub fn tensor_sample(s: &WebState, q: &Query) -> Reply {
+pub(crate) fn tensor_sample(s: &WebState, q: &Query) -> Reply {
     let t = match lookup(s, q) {
         Ok(t) => t,
         Err(e) => return e,
@@ -264,7 +264,7 @@ pub fn tensor_sample(s: &WebState, q: &Query) -> Reply {
     }
 }
 
-pub fn tensor_histogram(s: &WebState, q: &Query) -> Reply {
+pub(crate) fn tensor_histogram(s: &WebState, q: &Query) -> Reply {
     let t = match lookup(s, q) {
         Ok(t) => t,
         Err(e) => return e,
@@ -364,19 +364,19 @@ mod tests_support {
     use super::*;
     use std::path::PathBuf;
 
-    pub const TENSOR: &str = "model.layers.0.mlp.down_proj.weight";
+    pub(super) const TENSOR: &str = "model.layers.0.mlp.down_proj.weight";
 
     /// Build the shared state from a checked-in fixture, exactly as `run_web` does.
-    pub fn state() -> crate::web::WebState {
+    pub(super) fn state() -> WebState {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.safetensors");
         let files = vec![fixture];
         let model = crate::readers::read_local(&files).expect("fixture reads");
-        crate::web::WebState::build(model, &files, &[])
+        WebState::build(model, &files, &[])
     }
 
     /// Parse a reply body back into JSON so tests assert on the values a client sees.
-    pub fn json(reply: &Reply) -> serde_json::Value {
+    pub(super) fn json(reply: &Reply) -> Value {
         serde_json::from_slice(&reply.1).unwrap_or_else(|e| {
             panic!(
                 "reply body is not JSON ({e}): {}",
@@ -385,7 +385,7 @@ mod tests_support {
         })
     }
 
-    pub fn query(pairs: &[(&str, &str)]) -> Query {
+    pub(super) fn query(pairs: &[(&str, &str)]) -> Query {
         pairs
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))

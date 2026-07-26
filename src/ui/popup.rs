@@ -268,7 +268,7 @@ pub(super) fn render_hover_bubble(
 
 /// A help bubble for a footer shortcut chip (no title, key-cyan border), floated
 /// adjacent to the chip. See [`render_hover_bubble`].
-pub fn render_shortcut_bubble(frame: &mut Frame, anchor: Rect, help: &str) {
+pub(crate) fn render_shortcut_bubble(frame: &mut Frame, anchor: Rect, help: &str) {
     render_hover_bubble(frame, anchor, palette::KEY, None, help);
 }
 

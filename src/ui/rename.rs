@@ -17,7 +17,7 @@ use super::{ChipRegions, Link, LinkRegions, UI};
 /// One rule's line in the rename preview: the before→after *schema* plus how many
 /// tensors it touches and how they break down by [`RenameStatus`]. Summarising per
 /// rule keeps the preview a few lines even when a rule matches every layer.
-pub struct RenameRuleView {
+pub(crate) struct RenameRuleView {
     pub from: String,
     pub to: String,
     /// Tensors whose name the rule *changes* (the rows the preview lists).
@@ -38,7 +38,7 @@ pub struct RenameRuleView {
 /// One entry in the rename editor's autocomplete dropdown: a tensor-family schema,
 /// how many tensors it covers, and (optionally) the char range of the typed query
 /// within it to embolden.
-pub struct RenameCompletion {
+pub(crate) struct RenameCompletion {
     pub text: String,
     /// Tensors this family schema covers — shown as a dim `×N` metadata column.
     pub count: usize,
@@ -50,7 +50,7 @@ pub struct RenameCompletion {
 /// Everything [`UI::render_rename`] draws: the dynamic list of source→new-name rule
 /// pairs (with the focused field + its autocomplete) and a compact, per-rule
 /// before→after preview marking each rule's in-place feasibility.
-pub struct RenameView<'a> {
+pub(crate) struct RenameView<'a> {
     pub root: &'a str,
     /// `(source, new-name)` for each rule pair, in order.
     pub pairs: &'a [(String, String)],
@@ -94,7 +94,7 @@ impl UI {
     /// won't-fit, and the common footer / confirm bar. Returns the preview pane's
     /// max scroll offset, the footer chip regions (clickable, like the other
     /// views), and the preview's nav-link regions.
-    pub fn render_rename(
+    pub(crate) fn render_rename(
         frame: &mut Frame,
         view: &RenameView,
     ) -> (
@@ -683,7 +683,7 @@ mod tests {
         assert!(
             clicks.iter().any(|(_, t)| matches!(
                 t,
-                crate::ui::Link::Layout(p) if p == "/ckpt/model.safetensors"
+                Link::Layout(p) if p == "/ckpt/model.safetensors"
             )),
             "expected a clickable shard region"
         );

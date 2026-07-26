@@ -25,7 +25,30 @@ export default defineConfig({
       include: ['src/lib/**/*.ts', 'src/stores/**/*.ts'],
       // Type-only module: it compiles to nothing, so v8 reports it as 0% forever.
       exclude: ['src/lib/types.ts'],
-      reporter: ['text', 'json-summary'],
+      // `lcov` for the Codecov upload, `json-summary` for the PR comment, `text` for a
+      // human reading the CI log.
+      reporter: ['text', 'json-summary', 'lcov'],
+      // The offline half of the ratchet: vitest fails the run if coverage drops below
+      // these, so a regression is caught by `npm test` in a fork or on a laptop, not
+      // only by Codecov's comparison against the parent commit. Raise them when
+      // coverage rises (`--coverage.thresholds.autoUpdate` rewrites this block for
+      // you); never lower them without saying why in the commit.
+      //
+      // `lib/` is held at 100% because it is all pure logic with no excuse for a gap.
+      // The global floor is lower because `stores/` deliberately keeps its DOM wiring
+      // uncovered (see the note above).
+      thresholds: {
+        lines: 64,
+        statements: 64,
+        functions: 95,
+        branches: 95,
+        'src/lib/**/*.ts': {
+          lines: 100,
+          statements: 100,
+          functions: 100,
+          branches: 95,
+        },
+      },
     },
   },
 });

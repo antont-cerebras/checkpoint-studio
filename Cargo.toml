@@ -102,6 +102,42 @@ comparison_chain = "allow"  # 1
 # Remaining measured families.
 ref_option = "allow"  # 7
 
+# --- Selected `restriction` lints (added in the strictness pass) ---------------
+#
+# `restriction` is not meant to be enabled as a group (it contains mutually exclusive
+# opinions), so these are the individual ones worth having, each measured clean on this
+# tree so they catch regressions rather than logging debt.
+dbg_macro = "deny"            # a stray `dbg!` in a TUI corrupts the screen
+todo = "deny"
+unimplemented = "deny"
+mem_forget = "deny"
+print_stdout = "allow"        # this IS a CLI; stdout is the product
+verbose_file_reads = "deny"
+lossy_float_literal = "deny"
+# NOT enabled: `rc_buffer`. The static-body cache is `Arc<Vec<u8>>` on purpose — the
+# suggested `Arc<[u8]>` would mean copying every cached response body once to convert it,
+# which is exactly the allocation that cache exists to avoid.
+rest_pat_in_fully_bound_structs = "deny"
+# NOT enabled: `unwrap_used` / `expect_used`. There are 55 outside test modules, and two
+# of the bugs fixed this week were exactly that class (`decode_prim`, GGUF's allocation),
+# so it is the most valuable remaining gate — but turning it on means auditing all 55,
+# each with a justification or a refactor. Deliberate follow-up, not an oversight.
+
+[workspace.lints.rust]
+# Compiler lints beyond the defaults, all measured clean here. Measured and left off:
+# `elided_lifetimes_in_paths` — 144 sites, purely notational (`Foo` vs `Foo<'_>`), so it
+# would be 144 edits of churn for no behavioural gain. (Some were tidied anyway where
+# the surrounding code was already being touched.)
+unused_qualifications = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unused_lifetimes = "warn"
+single_use_lifetimes = "warn"
+unreachable_pub = "warn"
+# NOT enabled: `unsafe_code`. Two places need it and both are justified — the HDF5 LZ4
+# filter registration (FFI into the bundled libhdf5) and the pty test's `openpty`/`ioctl`
+# — so a blanket deny would mean a blanket allow at both, which says less than the
+# per-call safety comments already there.
+
 [dependencies]
 # The frontend-free core: model + readers + views + reports. The TUI/CLI here
 # drive it and render its serializable outputs.

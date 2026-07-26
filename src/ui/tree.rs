@@ -33,7 +33,7 @@ const TREE_FOOTER_HEIGHT: usize = 2;
 impl UI {
     /// How many tree rows are visible at once (one screenful), used to size a
     /// PageUp/PageDown jump. `terminal_height` is the full terminal height.
-    pub fn visible_tree_rows(terminal_height: u16) -> usize {
+    pub(crate) fn visible_tree_rows(terminal_height: u16) -> usize {
         (terminal_height as usize)
             .saturating_sub(TREE_HEADER_HEIGHT + TREE_FOOTER_HEIGHT)
             .max(1)
@@ -42,7 +42,7 @@ impl UI {
     /// Rows the tree's bottom-pinned key-hint footer occupies (0 while searching —
     /// the search bar rides the header instead). Kept in sync with
     /// [`Self::render_tree`] so scroll / hit-testing align.
-    pub fn tree_hint_rows(
+    pub(crate) fn tree_hint_rows(
         width: u16,
         search_mode: bool,
         can_repack: bool,
@@ -59,7 +59,7 @@ impl UI {
     /// scroll offset so it stays consistent with [`Self::render_tree`]'s layout
     /// (header = title + optional search line + rule; a bottom-pinned hint footer;
     /// then the two status lines).
-    pub fn tree_visible_rows(
+    pub(crate) fn tree_visible_rows(
         width: u16,
         height: u16,
         search_mode: bool,
@@ -77,7 +77,7 @@ impl UI {
     /// search line while searching + rule; the key hints are a bottom footer now).
     /// Used for mouse hit-testing: a click at row `r >= tree_header_rows()` and above
     /// the hint footer lands on tree row `scroll_offset + (r - tree_header_rows())`.
-    pub fn tree_header_rows(search_mode: bool) -> usize {
+    pub(crate) fn tree_header_rows(search_mode: bool) -> usize {
         if search_mode { 3 } else { 2 } // title + [search] + rule
     }
 
@@ -86,7 +86,7 @@ impl UI {
     /// no bar is drawn and no column reserved). Shared by [`Self::render_tree`]
     /// and the mouse handler, so click / drag hit-testing lines up with what's
     /// drawn. The bar rides the rightmost column of the body region.
-    pub fn tree_scrollbar(
+    pub(crate) fn tree_scrollbar(
         width: u16,
         height: u16,
         search_mode: bool,
@@ -111,7 +111,7 @@ impl UI {
     /// Ratatui render of the tree browser: header (title, hint or search line,
     /// rule), the visible tree rows from `config.scroll_offset`, and the bottom
     /// two-line status bar, driven by the shared `DrawConfig`.
-    pub fn render_tree(frame: &mut Frame, config: &DrawConfig) -> Vec<(Rect, KeyEvent)> {
+    pub(crate) fn render_tree(frame: &mut Frame, config: &DrawConfig) -> Vec<(Rect, KeyEvent)> {
         let area = frame.area();
         let (width, height) = (area.width, area.height);
         if height < (TREE_FOOTER_HEIGHT as u16 + 1) {
@@ -389,7 +389,7 @@ fn tree_search_line(config: &DrawConfig) -> Line<'static> {
 /// The plain text of one tree row (no colour), exactly as [`tree_node_line`]
 /// draws it — the shared building block for exporting the tree / a tensor list
 /// (`t`, `--print-tree`, `--print-tensors`).
-pub fn tree_row_text(
+pub(crate) fn tree_row_text(
     node: &TreeNode,
     depth: usize,
     unindexed: &HashSet<String>,
@@ -400,7 +400,7 @@ pub fn tree_row_text(
 
 /// The styled tree row (the colour the browser draws) — the building block for
 /// the export text and the copy-menu preview.
-pub fn tree_row_line(
+pub(crate) fn tree_row_line(
     node: &TreeNode,
     depth: usize,
     unindexed: &HashSet<String>,
@@ -418,7 +418,7 @@ pub fn tree_row_line(
 
 /// A tensor's row for the flat list: the same coloured fields as the tree, at
 /// its full name, but without the leading `·` bullet a flat list doesn't need.
-pub fn tensor_list_line(
+pub(crate) fn tensor_list_line(
     info: &TensorInfo,
     unindexed: &HashSet<String>,
     packing_schemas: &HashMap<String, PackingSchema>,

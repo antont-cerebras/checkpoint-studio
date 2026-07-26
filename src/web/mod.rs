@@ -7,8 +7,8 @@
 //! `&mut` (only the on-demand tensor-data scans touch disk, behind a small cache).
 
 mod assets;
-pub mod dto;
-pub mod handlers;
+pub(crate) mod dto;
+pub(crate) mod handlers;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -23,7 +23,7 @@ use crate::{
 use handlers::{Query, Reply};
 
 /// Everything the API serves, computed once from a local read. Shared read-only.
-pub struct WebState {
+pub(crate) struct WebState {
     pub root: String,
     /// The full serializable model (backs `/api/model`).
     pub checkpoint: model::Checkpoint,
@@ -62,7 +62,7 @@ type StaticBodies = Mutex<HashMap<(&'static str, bool), Arc<Vec<u8>>>>;
 impl WebState {
     /// Build the shared state from a local checkpoint read. `files`/`index_specs`
     /// are what `run_explore` already resolved (for the structural check + health).
-    pub fn build(
+    pub(crate) fn build(
         checkpoint: model::Checkpoint,
         files: &[PathBuf],
         index_specs: &[health::IndexSpec],
@@ -204,7 +204,7 @@ impl WebState {
 /// port is already in use, fall back to an OS-assigned free port so the command
 /// still comes up — and warn where it landed (so a stale server, or a chosen port,
 /// doesn't just fail).
-pub fn bind(host: IpAddr, port: u16) -> Result<tiny_http::Server> {
+pub(crate) fn bind(host: IpAddr, port: u16) -> Result<tiny_http::Server> {
     match tiny_http::Server::http(SocketAddr::new(host, port)) {
         Ok(server) => Ok(server),
         Err(e) if port != 0 => {
@@ -226,13 +226,17 @@ pub fn bind(host: IpAddr, port: u16) -> Result<tiny_http::Server> {
 /// Start the server and block until the process is stopped (Ctrl-C). Binds the
 /// port immediately (see [`bind`]); for a remote read, bind first and pass the
 /// server to [`serve_on`] so the port is held while the read runs.
-pub fn serve(state: Arc<WebState>, host: IpAddr, port: u16) -> Result<()> {
+pub(crate) fn serve(state: Arc<WebState>, host: IpAddr, port: u16) -> Result<()> {
     serve_on(bind(host, port)?, state, host)
 }
 
 /// Serve on an already-[`bind`]-ed socket and block until stopped. `host` is only
 /// used to render a reachable URL (a wildcard bind isn't clickable).
-pub fn serve_on(server: tiny_http::Server, state: Arc<WebState>, host: IpAddr) -> Result<()> {
+pub(crate) fn serve_on(
+    server: tiny_http::Server,
+    state: Arc<WebState>,
+    host: IpAddr,
+) -> Result<()> {
     let bound = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
     // Print a URL the browser can actually reach: a wildcard bind (0.0.0.0 / ::)
     // isn't clickable, so show this host's FQDN instead of the bind address.

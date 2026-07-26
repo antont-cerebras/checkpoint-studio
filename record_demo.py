@@ -18,9 +18,9 @@ stats/histogram + heatmap + numeric grid, an on-the-fly 4-bit (u4) decode, and a
 coloured structural `diff`. Tweak the feed()/send() timings to taste.
 """
 
+import contextlib
 import fcntl
 import json
-import contextlib
 import os
 import pty
 import select
@@ -105,7 +105,6 @@ header = {"version": 2, "width": COLS, "height": ROWS,
           "env": {"TERM": "xterm-256color", "SHELL": "/bin/bash"}}
 with open("/tmp/demo.cast", "w") as f:
     f.write(json.dumps(header) + "\n")
-    for ev in events:
-        f.write(json.dumps(ev) + "\n")
+    f.writelines(json.dumps(ev) + "\n" for ev in events)
 print(f"cast: {len(events)} events, {events[-1][0] if events else 0:.1f}s, "
       f"{os.path.getsize('/tmp/demo.cast')} bytes")

@@ -293,7 +293,7 @@ fn stream_copy<T: hdf5_metno::H5Type + Clone + Default>(
     let inner: usize = shape[1..].iter().product::<usize>().max(1);
     let chunk0 = chunk.first().copied().unwrap_or(outer).max(1);
     // Aim for ~buffer_bytes per block, rounded to whole chunks along axis 0.
-    let target_elems = (buffer_bytes / std::mem::size_of::<T>().max(1)).max(1);
+    let target_elems = (buffer_bytes / size_of::<T>().max(1)).max(1);
     let rows = ((target_elems / inner).max(1) / chunk0).max(1) * chunk0;
 
     let mut i = 0;

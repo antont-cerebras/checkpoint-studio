@@ -20,7 +20,7 @@ use ratatui::{
 };
 
 /// The live terminal type owned by the interactive loop.
-pub type LiveTerminal = Terminal<CrosstermBackend<Stdout>>;
+pub(crate) type LiveTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 /// Set up the live terminal: raw mode, the **alternate screen**, hidden cursor,
 /// and a Ratatui terminal over stdout. The alternate screen gives the TUI its own
@@ -30,7 +30,7 @@ pub type LiveTerminal = Terminal<CrosstermBackend<Stdout>>;
 /// ~1s tmux -CC lag switching into a big tree). Entering it also hides any pre-TUI
 /// output (e.g. the `--ssh-proxy` password prompt + read spinner) without having to
 /// scrub the primary scrollback.
-pub fn init() -> Result<LiveTerminal> {
+pub(crate) fn init() -> Result<LiveTerminal> {
     terminal::enable_raw_mode()?;
     let mut out = io::stdout();
     // Capture the mouse so rows can be clicked and the wheel scrolls. (This means
@@ -60,7 +60,7 @@ pub fn init() -> Result<LiveTerminal> {
 /// `handle_mouse` take `&mut LiveTerminal` — can be exercised in unit tests instead of
 /// only through the end-to-end `--plain` snapshots.
 #[cfg(test)]
-pub fn test_terminal(width: u16, height: u16) -> LiveTerminal {
+pub(crate) fn test_terminal(width: u16, height: u16) -> LiveTerminal {
     Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
         TerminalOptions {
@@ -73,7 +73,7 @@ pub fn test_terminal(width: u16, height: u16) -> LiveTerminal {
 /// Restore the terminal after the interactive loop: stop mouse capture, leave the
 /// alternate screen (which brings back the pre-launch primary buffer + shell
 /// prompt), show the cursor, and leave raw mode.
-pub fn restore(_terminal: &mut LiveTerminal) -> Result<()> {
+pub(crate) fn restore(_terminal: &mut LiveTerminal) -> Result<()> {
     let mut out = io::stdout();
     // Stop mouse capture before leaving the alternate screen / handing back the tty.
     execute!(out, DisableMouseCapture)?;
@@ -127,7 +127,11 @@ pub fn restore(_terminal: &mut LiveTerminal) -> Result<()> {
 /// the resulting screen as plain text — the headless render path. Each row is the
 /// buffer's cell symbols with trailing spaces trimmed, and trailing blank rows are
 /// dropped, matching the shape the snapshot tests expect.
-pub fn headless_render(width: u16, height: u16, f: impl FnOnce(&mut Frame)) -> Result<String> {
+pub(crate) fn headless_render(
+    width: u16,
+    height: u16,
+    f: impl FnOnce(&mut Frame),
+) -> Result<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal.draw(f)?;
     Ok(buffer_to_string(terminal.backend().buffer()))
@@ -136,7 +140,7 @@ pub fn headless_render(width: u16, height: u16, f: impl FnOnce(&mut Frame)) -> R
 /// Flatten a Ratatui [`Buffer`] to plain text: one line per row (cell symbols
 /// concatenated; a wide glyph's trailing skip cell contributes nothing), trailing
 /// spaces trimmed per row, trailing blank rows dropped.
-pub fn buffer_to_string(buffer: &Buffer) -> String {
+pub(crate) fn buffer_to_string(buffer: &Buffer) -> String {
     use unicode_width::UnicodeWidthStr;
     let width = buffer.area.width as usize;
     let height = buffer.area.height as usize;

@@ -11,10 +11,10 @@ Read-only: loads and compares; never writes to either checkpoint.
 # cluster's interpreter, and modern syntax works on our 3.9 floor.
 from __future__ import annotations
 
-import sys
 import json
-import time
+import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, NamedTuple
 
@@ -182,7 +182,7 @@ def work(idx: int) -> int:
         # to be two float64 passes over the whole tensor: one to diff and find the
         # range, another to bin — twice the widening and twice the memory traffic on
         # every `--values --histogram` run.
-        n = BINS if BINS else 40
+        n = BINS or 40
         lo_c = hi_c = 0.0
         oc = nc = None
         onf = nnf = 0

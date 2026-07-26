@@ -19,7 +19,7 @@ use super::theme::key_span;
 /// index + column + width) and the key it stands for. The `render_*` functions
 /// translate these to absolute screen [`Rect`]s and pair them with the key, so a
 /// click can be turned into the equivalent keypress.
-pub struct ChipHit {
+pub(crate) struct ChipHit {
     pub line: u16,
     pub col: u16,
     pub width: u16,
@@ -85,14 +85,18 @@ pub(super) fn data_view_regions(
 }
 
 /// True when `(col, row)` falls inside a clickable region.
-pub fn region_hit(regions: &[(Rect, KeyEvent)], col: u16, row: u16) -> Option<KeyEvent> {
+pub(crate) fn region_hit(regions: &[(Rect, KeyEvent)], col: u16, row: u16) -> Option<KeyEvent> {
     region_at(regions, col, row).map(|(_, k)| k)
 }
 
 /// The clickable region (its rect and key) under `(col, row)`, if any — like
 /// [`region_hit`] but keeps the rect too, so a hover can anchor a help bubble to
 /// the chip it points at.
-pub fn region_at(regions: &[(Rect, KeyEvent)], col: u16, row: u16) -> Option<(Rect, KeyEvent)> {
+pub(crate) fn region_at(
+    regions: &[(Rect, KeyEvent)],
+    col: u16,
+    row: u16,
+) -> Option<(Rect, KeyEvent)> {
     regions
         .iter()
         .find(|(r, _)| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
@@ -104,7 +108,7 @@ pub fn region_at(regions: &[(Rect, KeyEvent)], col: u16, row: u16) -> Option<(Re
 /// screen row: `1` for the tree/files header hints, or `footer_top` for the modes
 /// whose hints sit in the bottom footer. Replaces the per-mode remap that was
 /// copy-pasted across every screen renderer.
-pub fn chip_regions(chips: &[ChipHit], base_row: u16) -> ChipRegions {
+pub(super) fn chip_regions(chips: &[ChipHit], base_row: u16) -> ChipRegions {
     chips
         .iter()
         .map(|c| {
@@ -124,7 +128,7 @@ pub fn chip_regions(chips: &[ChipHit], base_row: u16) -> ChipRegions {
 /// Which screen a footer shortcut sits on, so [`shortcut_help`] can disambiguate
 /// keys that mean different things per screen (`h`, `b`, `r`, the arrows).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum HelpCtx {
+pub(crate) enum HelpCtx {
     Tree,
     Files,
     Layout,
@@ -136,7 +140,7 @@ pub enum HelpCtx {
 
 /// A one-line help description for a footer shortcut `key` on screen `ctx`, shown
 /// as a bubble when the mouse hovers the chip. `None` for keys with no help.
-pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
+pub(crate) fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
     use HelpCtx::{Data, Detail, Files, Layout, Rename, Stats, Tree};
     use KeyCode::{Backspace, Char, Down, Left, PageDown, PageUp, Right, Tab, Up};
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -448,7 +452,7 @@ fn view_footer_items(
 /// (tensor name + file) never scrolls off. Shares [`wrap_hint_items`] with
 /// [`data_view_footer_wrapped_lines`] so the reservation can't drift from what's
 /// drawn.
-pub fn data_view_footer_lines(
+pub(crate) fn data_view_footer_lines(
     mode: SampleMode,
     slices: usize,
     overridable: bool,

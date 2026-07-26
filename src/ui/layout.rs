@@ -22,13 +22,13 @@ const LAYOUT_HEADER_ROWS: usize = 3;
 impl UI {
     /// The first terminal row of the layout map's strip (its fixed header height),
     /// for the mouse click-to-select hit-test.
-    pub fn layout_header_rows() -> usize {
+    pub(crate) fn layout_header_rows() -> usize {
         LAYOUT_HEADER_ROWS
     }
 
     /// Body rows the layout map's vertical strip occupies (total height minus the
     /// 3-row header and the footer hint line(s)).
-    pub fn layout_visible_rows(width: u16, height: u16) -> usize {
+    pub(crate) fn layout_visible_rows(width: u16, height: u16) -> usize {
         (height as usize)
             .saturating_sub(LAYOUT_HEADER_ROWS + layout_hint_lines(width).0.len())
             .max(1)
@@ -42,7 +42,7 @@ impl UI {
     /// remaining rows list its `__metadata__` entries tree-like. The `selected`
     /// segment's label row is highlighted. Returns the max scroll offset (so the
     /// caller can clamp) and the clickable footer chips.
-    pub fn render_layout(
+    pub(crate) fn render_layout(
         frame: &mut Frame,
         map: &crate::safelayout::LayoutMap,
         selected: usize,
@@ -268,7 +268,7 @@ impl UI {
     /// as a trailing entry (so band `i` spans `[starts[i], starts[i+1])`). Lets the
     /// browsing loop map a click to a segment and snap the scroll to the selection,
     /// using the same band heights [`Self::render_layout`] draws.
-    pub fn layout_band_starts(
+    pub(crate) fn layout_band_starts(
         map: &crate::safelayout::LayoutMap,
         width: u16,
         height: u16,

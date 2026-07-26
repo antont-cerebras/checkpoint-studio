@@ -563,11 +563,11 @@ struct Prompter<'a> {
 }
 
 impl ssh2::KeyboardInteractivePrompt for Prompter<'_> {
-    fn prompt<'a>(
+    fn prompt(
         &mut self,
         _user: &str,
         instructions: &str,
-        prompts: &[ssh2::Prompt<'a>],
+        prompts: &[ssh2::Prompt<'_>],
     ) -> Vec<String> {
         if !instructions.trim().is_empty() {
             eprintln!("{}", instructions.trim());

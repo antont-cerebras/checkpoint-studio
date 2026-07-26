@@ -100,7 +100,7 @@ impl S3Meta {
                     etag: o.etag.clone(),
                     checksum: o.checksum.clone(),
                     last_modified: o.last_modified.clone(),
-                    tags: o.tags.as_ref().map(std::collections::BTreeMap::len),
+                    tags: o.tags.as_ref().map(BTreeMap::len),
                     user_meta: o.user_meta.len(),
                 })
                 .collect(),
@@ -787,7 +787,7 @@ impl RemoteRead {
         new_uri: &str,
         pairs: &[(String, String)],
         opts: &RemoteValueOpts,
-        mut on_event: impl FnMut(RepackEvent),
+        mut on_event: impl FnMut(RepackEvent<'_>),
     ) -> Result<(HashMap<String, RemoteTensorDiff>, Option<RemoteValueStats>)> {
         let script = value_diff_script(old_uri, new_uri, pairs, opts);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
@@ -815,7 +815,7 @@ impl RemoteRead {
         pairs: &[(String, String)],
         bits: usize,
         auto_sparse: bool,
-        mut on_event: impl FnMut(RepackEvent),
+        mut on_event: impl FnMut(RepackEvent<'_>),
     ) -> Result<(HashMap<String, RepackResult>, Option<RemoteValueStats>)> {
         let script = repack_verify_script(old_uri, new_uri, pairs, bits, auto_sparse);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
@@ -834,7 +834,7 @@ impl RemoteRead {
 fn dispatch_stream_line(
     line: &str,
     status: &impl Fn(&serde_json::Value) -> CompareStatus,
-    on_event: &mut impl FnMut(RepackEvent),
+    on_event: &mut impl FnMut(RepackEvent<'_>),
 ) {
     if let Some(rest) = line.strip_prefix(STATUS_TAG) {
         let mut f = rest.split('\t');

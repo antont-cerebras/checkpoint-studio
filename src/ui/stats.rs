@@ -447,7 +447,7 @@ impl UI {
     /// own) and the clickable regions — the on-disk fold toggle, the footer chips,
     /// and the top-right `[×]`. Used by the interactive [`StatsMode`] and headless
     /// `--stats`, so the two stay byte-identical.
-    pub fn render_stats_frame(
+    pub(crate) fn render_stats_frame(
         frame: &mut Frame,
         s: &crate::stats::CheckpointStats,
         scroll: usize,

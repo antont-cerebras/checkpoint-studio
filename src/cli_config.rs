@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// The CLI defaults a user can set in `config.toml`. All optional.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct CliConfig {
+pub(crate) struct CliConfig {
     /// Default `--ssh-proxy` host (`[USER@]HOST`) for reading remote / `s3://`
     /// checkpoints — the tedious-to-retype one.
     pub ssh_proxy: Option<String>,
@@ -19,7 +19,7 @@ pub struct CliConfig {
 impl CliConfig {
     /// Load from [`Self::path`], or return the defaults (all `None`) when the file
     /// is absent or unreadable — a missing/typo'd config is never fatal.
-    pub fn load() -> CliConfig {
+    pub(crate) fn load() -> CliConfig {
         Self::path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|s| Self::parse(&s))
@@ -28,7 +28,7 @@ impl CliConfig {
 
     /// The config file path: `$XDG_CONFIG_HOME/checkpoint-studio/config.toml`, or
     /// `$HOME/.config/checkpoint-studio/config.toml`. `None` if neither var is set.
-    pub fn path() -> Option<PathBuf> {
+    pub(crate) fn path() -> Option<PathBuf> {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
@@ -39,7 +39,7 @@ impl CliConfig {
     /// Parse `key = "value"` lines (a TOML subset): blank lines and `#` comments are
     /// ignored, values may be quoted or bare, and unknown keys are ignored (so a
     /// newer config doesn't break an older binary). Accepts `ssh_proxy`/`ssh-proxy`.
-    pub fn parse(text: &str) -> CliConfig {
+    pub(crate) fn parse(text: &str) -> CliConfig {
         let mut cfg = CliConfig::default();
         for line in text.lines() {
             let line = line.trim();

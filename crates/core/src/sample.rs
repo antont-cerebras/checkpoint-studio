@@ -1725,7 +1725,14 @@ impl DiffAcc {
     /// `da.subs` (== `db.subs`) logical values from each.
     // Exact value diff, with NaN handled explicitly on the next line.
     #[allow(clippy::float_cmp)]
-    fn add_block(&mut self, a: &[u8], b: &[u8], da: &Decoder, db: &Decoder, containers: usize) {
+    fn add_block(
+        &mut self,
+        a: &[u8],
+        b: &[u8],
+        da: &Decoder<'_>,
+        db: &Decoder<'_>,
+        containers: usize,
+    ) {
         for c in 0..containers {
             for sub in 0..da.subs {
                 let va = da.at(a, c, sub);

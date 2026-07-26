@@ -70,7 +70,7 @@ const histCache = new Map<string, Promise<HistogramDto>>();
 function memo<T>(cache: Map<string, Promise<T>>, key: string, start: () => Promise<T>): Promise<T> {
   let p = cache.get(key);
   if (!p) {
-    p = start().catch((e) => {
+    p = start().catch((e: unknown) => {
       cache.delete(key); // a transient 500 must not poison this key forever
       throw e;
     });

@@ -303,6 +303,9 @@ fn read_gguf(file_path: &Path, source_path: &str) -> Result<(Vec<TensorInfo>, Ve
     let mut file = std::fs::File::open(file_path)
         .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
     let mut buffer = Vec::new();
+    // `read_to_end` on an open handle: the caller already opened it to read the
+    // header, so re-opening by path (what `fs::read` would do) would race a rename.
+    #[allow(clippy::verbose_file_reads)]
     file.read_to_end(&mut buffer)
         .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
     let gguf = GGUFFile::read(&buffer)

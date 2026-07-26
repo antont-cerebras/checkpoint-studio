@@ -21,6 +21,10 @@ function legacyCopy(text: string): boolean {
     document.body.appendChild(ta);
     ta.focus();
     ta.select();
+    // `execCommand` is deprecated, and deliberately so here: it is the ONLY copy path
+    // that works in a non-secure context, which is how this app is served (plain http
+    // on a hostname). The modern API is tried first in `copyText`.
+    // eslint-disable-next-line @typescript-eslint/no-deprecated
     const ok = document.execCommand('copy');
     document.body.removeChild(ta);
     return ok;

@@ -67,13 +67,13 @@ pub(super) fn tree_span(selected: bool, color: Color, text: impl Into<String>) -
 }
 
 /// A dimmed span (field labels, chrome) for the detail screen.
-pub fn dim_span(text: impl Into<String>) -> Span<'static> {
+pub(crate) fn dim_span(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(palette::DIM))
 }
 
 /// A bold green span — a "✓ copied" style confirmation, matching the copy
 /// flashes elsewhere. Used by the preview pop-up's copy hint.
-pub fn success_span(text: impl Into<String>) -> Span<'static> {
+pub(crate) fn success_span(text: impl Into<String>) -> Span<'static> {
     Span::styled(
         text.into(),
         Style::default()

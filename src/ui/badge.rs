@@ -16,7 +16,7 @@ use super::popup::render_hover_bubble;
 /// badge; warnings only (e.g. extra files on disk not in the index) show a softer
 /// orange one, so the screaming red is reserved for genuine problems.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum HealthAlert {
+pub(crate) enum HealthAlert {
     Warning,
     Error,
 }
@@ -29,7 +29,7 @@ pub enum HealthAlert {
 /// [`ReadOnly`](AccessBadge::ReadOnly), and browsing never modifies it either way.
 /// It is the rightmost [`Badge`] in the [`status bar`](UI::render_badge_bar).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AccessBadge {
+pub(crate) enum AccessBadge {
     ReadOnly,
     Editable,
 }
@@ -84,7 +84,7 @@ const BADGE_GAP: u16 = 2;
 /// one path for width, gap, colour, hover bubble and click action (they used to be
 /// three hand-threaded implementations that kept drifting).
 #[derive(Clone, Copy)]
-pub struct Badge {
+pub(crate) struct Badge {
     /// Chip text, already padded (`" read-only "`, `" ⚠ health "`, …); also the
     /// hover bubble's title.
     label: &'static str,
@@ -107,7 +107,7 @@ impl Badge {
     }
 
     /// The key a click on this badge acts as, if any.
-    pub fn action(self) -> Option<char> {
+    pub(crate) fn action(self) -> Option<char> {
         self.action
     }
 }
@@ -117,7 +117,7 @@ impl Badge {
 /// when the index/file check flagged something, then the metadata-only badge for a
 /// remote source. This is the single source of truth both the renderer and the
 /// hover / click hit-test build from, so they can't disagree.
-pub fn status_badges(
+pub(crate) fn status_badges(
     access: AccessBadge,
     health: Option<HealthAlert>,
     metadata_only: bool,
@@ -192,7 +192,7 @@ impl UI {
     /// [`status_badges`]) right-aligned on the last row, and, when `hovered` is
     /// `Some(i)`, that badge's hover bubble floated above it. Rendered last on a
     /// view so the chips sit over whatever occupies that row.
-    pub fn render_badge_bar(frame: &mut Frame, badges: &[Badge], hovered: Option<usize>) {
+    pub(crate) fn render_badge_bar(frame: &mut Frame, badges: &[Badge], hovered: Option<usize>) {
         let area = frame.area();
         let rects = badge_rects(area.width, area.height, badges);
         for (b, rect) in badges.iter().zip(&rects) {
@@ -217,7 +217,7 @@ impl UI {
 
     /// The index of the badge under `(col, row)`, if any — for the hover bubble and
     /// click actions. Shares [`badge_rects`] with the renderer, so they can't drift.
-    pub fn badge_bar_hit(
+    pub(crate) fn badge_bar_hit(
         width: u16,
         height: u16,
         col: u16,
@@ -231,7 +231,7 @@ impl UI {
 
     /// Columns the badge bar reserves on the right of the status line, so the
     /// status text never runs under it (a [`BADGE_GAP`] before each badge).
-    pub fn badge_bar_width(badges: &[Badge]) -> u16 {
+    pub(crate) fn badge_bar_width(badges: &[Badge]) -> u16 {
         badges.iter().map(|b| b.width() + BADGE_GAP).sum()
     }
 }

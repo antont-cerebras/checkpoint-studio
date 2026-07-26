@@ -155,7 +155,8 @@ def run_script(
     """Exec one script with `params` substituted and `modules` stubbed; return its
     stdout lines. Mirrors `remote.rs::with_params`, so the substitution under test is
     the same one that ships."""
-    text = (SCRIPTS / name).read_text()
+    path = SCRIPTS / name
+    text = path.read_text()
     if tweak:
         text = tweak(text)
     literal = json.dumps(json.dumps(params))
@@ -166,7 +167,10 @@ def run_script(
     out = io.StringIO()
     try:
         with redirect_stdout(out):
-            exec(compile(text, name, "exec"), {"__name__": "__main__"})
+            # Compile under the script's real path: tracebacks point at the file being
+            # tested, and coverage.py attributes the executed lines to it rather than to
+            # a phantom module.
+            exec(compile(text, str(path), "exec"), {"__name__": "__main__"})
     except SystemExit:
         pass  # the scripts exit(0) after reporting an error
     finally:

@@ -18,7 +18,7 @@ use super::theme::{
 /// lists only the glyphs and colour cues that appear on the screen it was opened
 /// from.
 #[derive(Clone, Copy)]
-pub enum Legend {
+pub(crate) enum Legend {
     Tree,
     Detail,
     Heatmap,
@@ -32,7 +32,7 @@ impl UI {
     /// centred, rounded [`Block`] pop-up (its context is the box title), drawn last
     /// so the screen behind keeps animating. Shared by every screen's `l` overlay
     /// and by `--plain --legend`.
-    pub fn render_legend_band(frame: &mut Frame, legend: Legend) {
+    pub(crate) fn render_legend_band(frame: &mut Frame, legend: Legend) {
         render_popup_box(
             frame,
             legend_title(legend),
@@ -502,13 +502,10 @@ mod tests {
     fn the_tree_legend_explains_the_markers_the_tree_draws() {
         let out = render(Legend::Tree);
         // The glyphs a tree row can carry, each defined in `theme`.
-        for marker in [
-            crate::ui::theme::UNINDEXED_MARK,
-            crate::ui::theme::COMPRESSED_MARK,
-        ] {
+        for marker in [UNINDEXED_MARK, COMPRESSED_MARK] {
             assert!(out.contains(marker), "{marker} unexplained:\n{out}");
         }
-        assert!(out.contains(crate::ui::theme::UNCOMPRESSED_TAG), "{out}");
+        assert!(out.contains(UNCOMPRESSED_TAG), "{out}");
     }
 
     #[test]

@@ -848,7 +848,7 @@ fn main() -> Result<()> {
                     }
                 };
             let (old, new) = (&srcs[0], &srcs[1]);
-            let remote = remote.map(|(host, venv)| crate::remote::RemoteRead::new(host, venv));
+            let remote = remote.map(|(host, venv)| remote::RemoteRead::new(host, venv));
             let filter = match build_tensor_filter(
                 &name,
                 names.as_deref(),
@@ -943,7 +943,7 @@ fn main() -> Result<()> {
                     .unwrap_or(4)
             });
             let (paths, remote) = resolve_remote_sources(&paths, ssh_proxy, ssh_venv, &cfg)?;
-            let remote = remote.map(|(host, venv)| crate::remote::RemoteRead::new(host, venv));
+            let remote = remote.map(|(host, venv)| remote::RemoteRead::new(host, venv));
             std::process::exit(run_check(
                 &paths,
                 recursive,
@@ -1001,7 +1001,7 @@ fn run_check(
     jobs: usize,
     format: Format,
     no_color: bool,
-    remote: Option<&crate::remote::RemoteRead>,
+    remote: Option<&remote::RemoteRead>,
 ) -> i32 {
     let filter = match filter::NameFilter::parse(name) {
         Ok(f) => f,
@@ -1408,9 +1408,9 @@ fn erase_block(prev_lines: usize) {
 /// not among the pairs we asked for are ignored.
 fn drive_bars(
     bars: &progress::Bars,
-    index: &std::collections::HashMap<&str, usize>,
+    index: &HashMap<&str, usize>,
     finished: &std::cell::RefCell<Vec<bool>>,
-    ev: crate::remote::RepackEvent,
+    ev: remote::RepackEvent,
 ) {
     use crate::remote::RepackEvent as E;
     match ev {
@@ -1453,7 +1453,7 @@ fn drive_bars(
         }
         E::Done { name, status } => {
             if let Some(&i) = index.get(name) {
-                bars.finish(i, status != crate::remote::CompareStatus::Error);
+                bars.finish(i, status != remote::CompareStatus::Error);
                 if let Some(f) = finished.borrow_mut().get_mut(i) {
                     *f = true;
                 }
@@ -1493,14 +1493,14 @@ fn truncate_tail(s: &str, max: usize) -> String {
 type Loaded = (Vec<TensorInfo>, Vec<MetadataInfo>);
 /// One diff side: its loaded structure plus, for an `s3://` source, the underlying
 /// S3 objects' metadata (`None` for a local / SFTP source).
-type SideLoad = (Loaded, Option<crate::remote::S3Meta>);
+type SideLoad = (Loaded, Option<remote::S3Meta>);
 
 /// Whether an error is the [`crate::sftp::RemoteSession::ABORTED`] marker — a read
 /// cut short because the *other* side of a parallel `diff` failed first (not a
 /// failure of this read itself).
 fn is_aborted_err(e: &anyhow::Error) -> bool {
     e.chain()
-        .any(|c| c.to_string().contains(crate::sftp::RemoteSession::ABORTED))
+        .any(|c| c.to_string().contains(sftp::RemoteSession::ABORTED))
 }
 
 /// An effective SSH proxy for a read: `(host, venv)`.
@@ -1625,7 +1625,7 @@ fn run_diff(
     filter: &diff::TensorFilter,
     name_map: &diff::NameMap,
     jobs: usize,
-    remote: Option<&crate::remote::RemoteRead>,
+    remote: Option<&remote::RemoteRead>,
     verify_repack: bool,
     repack_bits: Option<usize>,
     old_root: Option<&str>,
@@ -1670,36 +1670,35 @@ fn run_diff(
             // failing read trips this flag; the sibling's read loop checks it between
             // streamed progress lines and bails promptly.
             let abort = std::sync::atomic::AtomicBool::new(false);
-            let read =
-                |session: &crate::sftp::RemoteSession, src: &str, i: usize| -> Result<SideLoad> {
-                    let progress = bars.progress(i);
-                    let out = r
-                        // `diff` compares S3 object metadata for s3-vs-s3 → fetch it.
-                        .read(
-                            session,
-                            src,
-                            &password,
-                            progress.as_deref(),
-                            remote::ObjectMeta::Fetch,
-                            Some(&abort),
-                        )
-                        .with_context(|| format!("reading {src}"));
-                    // A failure trips the abort so the sibling stops promptly.
-                    if out.is_err() {
-                        abort.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    // Distinguish an abort (this side was cut short — dim `⊘`) from a
-                    // real failure (`✗`), so a fine-but-cancelled read doesn't look
-                    // broken.
-                    match &out {
-                        Ok(_) => bars.finish(i, true),
-                        Err(e) if is_aborted_err(e) => bars.abort(i),
-                        Err(_) => bars.finish(i, false),
-                    }
-                    // `diff` compares structure + (for s3://) S3 object metadata, not
-                    // the on-disk footprint or health.
-                    out.map(|rc| ((rc.tensors, rc.metadata), rc.s3))
-                };
+            let read = |session: &sftp::RemoteSession, src: &str, i: usize| -> Result<SideLoad> {
+                let progress = bars.progress(i);
+                let out = r
+                    // `diff` compares S3 object metadata for s3-vs-s3 → fetch it.
+                    .read(
+                        session,
+                        src,
+                        &password,
+                        progress.as_deref(),
+                        remote::ObjectMeta::Fetch,
+                        Some(&abort),
+                    )
+                    .with_context(|| format!("reading {src}"));
+                // A failure trips the abort so the sibling stops promptly.
+                if out.is_err() {
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Distinguish an abort (this side was cut short — dim `⊘`) from a
+                // real failure (`✗`), so a fine-but-cancelled read doesn't look
+                // broken.
+                match &out {
+                    Ok(_) => bars.finish(i, true),
+                    Err(e) if is_aborted_err(e) => bars.abort(i),
+                    Err(_) => bars.finish(i, false),
+                }
+                // `diff` compares structure + (for s3://) S3 object metadata, not
+                // the on-disk footprint or health.
+                out.map(|rc| ((rc.tensors, rc.metadata), rc.s3))
+            };
             let (ra, rb) = std::thread::scope(|s| {
                 let (oref, nref): (&str, &str) = (&old_str, &new_str);
                 let ta = s.spawn(|| read(&sa, oref, 0));
@@ -1851,7 +1850,7 @@ fn run_diff(
             let b = new_t.iter().find(|t| t.name == name);
             match (a, b) {
                 (Some(a), Some(b)) if a.shape == b.shape => {
-                    let vopts = crate::remote::RemoteValueOpts {
+                    let vopts = remote::RemoteValueOpts {
                         values: true,
                         histogram: opts.histogram,
                         bins,
@@ -1955,7 +1954,7 @@ fn run_diff(
         .tensors
         .keys()
         .chain(new_sum.tensors.keys())
-        .collect::<std::collections::HashSet<_>>()
+        .collect::<HashSet<_>>()
         .len();
     // Scope the diff to the selected subset (no-op when no filter was given).
     filter.apply(&mut old_sum, &mut new_sum);
@@ -1968,7 +1967,7 @@ fn run_diff(
     // indices (repack-style), rendered in their own section after the report.
     let mut sparse_pairs: Vec<(String, String)> = Vec::new();
     let mut sparse_bits = 0usize;
-    let mut sparse_results: HashMap<String, crate::remote::RepackResult> = HashMap::new();
+    let mut sparse_results: HashMap<String, remote::RepackResult> = HashMap::new();
 
     let mut report = if opts.values || opts.histogram {
         use rayon::prelude::*;
@@ -2030,7 +2029,7 @@ fn run_diff(
                     )
                 })
                 .sum();
-            let vopts = crate::remote::RemoteValueOpts {
+            let vopts = remote::RemoteValueOpts {
                 values: opts.values,
                 histogram: opts.histogram,
                 bins,
@@ -2183,7 +2182,7 @@ fn run_diff(
             eprintln!("checkpoint-studio diff: compared {count} S3 object(s)' metadata");
             // Each checkpoint's last-modified = the newest object under its prefix
             // (ISO-8601 UTC strings sort chronologically), shown in the summary.
-            let latest = |m: &crate::remote::S3Meta| {
+            let latest = |m: &remote::S3Meta| {
                 m.objects
                     .iter()
                     .map(|x| x.last_modified.clone())
@@ -2257,7 +2256,7 @@ fn run_diff(
 /// matched tensor is equivalent (and nothing else differs), 1 otherwise, 2 on trouble.
 #[allow(clippy::too_many_arguments)]
 fn run_repack_verify(
-    remote: Option<&crate::remote::RemoteRead>,
+    remote: Option<&remote::RemoteRead>,
     password: &mut Option<String>,
     old_uri: &str,
     new_uri: &str,
@@ -2305,7 +2304,7 @@ fn run_repack_verify(
     // themselves always show as "changed" (shape/dtype), so they're excluded: if
     // they verify equivalent and nothing else differs, the checkpoints are the same
     // modulo packing (exit 0).
-    let verified: std::collections::HashSet<&String> = pairs.iter().map(|(_, n)| n).collect();
+    let verified: HashSet<&String> = pairs.iter().map(|(_, n)| n).collect();
     let added = new_sum
         .tensors
         .keys()
@@ -2343,7 +2342,7 @@ fn local_repack(
     pairs: &[(String, String)],
     bits: usize,
     fold_override: Option<usize>,
-) -> HashMap<String, crate::remote::RepackResult> {
+) -> HashMap<String, remote::RepackResult> {
     let find = |ts: &[TensorInfo], n: &str| ts.iter().find(|t| t.name == n).cloned();
     let mut out = HashMap::new();
     for (oname, nname) in pairs {
@@ -2363,7 +2362,7 @@ fn local_repack(
         };
         let (ocb, ncb) = (sib(oname, "codebook"), sib(nname, "codebook"));
         let (oqs, nqs) = (sib(oname, "qscale"), sib(nname, "qscale"));
-        let rr = crate::repack::verify_local(
+        let rr = repack::verify_local(
             &ow,
             &nw,
             fold,
@@ -2406,14 +2405,10 @@ fn auto_sparse_families(
     common: &[&str],
     old_map: &HashMap<String, &TensorInfo>,
     new_map: &HashMap<String, &TensorInfo>,
-) -> (
-    Vec<(String, String)>,
-    Option<usize>,
-    std::collections::HashSet<String>,
-) {
+) -> (Vec<(String, String)>, Option<usize>, HashSet<String>) {
     let mut pairs = Vec::new();
     let mut bits = None;
-    let mut handled = std::collections::HashSet::new();
+    let mut handled = HashSet::new();
     for &k in common {
         let Some(stem) = k.strip_suffix(".weight") else {
             continue;
@@ -2471,7 +2466,7 @@ fn repack_bar_labels(
 /// a per-tensor download bar (weights + sibling codebook/qscale) + a final I/O line.
 #[allow(clippy::too_many_arguments)]
 fn fetch_remote_repack(
-    r: &crate::remote::RemoteRead,
+    r: &remote::RemoteRead,
     password: &mut Option<String>,
     old_uri: &str,
     new_uri: &str,
@@ -2479,7 +2474,7 @@ fn fetch_remote_repack(
     bar_labels: &[String],
     bits: usize,
     auto_sparse: bool,
-) -> Result<HashMap<String, crate::remote::RepackResult>> {
+) -> Result<HashMap<String, remote::RepackResult>> {
     let session = r.open_with(password)?;
     if auto_sparse {
         eprintln!(
@@ -2501,7 +2496,7 @@ fn fetch_remote_repack(
     // labelled by the *new* name, each filling over its (old + new) S3 byte size as
     // the proxy streams the two sides.
     let bars = progress::Bars::start(bar_labels.to_vec());
-    let index: std::collections::HashMap<&str, usize> = bar_labels
+    let index: HashMap<&str, usize> = bar_labels
         .iter()
         .enumerate()
         .map(|(i, n)| (n.as_str(), i))
@@ -2521,11 +2516,11 @@ fn fetch_remote_repack(
     let (map, stats) = out?;
     if let Some(s) = stats {
         let elapsed = std::time::Duration::from_secs_f64(s.elapsed_s.max(0.0));
-        let read = crate::utils::format_size(s.bytes as usize);
+        let read = utils::format_size(s.bytes as usize);
         let rate = if s.elapsed_s > 0.0 {
             format!(
                 " ({}/s from S3)",
-                crate::utils::format_size((s.bytes as f64 / s.elapsed_s) as usize)
+                utils::format_size((s.bytes as f64 / s.elapsed_s) as usize)
             )
         } else {
             String::new()
@@ -2544,7 +2539,7 @@ fn fetch_remote_repack(
 /// false), 1 = any mismatch / format violation / other structural change.
 fn render_repack_verdict(
     pairs: &[(String, String)],
-    results: &HashMap<String, crate::remote::RepackResult>,
+    results: &HashMap<String, remote::RepackResult>,
     bits: usize,
     other_differs: bool,
 ) -> i32 {
@@ -2574,7 +2569,7 @@ fn render_repack_verdict(
         let counts = format!(
             "fold {}, {} indices",
             rr.fold,
-            crate::utils::format_parameters(rr.elements as usize)
+            utils::format_parameters(rr.elements as usize)
         );
         if rr.sparse_bad > 0 || rr.dense_bad > 0 {
             all_ok = false;
@@ -2600,18 +2595,18 @@ fn render_repack_verdict(
                 format!(
                     "{dim}max |Δ| {}, {} by >1{reset}",
                     rr.max_delta,
-                    crate::utils::format_parameters(rr.differing_gt1 as usize),
+                    utils::format_parameters(rr.differing_gt1 as usize),
                 )
             };
             println!(
                 "  {yellow}≠{reset} {name}  {yellow}{} of {} indices differ{reset} — {adj}{where_}",
-                crate::utils::format_parameters(rr.differing as usize),
-                crate::utils::format_parameters(rr.elements as usize),
+                utils::format_parameters(rr.differing as usize),
+                utils::format_parameters(rr.elements as usize),
             );
             // Aggregate magnitude + whether the average value is preserved.
             println!(
                 "      {dim}Σ|Δ| {} · mean |Δ|/param {:.4} · mean index {:.4} → {:.4} (Δ {:+.4}){reset}",
-                crate::utils::format_parameters(rr.sum_abs as usize),
+                utils::format_parameters(rr.sum_abs as usize),
                 rr.mean_abs,
                 rr.mean_old,
                 rr.mean_new,
@@ -2648,7 +2643,7 @@ fn render_repack_verdict(
 
 /// Whether a sibling codebook/qscale diff counts as a difference (missing on a
 /// side, shape mismatch, or any differing value).
-fn aux_differs(aux: Option<&crate::remote::RepackAux>) -> bool {
+fn aux_differs(aux: Option<&remote::RepackAux>) -> bool {
     aux.is_some_and(|a| !a.present() || a.shape_mismatch.is_some() || a.differing > 0)
 }
 
@@ -2658,7 +2653,7 @@ fn aux_differs(aux: Option<&crate::remote::RepackAux>) -> bool {
 /// empty on a remote error (already reported) or a non-s3 remote (data unreachable).
 #[allow(clippy::too_many_arguments)]
 fn run_auto_sparse(
-    remote: Option<&crate::remote::RemoteRead>,
+    remote: Option<&remote::RemoteRead>,
     password: &mut Option<String>,
     s3_pair: bool,
     old_uri: &str,
@@ -2667,7 +2662,7 @@ fn run_auto_sparse(
     new_t: &[TensorInfo],
     pairs: &[(String, String)],
     bits: usize,
-) -> HashMap<String, crate::remote::RepackResult> {
+) -> HashMap<String, remote::RepackResult> {
     if let Some(r) = remote.filter(|_| s3_pair) {
         let labels = repack_bar_labels(pairs, old_t, new_t);
         match fetch_remote_repack(r, password, old_uri, new_uri, pairs, &labels, bits, true) {
@@ -2695,7 +2690,7 @@ fn run_auto_sparse(
 /// anything differs, else 0.
 fn render_auto_sparse(
     pairs: &[(String, String)],
-    results: &HashMap<String, crate::remote::RepackResult>,
+    results: &HashMap<String, remote::RepackResult>,
 ) -> i32 {
     use std::io::IsTerminal;
     let color = std::io::stdout().is_terminal();
@@ -2738,16 +2733,16 @@ fn render_auto_sparse(
             } else if is_float {
                 format!(
                     "{} of {} values differ (max |Δ| {:.5}, mean {:.5})",
-                    crate::utils::format_parameters(fb.differing as usize),
-                    crate::utils::format_parameters(fb.elements as usize),
+                    utils::format_parameters(fb.differing as usize),
+                    utils::format_parameters(fb.elements as usize),
                     fb.max_abs,
                     fb.mean_abs,
                 )
             } else {
                 format!(
                     "{} of {} 16-bit words differ",
-                    crate::utils::format_parameters(fb.differing as usize),
-                    crate::utils::format_parameters(fb.elements as usize),
+                    utils::format_parameters(fb.differing as usize),
+                    utils::format_parameters(fb.elements as usize),
                 )
             };
             let how = if is_float {
@@ -2765,7 +2760,7 @@ fn render_auto_sparse(
             let counts = format!(
                 "{}-bit, {} indices, {:.0}% zero",
                 rr.bits,
-                crate::utils::format_parameters(rr.elements as usize),
+                utils::format_parameters(rr.elements as usize),
                 rr.zero_frac * 100.0,
             );
             if rr.differing > 0 {
@@ -2782,17 +2777,17 @@ fn render_auto_sparse(
                     format!(
                         "{dim}max |Δ| {}, {} by >1{reset}",
                         rr.max_delta,
-                        crate::utils::format_parameters(rr.differing_gt1 as usize),
+                        utils::format_parameters(rr.differing_gt1 as usize),
                     )
                 };
                 println!(
                     "  {yellow}≠{reset} {name}  {yellow}{} of {} indices differ{reset} — {adj}{where_} {dim}({counts}){reset}",
-                    crate::utils::format_parameters(rr.differing as usize),
-                    crate::utils::format_parameters(rr.elements as usize),
+                    utils::format_parameters(rr.differing as usize),
+                    utils::format_parameters(rr.elements as usize),
                 );
                 println!(
                     "      {dim}Σ|Δ| {} · mean |Δ|/param {:.4} · mean index {:.4} → {:.4} (Δ {:+.4}){reset}",
-                    crate::utils::format_parameters(rr.sum_abs as usize),
+                    utils::format_parameters(rr.sum_abs as usize),
                     rr.mean_abs,
                     rr.mean_old,
                     rr.mean_new,
@@ -2815,7 +2810,7 @@ fn render_auto_sparse(
 /// tensor: the OLD grid, then the NEW grid with cells that differ from old in red —
 /// so the pattern of the difference is visible (a consistent shift ⇒ a mapping bug;
 /// scattered ±1 ⇒ independent quantizations). Indices are 0..7 (single digit).
-fn print_repack_sample(rr: &crate::remote::RepackResult, red: &str, dim: &str, reset: &str) {
+fn print_repack_sample(rr: &remote::RepackResult, red: &str, dim: &str, reset: &str) {
     let Some(s) = &rr.sample else { return };
     let rows = s.old.len().min(s.new.len());
     if rows == 0 {
@@ -2860,7 +2855,7 @@ fn print_repack_sample(rr: &crate::remote::RepackResult, red: &str, dim: &str, r
 /// `differs — max/mean |Δ|`, or `shape differs`.
 fn print_repack_aux(
     label: &str,
-    aux: Option<&crate::remote::RepackAux>,
+    aux: Option<&remote::RepackAux>,
     green: &str,
     yellow: &str,
     dim: &str,
@@ -2897,8 +2892,8 @@ fn print_repack_aux(
             a.shape,
             a.max_abs,
             a.mean_abs,
-            crate::utils::format_parameters(a.differing as usize),
-            crate::utils::format_parameters(a.elements as usize),
+            utils::format_parameters(a.differing as usize),
+            utils::format_parameters(a.elements as usize),
         );
     }
 }
@@ -2959,14 +2954,14 @@ fn tensor_histogram(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> Option<di
 /// sides, stored dtype) — for the intro estimate. Used for both the bulk
 /// `--values`/`--histogram` run and the single `--tensor` focus.
 fn fetch_remote_value_diff(
-    r: &crate::remote::RemoteRead,
+    r: &remote::RemoteRead,
     password: &mut Option<String>,
     old_uri: &str,
     new_uri: &str,
     pairs: &[(String, String)],
-    vopts: &crate::remote::RemoteValueOpts,
+    vopts: &remote::RemoteValueOpts,
     total_bytes: u64,
-) -> Result<HashMap<String, crate::remote::RemoteTensorDiff>> {
+) -> Result<HashMap<String, remote::RemoteTensorDiff>> {
     let session = r.open_with(password)?;
     eprintln!(
         "checkpoint-studio diff: comparing {} tensor(s) on {} — reading ≈ {} from S3 \
@@ -2974,14 +2969,14 @@ fn fetch_remote_value_diff(
          --jobs 1 if the remote misbehaves) …",
         pairs.len(),
         r.host,
-        crate::utils::format_size(total_bytes as usize),
+        utils::format_size(total_bytes as usize),
         vopts.jobs.max(1),
     );
     // One standard progress bar per compared tensor, each filling over its
     // (old + new) S3 byte size as the proxy streams the two sides (the values are
     // still compared on the proxy — only the byte counts and result cross ssh).
     let bars = progress::Bars::start(pairs.iter().map(|(_, n)| n.clone()).collect());
-    let index: std::collections::HashMap<&str, usize> = pairs
+    let index: HashMap<&str, usize> = pairs
         .iter()
         .enumerate()
         .map(|(i, (_, n))| (n.as_str(), i))
@@ -3002,11 +2997,11 @@ fn fetch_remote_value_diff(
     // `elapsed_s` is the remote compare time (excludes the ssh handshake).
     if let Some(s) = stats {
         let elapsed = std::time::Duration::from_secs_f64(s.elapsed_s.max(0.0));
-        let read = crate::utils::format_size(s.bytes as usize);
+        let read = utils::format_size(s.bytes as usize);
         let rate = if s.elapsed_s > 0.0 {
             format!(
                 " ({}/s from S3)",
-                crate::utils::format_size((s.bytes as f64 / s.elapsed_s) as usize)
+                utils::format_size((s.bytes as f64 / s.elapsed_s) as usize)
             )
         } else {
             String::new()
@@ -3030,11 +3025,11 @@ fn fetch_remote_value_diff(
 /// every object (order-independent, non-empty). An ETag is a content hash, so equal
 /// key+ETag ⇒ identical bytes ⇒ identical tensor values — letting a value diff skip
 /// the data read entirely (e.g. a checkpoint vs. itself or an unchanged copy).
-fn s3_objects_identical(a: &crate::remote::S3Meta, b: &crate::remote::S3Meta) -> bool {
+fn s3_objects_identical(a: &remote::S3Meta, b: &remote::S3Meta) -> bool {
     if a.objects.is_empty() || a.objects.len() != b.objects.len() {
         return false;
     }
-    let sorted = |m: &crate::remote::S3Meta| {
+    let sorted = |m: &remote::S3Meta| {
         let mut v: Vec<(String, String, u64)> = m
             .objects
             .iter()
@@ -3050,7 +3045,7 @@ fn s3_objects_identical(a: &crate::remote::S3Meta, b: &crate::remote::S3Meta) ->
 /// [`diff::TensorExtras`] the report is built from — the value stats verbatim, the
 /// histogram summarized to its `(tvd, bins)` shift. A per-tensor remote error leaves
 /// both empty (the tensor then shows as a structural-only change).
-fn extras_from_remote(rd: &crate::remote::RemoteTensorDiff) -> diff::TensorExtras {
+fn extras_from_remote(rd: &remote::RemoteTensorDiff) -> diff::TensorExtras {
     diff::TensorExtras {
         values: rd.values,
         histogram: rd
@@ -3073,7 +3068,7 @@ fn run_diff_tensor(
     ctx: &ValueCtx,
     opts: diff::DiffOpts,
     remote: bool,
-    remote_diff: Option<&crate::remote::RemoteTensorDiff>,
+    remote_diff: Option<&remote::RemoteTensorDiff>,
 ) -> i32 {
     let old_info = old_t.iter().find(|t| t.name == name);
     let new_info = new_t.iter().find(|t| t.name == name);
@@ -3172,7 +3167,7 @@ fn value_cmp(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> diff::ValueCmp {
 fn value_cmp_remote(
     a: &TensorInfo,
     b: &TensorInfo,
-    rd: Option<&crate::remote::RemoteTensorDiff>,
+    rd: Option<&remote::RemoteTensorDiff>,
 ) -> diff::ValueCmp {
     if a.shape != b.shape {
         return diff::ValueCmp::Skipped("shapes differ".to_string());
@@ -3279,7 +3274,7 @@ fn run_web(
         // immediately, and if the requested port is taken we land on a free one and
         // hold it while the read runs — so the wait is never wasted.
         let server = web::bind(host, port)?;
-        let remote = crate::remote::RemoteRead::new(rhost, venv);
+        let remote = remote::RemoteRead::new(rhost, venv);
         // Fetch the S3 object metadata: the browser shows the same stats S3 section
         // and health cross-check the TUI does, and this is a one-off at server start.
         let model = remote.read_checkpoint(&src, remote::ObjectMeta::Fetch)?;
@@ -3505,7 +3500,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
                 .unwrap_or_else(|| "~/venv".to_string());
             // `--print-model` dumps the structure; the per-object S3 metadata would
             // add a HEAD per object for data it doesn't print.
-            crate::remote::RemoteRead::new(host.clone(), venv)
+            remote::RemoteRead::new(host.clone(), venv)
                 .read_checkpoint(&files[0].to_string_lossy(), remote::ObjectMeta::Skip)?
         } else {
             readers::read_local(&files)?
@@ -4038,7 +4033,7 @@ mod tests {
             );
         }
         // The shard listed in the index *and* found by the scan must appear once.
-        let unique: std::collections::HashSet<_> = files.iter().collect();
+        let unique: HashSet<_> = files.iter().collect();
         assert_eq!(files.len(), unique.len(), "duplicate paths: {names:?}");
 
         let _ = fs::remove_dir_all(&dir);

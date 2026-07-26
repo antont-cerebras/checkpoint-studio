@@ -22,7 +22,7 @@ impl UI {
     /// menu on the bottom two rows of the live preview frame — a `view as:` label
     /// followed by the available views as buttons (`current` highlighted), with a
     /// hint line below. Composited *after* the preview is drawn into the frame.
-    pub fn render_dtype_menu(frame: &mut Frame, options: &[ViewDtype], current: usize) {
+    pub(crate) fn render_dtype_menu(frame: &mut Frame, options: &[ViewDtype], current: usize) {
         let mut menu: Vec<Span> = vec![dim_span("view as:")];
         for (i, opt) in options.iter().enumerate() {
             let label = format!(" {} ", opt.menu_label());
@@ -49,7 +49,12 @@ impl UI {
     /// The Ratatui port of [`Self::draw_slice_prompt`]: a bottom-pinned prompt to
     /// jump to a slice by index (over the live data view), with a fixed-width
     /// input box and a feedback line below for an out-of-range / invalid entry.
-    pub fn render_slice_prompt(frame: &mut Frame, slices: usize, input: &str, error: Option<&str>) {
+    pub(crate) fn render_slice_prompt(
+        frame: &mut Frame,
+        slices: usize,
+        input: &str,
+        error: Option<&str>,
+    ) {
         let mut prompt: Vec<Span> = vec![
             Span::styled("Go to slice ", Style::default().fg(palette::KEY)),
             dim_span(format!("(0-{} or 0-100%)", slices.saturating_sub(1))),
@@ -67,7 +72,7 @@ impl UI {
     /// The Ratatui port of [`Self::draw_reshape_prompt`]: shows the stored shape
     /// and the element count the entry must multiply to, the input box, and a
     /// feedback line for errors.
-    pub fn render_reshape_prompt(
+    pub(crate) fn render_reshape_prompt(
         frame: &mut Frame,
         elements: usize,
         stored: &[usize],
@@ -96,7 +101,12 @@ impl UI {
     /// The Ratatui port of [`Self::draw_text_prompt`]: a bottom-pinned free-text
     /// input (label + editable box + optional error line). Used for the repack
     /// output filename, buffer size, and histogram bin count.
-    pub fn render_text_prompt(frame: &mut Frame, label: &str, input: &str, error: Option<&str>) {
+    pub(crate) fn render_text_prompt(
+        frame: &mut Frame,
+        label: &str,
+        input: &str,
+        error: Option<&str>,
+    ) {
         let mut prompt: Vec<Span> = vec![Span::styled(
             format!("{label} "),
             Style::default().fg(palette::KEY),
@@ -113,7 +123,12 @@ impl UI {
     /// The Ratatui port of [`Self::draw_choice_menu`]: a full-screen single-choice
     /// menu — a title, an underline rule, and a strip of `options` with `current`
     /// highlighted, plus a hint line. Used to pick the repack codec / confirm.
-    pub fn render_choice_menu(frame: &mut Frame, title: &str, options: &[&str], current: usize) {
+    pub(crate) fn render_choice_menu(
+        frame: &mut Frame,
+        title: &str,
+        options: &[&str],
+        current: usize,
+    ) {
         let mut strip: Vec<Span> = Vec::new();
         for (i, opt) in options.iter().enumerate() {
             let label = format!(" {opt} ");
@@ -149,7 +164,7 @@ impl UI {
     /// visible): a title, the `body` summary lines, then an `[Apply] [Cancel]`-style
     /// choice strip (the `selected` option inverted) and a key hint. Drives the
     /// in-place rename apply confirmation.
-    pub fn render_confirm_popup(
+    pub(crate) fn render_confirm_popup(
         frame: &mut Frame,
         title: &str,
         body: &[String],
@@ -193,7 +208,7 @@ impl UI {
     /// key hint. Used by the `t` copy-format picker; the caller drives selection
     /// and repaints. Returns each item's on-screen rect so clicks/hovers can be
     /// mapped back to a row.
-    pub fn render_menu_box(
+    pub(crate) fn render_menu_box(
         frame: &mut Frame,
         title: &str,
         items: &[&str],
@@ -251,7 +266,7 @@ impl UI {
     /// (each `key`, `title`, and `help`), the selected row inverted. Returns the
     /// on-screen rect of every listed row so a click can pick it. Fixed width so
     /// the box doesn't jump as the query filters the list.
-    pub fn render_command_palette(
+    pub(crate) fn render_command_palette(
         frame: &mut Frame,
         query: &str,
         rows: &[(String, String, String, String)],

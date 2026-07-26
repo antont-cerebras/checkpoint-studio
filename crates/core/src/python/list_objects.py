@@ -10,8 +10,8 @@ Read-only: `list_objects_v2` is a read; this never writes.
 # cluster's interpreter, and modern syntax works on our 3.9 floor.
 from __future__ import annotations
 
-import sys
 import json
+import sys
 from typing import Any
 
 # Parameters from the Rust caller: the single `__PARAMS__` slot is replaced with a
@@ -23,8 +23,9 @@ S = PARAMS["sentinel"]
 def emit(obj: dict[str, Any]) -> None:
     sys.stdout.write(S + json.dumps(obj) + "\n"); sys.stdout.flush()
 try:
-    import boto3
     from urllib.parse import urlparse
+
+    import boto3
 except Exception as e:
     emit({"error": "import boto3 failed: %r" % (e,)}); sys.exit(0)
 try:
