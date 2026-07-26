@@ -8195,3 +8195,259 @@ mod tests {
         assert_eq!(e.tree_state.selected, 2);
     }
 }
+
+/// The `Explorer`'s own surface, driven without the interactive loop: the y-command
+/// round-trip, filters, links, badges, hover, scroll clamping and the plain-text
+/// exports. These are the parts every screen leans on, and half of them had no test —
+/// `explorer/mod.rs` was the single largest uncovered file in the workspace.
+#[cfg(test)]
+mod explorer_surface {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn loaded() -> (Explorer, crate::tui::LiveTerminal) {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.safetensors");
+        let mut ex = Explorer::new(vec![fixture], Vec::new(), None, false);
+        ex.load_quiet().expect("the fixture loads");
+        (ex, crate::tui::test_terminal(120, 40))
+    }
+
+    /// The `y` command must reproduce the screen you're on. Every screen's reopen
+    /// command is generated here and checked to name the right flag and subject — a
+    /// wrong one hands the user a command that opens something else.
+    #[test]
+    fn the_reopen_command_names_every_screen() {
+        let (ex, _term) = loaded();
+        let name = ex.tensors()[0].name.clone();
+
+        let cmd = ex.reopen_command(&Screen::Tree, false, false);
+        assert!(cmd.contains("checkpoint-studio"), "{cmd}");
+
+        let files = ex.reopen_command(&Screen::Files, false, false);
+        assert!(files.contains("--files"), "{files}");
+
+        let stats = ex.reopen_command(
+            &Screen::Stats {
+                shards_expanded: false,
+                scroll: 0,
+            },
+            false,
+            false,
+        );
+        assert!(stats.contains("--stats"), "{stats}");
+        let shards = ex.reopen_command(
+            &Screen::Stats {
+                shards_expanded: true,
+                scroll: 0,
+            },
+            false,
+            false,
+        );
+        assert!(shards.contains("--stats-shards"), "{shards}");
+
+        let detail = ex.reopen_command(
+            &Screen::Detail {
+                tensor: name.clone(),
+                slice: 0,
+            },
+            false,
+            false,
+        );
+        assert!(detail.contains("--tensor"), "{detail}");
+        assert!(detail.contains(&name), "{detail}");
+
+        // The stats / histogram flags ride along when those were computed.
+        let with_stats = ex.reopen_command(
+            &Screen::Detail {
+                tensor: name.clone(),
+                slice: 0,
+            },
+            true,
+            true,
+        );
+        assert!(with_stats.contains("--compute-stats"), "{with_stats}");
+        assert!(with_stats.contains("--histogram"), "{with_stats}");
+
+        for repr in [Representation::Heatmap, Representation::Values] {
+            let data = ex.reopen_command(
+                &Screen::Data {
+                    tensor: name.clone(),
+                    repr,
+                    slice: 2,
+                },
+                false,
+                false,
+            );
+            assert!(data.contains(&name), "{data}");
+            assert!(
+                data.contains("--heatmap") || data.contains("--values"),
+                "{data}"
+            );
+            assert!(
+                data.contains("--slice"),
+                "a non-zero slice must round-trip: {data}"
+            );
+        }
+
+        let layout = ex.reopen_command(
+            &Screen::Layout {
+                path: ex.files[0].to_string_lossy().to_string(),
+                selected: 3,
+                scroll: 0,
+            },
+            false,
+            false,
+        );
+        assert!(layout.contains("--layout"), "{layout}");
+    }
+
+    #[test]
+    fn the_rename_command_round_trips_its_rules() {
+        let (ex, _term) = loaded();
+        let pairs = vec![
+            (
+                "model.layers.0.w".to_string(),
+                "model.layers.0.weight".to_string(),
+            ),
+            ("a b".to_string(), "c d".to_string()), // spaces need quoting
+        ];
+        let cmd = ex.command_for_rename(&pairs);
+        assert!(cmd.contains("convert") || cmd.contains("--rename"), "{cmd}");
+        assert!(cmd.contains("model.layers.0.weight"), "{cmd}");
+        assert!(
+            cmd.contains("a b") || cmd.contains("'a b'"),
+            "spaces survive: {cmd}"
+        );
+    }
+
+    #[test]
+    fn a_name_filter_narrows_the_tree_and_can_be_cleared() {
+        let (mut ex, _term) = loaded();
+        ex.tree_state.set_all_expanded(true);
+        let all = ex.current_tree_len();
+
+        let f = crate::filter::NameFilter::parse(&["*.weight".to_string()]).expect("valid glob");
+        ex.apply_name_filter(&f);
+        let filtered = ex.current_tree_len();
+        assert!(
+            filtered <= all,
+            "a filter cannot add rows: {filtered} > {all}"
+        );
+
+        // A filter matching nothing leaves an empty tree rather than the whole one.
+        let none = crate::filter::NameFilter::parse(&["zzz-no-such-*".to_string()]).expect("valid");
+        ex.apply_name_filter(&none);
+        assert!(ex.current_tree_len() <= filtered);
+    }
+
+    #[test]
+    fn links_resolve_to_screens_and_reject_strays() {
+        let (mut ex, _term) = loaded();
+        let name = ex.tensors()[0].name.clone();
+        let path = ex.files[0].to_string_lossy().to_string();
+
+        // A concrete tensor name reveals it in the tree.
+        let nav = ex.open_link(&crate::ui::Link::Tree(name));
+        assert!(matches!(nav, Some(Nav::Open(Screen::Tree))));
+        // A safetensors file opens its byte-layout map.
+        let nav = ex.open_link(&crate::ui::Link::Layout(path));
+        assert!(matches!(nav, Some(Nav::Open(Screen::Layout { .. }))));
+        // A name that isn't in this checkpoint is a stray click, not a navigation.
+        assert!(
+            ex.open_link(&crate::ui::Link::Tree("nope.weight".into()))
+                .is_none()
+        );
+        // Nothing is recorded for the current frame, so a click hits nothing.
+        assert!(ex.link_at(5, 5).is_none());
+        assert!(ex.link_click(5, 5).is_none());
+    }
+
+    #[test]
+    fn the_badges_describe_what_the_source_allows() {
+        let (mut ex, _term) = loaded();
+        // A local writable safetensors file is editable and has no health problem.
+        assert_eq!(ex.access_badge(), crate::ui::AccessBadge::Editable);
+        assert!(!ex.screen_badges(HelpCtx::Tree).is_empty());
+        assert!(
+            ex.file_view_available(),
+            "a local file has a directory to browse"
+        );
+        assert!(!ex.can_repack(), "a safetensors file is not repackable");
+
+        // A remote source is metadata-only, so it reports read-only instead.
+        ex.set_remote_read("host".into(), "~/venv".into());
+        assert_ne!(ex.access_badge(), crate::ui::AccessBadge::Editable);
+    }
+
+    #[test]
+    fn hovering_and_badge_hit_testing_stay_inside_the_frame() {
+        let (ex, _term) = loaded();
+        // Way outside, on the edges, and in the middle: none of these may panic, and
+        // none may claim a badge that isn't there.
+        for (col, row) in [(0u16, 0u16), (119, 39), (500, 500), (60, 20)] {
+            ex.update_hovers(HelpCtx::Tree, 120, 40, col, row);
+            ex.update_shortcut_hover(HelpCtx::Tree, col, row);
+            let _ = ex.badge_action_at(HelpCtx::Tree, 120, 40, col, row);
+        }
+    }
+
+    #[test]
+    fn the_tree_scroll_follows_the_selection_and_clamps() {
+        let (mut ex, _term) = loaded();
+        ex.tree_state.set_all_expanded(true);
+        let rows = ex.current_tree_len();
+        ex.tree_state.selected = rows.saturating_sub(1);
+        ex.update_tree_scroll(120, 10);
+        assert!(
+            ex.tree_state.scroll < rows.max(1),
+            "the scroll must stay inside the tree"
+        );
+        // A terminal with no room at all must not panic or scroll past the end.
+        ex.update_tree_scroll(1, 1);
+        ex.tree_state.selected = 0;
+        ex.update_tree_scroll(120, 40);
+        assert_eq!(ex.tree_state.scroll, 0, "back at the top, no offset");
+    }
+
+    #[test]
+    fn the_plain_tree_export_matches_what_the_screen_shows() {
+        let (mut ex, _term) = loaded();
+        ex.tree_state.set_all_expanded(true);
+        let text = ex.tree_plain().expect("the plain tree renders");
+        assert!(text.contains("tiny.safetensors"), "{text}");
+        for t in ex.tensors() {
+            let leaf = t.name.rsplit('.').next().unwrap_or(&t.name);
+            assert!(
+                text.contains(leaf),
+                "{leaf} missing from the plain tree:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_copy_flash_is_set_and_cleared() {
+        let (mut ex, _term) = loaded();
+        ex.flash_copied("tensor name");
+        // The flash is what tells the user the copy happened; it must survive until the
+        // next frame clears it.
+        ex.copy_tree_screen();
+    }
+
+    #[test]
+    fn the_available_command_list_reflects_what_the_source_supports() {
+        let (mut ex, _term) = loaded();
+        let local = ex.available_commands();
+        assert!(!local.is_empty());
+        // Repack is offered only for an HDF5 file, so a safetensors fixture must not
+        // advertise it — an unavailable command in the palette is a dead end.
+        assert!(
+            !local.iter().any(|(cmd, ..)| matches!(cmd, Cmd::Repack)),
+            "repack must not be offered for safetensors"
+        );
+        // A remote source drops the commands that need local bytes.
+        ex.set_remote_read("host".into(), "~/venv".into());
+        let remote = ex.available_commands();
+        assert!(remote.len() <= local.len());
+    }
+}

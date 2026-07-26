@@ -442,6 +442,19 @@ fn prepare_asset(path: &str, gzip: bool) -> Prepared {
             "public, max-age=31536000, immutable",
         ),
         Some(f) => (f.data.into_owned(), assets::content_type(rel), "no-cache"),
+        // A miss under `assets/` is a missing *fingerprinted* file — a stale
+        // index.html asking for a bundle a redeploy removed. Returning the SPA shell
+        // there hands the browser HTML to parse as JavaScript; a 404 lets it fail
+        // cleanly (and index.html is `no-cache`, so the next load self-heals).
+        None if rel.starts_with("assets/") => {
+            return Prepared {
+                status: 404,
+                body: Body::Owned(format!("no such asset: {rel}").into_bytes()),
+                content_type: "text/plain; charset=utf-8",
+                gzipped: false,
+                cache_control: Some("no-cache"),
+            };
+        }
         None => match assets::WebAssets::get("index.html") {
             Some(f) => (
                 f.data.into_owned(),
@@ -544,7 +557,167 @@ fn fqdn() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_query;
+    use std::path::PathBuf;
+
+    use super::{WebState, maybe_gzip, parse_query, prepare};
+
+    /// The request layer: routing, the JSON/asset split, caching, gzip and the panic
+    /// boundary. Exercised through `prepare` — the same function `handle` calls — so
+    /// these are the real responses a browser gets, minus the socket.
+    fn state() -> WebState {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.safetensors");
+        let files = vec![fixture];
+        let model = crate::readers::read_local(&files).expect("the fixture reads");
+        WebState::build(model, &files, &[])
+    }
+
+    #[test]
+    fn every_api_route_answers_with_json() {
+        let s = state();
+        let name = s.tensors[0].name.clone();
+        // The layout endpoint takes a shard basename, which is what the tensors carry.
+        let file = s.tensors[0]
+            .source_path
+            .rsplit('/')
+            .next()
+            .expect("a source path")
+            .to_string();
+        let cases = [
+            ("/api/tree", String::new()),
+            ("/api/files", String::new()),
+            ("/api/stats", String::new()),
+            ("/api/health", String::new()),
+            ("/api/check", String::new()),
+            ("/api/model", String::new()),
+            ("/api/tensor", format!("name={name}")),
+            ("/api/layout", format!("file={file}")),
+            ("/api/filter", "q=dtype:F16".to_string()),
+            ("/api/schema", "q=*".to_string()),
+        ];
+        for (path, query) in cases {
+            let out = prepare(&s, path, &query, false);
+            assert_eq!(out.status, 200, "{path}?{query} → {}", out.status);
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(out.body.as_slice()).is_ok(),
+                "{path} did not return JSON"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_api_route_is_a_404_with_an_error_envelope() {
+        let s = state();
+        let out = prepare(&s, "/api/nope", "", false);
+        assert_eq!(out.status, 404);
+        let body: serde_json::Value =
+            serde_json::from_slice(out.body.as_slice()).expect("an error envelope is JSON");
+        assert!(body.get("error").is_some(), "{body}");
+    }
+
+    #[test]
+    fn a_missing_tensor_is_reported_not_guessed() {
+        let s = state();
+        let out = prepare(&s, "/api/tensor", "name=no.such.tensor", false);
+        assert!(
+            out.status >= 400,
+            "expected an error status, got {}",
+            out.status
+        );
+        let body: serde_json::Value = serde_json::from_slice(out.body.as_slice()).expect("JSON");
+        assert!(body.get("error").is_some(), "{body}");
+    }
+
+    #[test]
+    fn the_spa_is_served_for_the_root_and_for_unknown_paths() {
+        // A client-routed URL (`/#detail?...` arrives as a path on reload) must get
+        // index.html, not a 404 — otherwise a deep link breaks on refresh.
+        for path in ["/", "/index.html", "/tree", "/some/client/route"] {
+            let out = prepare(&state(), path, "", false);
+            assert_eq!(out.status, 200, "{path} → {}", out.status);
+            assert!(
+                out.body.as_slice().starts_with(b"<!") || out.body.as_slice().starts_with(b"<html"),
+                "{path} did not return the SPA shell"
+            );
+        }
+    }
+
+    #[test]
+    fn assets_are_served_with_a_content_type_and_are_cacheable() {
+        let s = state();
+        let index =
+            String::from_utf8_lossy(prepare(&s, "/", "", false).body.as_slice()).to_string();
+        // Pull the hashed bundle names out of the shell and fetch them.
+        for ext in ["js", "css"] {
+            let needle = format!(".{ext}");
+            let Some(pos) = index.find(&needle) else {
+                continue;
+            };
+            let start = index[..pos].rfind("/assets/").expect("an asset path");
+            let path = &index[start..pos + needle.len()];
+            let out = prepare(&s, path, "", false);
+            assert_eq!(out.status, 200, "{path} → {}", out.status);
+            assert!(!out.body.as_slice().is_empty(), "{path} was empty");
+        }
+        // A missing asset is a 404, not the SPA shell (which would corrupt a script).
+        let out = prepare(&s, "/assets/nope-12345678.js", "", false);
+        assert_eq!(out.status, 404);
+    }
+
+    #[test]
+    fn gzip_is_applied_only_when_the_client_asks_and_it_helps() {
+        let s = state();
+        // A large JSON body compresses, and the compressed form is what's sent.
+        let plain = prepare(&s, "/api/model", "", false);
+        let zipped = prepare(&s, "/api/model", "", true);
+        assert_eq!(plain.status, 200);
+        assert!(
+            zipped.body.as_slice().len() <= plain.body.as_slice().len(),
+            "gzip made the body bigger: {} vs {}",
+            zipped.body.as_slice().len(),
+            plain.body.as_slice().len()
+        );
+        // `maybe_gzip` reports whether it actually encoded, so the header can't lie.
+        let (small, encoded) = maybe_gzip(b"tiny".to_vec(), true);
+        assert!(
+            !encoded || small.len() < 4,
+            "a tiny body isn't worth encoding"
+        );
+        let (raw, encoded) = maybe_gzip(b"whatever".to_vec(), false);
+        assert!(!encoded && raw == b"whatever");
+    }
+
+    #[test]
+    fn the_precomputed_bodies_are_cached_and_shared() {
+        let s = state();
+        // The second request for a static endpoint must reuse the first body rather than
+        // re-serialising it — an unbounded rebuild per request leaked 2 GB before.
+        let first = prepare(&s, "/api/tree", "", false);
+        let second = prepare(&s, "/api/tree", "", false);
+        assert_eq!(first.body.as_slice(), second.body.as_slice());
+        // The cache is keyed by endpoint name (see `STATIC_ENDPOINTS`), not by path.
+        assert!(
+            s.cached_body("tree", false).is_some(),
+            "the body was cached"
+        );
+        // Gzipped and plain are cached separately, so a mixed client set can't cross.
+        let _ = prepare(&s, "/api/tree", "", true);
+        assert!(s.cached_body("tree", true).is_some());
+        // A parameterised endpoint is not cached under the static key.
+        assert!(
+            s.cached_body("tensor", false).is_none(),
+            "a parameterised endpoint must not be cached"
+        );
+    }
+
+    #[test]
+    fn a_query_string_is_percent_decoded_per_value() {
+        let q = parse_query("name=model.layers.0%2Fw&dtype=F16&flag=");
+        assert_eq!(q.get("name").map(String::as_str), Some("model.layers.0/w"));
+        assert_eq!(q.get("dtype").map(String::as_str), Some("F16"));
+        assert_eq!(q.get("flag").map(String::as_str), Some(""));
+        assert!(q.get("missing").is_none());
+    }
 
     #[test]
     fn decodes_encoded_tensor_name() {
