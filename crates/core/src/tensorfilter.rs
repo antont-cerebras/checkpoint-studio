@@ -242,10 +242,9 @@ fn tokenize(q: &str) -> Vec<String> {
 }
 
 fn parse_term(tok: &str) -> Result<Term> {
-    let (negate, body) = match tok.strip_prefix('!') {
-        Some(rest) => (true, rest),
-        None => (false, tok),
-    };
+    let (negate, body) = tok
+        .strip_prefix('!')
+        .map_or((false, tok), |rest| (true, rest));
     let pred = match body.split_once(':') {
         // A bare word (no facet) is a name substring — `q_proj` just works.
         None => Predicate::Name(NameMatch::Substr(body.to_string())),

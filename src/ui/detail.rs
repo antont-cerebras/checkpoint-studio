@@ -264,15 +264,10 @@ pub(super) fn render_line_gauge(
     ratio: f64,
     max_line: Option<usize>,
 ) {
-    let area = match max_line {
-        // LineGauge lays out `label` then a space then the line, so bound the width
-        // to the label plus the wanted line length (clamped to what's available).
-        Some(cells) => Rect {
-            width: ((label.width() + 1 + cells) as u16).min(area.width),
-            ..area
-        },
-        None => area,
-    };
+    let area = max_line.map_or(area, |cells| Rect {
+        width: ((label.width() + 1 + cells) as u16).min(area.width),
+        ..area
+    });
     LineGauge::default()
         .line_set(ratatui::symbols::line::THICK)
         .filled_style(

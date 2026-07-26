@@ -277,22 +277,27 @@ impl UI {
 
         // Second line: a transient copy confirmation (green, shown verbatim)
         // overrides the dimmed source file.
-        let row1 = if let Some(flash) = config.copied_flash {
-            Line::from(Span::styled(
-                flash.to_string(),
-                Style::default()
-                    .fg(palette::SUCCESS)
-                    .add_modifier(Modifier::BOLD),
-            ))
-        } else if !config.status_secondary.is_empty() {
-            let text = truncate_keep_end(config.status_secondary, max_text);
-            Line::from(Span::styled(
-                format!("   {text}"),
-                Style::default().fg(palette::DIM),
-            ))
-        } else {
-            Line::default()
-        };
+        let row1 = config.copied_flash.map_or_else(
+            || {
+                if config.status_secondary.is_empty() {
+                    Line::default()
+                } else {
+                    let text = truncate_keep_end(config.status_secondary, max_text);
+                    Line::from(Span::styled(
+                        format!("   {text}"),
+                        Style::default().fg(palette::DIM),
+                    ))
+                }
+            },
+            |flash| {
+                Line::from(Span::styled(
+                    flash.to_string(),
+                    Style::default()
+                        .fg(palette::SUCCESS)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            },
+        );
         Paragraph::new(row1).render(
             Rect {
                 x: 0,
@@ -469,10 +474,8 @@ fn tree_node_line(
             stored_size,
         } => {
             let arrow = if *expanded { "▾" } else { "▸" };
-            let layer_prefix = match layer_count(children) {
-                Some(n) => format!("≡ {n}, "),
-                None => String::new(),
-            };
+            let layer_prefix =
+                layer_count(children).map_or_else(String::new, |n| format!("≡ {n}, "));
             let size_field = if stored_size == total_size {
                 format_size(*total_size)
             } else {

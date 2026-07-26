@@ -1462,10 +1462,9 @@ impl Explorer {
         // can't. Capture the intent and the bin count, then strip the histogram
         // from the request so `open_requested` only applies the dtype/shape/slice
         // overrides (and doesn't kick off the interactive scan).
-        let (want_hist, want_stats, bins) = match &self.open {
-            Some(r) => (r.histogram.on(), r.compute_stats, r.histogram.bins()),
-            None => (false, false, None),
-        };
+        let (want_hist, want_stats, bins) = self.open.as_ref().map_or((false, false, None), |r| {
+            (r.histogram.on(), r.compute_stats, r.histogram.bins())
+        });
         let want_legend = self.open.as_ref().is_some_and(|r| r.legend);
         let want_health_findings = self.open.as_ref().is_some_and(|r| r.health.findings());
         let want_health =
@@ -1787,10 +1786,7 @@ impl Explorer {
         } else {
             self.cached_stats(&tensor, view)
         };
-        let stats_view = match &stats {
-            Some(s) => StatsView::Ready(s),
-            None => StatsView::Pending,
-        };
+        let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
         let overlay = want_legend.then_some(Overlay::Legend(Legend::Detail));
         self.detail_plain(
             &tensor,
@@ -1839,10 +1835,7 @@ impl Explorer {
             },
         };
         let stats = self.compute_stats_sync(&tensor, view);
-        let stats_view = match &stats {
-            Some(s) => StatsView::Ready(s),
-            None => StatsView::Pending,
-        };
+        let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
         let legend = match repr {
             Representation::Heatmap => Legend::Heatmap,
             Representation::Values => Legend::Values,
@@ -2869,7 +2862,7 @@ impl Explorer {
     /// The file browser's command palette (Space or `:`) — the file-view analogue
     /// of [`Self::command_palette`], over [`FILE_COMMANDS`].
     fn file_command_palette(&mut self, term: &mut crate::tui::LiveTerminal) -> Option<FileCmd> {
-        let entries = self.available_file_commands();
+        let entries = Self::available_file_commands();
         self.run_palette(term, entries, HelpCtx::Files, |s, f| {
             s.render_files_frame(f, true);
         })
@@ -3030,8 +3023,9 @@ impl Explorer {
             // Local: assemble the browser from the cached directory walk in the
             // model (no `readdir`/`stat` on `Tab`). Falls back to a fresh walk only
             // if the model wasn't populated.
-            None => match self.checkpoint() {
-                Some(cp) => {
+            None => self.checkpoint().map_or_else(
+                || Ok(crate::filetree::build(&self.browse_root, 8)),
+                |cp| {
                     let root = &self.browse_root;
                     let mut listing: HashMap<PathBuf, Vec<crate::filetree::DirEntry>> =
                         HashMap::new();
@@ -3054,9 +3048,8 @@ impl Explorer {
                     }
                     let list = move |p: &Path| listing.get(p).cloned().unwrap_or_default();
                     Ok(crate::filetree::build_from(&list, root, 8))
-                }
-                None => Ok(crate::filetree::build(&self.browse_root, 8)),
-            },
+                },
+            ),
             Some(RemoteBrowse::Sftp(dir)) => {
                 // Fetch the whole tree in one SFTP channel + one batch `stat -L`
                 // (up front), then assemble it from the in-memory listing — so the
@@ -3125,7 +3118,7 @@ impl Explorer {
     }
 
     /// One screenful of file rows, to size a PageUp/PageDown jump.
-    fn file_page_rows(&self) -> usize {
+    fn file_page_rows() -> usize {
         let (w, h) = terminal::size().unwrap_or((80, 40));
         UI::visible_file_rows(w, h)
     }
@@ -3466,7 +3459,7 @@ impl Explorer {
 
     /// The file browser's commands available now (no preconditions — the whole
     /// registry), for its palette.
-    fn available_file_commands(&self) -> Vec<FileCmdEntry> {
+    fn available_file_commands() -> Vec<FileCmdEntry> {
         FILE_COMMANDS.to_vec()
     }
 
@@ -3655,7 +3648,6 @@ impl Explorer {
     /// How many segments to move the layout selection for one PageUp/PageDown —
     /// the number of bands currently on screen (at least one).
     fn layout_page_segments(
-        &self,
         map: &crate::safelayout::LayoutMap,
         size: Option<ratatui::layout::Size>,
     ) -> usize {
@@ -3713,6 +3705,7 @@ impl Explorer {
         selected: usize,
         scroll: usize,
     ) {
+        const HIGHLIGHT_CAP: usize = 256 << 10; // 256 KiB of header JSON
         const CAP: u64 = 2 << 20; // 2 MiB — a shard's header is far smaller
         // The JSON length `N` (the file's first 8 bytes hold this as a u64 LE).
         let n = map.header_len.saturating_sub(8);
@@ -3735,7 +3728,6 @@ impl Explorer {
                 // Syntax-highlighting a big header (colored_json + ANSI parse) is
                 // slow, so only colour modest headers; a large one renders plain
                 // (pretty-printed, uncoloured) — instant. `c` still copies the raw.
-                const HIGHLIGHT_CAP: usize = 256 << 10; // 256 KiB of header JSON
                 let json_lines = if json.len() <= HIGHLIGHT_CAP {
                     crate::ui::highlight_json_lines_inline(&json)
                 } else {
@@ -3915,26 +3907,29 @@ impl Explorer {
                     // Files sharing a directory show + copy that directory; files
                     // that don't show a span and copy the first (nothing shared).
                     n => {
-                        if let Some(dir) = common_dir(&files) {
-                            SelectionView {
+                        common_dir(&files).map_or_else(
+                            || {
+                                // Both ends of the set, or (for an empty one) empty names —
+                                // the count in the message is what carries the information.
+                                let first = files.iter().next().cloned().unwrap_or_default();
+                                let last = files.iter().next_back().cloned().unwrap_or_default();
+                                let (first_name, last_name) = (file_name(&first), file_name(&last));
+                                SelectionView {
+                                    status: (
+                                        "▸",
+                                        format!(
+                                            "stored across {n} files: {first_name} … {last_name}"
+                                        ),
+                                        String::new(),
+                                    ),
+                                    copy_path: Some(first),
+                                }
+                            },
+                            |dir| SelectionView {
                                 status: ("▸", format!("{n} files in {dir}"), String::new()),
                                 copy_path: Some(dir),
-                            }
-                        } else {
-                            // Both ends of the set, or (for an empty one) empty names —
-                            // the count in the message is what carries the information.
-                            let first = files.iter().next().cloned().unwrap_or_default();
-                            let last = files.iter().next_back().cloned().unwrap_or_default();
-                            let (first_name, last_name) = (file_name(&first), file_name(&last));
-                            SelectionView {
-                                status: (
-                                    "▸",
-                                    format!("stored across {n} files: {first_name} … {last_name}"),
-                                    String::new(),
-                                ),
-                                copy_path: Some(first),
-                            }
-                        }
+                            },
+                        )
                     }
                 }
             }
@@ -3985,7 +3980,7 @@ impl Explorer {
 
     /// One screenful of tree rows, used to size a PageUp/PageDown jump so it
     /// matches what's currently visible.
-    fn page_rows(&self) -> usize {
+    fn page_rows() -> usize {
         let height = terminal::size().map_or(40, |(_, h)| h);
         UI::visible_tree_rows(height)
     }
@@ -4102,7 +4097,7 @@ impl Explorer {
         match self.handle_selection() {
             (Some(screen), _) => Some(Nav::Open(screen)),
             (None, Some(info)) => {
-                self.show_metadata_detail(term, &info);
+                Self::show_metadata_detail(term, &info);
                 None
             }
             (None, None) => None,
@@ -4522,10 +4517,7 @@ impl Explorer {
         if ready {
             self.scan_histogram(term, tensor, view, |term, snap, scanning, overlay| {
                 let stats = self.cached_stats(tensor, view);
-                let sv = match &stats {
-                    Some(s) => StatsView::Ready(s),
-                    None => StatsView::Pending,
-                };
+                let sv = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
                 let _ = term.draw(|f| {
                     self.render_detail_frame(
                         f,
@@ -4924,7 +4916,6 @@ impl Explorer {
     /// element count. Enter on an empty entry clears any override; `Esc`
     /// cancels. Prefilled with the current override, if any.
     fn prompt_reshape(
-        &self,
         term: &mut crate::tui::LiveTerminal,
         background: impl Fn(&mut ratatui::Frame),
         tensor: &TensorInfo,
@@ -4988,7 +4979,6 @@ impl Explorer {
     }
 
     fn prompt_slice(
-        &self,
         term: &mut crate::tui::LiveTerminal,
         background: impl Fn(&mut ratatui::Frame),
         slices: usize,
@@ -5031,7 +5021,7 @@ impl Explorer {
         }
     }
 
-    fn show_metadata_detail(&self, term: &mut crate::tui::LiveTerminal, metadata: &MetadataInfo) {
+    fn show_metadata_detail(term: &mut crate::tui::LiveTerminal, metadata: &MetadataInfo) {
         if term
             .draw(|f| UI::render_metadata_detail(f, metadata))
             .is_ok()
@@ -5180,26 +5170,25 @@ impl Explorer {
             return;
         };
         let default = default_repacked_name(&input);
-        let Some(output) = self.prompt_output_path(term, &default) else {
+        let Some(output) = Self::prompt_output_path(term, &default) else {
             return;
         };
-        let Some(codec) = self.prompt_codec(term) else {
+        let Some(codec) = Self::prompt_codec(term) else {
             return;
         };
-        if !self.confirm_same_codec(term, &input, codec) {
+        if !Self::confirm_same_codec(term, &input, codec) {
             return;
         }
-        let Some(buffer_bytes) = self.prompt_buffer(term) else {
+        let Some(buffer_bytes) = Self::prompt_buffer(term) else {
             return;
         };
-        self.run_repack(term, &input, &output, codec, buffer_bytes);
+        Self::run_repack(term, &input, &output, codec, buffer_bytes);
     }
 
     /// If the source already uses `codec`, ask whether to re-encode anyway
     /// (a plain copy would be equivalent). Returns `true` to proceed.
     #[cfg(feature = "hdf5")]
     fn confirm_same_codec(
-        &self,
         term: &mut crate::tui::LiveTerminal,
         input: &Path,
         codec: crate::codec::Codec,
@@ -5232,7 +5221,6 @@ impl Explorer {
 
     #[cfg(not(feature = "hdf5"))]
     fn confirm_same_codec(
-        &self,
         _term: &mut crate::tui::LiveTerminal,
         _input: &Path,
         _codec: crate::codec::Codec,
@@ -5241,7 +5229,7 @@ impl Explorer {
     }
 
     /// Pick the output compression codec from a menu. Returns `None` if cancelled.
-    fn prompt_codec(&self, term: &mut crate::tui::LiveTerminal) -> Option<crate::codec::Codec> {
+    fn prompt_codec(term: &mut crate::tui::LiveTerminal) -> Option<crate::codec::Codec> {
         use crate::codec::Codec;
         let codecs = [Codec::Gzip, Codec::Zstd, Codec::Lz4, Codec::Uncompressed];
         let labels: Vec<&str> = codecs.iter().map(|c| c.label()).collect();
@@ -5273,7 +5261,6 @@ impl Explorer {
     /// Prompt for the histogram bucket count, pre-filled with the current count.
     /// An empty entry returns to the automatic count; `Esc` leaves it unchanged.
     fn prompt_bins(
-        &self,
         term: &mut crate::tui::LiveTerminal,
         background: impl Fn(&mut ratatui::Frame),
         current: Option<usize>,
@@ -5300,7 +5287,7 @@ impl Explorer {
         .unwrap_or(BinsChoice::Cancel)
     }
 
-    fn prompt_buffer(&self, term: &mut crate::tui::LiveTerminal) -> Option<usize> {
+    fn prompt_buffer(term: &mut crate::tui::LiveTerminal) -> Option<usize> {
         run_text_prompt(
             term,
             "Streaming buffer size (e.g. 64M, 256M, 1G)",
@@ -5352,11 +5339,7 @@ impl Explorer {
         )
     }
 
-    fn prompt_output_path(
-        &self,
-        term: &mut crate::tui::LiveTerminal,
-        default: &Path,
-    ) -> Option<PathBuf> {
+    fn prompt_output_path(term: &mut crate::tui::LiveTerminal, default: &Path) -> Option<PathBuf> {
         run_text_prompt(
             term,
             "Save repacked checkpoint as",
@@ -5376,7 +5359,6 @@ impl Explorer {
 
     #[cfg(feature = "hdf5")]
     fn run_repack(
-        &self,
         term: &mut crate::tui::LiveTerminal,
         input: &Path,
         output: &Path,
@@ -5414,7 +5396,6 @@ impl Explorer {
 
     #[cfg(not(feature = "hdf5"))]
     fn run_repack(
-        &self,
         term: &mut crate::tui::LiveTerminal,
         _input: &Path,
         _output: &Path,
@@ -5478,9 +5459,7 @@ impl Explorer {
         // Compute it now if it isn't cached, so `report` is a value from here on rather
         // than an option that every later line knows is `Some`.
         let cached = self.cached_check.borrow().clone();
-        let mut report = if let Some(report) = cached {
-            report
-        } else {
+        let mut report = cached.unwrap_or_else(|| {
             let _ = term.draw(|f| {
                 self.render_tree_frame(f, true);
                 UI::render_notice(f, "Running health checks…");
@@ -5504,7 +5483,7 @@ impl Explorer {
             );
             *self.cached_check.borrow_mut() = Some(computed.clone());
             computed
-        };
+        });
 
         // What was just copied (and when), so the footer can flash it briefly.
         let mut copied_at: Option<(std::time::Instant, &'static str)> = None;
@@ -5828,10 +5807,8 @@ impl Explorer {
     fn checkpoint_path_parts(&self) -> Vec<String> {
         let host = self.remote_scp_host();
         let render = |s: &str| -> String {
-            match &host {
-                Some(h) => shell_quote(&format!("{h}:{s}")),
-                None => shell_quote(s),
-            }
+            host.as_ref()
+                .map_or_else(|| shell_quote(s), |h| shell_quote(&format!("{h}:{s}")))
         };
         match self.files.as_slice() {
             [] => Vec::new(),
@@ -5841,10 +5818,10 @@ impl Explorer {
                     .iter()
                     .map(|p| p.to_string_lossy().into_owned())
                     .collect();
-                match common_dir(&set) {
-                    Some(dir) => vec![render(&dir)],
-                    None => many.iter().map(|p| render(&p.to_string_lossy())).collect(),
-                }
+                common_dir(&set).map_or_else(
+                    || many.iter().map(|p| render(&p.to_string_lossy())).collect(),
+                    |dir| vec![render(&dir)],
+                )
             }
         }
     }
@@ -5897,10 +5874,9 @@ impl Explorer {
         } else {
             None
         };
-        match state {
-            Some(s) => vec!["--tree-state".to_string(), s.label().to_string()],
-            None => Vec::new(),
-        }
+        state.map_or_else(Vec::new, |s| {
+            vec!["--tree-state".to_string(), s.label().to_string()]
+        })
     }
 
     /// The command `y` copies from the tree: when a tensor row is highlighted

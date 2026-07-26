@@ -381,6 +381,21 @@ struct BarView<'a> {
 /// arithmetic here is what keeps a line from wrapping (a wrapped line breaks the
 /// fixed-height in-place redraw), and inside the thread there was no way to check it
 /// without a terminal and an eyeball.
+/// The dimmed step text that trails the timer, fitted to the `room` columns left over —
+/// the full phrase, the terse one, or nothing at all.
+///
+/// A function rather than a closure chain at the call site so the three outcomes read
+/// top-to-bottom: no step to report, a step that doesn't fit, a step that does.
+fn stage_text(stage: Option<Stage>, room: usize) -> String {
+    let Some(s) = stage else {
+        return String::new();
+    };
+    match fit_stage(room, s.label(), s.short()) {
+        "" => String::new(),
+        text => format!("  {DIM}{text}{RESET}"),
+    }
+}
+
 fn render_line(v: &BarView, frame: usize, cols: usize) -> String {
     let (color, mark) = match v.state {
         OK => (DONE, '✓'),
@@ -500,17 +515,10 @@ fn render_line(v: &BarView, frame: usize, cols: usize) -> String {
     // count still says what it's doing. Only while running: a finished `✓` line
     // shouldn't claim to still be reading. Sized to the columns left over, so it never
     // pushes the line into wrapping.
-    let stage = match v.stage.filter(|_| v.state == RUNNING) {
-        None => String::new(),
-        Some(s) => match fit_stage(
-            cols.saturating_sub(width(&label, gauge_cols, count_cols)),
-            s.label(),
-            s.short(),
-        ) {
-            "" => String::new(),
-            text => format!("  {DIM}{text}{RESET}"),
-        },
-    };
+    let stage = stage_text(
+        v.stage.filter(|_| v.state == RUNNING),
+        cols.saturating_sub(width(&label, gauge_cols, count_cols)),
+    );
     // `\r` + text + clear-to-EOL (`\x1b[K` *after* the text, so there's no
     // blank-then-fill flash) — overwrites the line in place.
     format!("\r  {color}{mark}{RESET} {DIM}{label}{RESET}{gauge}{count}{timer}{stage}\x1b[K\n")

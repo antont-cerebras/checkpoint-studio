@@ -64,35 +64,37 @@ fn dataset_info(file: &hdf5_metno::File, key: &str, source_path: &str) -> Option
     let shape = dataset.shape();
     let num_elements: usize = shape.iter().product();
 
-    let (dtype, item_size) = match dataset.dtype() {
-        Ok(dt) => {
+    let (dtype, item_size) = dataset.dtype().map_or_else(
+        |_| ("?".to_string(), 0),
+        |dt| {
             let item = dt.size();
             let name = dt
                 .to_descriptor()
                 .ok()
                 .map_or_else(|| "?".to_string(), |d| dtype_name(&d));
             (name, item)
-        }
-        Err(_) => ("?".to_string(), 0),
-    };
+        },
+    );
 
     // Logical (uncompressed) size, and the on-disk size when a compression
     // filter is in the pipeline.
     let size_bytes = num_elements * item_size;
-    let storage = match dataset.filters().iter().find_map(compression_codec) {
-        Some(codec) => {
-            let stored = dataset.storage_size() as usize;
-            if stored > 0 {
-                Storage::Compressed {
-                    codec,
-                    stored_bytes: stored,
+    let storage =
+        dataset
+            .filters()
+            .iter()
+            .find_map(compression_codec)
+            .map_or(Storage::Raw, |codec| {
+                let stored = dataset.storage_size() as usize;
+                if stored > 0 {
+                    Storage::Compressed {
+                        codec,
+                        stored_bytes: stored,
+                    }
+                } else {
+                    Storage::Raw
                 }
-            } else {
-                Storage::Raw
-            }
-        }
-        None => Storage::Raw,
-    };
+            });
 
     // HDF5 data is chunked rather than a flat slice; report the chunk shape
     // and count when present.

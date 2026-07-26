@@ -788,10 +788,10 @@ impl CheckpointStats {
         // Experts.
         if let Some(x) = &self.experts {
             out.push(String::new());
-            let count = match x.layout.per_layer() {
-                Some(pl) => format!("  ×{pl} per layer"),
-                None => String::new(),
-            };
+            let count = x
+                .layout
+                .per_layer()
+                .map_or_else(String::new, |pl| format!("  ×{pl} per layer"));
             out.push(format!("{GLYPH_EXPERTS} Experts{count}"));
             let mut storage = x.layout.label().to_string();
             if x.gate_up_fused {
@@ -1139,9 +1139,8 @@ fn expert_stats(
     // fused: the per-layer count is the declared config count, else the leading
     // dimension of a stacked expert tensor (its expert axis), else unknown.
     let max_expert_idx = tensors.iter().filter_map(|t| expert_index(&t.name)).max();
-    let layout = match max_expert_idx {
-        Some(m) => ExpertLayout::Unfused { per_layer: m + 1 },
-        None => ExpertLayout::Fused {
+    let layout = max_expert_idx.map_or_else(
+        || ExpertLayout::Fused {
             per_layer: config
                 .and_then(|c| c.num_experts)
                 .map(|n| n as usize)
@@ -1152,7 +1151,8 @@ fn expert_stats(
                         .map(|t| t.shape[0])
                 }),
         },
-    };
+        |m| ExpertLayout::Unfused { per_layer: m + 1 },
+    );
 
     // Layers carrying experts, the expert totals, and the per-projection split.
     let mut layers = BTreeSet::new();

@@ -613,10 +613,10 @@ impl RemoteRead {
             for _ in 1..workers {
                 handles.push(s.spawn(move || {
                     let mut pw = password.cloned();
-                    match self.open_with(&mut pw) {
-                        Ok(extra) => extra.read_shards(files, displays, next, progress),
-                        Err(_) => Ok(Vec::new()), // one fewer reader; others cover it
-                    }
+                    self.open_with(&mut pw).map_or_else(
+                        |_| Ok(Vec::new()),
+                        |extra| extra.read_shards(files, displays, next, progress),
+                    )
                 }));
             }
             handles
@@ -663,30 +663,27 @@ impl RemoteRead {
         // index (references shards that aren't there, or lists tensors a shard
         // doesn't hold) surfaces in the tree's health popup and `⚠ health` badge,
         // just as for a local checkpoint.
-        let health = match index_path {
-            Some(index_path) => {
-                let mut present_by_file: HashMap<String, BTreeSet<String>> = HashMap::new();
-                for t in &tensors {
-                    if let Some(name) = std::path::Path::new(&t.source_path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                    {
-                        present_by_file
-                            .entry(name.to_string())
-                            .or_default()
-                            .insert(t.name.clone());
-                    }
-                }
-                let report =
-                    crate::health::reconcile(&index_path, &weight_map, &actual, &present_by_file);
-                if report.has_issues() {
-                    vec![report]
-                } else {
-                    Vec::new()
+        let health = index_path.map_or_else(Vec::new, |index_path| {
+            let mut present_by_file: HashMap<String, BTreeSet<String>> = HashMap::new();
+            for t in &tensors {
+                if let Some(name) = std::path::Path::new(&t.source_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                {
+                    present_by_file
+                        .entry(name.to_string())
+                        .or_default()
+                        .insert(t.name.clone());
                 }
             }
-            None => Vec::new(),
-        };
+            let report =
+                crate::health::reconcile(&index_path, &weight_map, &actual, &present_by_file);
+            if report.has_issues() {
+                vec![report]
+            } else {
+                Vec::new()
+            }
+        });
 
         Ok(RemoteCheckpoint {
             tensors,
@@ -1000,13 +997,13 @@ fn cstorch_prelude(script: &str) -> String {
     // in place well before any `cstorch.load`.
     const FUTURE: &str = "from __future__ import annotations\n";
     let prelude = include_str!("python/cstorch_fast.py");
-    match script.find(FUTURE) {
-        Some(i) => {
+    script.find(FUTURE).map_or_else(
+        || format!("{prelude}\n{script}"),
+        |i| {
             let cut = i + FUTURE.len();
             format!("{}\n{}\n{}", &script[..cut], prelude, &script[cut..])
-        }
-        None => format!("{prelude}\n{script}"),
-    }
+        },
+    )
 }
 
 fn with_params(template: &str, params: &serde_json::Value) -> String {
@@ -1439,10 +1436,9 @@ fn parse_repack_result(v: &serde_json::Value) -> RepackResult {
 fn parse_tensor_diff(v: &serde_json::Value) -> RemoteTensorDiff {
     let error = v.get("error").and_then(|e| e.as_str()).map(str::to_string);
     let values = v.get("values").and_then(parse_value_fields);
-    let (hist_shift, hist_full) = match v.get("histogram") {
-        Some(h) => (parse_hist_shift(h), parse_hist_full(h)),
-        None => (None, None),
-    };
+    let (hist_shift, hist_full) = v
+        .get("histogram")
+        .map_or((None, None), |h| (parse_hist_shift(h), parse_hist_full(h)));
     RemoteTensorDiff {
         values,
         hist_shift,

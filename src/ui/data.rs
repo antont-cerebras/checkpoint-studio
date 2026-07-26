@@ -272,10 +272,7 @@ impl UI {
             // Row striping bands the whole line; carried as a per-span background
             // so the index label is included like the raw path's band start.
             let row_bg = (stripe == StripeMode::Rows).then(|| band(i));
-            let bg_style = |base: Style| match row_bg {
-                Some(c) => base.bg(c),
-                None => base,
-            };
+            let bg_style = |base: Style| row_bg.map_or(base, |c| base.bg(c));
             let mut spans: Vec<Span> = Vec::new();
             // Dimmed row index.
             spans.push(Span::styled(
@@ -295,10 +292,7 @@ impl UI {
                             .get(i)
                             .and_then(|r| r.get(j))
                             .map(|&rb| crate::sample::format_int_bits(rb, signed));
-                        match exact {
-                            Some(s) => format!("{s:>cw$}"),
-                            None => format!("{:>cw$}", v as i64),
-                        }
+                        exact.map_or_else(|| format!("{:>cw$}", v as i64), |s| format!("{s:>cw$}"))
                     }
                     NumBase::Decimal => format!("{v:>cw$.3e}"),
                     _ => {
@@ -528,23 +522,19 @@ fn grid_cell_spans(
     } else {
         Style::default()
     };
-    let with_bg = |style: Style, bg: Option<ratatui::style::Color>| match bg {
-        Some(c) => style.bg(c),
-        None => style,
-    };
-    match col_bg {
-        // Leave the first column an uncoloured gutter (just the row band, if any)
-        // and band the rest, so the stripe is the same width for every column.
-        Some(c) => {
+    let with_bg =
+        |style: Style, bg: Option<ratatui::style::Color>| bg.map_or(style, |c| style.bg(c));
+    col_bg.map_or_else(
+        || vec![Span::styled(s.to_string(), with_bg(base, row_bg))],
+        |c| {
             let split = s.char_indices().nth(1).map_or(s.len(), |(i, _)| i);
             let (gutter, band) = s.split_at(split);
             vec![
                 Span::styled(gutter.to_string(), with_bg(base, row_bg)),
                 Span::styled(band.to_string(), with_bg(base, Some(c))),
             ]
-        }
-        None => vec![Span::styled(s.to_string(), with_bg(base, row_bg))],
-    }
+        },
+    )
 }
 
 /// Describe a contiguous window's extent along one axis — e.g. `120–179` for the

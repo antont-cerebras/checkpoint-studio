@@ -99,6 +99,7 @@ impl Explorer {
         view: ViewDtype,
         render: impl Fn(&mut ratatui::Frame, StatsView<'_>),
     ) -> ScanOutcome {
+        const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         if self.cached_stats(tensor, view).is_some() {
             return ScanOutcome::Completed;
         }
@@ -120,7 +121,6 @@ impl Explorer {
             return ScanOutcome::Completed;
         };
 
-        const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         let mut frame = 0usize;
         while !handle.is_finished() {
             // Only animate once it's clearly not instant, to avoid a flash for
@@ -541,10 +541,10 @@ impl Explorer {
         // natural-sorted) tensors/metadata/config. A local read hands over the
         // serializable model; a remote read without an assembled model supplies
         // the parts directly. Dedup + natural-sort now live in the kernel.
-        self.session = Some(match model {
-            Some(cp) => crate::kernel::Session::from_model(cp),
-            None => crate::kernel::Session::from_parts(tensors, metadata, config),
-        });
+        self.session = Some(model.map_or_else(
+            || crate::kernel::Session::from_parts(tensors, metadata, config),
+            crate::kernel::Session::from_model,
+        ));
 
         let schemas = crate::sample::parse_packing_schemas(self.tensors(), self.metadata());
         self.packing_schemas = schemas;
@@ -572,6 +572,10 @@ impl Explorer {
     /// — other formats read their whole structure in one cheap header pass, and a
     /// multi-file checkpoint may hold the tensor in any shard. Returns whether the
     /// fast read succeeded; on `false` the caller does a normal full load.
+    // `self` is used throughout the `hdf5` branch below; without that feature the body is
+    // a stub that ignores it. The receiver stays so the one call site doesn't need two
+    // spellings — the same cfg-pair reasoning as `readers::read_hdf5_shard`.
+    #[allow(clippy::unused_self)]
     pub(super) fn try_load_single_tensor(&mut self, name: &str) -> bool {
         #[cfg(feature = "hdf5")]
         {

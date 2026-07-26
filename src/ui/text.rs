@@ -174,10 +174,10 @@ pub(super) fn view_dtype_spans(
         (ViewDtype::Unpacked, Some(l)) => Some(format!("{l} (unpacked)")),
         _ => view.label().map(str::to_string),
     };
-    match label {
-        Some(label) => vec![dim_span(format!("{stored} as ")), key_span(label)],
-        None => vec![Span::raw(stored.to_string())],
-    }
+    label.map_or_else(
+        || vec![Span::raw(stored.to_string())],
+        |label| vec![dim_span(format!("{stored} as ")), key_span(label)],
+    )
 }
 
 /// The shape span(s) beside the dtype: the shape plain, or a dimmed `stored as` followed by

@@ -91,17 +91,19 @@ impl PackingSchema {
 
     /// Display label: `u3×5` when uniform, else the explicit width list.
     pub fn label(&self) -> String {
-        match self.uniform_width() {
-            Some(w) => format!("u{w}×{}", self.len_p()),
-            None => format!(
-                "[{}]",
-                self.bit_widths
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
+        // Early return rather than `map_or_else`: the uniform case is the common one and
+        // one line long, and a closure pair would put the seven-line fallback first.
+        if let Some(w) = self.uniform_width() {
+            return format!("u{w}×{}", self.len_p());
         }
+        format!(
+            "[{}]",
+            self.bit_widths
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
     }
 
     #[must_use]
@@ -2141,10 +2143,10 @@ fn reduce_view_hist(
             let (mut total, mut nonfinite) = (0u64, 0u64);
             for container in chunk.chunks_exact(item) {
                 for sub in 0..packing {
-                    let v = match unpack {
-                        Some(s) => s.extract(container_word(container), sub) as f64,
-                        None => decode(container, sub),
-                    };
+                    let v = unpack.map_or_else(
+                        || decode(container, sub),
+                        |s| s.extract(container_word(container), sub) as f64,
+                    );
                     if v.is_finite() {
                         counts[bin_index(bins, n, v)] += 1;
                         total += 1;
@@ -2275,10 +2277,7 @@ fn read_sampled(
 
     // The unmerge decodes a single fixed field per container; its width sizes the
     // raw-bit fallback. Otherwise the view's own element width applies.
-    let width = match unpack {
-        Some(s) => s.width(field) as u8,
-        None => view.bit_width(dtype) as u8,
-    };
+    let width = unpack.map_or_else(|| view.bit_width(dtype) as u8, |s| s.width(field) as u8);
     let mut values = Vec::with_capacity(rows.len());
     let mut raw_rows = Vec::with_capacity(rows.len());
     for ((&r, &start), buf) in rows.iter().zip(&starts).zip(bufs) {

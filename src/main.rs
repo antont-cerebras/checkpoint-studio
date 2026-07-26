@@ -1546,10 +1546,9 @@ fn config_proxy_prefixed(p: &Path) -> bool {
 
 /// Strip the leading `:` config-proxy marker (a no-op when absent).
 fn strip_config_proxy_prefix(p: &Path) -> PathBuf {
-    match p.to_string_lossy().strip_prefix(':') {
-        Some(rest) => PathBuf::from(rest),
-        None => p.to_path_buf(),
-    }
+    p.to_string_lossy()
+        .strip_prefix(':')
+        .map_or_else(|| p.to_path_buf(), PathBuf::from)
 }
 
 /// Resolve a command's positional sources + its effective SSH proxy in one place:
@@ -1597,12 +1596,13 @@ fn split_reroot(p: &Path) -> (PathBuf, Option<String>) {
 /// scope. A `None` root keeps every name as-is. This is a scope change, not a rename:
 /// only the *match key* moves; each tensor keeps its real name for data I/O.
 fn scope_key(name: &str, root: Option<&str>) -> Option<String> {
-    match root {
-        None => Some(name.to_string()),
-        Some(p) => name
-            .strip_prefix(&format!("{}.", p.trim_end_matches('.')))
-            .map(str::to_string),
-    }
+    root.map_or_else(
+        || Some(name.to_string()),
+        |p| {
+            name.strip_prefix(&format!("{}.", p.trim_end_matches('.')))
+                .map(str::to_string)
+        },
+    )
 }
 
 /// A scoped copy of a tensor list for the structural summary: keep only the tensors
@@ -1635,6 +1635,7 @@ fn run_diff(
     old_root: Option<&str>,
     new_root: Option<&str>,
 ) -> i32 {
+    const MAX_SCHEMA_LINES: usize = 40;
     let load_local = |path: &Path| -> Result<SideLoad> {
         let (files, _index_specs) =
             collect_safetensors_files(std::slice::from_ref(&path.to_path_buf()), recursive, true)?;
@@ -1656,89 +1657,92 @@ fn run_diff(
     // later session — the two parallel structure reads and, for an s3-vs-s3 value
     // diff, the comparison session opened afterwards — so the whole run is one prompt.
     let mut password: Option<String> = None;
-    let loaded: Result<(SideLoad, SideLoad)> = match remote {
-        Some(r) => (|| -> Result<(SideLoad, SideLoad)> {
-            // Open both sessions up front so the one password prompt happens here,
-            // before the spinner. Opening is silent, so nothing is printed until
-            // we're actually connected — then announce the read (not before, when
-            // we're still authenticating and nothing is being read yet).
-            let sa = r.open_with(&mut password)?;
-            let sb = r.open_with(&mut password)?;
-            eprintln!(
-                "checkpoint-studio diff: reading each checkpoint's tensor list over ssh \
-                 (names/dtypes/shapes only — no tensor data is transferred) …"
-            );
-            let bars = progress::Bars::start(&[old_str.to_string(), new_str.to_string()]);
-            // If one side fails to load, there's no point finishing the *other*
-            // side's (slow) S3-object-metadata scan — the diff can't proceed. A
-            // failing read trips this flag; the sibling's read loop checks it between
-            // streamed progress lines and bails promptly.
-            let abort = std::sync::atomic::AtomicBool::new(false);
-            let read = |session: &sftp::RemoteSession, src: &str, i: usize| -> Result<SideLoad> {
-                let progress = bars.progress(i);
-                let out = r
-                    // `diff` compares S3 object metadata for s3-vs-s3 → fetch it.
-                    .read(
-                        session,
-                        src,
-                        &password,
-                        progress.as_deref(),
-                        remote::ObjectMeta::Fetch,
-                        Some(&abort),
-                    )
-                    .with_context(|| format!("reading {src}"));
-                // A failure trips the abort so the sibling stops promptly.
-                if out.is_err() {
-                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                // Distinguish an abort (this side was cut short — dim `⊘`) from a
-                // real failure (`✗`), so a fine-but-cancelled read doesn't look
-                // broken.
-                match &out {
-                    Ok(_) => bars.finish(i, true),
-                    Err(e) if is_aborted_err(e) => bars.abort(i),
-                    Err(_) => bars.finish(i, false),
-                }
-                // `diff` compares structure + (for s3://) S3 object metadata, not
-                // the on-disk footprint or health.
-                out.map(|rc| ((rc.tensors, rc.metadata), rc.s3))
-            };
-            let (ra, rb) = std::thread::scope(|s| {
-                let (oref, nref): (&str, &str) = (&old_str, &new_str);
-                let ta = s.spawn(|| read(&sa, oref, 0));
-                let tb = s.spawn(|| read(&sb, nref, 1));
-                (ta.join(), tb.join())
-            });
-            bars.join();
-            let ra = ra.map_err(|_| anyhow::anyhow!("remote read thread panicked"))?;
-            let rb = rb.map_err(|_| anyhow::anyhow!("remote read thread panicked"))?;
-            match (ra, rb) {
-                (Ok(a), Ok(b)) => Ok((a, b)),
-                (ra, rb) => {
-                    // At least one side failed. Prefer the *real* failure over an
-                    // abort-induced one (the sibling we cut short), so the reported
-                    // error names the checkpoint that actually couldn't load.
-                    Err(match (ra.err(), rb.err()) {
-                        (Some(ea), Some(eb)) => {
-                            if is_aborted_err(&ea) {
-                                eb
-                            } else {
-                                ea
-                            }
-                        }
-                        (Some(e), None) | (None, Some(e)) => e,
-                        (None, None) => unreachable!("matched the failure arm"),
-                    })
-                }
-            }
-        })(),
-        None => (|| {
+    let loaded: Result<(SideLoad, SideLoad)> = remote.map_or_else(
+        || {
             Ok((
                 load_local(old).with_context(|| format!("reading {}", old.display()))?,
                 load_local(new).with_context(|| format!("reading {}", new.display()))?,
             ))
-        })(),
-    };
+        },
+        |r| {
+            (|| -> Result<(SideLoad, SideLoad)> {
+                // Open both sessions up front so the one password prompt happens here,
+                // before the spinner. Opening is silent, so nothing is printed until
+                // we're actually connected — then announce the read (not before, when
+                // we're still authenticating and nothing is being read yet).
+                let sa = r.open_with(&mut password)?;
+                let sb = r.open_with(&mut password)?;
+                eprintln!(
+                    "checkpoint-studio diff: reading each checkpoint's tensor list over ssh \
+                 (names/dtypes/shapes only — no tensor data is transferred) …"
+                );
+                let bars = progress::Bars::start(&[old_str.to_string(), new_str.to_string()]);
+                // If one side fails to load, there's no point finishing the *other*
+                // side's (slow) S3-object-metadata scan — the diff can't proceed. A
+                // failing read trips this flag; the sibling's read loop checks it between
+                // streamed progress lines and bails promptly.
+                let abort = std::sync::atomic::AtomicBool::new(false);
+                let read =
+                    |session: &sftp::RemoteSession, src: &str, i: usize| -> Result<SideLoad> {
+                        let progress = bars.progress(i);
+                        let out = r
+                            // `diff` compares S3 object metadata for s3-vs-s3 → fetch it.
+                            .read(
+                                session,
+                                src,
+                                &password,
+                                progress.as_deref(),
+                                remote::ObjectMeta::Fetch,
+                                Some(&abort),
+                            )
+                            .with_context(|| format!("reading {src}"));
+                        // A failure trips the abort so the sibling stops promptly.
+                        if out.is_err() {
+                            abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        // Distinguish an abort (this side was cut short — dim `⊘`) from a
+                        // real failure (`✗`), so a fine-but-cancelled read doesn't look
+                        // broken.
+                        match &out {
+                            Ok(_) => bars.finish(i, true),
+                            Err(e) if is_aborted_err(e) => bars.abort(i),
+                            Err(_) => bars.finish(i, false),
+                        }
+                        // `diff` compares structure + (for s3://) S3 object metadata, not
+                        // the on-disk footprint or health.
+                        out.map(|rc| ((rc.tensors, rc.metadata), rc.s3))
+                    };
+                let (ra, rb) = std::thread::scope(|s| {
+                    let (oref, nref): (&str, &str) = (&old_str, &new_str);
+                    let ta = s.spawn(|| read(&sa, oref, 0));
+                    let tb = s.spawn(|| read(&sb, nref, 1));
+                    (ta.join(), tb.join())
+                });
+                bars.join();
+                let ra = ra.map_err(|_| anyhow::anyhow!("remote read thread panicked"))?;
+                let rb = rb.map_err(|_| anyhow::anyhow!("remote read thread panicked"))?;
+                match (ra, rb) {
+                    (Ok(a), Ok(b)) => Ok((a, b)),
+                    (ra, rb) => {
+                        // At least one side failed. Prefer the *real* failure over an
+                        // abort-induced one (the sibling we cut short), so the reported
+                        // error names the checkpoint that actually couldn't load.
+                        Err(match (ra.err(), rb.err()) {
+                            (Some(ea), Some(eb)) => {
+                                if is_aborted_err(&ea) {
+                                    eb
+                                } else {
+                                    ea
+                                }
+                            }
+                            (Some(e), None) | (None, Some(e)) => e,
+                            (None, None) => unreachable!("matched the failure arm"),
+                        })
+                    }
+                }
+            })()
+        },
+    );
     let (((old_t, old_m), old_s3), ((new_t, new_m), new_s3)) = match loaded {
         Ok(v) => v,
         Err(e) => {
@@ -1765,9 +1769,11 @@ fn run_diff(
     }
 
     // Show the re-root in the diff header so a scoped comparison is self-explanatory.
-    let label = |p: &Path, root: Option<&str>| match root {
-        Some(r) => format!("{}#{r}", p.display()),
-        None => p.display().to_string(),
+    let label = |p: &Path, root: Option<&str>| {
+        root.map_or_else(
+            || p.display().to_string(),
+            |r| format!("{}#{r}", p.display()),
+        )
     };
     let (old_label, new_label) = (label(old, old_root), label(new, new_root));
 
@@ -2093,12 +2099,15 @@ fn run_diff(
             let pairs: Vec<(&str, diff::TensorExtras)> = if jobs <= 1 {
                 common.iter().map(|&n| (n, compute(n))).collect()
             } else {
-                match rayon::ThreadPoolBuilder::new().num_threads(jobs).build() {
-                    Ok(pool) => {
-                        pool.install(|| common.par_iter().map(|&n| (n, compute(n))).collect())
-                    }
-                    Err(_) => common.iter().map(|&n| (n, compute(n))).collect(),
-                }
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(jobs)
+                    .build()
+                    .map_or_else(
+                        |_| common.iter().map(|&n| (n, compute(n))).collect(),
+                        |pool| {
+                            pool.install(|| common.par_iter().map(|&n| (n, compute(n))).collect())
+                        },
+                    )
             };
             progress.finish();
             pairs.into_iter().map(|(n, e)| (n.to_string(), e)).collect()
@@ -2167,7 +2176,6 @@ fn run_diff(
                 names.len()
             );
             let schema = diff::name_schema(&names);
-            const MAX_SCHEMA_LINES: usize = 40;
             for (tmpl, count) in schema.iter().take(MAX_SCHEMA_LINES) {
                 if *count > 1 {
                     eprintln!("    {tmpl}  (×{count})");
@@ -2673,7 +2681,15 @@ fn run_auto_sparse(
     pairs: &[(String, String)],
     bits: usize,
 ) -> HashMap<String, remote::RepackResult> {
-    if let Some(r) = remote.filter(|_| s3_pair) {
+    remote.filter(|_| s3_pair).map_or_else(|| if remote.is_some() {
+        eprintln!(
+            "checkpoint-studio diff: sparse index compare needs s3:// data over --ssh-proxy \
+             (a remote safetensors dir isn't reachable) — skipped"
+        );
+        HashMap::new()
+    } else {
+        local_repack(old_t, new_t, pairs, bits, Some(1))
+    }, |r| {
         let labels = repack_bar_labels(pairs, old_t, new_t);
         match fetch_remote_repack(r, password, old_uri, new_uri, pairs, &labels, bits, true) {
             Ok(m) => m,
@@ -2682,15 +2698,7 @@ fn run_auto_sparse(
                 HashMap::new()
             }
         }
-    } else if remote.is_some() {
-        eprintln!(
-            "checkpoint-studio diff: sparse index compare needs s3:// data over --ssh-proxy \
-             (a remote safetensors dir isn't reachable) — skipped"
-        );
-        HashMap::new()
-    } else {
-        local_repack(old_t, new_t, pairs, bits, Some(1))
-    }
+    })
 }
 
 /// Render the auto-detected sparse-packed index comparison (the `--values` path on
@@ -3724,10 +3732,10 @@ fn collect_safetensors_files(
         }
 
         // Try to expand as glob pattern
-        let expanded_paths: Vec<PathBuf> = match glob::glob(&path.to_string_lossy()) {
-            Ok(paths) => paths.filter_map(Result::ok).collect(),
-            Err(_) => vec![path.clone()], // Not a valid glob, treat as literal path
-        };
+        let expanded_paths: Vec<PathBuf> = glob::glob(&path.to_string_lossy()).map_or_else(
+            |_| vec![path.clone()],
+            |paths| paths.filter_map(Result::ok).collect(),
+        );
 
         // Process each expanded path
         for expanded_path in expanded_paths {

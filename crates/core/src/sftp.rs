@@ -436,10 +436,9 @@ fn parse_target(target: &str) -> (String, String, u16) {
         None => (default_user(), target),
     };
     let (host, port) = match rest.rsplit_once(':') {
-        Some((h, p)) => match p.parse::<u16>() {
-            Ok(n) => (h.to_string(), n),
-            Err(_) => (rest.to_string(), 22),
-        },
+        Some((h, p)) => p
+            .parse::<u16>()
+            .map_or_else(|_| (rest.to_string(), 22), |n| (h.to_string(), n)),
         None => (rest.to_string(), 22),
     };
     (user, host, port)
@@ -625,8 +624,9 @@ fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<ShardListing> {
 
     // The `.safetensors` files actually present — full paths (for the read order,
     // sorted) and basenames (for the health check). The listing is the truth.
-    let (on_disk, actual, listed) = match sftp.readdir(Path::new(base)) {
-        Ok(entries) => {
+    let (on_disk, actual, listed) = sftp.readdir(Path::new(base)).map_or_else(
+        |_| (Vec::new(), BTreeSet::new(), false),
+        |entries| {
             let names: Vec<String> = entries
                 .iter()
                 .filter_map(|(p, _)| p.file_name().and_then(|n| n.to_str()))
@@ -636,9 +636,8 @@ fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<ShardListing> {
             let mut full: Vec<String> = names.iter().map(|n| format!("{base}/{n}")).collect();
             full.sort();
             (full, names.into_iter().collect::<BTreeSet<_>>(), true)
-        }
-        Err(_) => (Vec::new(), BTreeSet::new(), false),
-    };
+        },
+    );
 
     // The index gives the preferred shard order and the health check's weight_map.
     let mut indexed: Vec<String> = Vec::new();

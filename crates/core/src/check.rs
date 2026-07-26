@@ -432,10 +432,9 @@ impl CheckReport {
                     Severity::Error => ("✗", RED),
                     Severity::Warning => ("⚠", YELLOW),
                 };
-                let subject = match &f.subject {
-                    Some(subj) => format!("{}  ", paint(subj, color, BOLD)),
-                    None => String::new(),
-                };
+                let subject = f.subject.as_ref().map_or_else(String::new, |subj| {
+                    format!("{}  ", paint(subj, color, BOLD))
+                });
                 let _ = writeln!(
                     s,
                     "      {} {}{}",
@@ -556,10 +555,10 @@ impl CheckReport {
                 let mut obj = serde_json::Map::new();
                 obj.insert("ruleId".into(), json!(r.id));
                 obj.insert("level".into(), json!(level));
-                let text = match &f.subject {
-                    Some(s) => format!("{s}: {}", f.message),
-                    None => f.message.clone(),
-                };
+                let text = f
+                    .subject
+                    .as_ref()
+                    .map_or_else(|| f.message.clone(), |s| format!("{s}: {}", f.message));
                 obj.insert("message".into(), json!({ "text": text }));
                 if let Some(subject) = &f.subject {
                     obj.insert("locations".into(), json!([sarif_location(subject)]));

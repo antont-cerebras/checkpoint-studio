@@ -149,6 +149,15 @@ impl UI {
         // --- one-line status bar (selected entry, or a copy confirmation) ---
         let reserve = Self::badge_bar_width(badges) as usize;
         let max_text = (width as usize).saturating_sub(6 + reserve);
+        // A copy confirmation wins the bar while it lasts; otherwise the selected path,
+        // or nothing when the listing is empty. Written as three cases in the order they
+        // take precedence — a `map_or_else` pair would nest the second two inside a
+        // closure and read backwards.
+        // Three cases in precedence order (a flash, then the content, then a fallback).
+        // `option_if_let_else` wants `map_or_else` for the outer test, which would nest the
+        // other two inside a closure and put the fallback ahead of the common case — every
+        // shape the lint accepts here reads worse than this one.
+        #[allow(clippy::option_if_let_else)]
         let status = if let Some(flash) = copied_flash {
             Line::from(Span::styled(
                 flash.to_string(),

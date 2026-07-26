@@ -180,10 +180,10 @@ pub fn last_segment(name: &str) -> &str {
 /// their final dotted segment.
 #[must_use]
 pub fn metadata_short(name: &str) -> String {
-    match name.strip_suffix(".__metadata__") {
-        Some(stem) => format!("{}.__metadata__", stem.rsplit('.').next().unwrap_or(stem)),
-        None => name.rsplit('.').next().unwrap_or(name).to_string(),
-    }
+    name.strip_suffix(".__metadata__").map_or_else(
+        || name.rsplit('.').next().unwrap_or(name).to_string(),
+        |stem| format!("{}.__metadata__", stem.rsplit('.').next().unwrap_or(stem)),
+    )
 }
 
 #[must_use]

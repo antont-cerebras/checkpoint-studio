@@ -77,13 +77,6 @@ missing_const_for_fn = "allow"
 # reachable and is therefore never reported as unused.
 redundant_pub_crate = "allow"
 
-# `if let Some(x) = o { a } else { b }` → `o.map_or_else(|| b, |x| a)`. A nursery lint whose
-# suggestion clippy itself marks `MaybeIncorrect` (which is why `--fix` skips it), and the
-# rewrite is a readability regression wherever the `None` branch is the longer of the two:
-# `map_or_else` puts the fallback FIRST, so the common case ends up last. The 22 sites here
-# are mostly `match` on an `Option` with a multi-line arm, where `match` reads better.
-option_if_let_else = "allow"
-
 # A 100-line ceiling on 7 functions that are flat, top-to-bottom report builders — the
 # check runner, the diff renderer, the health reconciler, the stats formatter. They are long
 # because the report has that many sections, not because they hide nested logic, and cutting
@@ -107,16 +100,6 @@ multiple_crate_versions = "allow"
 # the per-screen enumeration that makes a missing entry visible. The rest is `ui/theme.rs`
 # mapping both a named colour and its indexed twin to one output, which is the same story.
 match_same_arms = "allow"
-
-# 15 methods that read no field. They are on `Explorer` because that is where the screens
-# call them from and where they will grow to need state; making them free functions now
-# would move 15 call sites and invert the grouping for no behavioural gain.
-unused_self = "allow"
-
-# 10 `const`/`use` items after the first statement in a function. Purely notational: an item
-# is in scope for the whole block whatever line it sits on, and each of these sits next to
-# the loop it belongs to, which is where a reader wants it.
-items_after_statements = "allow"
 
 # Taking a `Vec`/`Arc` by value where the body only reads it. Several of these are spawned
 # onto a thread (the value must be owned), and the rest are one-shot builders where the

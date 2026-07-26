@@ -61,10 +61,9 @@ impl Report {
             }
             std::cmp::Ordering::Equal => "same size".to_string(),
         };
-        let from = match self.source_codec {
-            Some(c) => c.label(),
-            None => "uncompressed/mixed",
-        };
+        let from = self
+            .source_codec
+            .map_or("uncompressed/mixed", |c| c.label());
         let vs_logical = self.logical_bytes as f64 / self.out_bytes.max(1) as f64;
         format!(
             "{} datasets{} · on disk {} ({from}) → {} ({}): {change} · {:.2}× vs uncompressed",

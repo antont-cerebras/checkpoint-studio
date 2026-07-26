@@ -352,13 +352,12 @@ pub(super) fn render_bottom_band(
 /// The feedback line below a prompt: a red error message, or an empty line (which
 /// still clears the row) when there's nothing to report.
 pub(super) fn error_line(error: Option<&str>) -> Line<'static> {
-    match error {
-        Some(msg) => Line::from(Span::styled(
+    error.map_or_else(Line::default, |msg| {
+        Line::from(Span::styled(
             msg.to_string(),
             Style::default().fg(palette::ERROR),
-        )),
-        None => Line::default(),
-    }
+        ))
+    })
 }
 
 #[cfg(test)]

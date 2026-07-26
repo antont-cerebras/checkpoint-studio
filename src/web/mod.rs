@@ -302,6 +302,9 @@ pub(crate) fn serve_on(
 /// coloured load-progress bar was printed just above it. Plain (unstyled, one line)
 /// when stdout isn't a terminal or `NO_COLOR` is set, so a captured log stays clean.
 fn print_serve_banner(url: &str) {
+    const DIM: &str = "\x1b[2m";
+    const URL: &str = "\x1b[1;4;96m"; // bold + underline + bright cyan (link-like)
+    const RESET: &str = "\x1b[0m";
     use std::io::IsTerminal;
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     if !color {
@@ -311,9 +314,6 @@ fn print_serve_banner(url: &str) {
     // Raw ANSI via named consts + a terminal/NO_COLOR guard — the same convention
     // the other one-shot CLI status lines use (e.g. `sftp`'s retry notice, the
     // `diff: done` footer, `progress`'s bars). `yansi` is reserved for the TUI layer.
-    const DIM: &str = "\x1b[2m";
-    const URL: &str = "\x1b[1;4;96m"; // bold + underline + bright cyan (link-like)
-    const RESET: &str = "\x1b[0m";
     // Blank line to break from the finished ✓ load bar above; the label dim, the URL
     // the one bright thing on the line so it wins the eye.
     println!(
@@ -519,10 +519,7 @@ fn prepare_asset(path: &str, gzip: bool) -> Prepared {
 /// it (the tensor-tree JSON is tens of MB). Returns the body and whether it's encoded.
 fn maybe_gzip(data: Vec<u8>, gzip: bool) -> (Vec<u8>, bool) {
     if gzip && data.len() > 1024 {
-        match gzip_bytes(&data) {
-            Ok(compressed) => (compressed, true),
-            Err(_) => (data, false),
-        }
+        gzip_bytes(&data).map_or((data, false), |compressed| (compressed, true))
     } else {
         (data, false)
     }

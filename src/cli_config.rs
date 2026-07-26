@@ -52,15 +52,14 @@ impl CliConfig {
             // Strip surrounding quotes, then any inner whitespace, then an inline
             // `# comment` on a bare (unquoted) value.
             let val = val.trim();
-            let val = if let Some(inner) = val
+            let val = val
                 .strip_prefix('"')
                 .and_then(|v| v.strip_suffix('"'))
                 .or_else(|| val.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-            {
-                inner.to_string()
-            } else {
-                val.split('#').next().unwrap_or("").trim().to_string()
-            };
+                .map_or_else(
+                    || val.split('#').next().unwrap_or("").trim().to_string(),
+                    ToString::to_string,
+                );
             if val.is_empty() {
                 continue;
             }

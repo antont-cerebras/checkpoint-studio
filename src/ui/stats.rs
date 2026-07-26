@@ -27,13 +27,15 @@ impl UI {
         s: &crate::stats::CheckpointStats,
         shards_expanded: bool,
     ) -> (Vec<Line<'static>>, Option<usize>) {
+        // Label column widths, so the values line up down the popup.
+        const LW: usize = 12;
+        const LBL: usize = 13;
         let sty = |t: String, style: Style| Span::styled(t, style);
         let plain = |t: String| sty(t, Style::default());
         let dim = |t: String| sty(t, Style::default().fg(palette::DIM));
 
         // A section header, then indented "label   value" rows. Labels align to a
         // fixed column so the values line up down the popup.
-        const LW: usize = 12;
         let header = |t: &str| {
             Line::from(sty(
                 t.to_string(),
@@ -172,10 +174,10 @@ impl UI {
         // ── Experts (MoE) ─────────────────────────────────────────────────────
         if let Some(x) = &s.experts {
             lines.push(Line::from(sty(String::new(), Style::default())));
-            let (count, qualifier) = match x.layout.per_layer() {
-                Some(pl) => (format!("×{pl}"), " per layer"),
-                None => (String::new(), ""),
-            };
+            let (count, qualifier) = x.layout.per_layer().map_or_else(
+                || (String::new(), ""),
+                |pl| (format!("×{pl}"), " per layer"),
+            );
             lines.push(section(
                 crate::stats::GLYPH_EXPERTS,
                 "Experts",
@@ -212,7 +214,6 @@ impl UI {
         // a plain "uniform" note (a flat sparkline says nothing). Plus one
         // 100%-stacked composition bar (attention / ffn-experts / other) — its
         // segments are distinct glyphs *and* colours (colour is stripped headless).
-        const LBL: usize = 13;
         if let Some(pl) = &s.per_layer {
             lines.push(Line::from(sty(String::new(), Style::default())));
             lines.push(header("Per-layer profile"));

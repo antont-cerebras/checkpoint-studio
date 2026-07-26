@@ -188,13 +188,15 @@ impl Mode for FilesMode {
                 ex.file_state.move_selection(step);
             }
             KeyCode::PageUp => {
-                let step =
-                    (ex.file_page_rows() * ex.held_step(KeyCode::PageUp, accel_step_page)) as i32;
+                let step = (Explorer::file_page_rows()
+                    * ex.held_step(KeyCode::PageUp, accel_step_page))
+                    as i32;
                 ex.file_state.move_selection(-step);
             }
             KeyCode::PageDown => {
-                let step =
-                    (ex.file_page_rows() * ex.held_step(KeyCode::PageDown, accel_step_page)) as i32;
+                let step = (Explorer::file_page_rows()
+                    * ex.held_step(KeyCode::PageDown, accel_step_page))
+                    as i32;
                 ex.file_state.move_selection(step);
             }
             KeyCode::Home => ex.file_state.selected = 0,
@@ -459,12 +461,12 @@ impl Mode for LayoutMode {
                 self.selected = move_sel(self.selected, step);
             }
             KeyCode::PageUp => {
-                let page = ex.layout_page_segments(self.map(), term.size().ok());
+                let page = Explorer::layout_page_segments(self.map(), term.size().ok());
                 let step = (page * ex.held_step(KeyCode::PageUp, accel_step_page)) as i32;
                 self.selected = move_sel(self.selected, -step);
             }
             KeyCode::PageDown => {
-                let page = ex.layout_page_segments(self.map(), term.size().ok());
+                let page = Explorer::layout_page_segments(self.map(), term.size().ok());
                 let step = (page * ex.held_step(KeyCode::PageDown, accel_step_page)) as i32;
                 self.selected = move_sel(self.selected, step);
             }
@@ -717,15 +719,17 @@ impl Mode for TreeMode {
                 code: KeyCode::PageUp,
                 ..
             } => {
-                let step = (ex.page_rows() * ex.held_step(KeyCode::PageUp, accel_step_page)) as i32;
+                let step =
+                    (Explorer::page_rows() * ex.held_step(KeyCode::PageUp, accel_step_page)) as i32;
                 ex.tree_state.move_selection(-step);
             }
             KeyEvent {
                 code: KeyCode::PageDown,
                 ..
             } => {
-                let step =
-                    (ex.page_rows() * ex.held_step(KeyCode::PageDown, accel_step_page)) as i32;
+                let step = (Explorer::page_rows()
+                    * ex.held_step(KeyCode::PageDown, accel_step_page))
+                    as i32;
                 ex.tree_state.move_selection(step);
             }
             // ← jumps to the parent group; → enters the group's first child.
@@ -1004,10 +1008,10 @@ impl RenameMode2 {
     pub(super) fn confirm_apply(&self, term: &mut crate::tui::LiveTerminal) -> bool {
         let fallback = || vec!["Apply the entered renames in place?".to_string()];
         let summary = match self.editor.build_map() {
-            Ok((map, _)) => match self.loaded().plan(&map) {
-                Ok(plan) => plan.summary_lines(8),
-                Err(_) => fallback(),
-            },
+            Ok((map, _)) => self
+                .loaded()
+                .plan(&map)
+                .map_or_else(|_| fallback(), |plan| plan.summary_lines(8)),
             Err(_) => fallback(),
         };
         let mut idx = 1usize; // default to the safe choice (Cancel)
@@ -1259,10 +1263,9 @@ impl Mode for RenameMode2 {
                 self.dirty = true;
                 PaletteResult::Handled
             }
-            Some(RenameCmd::Apply) => match self.try_apply(ex, term) {
-                Some(nav) => PaletteResult::Nav(nav),
-                None => PaletteResult::Handled,
-            },
+            Some(RenameCmd::Apply) => self
+                .try_apply(ex, term)
+                .map_or(PaletteResult::Handled, PaletteResult::Nav),
             Some(RenameCmd::CopyApplyCmd) => {
                 self.do_copy_apply();
                 PaletteResult::Handled
@@ -1763,18 +1766,21 @@ impl Mode for DetailMode {
                         None,
                     );
                 };
-                let changed =
-                    match ex.prompt_bins(term, background, ex.data_view.histogram_bins.get()) {
-                        BinsChoice::Set(n) => {
-                            ex.data_view.histogram_bins.set(Some(n));
-                            true
-                        }
-                        BinsChoice::Clear => {
-                            ex.data_view.histogram_bins.set(None);
-                            true
-                        }
-                        BinsChoice::Cancel => false,
-                    };
+                let changed = match Explorer::prompt_bins(
+                    term,
+                    background,
+                    ex.data_view.histogram_bins.get(),
+                ) {
+                    BinsChoice::Set(n) => {
+                        ex.data_view.histogram_bins.set(Some(n));
+                        true
+                    }
+                    BinsChoice::Clear => {
+                        ex.data_view.histogram_bins.set(None);
+                        true
+                    }
+                    BinsChoice::Cancel => false,
+                };
                 if changed {
                     ex.ensure_detail_histogram(
                         term,
@@ -1852,7 +1858,7 @@ impl Mode for DetailMode {
                         None,
                     );
                 };
-                match ex.prompt_reshape(term, background, &tensor, current.as_deref()) {
+                match Explorer::prompt_reshape(term, background, &tensor, current.as_deref()) {
                     ReshapeChoice::Set(s) => {
                         ex.data_view
                             .shape_overrides
@@ -1939,7 +1945,7 @@ impl StatsMode {
     /// The whole-checkpoint statistics, computed and cached by `on_enter` (it scans every
     /// shard, so it cannot happen at construction).
     #[allow(clippy::expect_used)]
-    pub(super) fn stats(&self, ex: &Explorer) -> crate::stats::CheckpointStats {
+    pub(super) fn stats(ex: &Explorer) -> crate::stats::CheckpointStats {
         ex.checkpoint_stats_cache
             .borrow()
             .clone()
@@ -1949,7 +1955,7 @@ impl StatsMode {
     /// Whether the report has a foldable breakdown for `f` / a click to toggle: a
     /// multi-shard on-disk section, or the S3 per-object list (an s3 source has no
     /// on-disk section, so the two never coexist and share the one fold state).
-    pub(super) fn has_fold(&self, ex: &Explorer) -> bool {
+    pub(super) fn has_fold(ex: &Explorer) -> bool {
         let cache = ex.checkpoint_stats_cache.borrow();
         let Some(s) = cache.as_ref() else {
             return false;
@@ -1996,7 +2002,7 @@ impl Mode for StatsMode {
     }
 
     fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
-        let stats = self.stats(ex);
+        let stats = Self::stats(ex);
         let max = ex.render_stats_screen(f, &stats, self.scroll, self.shards_expanded);
         self.scroll_max.set(max);
         if let Some((what, _)) = &ex.copied_flash {
@@ -2009,8 +2015,8 @@ impl Mode for StatsMode {
         ex: &mut Explorer,
         term: &mut crate::tui::LiveTerminal,
     ) -> PaletteResult {
-        let stats = self.stats(ex);
-        let entries = available_stats_commands(self.has_fold(ex));
+        let stats = Self::stats(ex);
+        let entries = available_stats_commands(Self::has_fold(ex));
         let (scroll, shards_expanded) = (self.scroll, self.shards_expanded);
         let chosen = ex.run_palette(term, entries, HelpCtx::Stats, |s, f| {
             s.render_stats_screen(f, &stats, scroll, shards_expanded);
@@ -2031,13 +2037,13 @@ impl Mode for StatsMode {
         match key.code {
             // Fold / expand the on-disk per-shard breakdown (a no-op without one).
             KeyCode::Char('f') => {
-                if self.has_fold(ex) {
+                if Self::has_fold(ex) {
                     self.shards_expanded = !self.shards_expanded;
                 }
             }
             // Copy the report as plain text, matching the current fold state.
             KeyCode::Char('r') => {
-                let report = self.stats(ex).render(self.shards_expanded);
+                let report = Self::stats(ex).render(self.shards_expanded);
                 copy_to_clipboard(&report);
                 ex.copied_flash = Some((
                     "copied the report to the clipboard".to_string(),
@@ -2047,7 +2053,7 @@ impl Mode for StatsMode {
             // Copy the whole screen's text at the live terminal size.
             KeyCode::Char('c') => {
                 let (w, h) = term.size().map_or((120, 40), |s| (s.width, s.height));
-                let stats = self.stats(ex);
+                let stats = Self::stats(ex);
                 let (scroll, shards_expanded) = (self.scroll, self.shards_expanded);
                 if let Ok(text) = crate::tui::headless_render(w, h, |f| {
                     UI::render_stats_frame(f, &stats, scroll, shards_expanded);
@@ -2396,7 +2402,7 @@ impl Mode for DataMode {
                 let background = |f: &mut ratatui::Frame| {
                     ex.render_cached_data(f, &tensor, repr, stats_view, stripe, base);
                 };
-                match ex.prompt_reshape(term, background, &tensor, current.as_deref()) {
+                match Explorer::prompt_reshape(term, background, &tensor, current.as_deref()) {
                     ReshapeChoice::Set(s) => {
                         ex.data_view
                             .shape_overrides
@@ -2421,7 +2427,7 @@ impl Mode for DataMode {
                 let background = |f: &mut ratatui::Frame| {
                     ex.render_cached_data(f, &tensor, repr, stats_view, stripe, base);
                 };
-                if let Some(n) = ex.prompt_slice(term, background, slices) {
+                if let Some(n) = Explorer::prompt_slice(term, background, slices) {
                     self.slice.set(n);
                 }
             }

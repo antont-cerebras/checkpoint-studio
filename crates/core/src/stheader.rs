@@ -43,10 +43,9 @@ pub fn parse_header(
                 for (meta_key, meta_value) in meta_obj {
                     metadata.push(MetadataInfo {
                         name: meta_key.clone(),
-                        value: match meta_value.as_str() {
-                            Some(s) => s.to_string(),
-                            None => meta_value.to_string(),
-                        },
+                        value: meta_value
+                            .as_str()
+                            .map_or_else(|| meta_value.to_string(), ToString::to_string),
                         value_type: "string".to_string(),
                     });
                 }

@@ -390,17 +390,17 @@ fn summarize_indices(values: &[String]) -> String {
     if distinct.len() == 1 {
         return values[0].clone();
     }
-    match distinct
+    distinct
         .iter()
         .map(|s| s.parse::<i64>().ok())
         .collect::<Option<Vec<i64>>>()
-    {
-        Some(mut nums) => {
-            nums.sort_unstable();
-            format!("{{{}}}", compact_int_ranges(&nums))
-        }
-        None => format!("{{{}}}", distinct.into_iter().collect::<Vec<_>>().join(",")),
-    }
+        .map_or_else(
+            || format!("{{{}}}", distinct.into_iter().collect::<Vec<_>>().join(",")),
+            |mut nums| {
+                nums.sort_unstable();
+                format!("{{{}}}", compact_int_ranges(&nums))
+            },
+        )
 }
 
 /// Collapse a sorted integer list into comma-separated runs: `[0,1,2,5]` → `0-2,5`.

@@ -326,8 +326,9 @@ impl UI {
         // Build it first so its (possibly wrapped) height reserves the bottom rows,
         // like the layout/file views size their footers. (Apply confirmation is a
         // floating modal now, not an inline footer bar.)
-        let (footer_lines, chip_hits): (Vec<Line<'static>>, Vec<ChipHit>) =
-            if let Some(err) = view.error {
+        let (footer_lines, chip_hits): (Vec<Line<'static>>, Vec<ChipHit>) = view.error.map_or_else(
+            || rename_hint_lines(width, view.applicable),
+            |err| {
                 (
                     vec![Line::from(Span::styled(
                         format!("⚠ {err}"),
@@ -335,9 +336,8 @@ impl UI {
                     ))],
                     Vec::new(),
                 )
-            } else {
-                rename_hint_lines(width, view.applicable)
-            };
+            },
+        );
         let footer_h = (footer_lines.len() as u16).max(1);
         let footer_top = height.saturating_sub(footer_h);
 
@@ -413,6 +413,13 @@ impl UI {
 
         // The equivalent apply command (copyable with ^Y), just above the footer.
         if let Some(y) = cmd_y {
+            // Three cases in precedence order: a copy confirmation while it lasts, else
+            // the command to apply, else a hint that there is nothing to apply yet.
+            // Three cases in precedence order (a flash, then the content, then a fallback).
+            // `option_if_let_else` wants `map_or_else` for the outer test, which would nest the
+            // other two inside a closure and put the fallback ahead of the common case — every
+            // shape the lint accepts here reads worse than this one.
+            #[allow(clippy::option_if_let_else)]
             let cmd_line = if let Some(what) = view.copied {
                 Line::from(Span::styled(
                     format!("✓ copied {what} to the clipboard"),
@@ -503,11 +510,11 @@ fn render_completion_menu(
     cands: &[RenameCompletion],
     selected: usize,
 ) -> Vec<Rect> {
+    const CAPTION: &str = "↑/↓ pick · ↵ accept · Tab complete · Esc close";
     let area = frame.area();
     if cands.is_empty() || area.width <= anchor_x {
         return Vec::new();
     }
-    const CAPTION: &str = "↑/↓ pick · ↵ accept · Tab complete · Esc close";
     let count_label = |n: usize| format!("×{n}");
     let name_w = cands
         .iter()

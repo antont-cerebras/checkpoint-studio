@@ -146,10 +146,9 @@ pub(crate) fn health(s: &WebState) -> Reply {
 }
 
 pub(crate) fn check(s: &WebState) -> Reply {
-    match &s.check {
-        Some(report) => ok(report.to_json(false)),
-        None => ok(Value::Null),
-    }
+    s.check
+        .as_ref()
+        .map_or_else(|| ok(Value::Null), |report| ok(report.to_json(false)))
 }
 
 pub(crate) fn model(s: &WebState) -> Reply {
@@ -166,6 +165,7 @@ pub(crate) fn tensor(s: &WebState, q: &Query) -> Reply {
 /// Read a text/JSON file's content (capped) for the file browser's preview. Only
 /// serves paths that are in the checkpoint's own file list — no path traversal.
 pub(crate) fn file(s: &WebState, q: &Query) -> Reply {
+    const CAP: usize = 1 << 20; // 1 MiB — enough for config/index/readme/merges
     let Some(rel) = q.get("path") else {
         return err(400, "missing ?path=");
     };
@@ -178,7 +178,6 @@ pub(crate) fn file(s: &WebState, q: &Query) -> Reply {
         return err(404, format!("no such file: {rel}"));
     };
     let abs = std::path::Path::new(&s.root).join(&entry.rel_path);
-    const CAP: usize = 1 << 20; // 1 MiB — enough for config/index/readme/merges
     match std::fs::read(&abs) {
         Ok(bytes) => {
             let truncated = bytes.len() > CAP;
@@ -199,14 +198,10 @@ pub(crate) fn layout(s: &WebState, q: &Query) -> Reply {
     let Some(file) = q.get("file") else {
         return err(400, "missing ?file=");
     };
-    match s
-        .layouts
+    s.layouts
         .iter()
         .find(|l| l.name == *file || basename(&l.name) == file.as_str())
-    {
-        Some(l) => ok(l),
-        None => err(404, format!("no layout for file: {file}")),
-    }
+        .map_or_else(|| err(404, format!("no layout for file: {file}")), ok)
 }
 
 // ---- on-demand tensor-data routes (read bytes; local only) ----
@@ -330,10 +325,9 @@ fn lookup<'a>(s: &'a WebState, q: &Query) -> Result<&'a TensorInfo, Reply> {
 }
 
 fn view_of(q: &Query) -> Result<ViewDtype, Reply> {
-    match q.get("dtype") {
-        Some(d) => sample::parse_view_dtype(d).map_err(|e| err(400, e)),
-        None => Ok(ViewDtype::Stored),
-    }
+    q.get("dtype").map_or(Ok(ViewDtype::Stored), |d| {
+        sample::parse_view_dtype(d).map_err(|e| err(400, e))
+    })
 }
 
 fn name_of(q: &Query) -> &str {

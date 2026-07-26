@@ -99,18 +99,19 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<FileEntry>) {
         let is_symlink = entry.file_type().ok().is_some_and(|t| t.is_symlink());
         // Followed metadata (target), with the link's own as a broken-link fallback.
         let meta = std::fs::metadata(&path).or_else(|_| entry.metadata());
-        let (is_dir, apparent, allocated, mode, mtime, links, inode) = match &meta {
-            Ok(m) => (
-                m.is_dir(),
-                if m.is_dir() { 0 } else { m.len() },
-                block_bytes(m),
-                unix_mode(m),
-                mtime_secs(m),
-                nlink(m),
-                inode_of(m),
-            ),
-            Err(_) => (false, 0, 0, None, None, 1, None),
-        };
+        let (is_dir, apparent, allocated, mode, mtime, links, inode) =
+            meta.as_ref()
+                .map_or((false, 0, 0, None, None, 1, None), |m| {
+                    (
+                        m.is_dir(),
+                        if m.is_dir() { 0 } else { m.len() },
+                        block_bytes(m),
+                        unix_mode(m),
+                        mtime_secs(m),
+                        nlink(m),
+                        inode_of(m),
+                    )
+                });
         // A real directory descends; a symlinked directory stays a leaf.
         let descendable = is_dir && !is_symlink;
         let rel_path = path
