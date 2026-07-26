@@ -575,8 +575,10 @@ fn compact_node(node: TreeNode) -> TreeNode {
         return node; // tensors / metadata are leaves
     };
     let mut children = compact_nodes(children);
-    if children.len() == 1 {
-        match children.pop().unwrap() {
+    if children.len() == 1
+        && let Some(only) = children.pop()
+    {
+        match only {
             // Single sub-group: merge names, adopt its (already-compacted)
             // children. The aggregates match (the parent had only this child).
             TreeNode::Group {

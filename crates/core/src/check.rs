@@ -882,7 +882,9 @@ fn check_layers(tensors: &[TensorInfo]) -> CheckResult {
             continue;
         }
         checked_any = true;
-        let max = *idxmap.keys().next_back().unwrap();
+        let Some(&max) = idxmap.keys().next_back() else {
+            continue; // empty family: nothing to check
+        };
 
         // Index gaps.
         let missing: Vec<usize> = (0..=max).filter(|i| !idxmap.contains_key(i)).collect();
@@ -1002,7 +1004,9 @@ fn check_shapes_dtypes(tensors: &[TensorInfo]) -> CheckResult {
         if dtypes.len() < 2 {
             continue; // one dtype (or a lone tensor) for this role — nothing to compare
         }
-        let (&dom, &(dom_n, _)) = dtypes.iter().max_by_key(|&(_, &(c, _))| c).unwrap();
+        let Some((&dom, &(dom_n, _))) = dtypes.iter().max_by_key(|&(_, &(c, _))| c) else {
+            continue; // no dtypes for this role
+        };
         for (&dt, &(n, example)) in dtypes {
             if dt == dom {
                 continue;

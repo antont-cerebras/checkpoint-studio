@@ -1,3 +1,9 @@
+// An unwrap in a test IS the assertion — the panic is the failure report, and rewriting
+// hundreds of them into `?` would make the tests harder to read for no gain. So
+// `unwrap_used`/`expect_used` (denied for product code in Cargo.toml) are allowed in test
+// builds only.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 // This tool memory-maps multi-gigabyte checkpoints and converts 64-bit header offsets
 // and element counts to `usize` throughout. That is only sound on a 64-bit target, so
 // state it as a compile-time requirement instead of leaving it implied.
@@ -1858,6 +1864,9 @@ fn run_diff(
                         jobs: jobs.clamp(1, 32),
                     };
                     match fetch_remote_value_diff(
+                        // `remote_values` is only set on the branch that has a remote (the
+                        // `--ssh-proxy` path); the two travel together.
+                        #[allow(clippy::expect_used)]
                         remote.expect("remote_values implies a remote"),
                         &mut password,
                         &old_str,
@@ -2042,6 +2051,9 @@ fn run_diff(
                 HashMap::new()
             } else {
                 match fetch_remote_value_diff(
+                    // `remote_values` is only set on the branch that has a remote (the
+                    // `--ssh-proxy` path); the two travel together.
+                    #[allow(clippy::expect_used)]
                     remote.expect("remote_values implies a remote"),
                     &mut password,
                     &old_str,

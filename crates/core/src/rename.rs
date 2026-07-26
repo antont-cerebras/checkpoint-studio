@@ -321,7 +321,10 @@ pub fn load(path: &Path) -> Result<Loaded> {
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().expect("shard-header reader thread panicked"))
+            .map(|h| {
+                h.join()
+                    .map_err(|_| anyhow!("a shard-header reader thread panicked"))?
+            })
             .collect::<Result<Vec<_>>>()
     })?;
 
@@ -773,6 +776,10 @@ fn unique_token(base: &str, used: &[String]) -> String {
     // Bounded: with `used.len()` names taken, one of `base2..=base{len+2}` is always
     // free — so the search terminates and the `unwrap` can't panic. (An unbounded
     // `(2..)` relied on that invariant implicitly.)
+    // The range is `used.len() + 1` candidates for `used.len()` taken names, so at least
+    // one is free and `find` always succeeds — that bound is what the comment above
+    // establishes, and it is why this cannot panic.
+    #[allow(clippy::expect_used)]
     (2..=used.len() + 2)
         .map(|k| format!("{base}{k}"))
         .find(|c| !used.iter().any(|t| t == c))

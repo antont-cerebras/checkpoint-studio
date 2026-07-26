@@ -616,6 +616,9 @@ impl Session {
                 disk,
             ));
         }
+        // Set immediately above (the `if` that precedes this fills it), so the option
+        // is always `Some` here. Returning a reference is why it can't just be moved.
+        #[allow(clippy::expect_used)]
         self.stats.as_ref().expect("just set")
     }
 

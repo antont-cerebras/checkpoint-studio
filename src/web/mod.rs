@@ -108,6 +108,9 @@ impl WebState {
         }
 
         // Structural check only (values = false → no byte scan at startup).
+        // A literal empty filter: `parse` only fails on a malformed pattern, and there
+        // are none.
+        #[allow(clippy::expect_used)]
         let all = filter::NameFilter::parse(&[]).expect("empty NameFilter is valid");
         let check = Some(check::run(
             root.clone(),
@@ -528,6 +531,8 @@ fn send_encoded(
 }
 
 fn header(key: &str, value: &str) -> tiny_http::Header {
+    // Every caller passes a literal header name and an ASCII value.
+    #[allow(clippy::expect_used)]
     tiny_http::Header::from_bytes(key.as_bytes(), value.as_bytes()).expect("valid header")
 }
 

@@ -1,3 +1,10 @@
+// As in `modes.rs`: these are driver invariants, each stated at its site. The terminal is
+// taken and put back by `run_mode` (so it is `Some` whenever a mode runs), the filter is
+// read only when active, and the report is unwrapped on the line after it is computed or
+// read from the cache. Making them structural — a `Driver` that owns the terminal by value
+// — is the follow-up.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use anyhow::Result;
 use crossterm::{
     cursor,

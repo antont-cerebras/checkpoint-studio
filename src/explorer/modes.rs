@@ -6,6 +6,15 @@
 //! and the `residual` screen it restores to). The persistent selection/scroll state
 //! stays on [`Explorer`]; these hold only what the old per-screen loops kept as locals.
 
+// `unwrap`/`expect` in this module are all *mode-lifecycle* invariants: `on_enter` either
+// resolves the tensor / loads the map / starts the scan or leaves the mode, so by the time
+// `render_frame`, `pre_draw` or a key handler runs, the option is `Some` — and the
+// `*_command_for_key` calls are inside `if …is_some()` guards. Each site says which
+// invariant it relies on. Allowed at module scope rather than 12 times over; making the
+// invariant structural (a `Loaded` state type that can't be constructed empty) is the
+// follow-up that would let this be removed.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 // Imports are explicit, and external types are taken from their real source instead of
 // being laundered through the parent. What remains below is an honest measure of what
 // these screens need from `Explorer`: 50 names, where the wildcard's expansion was ~80.

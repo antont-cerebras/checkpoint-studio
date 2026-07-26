@@ -722,6 +722,8 @@ pub(super) fn wrap_hint_items(
         // glyph is a different action and the label between them is ambiguous.
         let key_count = segs.iter().filter(|s| matches!(s, Seg::Key(..))).count();
         if key_count == 1 {
+            // Exactly one `Seg::Key` by the count above, so the search finds it.
+            #[allow(clippy::expect_used, clippy::unwrap_used)]
             let key = segs
                 .iter()
                 .find_map(|s| match s {

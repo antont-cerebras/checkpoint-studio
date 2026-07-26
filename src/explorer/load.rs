@@ -6,6 +6,12 @@
 //! inherent impls across modules of one crate, and a child module can still reach its
 //! parent's private fields, so this needs no widening of `Explorer`'s internals.
 
+// The `self.remote.as_ref().unwrap()` sites here are inside `if self.remote_read().is_some()`
+// branches (a remote read is what the whole function is for), and the cache unwraps follow
+// the line that fills the cache. Same follow-up as `modes.rs`: thread the remote through as
+// a parameter instead of re-reading an option that is known to be `Some`.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 #[allow(clippy::wildcard_imports)] // a submodule of the module it was split from
 use super::*;
 

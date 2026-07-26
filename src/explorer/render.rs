@@ -151,6 +151,8 @@ impl Explorer {
             area.height,
         )?;
         let cache = self.sample_cache.borrow();
+        // Filled by the caller on the line before this one (the cache is what it just built).
+        #[allow(clippy::unwrap_used)]
         let sample = &cache.as_ref().unwrap().sample;
         *self.clickable.borrow_mut() = match repr {
             Representation::Heatmap => UI::render_heatmap(frame, tensor, sample, stats),

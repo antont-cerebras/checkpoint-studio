@@ -1036,6 +1036,11 @@ impl Prim {
 /// exact, but a **dtype override** re-reads the same bytes at a different width, and a
 /// tensor whose length isn't a whole multiple of that width leaves a partial tail — the
 /// `d` key on the wrong tensor used to abort the process there.
+// Each `try_into()` below converts a slice the line above just narrowed to exactly
+// `p.size()` bytes, which is the width `from_le_bytes` wants — so the conversion cannot
+// fail. (The *length* check that makes this true is the fix for the abort this function
+// used to cause on a dtype override; see the doc comment.)
+#[allow(clippy::unwrap_used)]
 fn decode_prim(p: Prim, b: &[u8]) -> f64 {
     if b.len() < p.size() {
         return f64::NAN;
@@ -2204,8 +2209,10 @@ fn read_sampled(
     } else {
         1
     };
-    let first_col = *cols.first().unwrap();
-    let last_col = *cols.last().unwrap();
+    let (Some(&first_col), Some(&last_col)) = (cols.first(), cols.last()) else {
+        // No columns sampled (a zero-width view): an empty grid, not an error.
+        return Ok((Vec::new(), Vec::new()));
+    };
     let container_for = |row_base: usize, col: usize| (row_base + col) / packing;
 
     // Per sampled row: the region to read, and the flat container index its
@@ -2310,8 +2317,12 @@ impl BlobReader {
         };
         let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
         let mmap = mmap_file(&t.source_path)?;
-        let header_len =
-            u64::from_le_bytes(mmap.get(0..8).ok_or("file too small")?.try_into().unwrap());
+        let header_len = u64::from_le_bytes(
+            mmap.get(0..8)
+                .ok_or("file too small")?
+                .try_into()
+                .map_err(|_| "truncated safetensors header")?,
+        );
         let data_start = (8 + header_len + start) as usize;
         let data_end = (8 + header_len + end) as usize;
         Self::mmapped(mmap, data_start, data_end, t, item)

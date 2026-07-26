@@ -135,6 +135,9 @@ impl RemoteSession {
                 }
             }
         }
+        // `max_attempts >= 1`, so the loop above ran and either returned or recorded an
+        // error; reaching here means it recorded one.
+        #[allow(clippy::expect_used)]
         Err(last_err.expect("at least one attempt was made"))
     }
 

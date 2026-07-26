@@ -118,10 +118,21 @@ lossy_float_literal = "deny"
 # suggested `Arc<[u8]>` would mean copying every cached response body once to convert it,
 # which is exactly the allocation that cache exists to avoid.
 rest_pat_in_fully_bound_structs = "deny"
-# NOT enabled: `unwrap_used` / `expect_used`. There are 55 outside test modules, and two
-# of the bugs fixed this week were exactly that class (`decode_prim`, GGUF's allocation),
-# so it is the most valuable remaining gate — but turning it on means auditing all 55,
-# each with a justification or a refactor. Deliberate follow-up, not an oversight.
+# A panic is a crashed TUI or a dead server, and two of the bugs fixed this week were
+# exactly this class (`decode_prim`'s slice unwrap, GGUF's unbounded allocation).
+#
+# The audit that turned these on found 52 sites in product code and sorted them:
+#   * 6 could actually fire (an empty map, a zero-column view, a truncated header, a
+#     panicked worker thread) — rewritten to propagate or to bind with `let … else`.
+#   * 13 are provable at the site and carry a per-site `#[allow]` with the proof.
+#   * 33 are lifecycle invariants concentrated in `explorer/{mod,modes,load}.rs` — the
+#     driver owns the terminal while a mode runs, `on_enter` resolves-or-leaves — and are
+#     allowed at module scope with the reason. Making those structural (a state type that
+#     cannot be constructed empty) is the follow-up that would delete those allows.
+# Test code is exempt via `cfg_attr(test, allow(...))` at each crate root and an inner
+# attribute in each integration test: an unwrap in a test IS the assertion.
+unwrap_used = "deny"
+expect_used = "deny"
 
 [workspace.lints.rust]
 # Compiler lints beyond the defaults, all measured clean here. Measured and left off:

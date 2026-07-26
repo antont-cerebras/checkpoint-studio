@@ -10,6 +10,9 @@
 //! fixture, waits for text to appear rather than sleeping a fixed time, and always
 //! quits with `q` so the terminal restore path runs too.
 
+// An unwrap in a test IS the assertion: the panic is the failure report. (Product code
+// denies these — see `[workspace.lints.clippy]` in Cargo.toml.)
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(unix)]
 
 use std::io::{Read, Write};

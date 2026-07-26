@@ -20,6 +20,10 @@
 //!
 //! `shared/parity/README.md` records the rules that are deliberately NOT shared.
 
+// An unwrap in a test IS the assertion: the panic is the failure report. (Product code
+// denies these — see `[workspace.lints.clippy]` in Cargo.toml.)
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::path::PathBuf;
 
 use checkpoint_studio_core::utils::{format_parameters, format_percent, format_size};

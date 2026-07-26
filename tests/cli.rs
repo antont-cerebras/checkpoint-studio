@@ -16,6 +16,10 @@
 //! because hdf5-metno isn't a dev-dependency. The HDF5 cases are gated on the
 //! `hdf5` feature.
 
+// An unwrap in a test IS the assertion: the panic is the failure report. (Product code
+// denies these — see `[workspace.lints.clippy]` in Cargo.toml.)
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
