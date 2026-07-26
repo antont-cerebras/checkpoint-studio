@@ -36,7 +36,24 @@
       gate_up_fused: boolean;
       by_category: { name: string; bytes: number }[];
     };
-    footprint?: { Disk?: { shards: { name: string; apparent: number; allocated: number }[] } };
+    footprint?: {
+      Disk?: { shards: { name: string; apparent: number; allocated: number }[] };
+      /** An `s3://` source: one object per tensor plus the checkpoint index. */
+      S3?: { objects: { key: string; size: number }[] };
+    };
+    /** The S3 section's ready-made phrases, worded by the server exactly as the TUI
+     * words them (absent for a local checkpoint). */
+    s3_summary?: {
+      count: number;
+      total_bytes: number;
+      checksums: string;
+      etags: string;
+      tags: string;
+      modified?: string | null;
+      user_meta_objects: number;
+      object_detail: Record<string, string>;
+      warnings: string[];
+    };
   }
 
   let s: Stats | null = null;
@@ -54,6 +71,11 @@
   $: dtypeTotal = s ? s.dtypes.reduce((a, d) => a + d.bytes, 0) : 0;
   $: layerMax = s?.per_layer ? Math.max(1, ...s.per_layer.rows.map((r) => r.bytes)) : 1;
   $: shards = s?.footprint?.Disk?.shards ?? [];
+  $: s3 = s?.s3_summary ?? null;
+  $: s3Objects = s?.footprint?.S3?.objects ?? [];
+  // Folded away by default, like the TUI's per-object breakdown: a 1155-object
+  // checkpoint would otherwise bury everything below it.
+  let s3Open = false;
 </script>
 
 <div class="stats">
@@ -130,6 +152,50 @@
         <div class="legend">
           <span><i class="attn"></i> attention</span><span><i class="ffn"></i> ffn</span><span><i class="other"></i> other</span>
         </div>
+      </section>
+    {/if}
+
+    {#if s3}
+      <section>
+        <h3>☁ S3 objects <span class="count">×{s3.count}</span></h3>
+        <table class="rows">
+          <tbody>
+            <tr><td class="k">Total</td><td class="mono">{humanSize(s3.total_bytes)}</td></tr>
+            <tr><td class="k">Checksums</td><td>{s3.checksums}</td></tr>
+            <tr><td class="k">ETags</td><td>{s3.etags}</td></tr>
+            <tr><td class="k">Tags</td><td>{s3.tags}</td></tr>
+            {#if s3.modified}
+              <tr><td class="k">Modified</td><td>{s3.modified}</td></tr>
+            {/if}
+            {#if s3.user_meta_objects}
+              <tr>
+                <td class="k">User meta</td>
+                <td>{s3.user_meta_objects} object{s3.user_meta_objects === 1 ? '' : 's'}</td>
+              </tr>
+            {/if}
+          </tbody>
+        </table>
+        {#each s3.warnings as w, wi (wi)}
+          <p class="warn">⚠ {w}</p>
+        {/each}
+        {#if s3Objects.length}
+          <button class="fold" on:click={() => (s3Open = !s3Open)}>
+            {s3Open ? '▾' : '▸'} per-object breakdown ({s3Objects.length})
+          </button>
+          {#if s3Open}
+            <table class="shards">
+              <thead><tr><th>object</th><th>detail</th></tr></thead>
+              <tbody>
+                {#each s3Objects as o, oi (oi)}
+                  <tr>
+                    <td class="mono">{o.key}</td>
+                    <td class="mono dim">{s3.object_detail[o.key] ?? humanSize(o.size)}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          {/if}
+        {/if}
       </section>
     {/if}
 
@@ -325,6 +391,45 @@
   }
   .shards td {
     padding: 2px 18px 2px 0;
+  }
+  /* The S3 section's label/value rows — the same two-column shape the TUI prints. */
+  .rows {
+    border-collapse: collapse;
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+  .rows td {
+    padding: 2px 18px 2px 0;
+    vertical-align: top;
+  }
+  .rows td.k {
+    color: var(--fg-dim);
+    font-size: 12px;
+    text-transform: none;
+    letter-spacing: normal;
+    white-space: nowrap;
+  }
+  h3 .count {
+    color: var(--fg-dim);
+    font-weight: 400;
+  }
+  /* Fold toggle for the per-object breakdown, matching the tree's disclosure look. */
+  .fold {
+    background: none;
+    border: none;
+    color: var(--fg-dim);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    padding: 2px 0;
+  }
+  .fold:hover {
+    color: var(--accent);
+  }
+  .warn {
+    color: var(--warn);
+    font-size: 12px;
+    margin: 4px 0;
   }
   .err {
     color: var(--danger);

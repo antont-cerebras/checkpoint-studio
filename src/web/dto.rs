@@ -226,6 +226,57 @@ fn mode_label(m: &SampleMode) -> String {
     .to_string()
 }
 
+/// The stats screen's S3 section, as the TUI words it.
+///
+/// The phrases (`checksums`, `tags`, `modified`) come from the *same* core functions
+/// the TUI renders, rather than being re-derived in TypeScript: their rules are subtle
+/// — "unavailable (permission)" versus "none", a single date versus an "earliest –
+/// latest" span — and two implementations of that would drift. The browser only prints
+/// what it's given. Per-object rows come from `footprint.S3.objects`, which the stats
+/// payload already carries.
+#[derive(serde::Serialize)]
+pub struct S3SummaryDto {
+    pub count: usize,
+    pub total_bytes: u64,
+    /// Stored-checksum coverage, e.g. `SHA256 on 126 of 1155` or `none`.
+    pub checksums: String,
+    /// `1155 of 1155 present`.
+    pub etags: String,
+    /// `none`, `12 of 1155 tagged`, or `unavailable (permission)`.
+    pub tags: String,
+    /// A single date, or `earliest – latest`; absent when no object reported one.
+    pub modified: Option<String>,
+    /// How many objects carry user metadata (`x-amz-meta-*`); 0 when none do.
+    pub user_meta_objects: usize,
+    /// Per-object detail tail (`   2.2 GiB  etag …`), keyed by object key — the same
+    /// string the TUI's folded per-object breakdown shows.
+    pub object_detail: std::collections::BTreeMap<String, String>,
+    /// Anything that went wrong while fetching the metadata (e.g. tags denied).
+    pub warnings: Vec<String>,
+}
+
+impl S3SummaryDto {
+    /// Build from the stats module's S3 view, or `None` for a checkpoint without one.
+    pub fn from_stats(stats: &crate::stats::CheckpointStats) -> Option<Self> {
+        let s3 = stats.s3()?;
+        Some(S3SummaryDto {
+            count: s3.count(),
+            total_bytes: s3.total_bytes(),
+            checksums: crate::stats::s3_checksums_phrase(s3),
+            etags: format!("{} of {} present", s3.etags(), s3.count()),
+            tags: crate::stats::s3_tags_phrase(s3),
+            modified: crate::stats::s3_modified_phrase(s3),
+            user_meta_objects: s3.with_user_meta(),
+            object_detail: s3
+                .objects
+                .iter()
+                .map(|o| (o.key.clone(), crate::stats::s3_object_detail(o)))
+                .collect(),
+            warnings: s3.warnings.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +326,56 @@ mod tests {
         let dto = StatsDto::from(&stats);
         assert_eq!(dto.zero_fraction, 0.25);
         assert!((dto.elapsed_ms - 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn s3_summary_is_absent_without_an_s3_footprint() {
+        let stats = crate::stats::CheckpointStats::compute(&[], None, None);
+        assert!(S3SummaryDto::from_stats(&stats).is_none());
+    }
+
+    #[test]
+    fn s3_summary_words_the_section_the_way_the_tui_does() {
+        use crate::stats::{S3ObjectStat, S3Stats};
+        let s3 = S3Stats {
+            objects: vec![
+                S3ObjectStat {
+                    key: "a.weight".into(),
+                    size: 2048,
+                    etag: "abc".into(),
+                    checksum: None,
+                    last_modified: "2026-06-26T10:00:00+00:00".into(),
+                    tags: Some(0),
+                    user_meta: 1,
+                },
+                S3ObjectStat {
+                    key: "__METADATA__".into(),
+                    size: 1024,
+                    etag: String::new(), // no ETag on this one
+                    checksum: None,
+                    last_modified: "2026-06-27T10:00:00+00:00".into(),
+                    tags: Some(0),
+                    user_meta: 0,
+                },
+            ],
+            warnings: vec!["tags unavailable".into()],
+        };
+        let stats =
+            crate::stats::CheckpointStats::compute(&[], None, None).with_s3(Some(s3.clone()));
+        let dto = S3SummaryDto::from_stats(&stats).expect("an s3 footprint yields a summary");
+
+        assert_eq!(dto.count, 2);
+        assert_eq!(dto.total_bytes, 3072);
+        // The phrases must be the core ones verbatim — that's the point of sending them
+        // rather than re-deriving them in the browser.
+        assert_eq!(dto.checksums, crate::stats::s3_checksums_phrase(&s3));
+        assert_eq!(dto.tags, crate::stats::s3_tags_phrase(&s3));
+        assert_eq!(dto.modified, crate::stats::s3_modified_phrase(&s3));
+        assert_eq!(dto.etags, "1 of 2 present"); // the empty one doesn't count
+        assert_eq!(dto.user_meta_objects, 1);
+        assert_eq!(dto.object_detail.len(), 2);
+        assert!(dto.object_detail["a.weight"].contains("etag abc"));
+        assert_eq!(dto.warnings, vec!["tags unavailable".to_string()]);
     }
 
     #[test]

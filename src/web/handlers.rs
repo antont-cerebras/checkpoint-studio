@@ -124,8 +124,21 @@ pub fn schema(s: &WebState, q: &Query) -> Reply {
     ok(json!({ "families": families }))
 }
 
+/// The checkpoint statistics, plus the S3 section's ready-made phrases for an
+/// `s3://` source (see [`dto::S3SummaryDto`]). Flattened, so every existing key keeps
+/// its place and `s3_summary` is simply absent for a local checkpoint.
 pub fn stats(s: &WebState) -> Reply {
-    ok(&s.stats)
+    #[derive(serde::Serialize)]
+    struct StatsResponse<'a> {
+        #[serde(flatten)]
+        stats: &'a crate::stats::CheckpointStats,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        s3_summary: Option<dto::S3SummaryDto>,
+    }
+    ok(&StatsResponse {
+        stats: &s.stats,
+        s3_summary: dto::S3SummaryDto::from_stats(&s.stats),
+    })
 }
 
 pub fn health(s: &WebState) -> Reply {
@@ -691,6 +704,57 @@ mod contract {
                 "elapsed_ms",
             ],
         );
+    }
+
+    #[test]
+    fn stats_view_s3_section_keys_match_the_component() {
+        // StatsView renders the S3 section from `s3_summary` (server-worded phrases) and
+        // the per-object rows from `footprint.S3.objects`. The fixture is local, so the
+        // summary is absent there — pin the serialised shape directly.
+        let s = state();
+        assert!(
+            json(&super::stats(&s)).get("s3_summary").is_none(),
+            "a local checkpoint has no S3 section"
+        );
+
+        let s3 = crate::stats::S3Stats {
+            objects: vec![crate::stats::S3ObjectStat {
+                key: "a.weight".into(),
+                size: 2048,
+                etag: "abc".into(),
+                checksum: None,
+                last_modified: "2026-06-26T10:00:00+00:00".into(),
+                tags: Some(0),
+                user_meta: 1,
+            }],
+            warnings: Vec::new(),
+        };
+        let stats = crate::stats::CheckpointStats::compute(&[], None, None).with_s3(Some(s3));
+        let summary = serde_json::to_value(
+            crate::web::dto::S3SummaryDto::from_stats(&stats)
+                .expect("an s3 footprint yields a summary"),
+        )
+        .expect("the summary serialises");
+        has_keys(
+            "stats.s3_summary",
+            &summary,
+            &[
+                "count",
+                "total_bytes",
+                "checksums",
+                "etags",
+                "tags",
+                "modified",
+                "user_meta_objects",
+                "object_detail",
+                "warnings",
+            ],
+        );
+        // The per-object rows come from the footprint, which must keep its `S3` tag and
+        // its objects' `key`/`size`.
+        let footprint = serde_json::to_value(&stats).expect("stats serialise");
+        let first = &footprint["footprint"]["S3"]["objects"][0];
+        has_keys("stats.footprint.S3.objects[]", first, &["key", "size"]);
     }
 
     #[test]
