@@ -125,7 +125,7 @@ jobs:
   # typo there fails in front of a user minutes into a job rather than at build
   # time. Lint and type-check them like first-class source.
   python:
-    name: Python (ruff, pyright)
+    name: Python (ruff, pyright, tests)
     runs-on: ubuntu-latest
 
     steps:
@@ -153,11 +153,18 @@ jobs:
         run: pyright
 
       - name: Typecheck (ty)
-        run: ty check crates/core/src/python gen_demo.py record_demo.py
+        run: ty check crates/core/src/python crates/core/tests/python gen_demo.py record_demo.py
 
       # Cheap syntax gate on the interpreter version we claim to support.
       - name: Byte-compile the remote scripts
         run: python -m compileall -q crates/core/src/python
+
+      # Run the scripts themselves, against stubbed cstorch/boto3: the protocol they
+      # print, the progress phases, the parallel S3 metadata pass, pagination and the
+      # error paths. Needs no cluster and no torch — see the module docstring for what
+      # is deliberately left to the recorded-transcript replay tests instead.
+      - name: Test the remote scripts
+        run: python -m unittest discover -s crates/core/tests/python -t crates/core/tests/python
 
       # NOTE: `ruff format --check` is deliberately not a gate yet. These scripts are
       # hand-formatted for density (they cross an ssh link as one payload) and have

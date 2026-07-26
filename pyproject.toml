@@ -56,7 +56,12 @@ ignore = [
 "crates/core/src/python/*.py" = ["BLE001"]
 
 [tool.pyright]
-include = ["crates/core/src/python", "gen_demo.py", "record_demo.py"]
+include = [
+  "crates/core/src/python",
+  "crates/core/tests/python",
+  "gen_demo.py",
+  "record_demo.py",
+]
 # Globs, and `target` matters a lot: it holds gigabytes of build artifacts and
 # walking it made a project-wide run take minutes instead of seconds.
 exclude = ["**/target", "**/node_modules", "web", "target"]
