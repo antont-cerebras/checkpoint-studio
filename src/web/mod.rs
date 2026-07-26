@@ -1,6 +1,12 @@
 //! `--web`: a headless HTTP server (sync/blocking, no async runtime) that serves
 //! the checkpoint as JSON — the **data** — plus the embedded Svelte UI, which owns
-//! its own **view state**. Local checkpoints only for now.
+//! its own **view state**.
+//!
+//! Remote sources work the same way the TUI's do: `web --ssh-proxy` reads the structure
+//! over SSH (an `s3://` URI or a remote path) and serves it. What a remote read cannot
+//! offer is the same in both frontends — the data views need the bytes, so the heatmap,
+//! value grid, histogram and whole-tensor scan return a 400 explaining that (see
+//! `handlers::require_local`), exactly as the terminal shows its `metadata-only` badge.
 //!
 //! `WebState` is read once at startup and shared read-only across worker threads
 //! (`Arc`); every derived view/report is precomputed so request handling needs no
@@ -92,8 +98,26 @@ impl WebState {
             .collect();
         let schemas = sample::parse_packing_schemas(&tensors, &metadata);
 
-        let file_tree =
-            dto::WebFileNode::from_node(&filetree::build(Path::new(&root), 8), Path::new(&root));
+        // A local read walks the directory; a remote one has no local directory to walk, so
+        // the tree comes from the listing the read already returned (`Checkpoint::files` —
+        // S3 object keys, or the SFTP shard listing). Without this the browser's Files
+        // screen was empty for every `--ssh-proxy` source while the terminal listed it.
+        let file_tree = if matches!(checkpoint.source, model::Source::Local) {
+            dto::WebFileNode::from_node(&filetree::build(Path::new(&root), 8), Path::new(&root))
+        } else {
+            let objects: Vec<(String, u64)> = checkpoint
+                .files
+                .iter()
+                .map(|f| (f.rel_path.clone(), f.apparent()))
+                .collect();
+            let label = root
+                .trim_end_matches('/')
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or(&root)
+                .to_string();
+            dto::WebFileNode::from_node(&filetree::build_from_keys(&label, &objects), Path::new(""))
+        };
 
         let mut health: Vec<health::HealthReport> = index_specs
             .iter()

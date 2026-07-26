@@ -179,9 +179,12 @@ The server (a dependency-light, blocking `tiny_http` server — no async runtime
 tree folding, selection, search). It reads the checkpoint once and serves the
 tensor tree, tensor detail, file browser, byte-layout map, stats, and the health /
 structural check — plus on-demand heatmaps, value histograms, sample/slice grids,
-and whole-tensor statistics that scan tensor bytes only when you open them. Local
-checkpoints only for now. The UI is a Svelte single-page app **embedded in the
-binary**, so a released `checkpoint-studio` needs nothing extra to serve it.
+and whole-tensor statistics that scan tensor bytes only when you open them. Remote
+checkpoints work too — `web --ssh-proxy HOST:VENV s3://…` serves a source read over SSH,
+with the same restriction the terminal has: the structure, stats and health are all there,
+while the data views (which need the bytes) report that the checkpoint is metadata-only.
+The UI is a Svelte single-page app **embedded in the binary**, so a released
+`checkpoint-studio` needs nothing extra to serve it.
 
 **Rebuilding the UI** — only needed when changing `web/`. Requires **Node 20**
 (pinned in `web/.nvmrc` / `web/.node-version`; `engine-strict` makes npm enforce it,

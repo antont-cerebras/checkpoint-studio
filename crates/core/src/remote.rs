@@ -454,6 +454,7 @@ impl RemoteRead {
         bars.join();
         let rc = out?;
         let config = self.read_config(&session, src);
+        let disk_shards = rc.disk.map(|d| d.shards).unwrap_or_default();
         Ok(assemble_remote_checkpoint(
             &self.host,
             src,
@@ -461,6 +462,7 @@ impl RemoteRead {
             rc.metadata,
             config,
             rc.s3,
+            &disk_shards,
         ))
     }
 
@@ -1651,6 +1653,54 @@ fn parse_s3_meta(v: &serde_json::Value) -> S3Meta {
 /// [`ShardHeader`](crate::model::ShardHeader) each (one shard for an `s3://`
 /// checkpoint, one per file for a remote safetensors dir), first-seen order;
 /// `__metadata__` (unstamped) rides on the first shard. No local files/index/bytes.
+/// The checkpoint's files as browsable entries, for a source with no local filesystem.
+///
+/// A remote read has no directory walk, so `Checkpoint::files` came back empty and any
+/// frontend's file browser showed nothing. The listing is already in hand by the time this
+/// runs, from whichever half of the read knows it:
+///
+/// * `s3://` — the per-object metadata (`ObjectMeta::Fetch`), whose keys and sizes are
+///   exactly what the browser should show. No extra request.
+/// * SFTP — the per-shard disk usage the reader captured while listing the directory.
+///
+/// Shared so the TUI and the web server show the same tree from the same numbers rather
+/// than each deriving it; the TUI's own copy of this is gone.
+#[must_use]
+pub fn remote_file_entries(
+    s3: Option<&S3Meta>,
+    disk_shards: &[ShardDisk],
+) -> Vec<crate::model::FileEntry> {
+    let entry = |name: &str, apparent: u64, allocated: u64| crate::model::FileEntry {
+        rel_path: name.to_string(),
+        name: name.rsplit('/').next().unwrap_or(name).to_string(),
+        // Flat: the keys carry their own `/`, and the file tree builder folds them into
+        // directories from `rel_path` (the same way it does for a local walk).
+        depth: 0,
+        mode: None,
+        mtime: None,
+        inode: None, // a remote read carries no inode identity
+        node: crate::model::FsNode::File {
+            apparent,
+            allocated,
+            kind: crate::filetree::FileKind::of(name),
+            links: 1,
+        },
+    };
+    if let Some(meta) = s3 {
+        // On S3 there is no block allocation, so apparent == allocated: reporting a
+        // different "on disk" figure would invent a saving that does not exist.
+        return meta
+            .objects
+            .iter()
+            .map(|o| entry(&o.key, o.size, o.size))
+            .collect();
+    }
+    disk_shards
+        .iter()
+        .map(|d| entry(&d.name, d.apparent, d.allocated))
+        .collect()
+}
+
 fn assemble_remote_checkpoint(
     host: &str,
     src: &str,
@@ -1658,6 +1708,7 @@ fn assemble_remote_checkpoint(
     mut metadata: Vec<MetadataInfo>,
     config: Option<crate::config::ModelConfig>,
     s3: Option<S3Meta>,
+    disk_shards: &[ShardDisk],
 ) -> crate::model::Checkpoint {
     use crate::model::{Checkpoint, ShardHeader, Source};
     let source = if src.starts_with("s3://") {
@@ -1697,7 +1748,7 @@ fn assemble_remote_checkpoint(
     Checkpoint {
         source,
         root: src.to_string(),
-        files: Vec::new(),
+        files: remote_file_entries(s3.as_ref(), disk_shards),
         shards,
         config,
         index: Vec::new(),
@@ -2373,6 +2424,76 @@ mod tests {
         assert_eq!(t[1].dtype, "I32");
     }
 
+    /// A remote read has no directory walk, so the file browser used to show an empty
+    /// tree for an `s3://` or SFTP checkpoint while the terminal listed it. Both frontends
+    /// now build the listing from what the read already returned.
+    #[test]
+    fn a_remote_read_is_browsable_from_the_listing_it_already_has() {
+        // s3://: the object metadata IS the listing, keys and sizes included.
+        let s3 = S3Meta {
+            objects: vec![
+                S3Object {
+                    key: "model.embed_tokens.weight".into(),
+                    size: 4096,
+                    etag: "e1".into(),
+                    checksum: None,
+                    last_modified: "2026-06-26T10:00:00+00:00".into(),
+                    user_meta: BTreeMap::new(),
+                    tags: None,
+                },
+                S3Object {
+                    key: "sub/dir/w.weight".into(),
+                    size: 128,
+                    etag: "e2".into(),
+                    checksum: None,
+                    last_modified: "2026-06-26T10:00:00+00:00".into(),
+                    user_meta: BTreeMap::new(),
+                    tags: None,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+        let files = remote_file_entries(Some(&s3), &[]);
+        assert_eq!(files.len(), 2);
+        // The key is the path (so the tree builder can fold `sub/dir/`), and the name is
+        // just its last component.
+        assert_eq!(files[1].rel_path, "sub/dir/w.weight");
+        assert_eq!(files[1].name, "w.weight");
+        let crate::model::FsNode::File {
+            apparent,
+            allocated,
+            ..
+        } = files[0].node
+        else {
+            panic!("an object is a file entry");
+        };
+        // S3 has no block allocation: claiming a different on-disk size would invent a
+        // saving that doesn't exist.
+        assert_eq!((apparent, allocated), (4096, 4096));
+
+        // SFTP: no object metadata, so the per-shard disk usage the reader captured.
+        let shards = vec![ShardDisk {
+            name: "model-00001-of-00002.safetensors".into(),
+            apparent: 1000,
+            allocated: 1024,
+        }];
+        let files = remote_file_entries(None, &shards);
+        assert_eq!(files.len(), 1);
+        let crate::model::FsNode::File {
+            apparent,
+            allocated,
+            ..
+        } = files[0].node
+        else {
+            panic!("a shard is a file entry");
+        };
+        // Here the two DO differ — that is the whole point of the on-disk column.
+        assert_eq!((apparent, allocated), (1000, 1024));
+
+        // Nothing known either way: an empty listing, not a panic.
+        assert!(remote_file_entries(None, &[]).is_empty());
+    }
+
     #[test]
     fn assembles_s3_checkpoint_into_one_shard() {
         let ts = vec![tensor("a"), tensor("b")]; // both carry source_path "h:/p"
@@ -2383,6 +2504,7 @@ mod tests {
             vec![meta("format")],
             None,
             None, // no object metadata was requested for this read
+            &[],  // and no directory listing, so there is nothing to browse
         );
         assert!(matches!(ck.source, crate::model::Source::S3 { .. }));
         assert_eq!(ck.root, "s3://bucket/ckpt");
@@ -2408,7 +2530,8 @@ mod tests {
             mk("b", "host:/ckpt/shard-1.safetensors"),
             mk("c", "host:/ckpt/shard-0.safetensors"),
         ];
-        let ck = assemble_remote_checkpoint("host", "/ckpt", ts, vec![meta("format")], None, None);
+        let ck =
+            assemble_remote_checkpoint("host", "/ckpt", ts, vec![meta("format")], None, None, &[]);
         assert!(matches!(ck.source, crate::model::Source::Sftp { .. }));
         assert_eq!(ck.shards.len(), 2);
         assert_eq!(ck.shards[0].path, "host:/ckpt/shard-0.safetensors");

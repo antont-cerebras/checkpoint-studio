@@ -450,23 +450,10 @@ impl Explorer {
                 metadata: metadata.clone(),
             });
         }
-        let files = disk_shards
-            .iter()
-            .map(|d| crate::model::FileEntry {
-                rel_path: d.name.clone(),
-                name: d.name.clone(),
-                depth: 0,
-                mode: None,
-                mtime: None,
-                inode: None, // remote reads carry no inode identity
-                node: crate::model::FsNode::File {
-                    apparent: d.apparent,
-                    allocated: d.allocated,
-                    kind: crate::filetree::FileKind::of(&d.name),
-                    links: 1,
-                },
-            })
-            .collect();
+        // The same listing the web server shows, from the same numbers (see
+        // `remote::remote_file_entries`) — an `s3://` source is described by its object
+        // metadata, an SFTP one by the per-shard disk usage.
+        let files = crate::remote::remote_file_entries(s3_meta.as_ref(), &disk_shards);
         let cp = crate::model::Checkpoint {
             source,
             root,
