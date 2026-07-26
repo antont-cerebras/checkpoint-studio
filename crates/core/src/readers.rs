@@ -607,3 +607,122 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Reading real files through the one entry point every frontend uses.
+///
+/// `read_local` is what turns paths into the `Checkpoint` model — the dispatch by
+/// format, the directory walk, the header parse, the shard grouping. It was exercised
+/// only end-to-end through the CLI; these pin the model it produces and the errors it
+/// gives for input a user can actually hand it.
+#[cfg(test)]
+mod local_reads {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("the workspace root")
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn reads_a_safetensors_file_into_the_model() {
+        let ck = read_local(&[fixture("tiny.safetensors")]).expect("the fixture reads");
+        assert!(!ck.shards.is_empty(), "a file yields at least one shard");
+        let tensors: Vec<_> = ck.shards.iter().flat_map(|s| &s.tensors).collect();
+        assert!(!tensors.is_empty(), "the fixture has tensors");
+        // Every tensor must carry the file it came from, or the detail screen can't
+        // open it and the layout link has nothing to point at.
+        for t in &tensors {
+            assert!(
+                t.source_path.ends_with("tiny.safetensors"),
+                "{} has source {}",
+                t.name,
+                t.source_path
+            );
+            assert!(
+                t.size_bytes > 0 && t.num_elements > 0,
+                "{} is empty",
+                t.name
+            );
+        }
+        // The root is the containing directory, so the file browser has somewhere to go.
+        assert!(ck.root.ends_with("fixtures"), "root was {}", ck.root);
+    }
+
+    #[test]
+    fn reads_several_files_as_several_shards() {
+        let ck = read_local(&[
+            fixture("diff_old.safetensors"),
+            fixture("diff_new.safetensors"),
+        ])
+        .expect("both fixtures read");
+        assert_eq!(ck.shards.len(), 2, "one shard per file");
+        let names: Vec<&str> = ck.shards.iter().map(|s| s.path.as_str()).collect();
+        assert!(names.iter().any(|p| p.ends_with("diff_old.safetensors")));
+        assert!(names.iter().any(|p| p.ends_with("diff_new.safetensors")));
+    }
+
+    #[test]
+    fn metadata_travels_with_its_shard() {
+        let ck = read_local(&[fixture("diff_meta.safetensors")]).expect("reads");
+        let meta: Vec<_> = ck.shards.iter().flat_map(|s| &s.metadata).collect();
+        assert!(!meta.is_empty(), "this fixture carries __metadata__");
+        for m in meta {
+            assert!(!m.name.is_empty() && !m.value_type.is_empty(), "{m:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error_naming_the_path() {
+        let missing = fixture("no-such-checkpoint.safetensors");
+        let err = read_local(&[missing.clone()])
+            .err()
+            .expect("a missing file must error");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("no-such-checkpoint"),
+            "the error should name the file: {text}"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_checkpoint_is_rejected() {
+        // The fixtures directory has non-checkpoint files (this source tree does too);
+        // point the reader at something with the wrong contents.
+        let dir = std::env::temp_dir().join("ckpt_studio_reader_test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let bogus = dir.join("not-a-checkpoint.safetensors");
+        std::fs::write(&bogus, b"this is not a safetensors header").expect("write");
+        assert!(
+            read_local(&[bogus.clone()]).is_err(),
+            "garbage must not parse as a checkpoint"
+        );
+        let _ = std::fs::remove_file(&bogus);
+    }
+
+    #[test]
+    fn an_empty_file_list_yields_an_empty_model_rather_than_an_error() {
+        // `--filter` can exclude everything; the app then shows an empty tree, so the
+        // reader must not fail on it.
+        let ck = read_local(&[]).expect("no files is not an error");
+        assert!(ck.shards.is_empty());
+    }
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn reads_an_hdf5_checkpoint() {
+        let ck = read_local(&[fixture("tiny.hdf5")]).expect("the hdf5 fixture reads");
+        let tensors: Vec<_> = ck.shards.iter().flat_map(|s| &s.tensors).collect();
+        assert!(!tensors.is_empty(), "the hdf5 fixture has datasets");
+        // HDF5 tracks chunked storage and compression; the model must carry both.
+        assert!(
+            tensors
+                .iter()
+                .any(|t| !matches!(t.layout, crate::tree::Layout::None)),
+            "an hdf5 tensor should report its layout"
+        );
+    }
+}

@@ -69,9 +69,19 @@ impl UI {
     /// widget — dim `│` track, accent `█` thumb). The `run_mode` engine calls this
     /// for every mode that reports a [`VScrollbar`], so no mode draws its own.
     pub fn render_vscrollbar(frame: &mut Frame, sb: &VScrollbar) {
+        // The geometry comes from the body rect its screen computed, which on a pane
+        // shorter than that screen's chrome can start or end past the frame. Clamp here
+        // — the one place every screen's bar is drawn — because a widget rect outside
+        // the buffer is a Ratatui panic, not a clip. (Found by the pty resize test at
+        // 12×2: the bar was asked to draw a row below the last one.)
+        let area = frame.area();
+        let rect = crate::ui::fit_rows(area, sb.top, sb.rows);
+        if rect.height == 0 || area.width == 0 {
+            return;
+        }
         let mut state = ScrollbarState::new(sb.max_offset + 1)
             .position(sb.offset)
-            .viewport_content_length(sb.rows as usize);
+            .viewport_content_length(rect.height as usize);
         StatefulWidget::render(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
@@ -81,10 +91,9 @@ impl UI {
                 .track_style(Style::default().fg(palette::DIM))
                 .thumb_style(Style::default().fg(palette::ACCENT)),
             Rect {
-                x: sb.col,
-                y: sb.top,
+                x: sb.col.min(area.width - 1),
                 width: 1,
-                height: sb.rows,
+                ..rect
             },
             frame.buffer_mut(),
             &mut state,

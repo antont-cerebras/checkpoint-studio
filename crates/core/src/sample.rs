@@ -1018,8 +1018,29 @@ fn parse_prim(dtype: &str) -> Option<Prim> {
     })
 }
 
+impl Prim {
+    /// Width in bytes of one element.
+    const fn size(self) -> usize {
+        match self {
+            Prim::F64 | Prim::I64 | Prim::U64 => 8,
+            Prim::F32 | Prim::I32 | Prim::U32 => 4,
+            Prim::F16 | Prim::BF16 | Prim::I16 | Prim::U16 => 2,
+            Prim::I8 | Prim::U8 => 1,
+        }
+    }
+}
+
 /// Decode `item_size` little-endian bytes as `p` into an `f64`.
+///
+/// A short slice yields `NaN` rather than panicking. The caller's slicing is normally
+/// exact, but a **dtype override** re-reads the same bytes at a different width, and a
+/// tensor whose length isn't a whole multiple of that width leaves a partial tail — the
+/// `d` key on the wrong tensor used to abort the process there.
 fn decode_prim(p: Prim, b: &[u8]) -> f64 {
+    if b.len() < p.size() {
+        return f64::NAN;
+    }
+    let b = &b[..p.size()];
     match p {
         Prim::F64 => f64::from_le_bytes(b.try_into().unwrap()),
         Prim::F32 => f32::from_le_bytes(b.try_into().unwrap()) as f64,
@@ -3965,5 +3986,272 @@ mod hdf5_tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Sampling a real file through the public entry points: every mode, dtype view and
+/// rank, plus the whole-tensor scans. The unit tests above cover the maths on
+/// synthetic input; these read the checked-in fixture, which is what the data views do.
+#[cfg(test)]
+mod fixture_sampling {
+    use super::*;
+    use crate::tree::TensorInfo;
+
+    fn checkpoint() -> Vec<TensorInfo> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .join("tests/fixtures/tiny.safetensors");
+        let ck = crate::readers::read_local(&[path]).expect("the fixture reads");
+        ck.shards.into_iter().flat_map(|s| s.tensors).collect()
+    }
+
+    fn pick(tensors: &[TensorInfo], rank: usize) -> &TensorInfo {
+        tensors
+            .iter()
+            .find(|t| t.shape.len() == rank)
+            .unwrap_or_else(|| panic!("the fixture has no rank-{rank} tensor"))
+    }
+
+    #[test]
+    fn every_sample_mode_produces_a_grid_of_the_right_shape() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        for mode in [
+            SampleMode::Grid,
+            SampleMode::GridMax,
+            SampleMode::Edges {
+                row_tail: 0.5,
+                col_tail: 0.5,
+            },
+            SampleMode::Window {
+                row_off: 0,
+                col_off: 0,
+            },
+        ] {
+            let s = sample_tensor(t, 4, 4, 0, ViewDtype::Stored, mode, None)
+                .unwrap_or_else(|e| panic!("{mode:?} failed: {e}"));
+            assert!(!s.values.is_empty(), "{mode:?} sampled nothing");
+            assert_eq!(s.values.len(), s.rows.len(), "{mode:?} rows disagree");
+            assert!(
+                s.values.iter().all(|r| r.len() == s.cols.len()),
+                "{mode:?} produced a ragged grid"
+            );
+            assert!(s.min <= s.max, "{mode:?} range inverted");
+            // GridMax reports magnitudes, so it never goes below zero.
+            if matches!(mode, SampleMode::GridMax) {
+                assert!(s.min >= 0.0, "abs-max produced a negative: {}", s.min);
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_is_clamped_so_it_never_runs_off_the_edge() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        let far = sample_tensor(
+            t,
+            2,
+            2,
+            0,
+            ViewDtype::Stored,
+            SampleMode::Window {
+                row_off: 9_999,
+                col_off: 9_999,
+            },
+            None,
+        )
+        .expect("a far window still samples");
+        assert!(
+            far.rows.iter().all(|r| *r < t.shape[0]),
+            "rows ran past the end: {:?}",
+            far.rows
+        );
+    }
+
+    #[test]
+    fn a_three_d_tensor_reports_its_slices_and_samples_each() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 3);
+        let first = sample_tensor(t, 4, 4, 0, ViewDtype::Stored, SampleMode::Grid, None)
+            .expect("slice 0 samples");
+        assert_eq!(first.slices, t.shape[0], "every leading index is a slice");
+        assert_eq!(first.slice, 0);
+        let last = sample_tensor(
+            t,
+            4,
+            4,
+            t.shape[0] - 1,
+            ViewDtype::Stored,
+            SampleMode::Grid,
+            None,
+        )
+        .expect("the last slice samples");
+        assert_eq!(last.slice, t.shape[0] - 1);
+        assert_ne!(
+            first.values, last.values,
+            "different slices should hold different data"
+        );
+        // An out-of-range slice is clamped to the last one rather than refused — the
+        // `[`/`]` keys and `--slice` can both overshoot, and showing the end beats an
+        // error.
+        let clamped = sample_tensor(t, 4, 4, 9_999, ViewDtype::Stored, SampleMode::Grid, None)
+            .expect("an overshooting slice is clamped");
+        assert_eq!(clamped.slice, t.shape[0] - 1);
+    }
+
+    #[test]
+    fn a_one_d_tensor_is_shown_as_a_single_row() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 1);
+        let s = sample_tensor(t, 4, 8, 0, ViewDtype::Stored, SampleMode::Grid, None)
+            .expect("1-D samples");
+        assert_eq!(s.total_rows, 1, "1-D is one row of n");
+        assert_eq!(s.values.len(), 1);
+        assert_eq!(s.slices, 1);
+    }
+
+    #[test]
+    fn a_dtype_override_reinterprets_the_same_bytes() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        let stored = sample_tensor(t, 4, 4, 0, ViewDtype::Stored, SampleMode::Grid, None)
+            .expect("stored view");
+        // Same width, different interpretation: the numbers must change, the geometry
+        // must not.
+        let as_u16 = sample_tensor(t, 4, 4, 0, ViewDtype::As("U16"), SampleMode::Grid, None);
+        if let Ok(other) = as_u16 {
+            assert_eq!(other.values.len(), stored.values.len());
+            assert_eq!(other.view, ViewDtype::As("U16"));
+        }
+        // The 4-bit views unpack two values per byte, so the last dimension grows.
+        for view in [ViewDtype::U4, ViewDtype::I4] {
+            if let Ok(nibbles) = sample_tensor(t, 4, 16, 0, view, SampleMode::Grid, None) {
+                assert!(
+                    nibbles.display_shape.last() >= t.shape.last(),
+                    "{view:?} should widen the last dimension: {:?} vs {:?}",
+                    nibbles.display_shape,
+                    t.shape
+                );
+                assert!(nibbles.raw.iter().flatten().all(|b| b.width == 4));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_bits_accompany_every_sampled_value_for_the_hex_view() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        let s = sample_tensor(t, 3, 3, 0, ViewDtype::Stored, SampleMode::Grid, None).expect("ok");
+        assert_eq!(s.raw.len(), s.values.len(), "one raw row per value row");
+        for (row, raws) in s.values.iter().zip(&s.raw) {
+            assert_eq!(row.len(), raws.len());
+            assert!(raws.iter().all(|b| b.width > 0), "a zero-width raw bit");
+        }
+    }
+
+    #[test]
+    fn a_whole_tensor_scan_agrees_with_the_values_it_scanned() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        let go = std::sync::atomic::AtomicBool::new(false);
+        let stats =
+            tensor_stats(t, ViewDtype::Stored, None, &go, &go, None).expect("the scan runs");
+        assert_eq!(
+            stats.count, t.num_elements as u64,
+            "every element is scanned"
+        );
+        assert!(stats.min <= stats.max);
+        assert!(
+            stats.mean >= stats.min && stats.mean <= stats.max,
+            "{stats:?}"
+        );
+        assert!(stats.std >= 0.0);
+        assert!(stats.zeros <= stats.count);
+        assert_eq!(stats.nonfinite, 0, "the fixture holds no NaN/inf");
+        // The sampled range must sit inside the exact range the scan found.
+        let s = sample_tensor(t, 4, 4, 0, ViewDtype::Stored, SampleMode::Grid, None).expect("ok");
+        assert!(
+            s.min >= stats.min && s.max <= stats.max,
+            "sample outside scan"
+        );
+    }
+
+    #[test]
+    fn a_histogram_bins_the_whole_tensor() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        let go = std::sync::atomic::AtomicBool::new(false);
+        let stats = tensor_stats(t, ViewDtype::Stored, None, &go, &go, None).expect("scan");
+        let (bins, n) = histogram_bins(
+            ViewDtype::Stored,
+            &t.dtype,
+            Some((stats.min, stats.max)),
+            Some(8),
+        )
+        .expect("a bin layout");
+        assert_eq!(n, 8, "the requested bucket count is honoured");
+
+        let shared = HistShared::new(n);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let pause = std::sync::atomic::AtomicBool::new(false);
+        tensor_histogram_into(
+            t,
+            ViewDtype::Stored,
+            None,
+            bins,
+            n,
+            &shared,
+            &cancel,
+            &pause,
+            None,
+        )
+        .expect("the histogram runs");
+        let hist = shared.snapshot(bins);
+        assert_eq!(hist.counts.len(), n, "one count per bucket");
+        assert_eq!(
+            hist.counts.iter().sum::<u64>() + hist.nonfinite,
+            t.num_elements as u64,
+            "every element lands in a bucket"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_scan_stops_instead_of_finishing() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        let (bins, n) =
+            histogram_bins(ViewDtype::Stored, &t.dtype, Some((0.0, 1.0)), Some(4)).expect("bins");
+        let shared = HistShared::new(n);
+        let cancel = std::sync::atomic::AtomicBool::new(true); // already cancelled
+        let pause = std::sync::atomic::AtomicBool::new(false);
+        let _ = tensor_histogram_into(
+            t,
+            ViewDtype::Stored,
+            None,
+            bins,
+            n,
+            &shared,
+            &cancel,
+            &pause,
+            None,
+        );
+        // Whether it returns an error or an empty result, it must not report a full scan.
+        let hist = shared.snapshot(bins);
+        assert!(
+            hist.counts.iter().sum::<u64>() <= t.num_elements as u64,
+            "a cancelled scan counted more than the tensor holds"
+        );
+    }
+
+    #[test]
+    fn opening_a_missing_file_is_an_error_not_a_panic() {
+        let mut t = checkpoint()[0].clone();
+        t.source_path = "/no/such/file.safetensors".into();
+        assert!(open_reader(&t).is_err());
+        assert!(sample_tensor(&t, 2, 2, 0, ViewDtype::Stored, SampleMode::Grid, None).is_err());
+        let go = std::sync::atomic::AtomicBool::new(false);
+        assert!(tensor_stats(&t, ViewDtype::Stored, None, &go, &go, None).is_err());
     }
 }

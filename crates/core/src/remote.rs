@@ -2531,6 +2531,158 @@ mod tests {
 /// carry a header noting where the payload was trimmed (only the arrays, never the
 /// structure). Non-sentinel lines in them — a urllib3 warning, the trim banner — are real
 /// noise the parsers must tolerate.
+/// The dump parser's error and edge paths. The replay tests below prove the happy path
+/// against recorded cluster output; these cover what a *broken* remote produces, which
+/// is what a user actually hits when a cluster misbehaves.
+#[cfg(test)]
+mod parse_edges {
+    use super::*;
+
+    const SRC: &str = "s3://bucket/ckpt";
+
+    fn dump(json: &str) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>, S3Meta)> {
+        parse_dump(json, SRC)
+    }
+
+    #[test]
+    fn an_error_payload_becomes_an_error_with_the_remote_message() {
+        let err = dump(r#"{"error": "cstorch.load failed: RuntimeError(...)"}"#)
+            .err()
+            .expect("an error payload must not parse as success");
+        assert!(
+            format!("{err:#}").contains("cstorch.load failed"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn an_error_payload_carries_the_s3_probe_into_the_message() {
+        // The probe is the difference between "it failed" and "your prefix has an empty
+        // __METADATA__", so it has to reach the user.
+        let json = r#"{"error": "boom", "s3_probe": {"prefix": "ckpt/", "total": 3,
+            "empty": 1, "bytes": 12, "metadata_key": "__METADATA__",
+            "metadata_empty": true, "sample": [["a", 0]]}}"#;
+        let err = dump(json).err().expect("still an error");
+        let text = format!("{err:#}");
+        assert!(text.contains("boom"), "{text}");
+        assert!(
+            text.contains("__METADATA__") || text.contains("empty"),
+            "the probe should explain why: {text}"
+        );
+    }
+
+    #[test]
+    fn malformed_json_is_reported_as_such() {
+        assert!(dump("not json at all").is_err());
+        assert!(dump("").is_err());
+        assert!(dump("[]").is_err(), "an array is not the expected object");
+    }
+
+    /// A payload with no tensors is treated as a **failure**, not an empty checkpoint:
+    /// on an `s3://` read it almost always means the prefix was wrong, and a clear error
+    /// beats an empty tree the user has to diagnose themselves.
+    #[test]
+    fn a_payload_with_no_tensors_is_an_error_naming_the_source() {
+        let err = dump(r#"{"tensors": [], "metadata": [], "s3_objects": []}"#)
+            .err()
+            .expect("no tensors is an error");
+        let text = format!("{err:#}");
+        assert!(text.contains("no tensors"), "{text}");
+        assert!(text.contains(SRC), "the message names the source: {text}");
+    }
+
+    #[test]
+    fn torch_dtypes_are_mapped_to_display_names_and_sizes_computed() {
+        let json = r#"{"tensors": [
+            {"name": "a", "dtype": "torch.bfloat16", "shape": [4, 8], "itemsize": 2},
+            {"name": "b", "dtype": "torch.float32", "shape": [16], "itemsize": 4},
+            {"name": "c", "dtype": "torch.int8", "shape": [2, 2, 2], "itemsize": 1}
+        ], "metadata": [], "s3_objects": []}"#;
+        let (tensors, _, _) = dump(json).expect("parses");
+        let by: std::collections::HashMap<_, _> =
+            tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+        assert_eq!(by["a"].dtype, "BF16");
+        assert_eq!(by["a"].num_elements, 32);
+        assert_eq!(by["a"].size_bytes, 64, "elements × itemsize");
+        assert_eq!(by["b"].dtype, "F32");
+        assert_eq!(by["c"].dtype, "I8");
+        assert_eq!(by["c"].num_elements, 8);
+        // Every tensor is stamped with the source it came from.
+        assert!(
+            tensors
+                .iter()
+                .all(|t| t.source_path.contains("bucket/ckpt"))
+        );
+    }
+
+    #[test]
+    fn an_unknown_dtype_passes_through_uppercased_rather_than_being_dropped() {
+        let json = r#"{"tensors": [{"name": "x", "dtype": "torch.some_future_type",
+            "shape": [2], "itemsize": 1}], "metadata": [], "s3_objects": []}"#;
+        let (tensors, _, _) = dump(json).expect("parses");
+        assert_eq!(
+            tensors.len(),
+            1,
+            "an unknown dtype must not drop the tensor"
+        );
+        assert_eq!(tensors[0].dtype, "SOME_FUTURE_TYPE");
+    }
+
+    #[test]
+    fn a_malformed_tensor_entry_is_skipped_not_fatal() {
+        // One bad entry among many must not lose the whole checkpoint.
+        let json = r#"{"tensors": [
+            {"name": "good", "dtype": "torch.float16", "shape": [2], "itemsize": 2},
+            {"dtype": "torch.float16", "shape": [2], "itemsize": 2},
+            {"name": "shapeless", "dtype": "torch.float16", "itemsize": 2}
+        ], "metadata": [], "s3_objects": []}"#;
+        let (tensors, _, _) = dump(json).expect("parses");
+        assert!(
+            tensors.iter().any(|t| t.name == "good"),
+            "the valid entry must survive: {tensors:?}"
+        );
+    }
+
+    #[test]
+    fn s3_objects_parse_with_their_checksums_tags_and_user_metadata() {
+        let json = r#"{"tensors": [{"name": "a.weight", "dtype": "torch.float16",
+              "shape": [4, 8], "itemsize": 2}], "metadata": [], "s3_objects": [
+            {"key": "a.weight", "size": 2048, "etag": "abc", "last_modified": "2026-06-26T10:00:00+00:00",
+             "checksum": ["sha256", "deadbeef"], "tags": {"owner": "team"},
+             "metadata": {"metadata": "{\"shapes\": [[4, 8]]}"}},
+            {"key": "b.weight", "size": 0, "etag": "", "last_modified": ""}
+        ], "s3_warnings": ["tags unavailable"]}"#;
+        let (_, _, s3) = dump(json).expect("parses");
+        assert_eq!(s3.objects.len(), 2);
+        let a = &s3.objects[0];
+        assert_eq!(a.size, 2048);
+        assert_eq!(a.etag, "abc");
+        let c = a.checksum.as_ref().expect("a checksum");
+        assert_eq!(c.algorithm.to_lowercase(), "sha256");
+        assert_eq!(
+            a.tags.as_ref().map(std::collections::BTreeMap::len),
+            Some(1)
+        );
+        assert_eq!(a.user_meta.len(), 1, "the cross-check reads this");
+        // The second object read no tags at all — `None` means "unavailable", which is
+        // distinct from `Some(empty)` meaning "read, none set".
+        assert!(s3.objects[1].tags.is_none());
+        assert_eq!(s3.warnings, vec!["tags unavailable".to_string()]);
+    }
+
+    #[test]
+    fn the_listing_parser_handles_pages_and_bad_entries() {
+        let objects = parse_list(r#"{"objects": [["a", 10], ["sub/b", 20], ["bad"], [42, 1]]}"#)
+            .expect("parses");
+        assert_eq!(objects.len(), 2, "malformed rows are skipped: {objects:?}");
+        assert_eq!(objects[0], ("a".to_string(), 10));
+        assert_eq!(objects[1], ("sub/b".to_string(), 20));
+        // An error payload is an error, and junk is an error — not an empty listing.
+        assert!(parse_list(r#"{"error": "no credentials"}"#).is_err());
+        assert!(parse_list("nonsense").is_err());
+    }
+}
+
 #[cfg(test)]
 mod replay {
     use super::*;

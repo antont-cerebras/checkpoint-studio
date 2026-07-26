@@ -716,7 +716,7 @@ mod tests {
         assert_eq!(q.get("name").map(String::as_str), Some("model.layers.0/w"));
         assert_eq!(q.get("dtype").map(String::as_str), Some("F16"));
         assert_eq!(q.get("flag").map(String::as_str), Some(""));
-        assert!(q.get("missing").is_none());
+        assert!(!q.contains_key("missing"));
     }
 
     #[test]

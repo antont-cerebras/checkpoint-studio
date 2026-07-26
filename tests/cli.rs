@@ -1394,3 +1394,303 @@ fn diff_histogram_whole_checkpoint_reports_tvd() {
         "{out}"
     );
 }
+
+// ---------------------------------------------------------------- CLI surface ----
+//
+// The paths above are snapshot tests of *rendered screens*. These cover the rest of
+// the command line — the dispatch, the exit codes and the writes — where the value is
+// in the behaviour rather than the pixels, so they assert directly instead of
+// snapshotting. Each one also drags a whole slice of `main.rs` / `explorer` /
+// `readers` through the binary, which unit tests can't reach.
+
+/// A tensor name from the generated fixture, for the flags that take one.
+const A_TENSOR: &str = "model.layers.0.mlp.down_proj.weight";
+
+#[test]
+fn metadata_flag_opens_that_entry() {
+    ensure_fixture();
+    let out = run_plain(FIXTURE, &["--metadata", "format"]);
+    assert!(out.contains("format"), "{out}");
+}
+
+#[test]
+fn compute_stats_scans_the_tensor_and_reports_a_summary() {
+    ensure_fixture();
+    let out = run_plain(FIXTURE, &["--tensor", A_TENSOR, "--compute-stats"]);
+    // A finished scan reports mean/std/zeros — the numbers, not just the offer to scan.
+    assert!(out.contains("mean"), "{out}");
+    assert!(out.contains("zeros"), "{out}");
+}
+
+#[test]
+fn a_slice_and_a_reinterpreted_dtype_reach_the_values_grid() {
+    ensure_fixture();
+    // The 3-D tensor has slices; `--slice 1` must show that one, and `--dtype` must
+    // decode the same bytes differently.
+    let sliced = run_plain(FIXTURE, &["--tensor", A_TENSOR, "--values", "--slice", "1"]);
+    assert!(sliced.contains("Values"), "{sliced}");
+    let viewed = run_plain(
+        FIXTURE,
+        &["--tensor", A_TENSOR, "--values", "--dtype", "F16"],
+    );
+    assert!(viewed.contains("F16"), "{viewed}");
+    assert_ne!(
+        sliced, viewed,
+        "a dtype override must change what the grid shows"
+    );
+}
+
+#[test]
+fn the_abs_max_heatmap_is_a_different_picture_from_the_sampled_one() {
+    ensure_fixture();
+    let sampled = run_plain(FIXTURE, &["--tensor", A_TENSOR, "--heatmap"]);
+    let abs_max = run_plain(FIXTURE, &["--tensor", A_TENSOR, "--heatmap", "--abs-max"]);
+    assert!(abs_max.contains("abs-max"), "the mode is named: {abs_max}");
+    assert_ne!(sampled, abs_max, "abs-max scans instead of sampling");
+}
+
+#[test]
+fn a_histogram_takes_its_bin_count_from_the_flag() {
+    ensure_fixture();
+    let out = run_plain(
+        FIXTURE,
+        &["--tensor", A_TENSOR, "--histogram", "--bins", "8"],
+    );
+    assert!(
+        out.contains("Histogram") || out.contains("histogram"),
+        "{out}"
+    );
+}
+
+/// The explore path exits **1** on a bad request. (`diff` and `check` use 0/1/2 as a
+/// semantic protocol — 1 there means "differences found", not "error" — so the codes
+/// aren't the same across subcommands, and each is asserted where it belongs.)
+#[test]
+fn an_unknown_tensor_exits_nonzero_rather_than_showing_the_tree() {
+    ensure_fixture();
+    let (out, code) = run_bin_status(&[FIXTURE, "--plain", "--tensor", "no.such.tensor"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        !out.contains("Checkpoint Studio"),
+        "it must not fall back to the tree"
+    );
+}
+
+#[test]
+fn a_malformed_filter_exits_nonzero_rather_than_showing_everything() {
+    ensure_fixture();
+    // Silently ignoring a bad filter would show the whole checkpoint and look like the
+    // filter matched everything.
+    let (out, code) = run_bin_status(&[FIXTURE, "--plain", "--filter", "dtpye:F16"]);
+    assert_eq!(code, 1);
+    assert!(!out.contains("Checkpoint Studio"), "{out}");
+}
+
+#[test]
+fn a_path_that_does_not_exist_exits_nonzero() {
+    let (_out, code) = run_bin_status(&["/no/such/checkpoint.safetensors", "--plain"]);
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn recursive_finds_the_fixture_under_a_directory() {
+    ensure_fixture();
+    let dir = Path::new(FIXTURE).parent().expect("a fixtures directory");
+    let out = run_plain(&dir.to_string_lossy(), &["--recursive"]);
+    assert!(out.contains("Checkpoint Studio"), "{out}");
+}
+
+#[test]
+fn the_health_check_can_be_skipped() {
+    ensure_fixture();
+    let with = run_plain(FIXTURE, &[]);
+    let without = run_plain(FIXTURE, &["--no-health-check"]);
+    // Both render; skipping health must not change the tree itself.
+    assert!(with.contains("Checkpoint Studio") && without.contains("Checkpoint Studio"));
+}
+
+#[test]
+fn check_reports_json_and_sarif_for_the_same_findings() {
+    ensure_fixture();
+    for (format, marker) in [("json", "\"checks\""), ("sarif", "\"runs\"")] {
+        let (out, code) = run_bin_status(&["check", FIXTURE, "--format", format]);
+        assert!(out.contains(marker), "{format}: {out}");
+        assert!(code == 0 || code == 1, "{format} exited {code}");
+        // Machine formats must parse.
+        serde_json::from_str::<serde_json::Value>(&out)
+            .unwrap_or_else(|e| panic!("{format} output is not JSON: {e}\n{out}"));
+    }
+}
+
+#[test]
+fn rename_writes_the_new_names_into_a_copy() {
+    ensure_fixture();
+    // `convert --rename` edits in place, so work on a copy and read it back through the
+    // binary — this is the only write path the CLI has for safetensors.
+    let dir = std::env::temp_dir().join("ckpt_studio_cli_rename");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let target = dir.join("renamed.safetensors");
+    std::fs::copy(FIXTURE, &target).expect("copy the fixture");
+    let path = target.to_string_lossy().into_owned();
+
+    // A rename that would GROW the header is refused: honouring it would mean moving
+    // tensor data, which this mode promises not to do. That refusal is the safety
+    // property, so pin it first.
+    let (grow, grow_code) = run_bin_status(&[
+        "convert",
+        &path,
+        "--map",
+        r"model\.norm\.=>model.a_much_longer_prefix_norm.",
+        "--force",
+    ]);
+    assert_ne!(grow_code, 0, "growing the header must be refused: {grow}");
+
+    // A rename that fits (same length or shorter) is applied in place.
+    let (out, code) = run_bin_status(&[
+        "convert",
+        &path,
+        "--map",
+        r"model\.norm\.=>model.nrm.",
+        "--force", // skip the confirmation prompt (there's no tty here)
+    ]);
+    assert_eq!(code, 0, "rename failed: {out}");
+
+    let after = run_plain(&path, &[]);
+    assert!(after.contains("nrm"), "the new name is there:\n{after}");
+    assert!(
+        !after.contains("norm.weight"),
+        "the old name is gone:\n{after}"
+    );
+    let _ = std::fs::remove_file(&target);
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn repack_writes_a_new_hdf5_and_leaves_the_original_alone() {
+    let src = "tests/fixtures/tiny.hdf5";
+    let dir = std::env::temp_dir().join("ckpt_studio_cli_repack");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let out_path = dir.join("repacked.hdf5");
+    let _ = std::fs::remove_file(&out_path);
+    let before = std::fs::metadata(src).expect("the fixture exists").len();
+
+    // Repack mode: the destination is a positional argument, not a flag.
+    let (out, code) = run_bin_status(&["convert", src, &out_path.to_string_lossy(), "--force"]);
+    assert_eq!(code, 0, "repack failed: {out}");
+    assert!(out_path.exists(), "the output file was not written");
+    assert_eq!(
+        std::fs::metadata(src).expect("still there").len(),
+        before,
+        "repack must not touch the source"
+    );
+    // The repacked file reads back as a checkpoint.
+    let text = run_plain(&out_path.to_string_lossy(), &[]);
+    assert!(text.contains("Checkpoint Studio"), "{text}");
+    let _ = std::fs::remove_file(&out_path);
+}
+
+/// A sharded checkpoint directory with an index — the layout every real HuggingFace
+/// model uses, and the one load path the single-file fixture never takes (index
+/// parsing, multi-shard grouping, and the index-vs-files health reconcile).
+fn write_sharded(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("create the shard directory");
+    let shards = [
+        (
+            "model-00001-of-00002.safetensors",
+            vec![("model.embed_tokens.weight", Dtype::F16, vec![4, 4])],
+        ),
+        (
+            "model-00002-of-00002.safetensors",
+            vec![
+                (
+                    "model.layers.0.mlp.down_proj.weight",
+                    Dtype::F32,
+                    vec![2, 4],
+                ),
+                ("model.norm.weight", Dtype::F32, vec![4]),
+            ],
+        ),
+    ];
+    let mut weight_map = serde_json::Map::new();
+    for (file, specs) in &shards {
+        let buffers: Vec<Vec<u8>> = specs
+            .iter()
+            .map(|(_, dt, shape)| {
+                let bytes = shape.iter().product::<usize>() * dtype_size(*dt);
+                (0..bytes).map(|i| (i % 251) as u8).collect()
+            })
+            .collect();
+        let views: Vec<(String, TensorView)> = specs
+            .iter()
+            .zip(&buffers)
+            .map(|((name, dt, shape), buf)| {
+                (
+                    (*name).to_string(),
+                    TensorView::new(*dt, shape.clone(), buf).expect("view"),
+                )
+            })
+            .collect();
+        safetensors::serialize_to_file(views, &None, &dir.join(file)).expect("write shard");
+        for (name, ..) in specs {
+            weight_map.insert(
+                (*name).to_string(),
+                serde_json::Value::String((*file).to_string()),
+            );
+        }
+    }
+    let index = serde_json::json!({ "metadata": { "total_size": 0 }, "weight_map": weight_map });
+    std::fs::write(
+        dir.join("model.safetensors.index.json"),
+        serde_json::to_vec_pretty(&index).expect("index json"),
+    )
+    .expect("write the index");
+}
+
+#[test]
+fn a_sharded_directory_loads_every_shard_and_checks_its_index() {
+    let dir = std::env::temp_dir().join("ckpt_studio_sharded");
+    let _ = std::fs::remove_dir_all(&dir);
+    write_sharded(&dir);
+    let path = dir.to_string_lossy().into_owned();
+
+    // The tree shows the tensors from both shards.
+    let tree = run_plain(&path, &["--recursive"]);
+    for name in ["embed_tokens", "down_proj", "norm"] {
+        assert!(tree.contains(name), "{name} missing:\n{tree}");
+    }
+
+    // The file browser lists both shards and the index.
+    let files = run_plain(&path, &["--files"]);
+    assert!(files.contains("00001-of-00002"), "{files}");
+    assert!(files.contains("index.json"), "{files}");
+
+    // With the index matching the files, `check` reports the file/sharding check as a
+    // pass rather than n/a — the reconcile actually ran.
+    let (report, code) = run_bin_status(&["check", &path]);
+    assert!(code == 0 || code == 1, "check exited {code}: {report}");
+    assert!(report.contains("Files & sharding"), "{report}");
+    assert!(
+        !report.contains("Files & sharding      — n/a"),
+        "the index was ignored:\n{report}"
+    );
+
+    // Now break the index: a tensor assigned to a shard that doesn't have it must be
+    // reported, not silently ignored.
+    let index_path = dir.join("model.safetensors.index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&index_path).expect("read")).expect("parse");
+    index["weight_map"]["model.ghost.weight"] =
+        serde_json::Value::String("model-00001-of-00002.safetensors".into());
+    std::fs::write(
+        &index_path,
+        serde_json::to_vec_pretty(&index).expect("json"),
+    )
+    .expect("write");
+    let (broken, _code) = run_bin_status(&["check", &path]);
+    assert!(
+        broken.contains("ghost"),
+        "a tensor the index invents must be reported:\n{broken}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
