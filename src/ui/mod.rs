@@ -76,6 +76,24 @@ pub(crate) use hints::{
     rename_hint_lines, stats_hint_lines, tree_hint_lines,
 };
 
+/// A `Rect` of `height` rows starting at `y`, clamped to what `area` actually has.
+///
+/// Ratatui **panics** when a widget's rect runs past the buffer instead of clipping, so
+/// any screen that computes a height — a header of N field lines, a footer wrapped to
+/// the terminal width — can kill the TUI on a pane smaller than its own chrome. That
+/// happened on four screens (the two data views, the detail screen, the tree and the
+/// stats report) at 10×10 and smaller; every one of them now goes through here, and
+/// `ui::small_terminal` sweeps all of them at seven sizes.
+pub(crate) fn fit_rows(area: Rect, y: u16, height: u16) -> Rect {
+    let y = y.min(area.height);
+    Rect {
+        x: area.x,
+        y,
+        width: area.width,
+        height: height.min(area.height.saturating_sub(y)),
+    }
+}
+
 /// A still-forming scan's progress indicator: a spinner glyph, the elapsed time,
 /// and an optional completed fraction (`None` when the total isn't known).
 pub type ScanProgress = (char, std::time::Duration, Option<f64>);
@@ -230,5 +248,197 @@ mod tests {
         assert_eq!(NumBase::Hex.digits(8), 2);
         assert_eq!(NumBase::Hex.digits(4), 1);
         assert_eq!(NumBase::Octal.digits(8), 3);
+    }
+}
+
+/// Every screen is drawn by bottom-pinning a **wrapped** footer under a header, so on a
+/// small pane either can need more rows than the pane has — and a `Paragraph` rect that
+/// runs past the buffer is a Ratatui panic, i.e. the TUI dying because someone shrank
+/// their window. The data views and the detail screen both did this at 10×10; this
+/// sweeps the rest so the next one is caught here rather than in a user's terminal.
+#[cfg(test)]
+mod small_terminal {
+    use super::*;
+    use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo};
+
+    const SIZES: [(u16, u16); 7] = [
+        (4, 2),
+        (10, 10),
+        (16, 4),
+        (24, 12),
+        (48, 20),
+        (120, 3),
+        (200, 60),
+    ];
+
+    fn tensor(name: &str) -> TensorInfo {
+        TensorInfo {
+            name: name.into(),
+            dtype: "F32".into(),
+            shape: vec![8, 8],
+            size_bytes: 256,
+            num_elements: 64,
+            storage: Storage::Raw,
+            source_path: "/ckpt/model.safetensors".into(),
+            layout: Layout::ByteRange { start: 0, end: 256 },
+        }
+    }
+
+    fn draw(what: &str, f: impl Fn(&mut ratatui::Frame) + Copy) {
+        for (w, h) in SIZES {
+            assert!(
+                crate::tui::headless_render(w, h, f).is_ok(),
+                "{what} panicked at {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tree_screen_fits_any_terminal() {
+        let nodes = vec![(
+            crate::tree::TreeNode::Tensor {
+                info: tensor("model.layers.0.weight"),
+                label: None,
+            },
+            0usize,
+        )];
+        let unindexed = HashSet::new();
+        let schemas = HashMap::new();
+        let badges = crate::ui::status_badges(AccessBadge::ReadOnly, None, false);
+        let config = DrawConfig {
+            tree: &nodes,
+            current_file: "/ckpt/model.safetensors",
+            file_idx: 0,
+            total_files: 1,
+            selected_idx: 0,
+            scroll_offset: 0,
+            search_mode: false,
+            search_query: "",
+            search_cursor: 0,
+            filter_query: "",
+            status_icon: "▪",
+            status_bar: "model.layers.0.weight",
+            status_secondary: "/ckpt/model.safetensors",
+            can_repack: false,
+            can_rename: false,
+            unindexed: &unindexed,
+            packing_schemas: &schemas,
+            copied_flash: None,
+            interactive: true,
+            badges: &badges,
+            hovered_badge: None,
+        };
+        draw("the tree", |f| {
+            UI::render_tree(f, &config);
+        });
+        // …and while searching, which adds the query row.
+        let searching = DrawConfig {
+            search_mode: true,
+            search_query: "weight",
+            search_cursor: 6,
+            ..config
+        };
+        draw("the tree while searching", |f| {
+            UI::render_tree(f, &searching);
+        });
+    }
+
+    #[test]
+    fn the_stats_screen_fits_any_terminal() {
+        let stats = crate::stats::CheckpointStats::compute(&[tensor("a.weight")], None, None);
+        draw("the stats screen", |f| {
+            UI::render_stats_frame(f, &stats, 0, false);
+        });
+        draw("the stats screen with shards expanded", |f| {
+            UI::render_stats_frame(f, &stats, 0, true);
+        });
+    }
+
+    #[test]
+    fn the_metadata_screen_fits_any_terminal() {
+        let m = MetadataInfo {
+            name: "format".into(),
+            value: "pt".into(),
+            value_type: "string".into(),
+        };
+        draw("the metadata screen", |f| UI::render_metadata_detail(f, &m));
+    }
+
+    #[test]
+    fn the_files_browser_fits_any_terminal() {
+        let rows = vec![crate::filetree::FileRow {
+            depth: 0,
+            name: "model.safetensors".into(),
+            path: std::path::PathBuf::from("/ckpt/model.safetensors"),
+            size: 256,
+            kind: crate::filetree::FileRowKind::File {
+                kind: crate::filetree::FileKind::Checkpoint,
+            },
+        }];
+        let badges = crate::ui::status_badges(AccessBadge::ReadOnly, None, false);
+        draw("the file browser", |f| {
+            UI::render_files(f, "/ckpt", &rows, 0, 0, None, true, &badges, None);
+        });
+    }
+
+    #[test]
+    fn the_layout_map_fits_any_terminal() {
+        let map = crate::safelayout::from_tensors(
+            "/ckpt/model.safetensors",
+            512,
+            64,
+            &[tensor("a.weight")],
+            &[],
+        );
+        draw("the layout map", |f| {
+            UI::render_layout(f, &map, 0, 0, None, true);
+        });
+    }
+
+    #[test]
+    fn the_check_report_fits_any_terminal() {
+        let report = crate::check::run(
+            "/ckpt".into(),
+            &[tensor("a.weight")],
+            &[],
+            &[],
+            &[],
+            None,
+            &crate::filter::NameFilter::parse(&[]).expect("empty filter"),
+            false,
+            1,
+        );
+        for state in [
+            CheckPopup::Idle {
+                copied: None,
+                can_scan: true,
+            },
+            CheckPopup::Scanning {
+                done: 1,
+                total: 4,
+                frame: 0,
+            },
+        ] {
+            draw("the check popup", |f| {
+                UI::render_check_report(f, &report, state, 0, true);
+            });
+        }
+    }
+
+    #[test]
+    fn the_overlays_fit_any_terminal() {
+        draw("the legend", |f| UI::render_legend_band(f, Legend::Tree));
+        draw("the command band", |f| {
+            UI::render_command_band(f, "checkpoint-studio --tensor a.weight --values");
+        });
+        draw("the notice box", |f| {
+            UI::render_notice_box(f, "metadata-only — data views need the file locally");
+        });
+        draw("the copied flash", |f| {
+            UI::render_copied_flash(f, "the tensor name")
+        });
+        draw("a message", |f| {
+            UI::render_message(f, "Title", "A message body")
+        });
     }
 }

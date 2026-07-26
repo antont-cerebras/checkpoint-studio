@@ -71,12 +71,14 @@ impl UI {
         // first screen row, so chip lines can be made absolute for hit-testing.
         let banner = usize::from(remote);
         let footer_top = (height as usize).saturating_sub(footer_len + banner) as u16;
+        // Clamped for the same reason as the footer below: a short pane can hold fewer
+        // rows than the header has lines, and an over-tall rect panics rather than clips.
         Paragraph::new(header).render(
             Rect {
                 x: 0,
                 y: 0,
                 width,
-                height: header_len as u16,
+                height: (header_len as u16).min(height),
             },
             frame.buffer_mut(),
         );
@@ -96,12 +98,15 @@ impl UI {
                 hist_scanning,
             );
         }
+        // Clamp to the rows that exist: the footer is wrapped to the terminal width, so
+        // a narrow pane can need more lines than the pane has — and a `Paragraph` rect
+        // past the end of the buffer is a panic, not a clip.
         Paragraph::new(footer).render(
             Rect {
                 x: 0,
                 y: footer_top,
                 width,
-                height: footer_len as u16,
+                height: (footer_len as u16).min(height.saturating_sub(footer_top)),
             },
             frame.buffer_mut(),
         );
@@ -709,5 +714,110 @@ mod tests {
         );
         // A non-safetensors (or remote) source has no layout map — so no link.
         assert!(links_for("/ckpt/model.gguf").is_empty(), "gguf has no map");
+    }
+}
+
+#[cfg(test)]
+mod small_terminal {
+    use super::*;
+
+    fn tensor() -> TensorInfo {
+        TensorInfo {
+            name: "model.layers.0.mlp.down_proj.weight".into(),
+            dtype: "F32".into(),
+            shape: vec![64, 64],
+            size_bytes: 16384,
+            num_elements: 4096,
+            storage: crate::tree::Storage::Raw,
+            source_path: "/ckpt/model.safetensors".into(),
+            layout: crate::tree::Layout::None,
+        }
+    }
+
+    /// Every screen bottom-pins a **wrapped** footer, so on a narrow pane the footer can
+    /// be taller than the pane — and a `Paragraph` rect that runs past the buffer is a
+    /// Ratatui panic, i.e. the TUI dying on a small window. The data views did exactly
+    /// that at 10×10 before this was clamped; check the rest of the screens too.
+    #[test]
+    fn the_detail_screen_survives_a_small_terminal() {
+        let t = tensor();
+        for (w, h) in [(10u16, 10u16), (16, 6), (24, 12), (48, 20), (120, 3)] {
+            assert!(
+                crate::tui::headless_render(w, h, |f| {
+                    UI::render_detail(
+                        f,
+                        &t,
+                        &t.shape,
+                        ViewDtype::Stored,
+                        true,
+                        false,
+                        StatsView::Pending,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                })
+                .is_ok(),
+                "the detail screen panicked at {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_metadata_detail_survives_a_small_terminal() {
+        let m = MetadataInfo {
+            name: "__metadata__.format".into(),
+            value: "{\"a\": [1, 2, 3], \"nested\": {\"b\": true}}".into(),
+            value_type: "json".into(),
+        };
+        for (w, h) in [(8u16, 4u16), (20, 8), (60, 20)] {
+            assert!(
+                crate::tui::headless_render(w, h, |f| UI::render_metadata_detail(f, &m)).is_ok(),
+                "the metadata screen panicked at {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_detail_screen_shows_the_tensor_and_its_fields() {
+        let t = tensor();
+        let out = crate::ui::tests_support::strip_ansi_codes(
+            &crate::tui::headless_render(140, 30, |f| {
+                UI::render_detail(
+                    f,
+                    &t,
+                    &t.shape,
+                    ViewDtype::Stored,
+                    true,
+                    false,
+                    StatsView::Ready(&crate::sample::Stats {
+                        count: 4096,
+                        min: -1.5,
+                        max: 1.5,
+                        mean: 0.01,
+                        std: 0.4,
+                        zeros: 0,
+                        nonfinite: 0,
+                        elapsed: std::time::Duration::from_millis(3),
+                    }),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            })
+            .expect("render"),
+        );
+        assert!(out.contains("down_proj.weight"), "{out}");
+        assert!(out.contains("(64, 64)"), "the shape shows:\n{out}");
+        assert!(out.contains("F32"), "{out}");
+        assert!(
+            out.contains("4096") || out.contains("4.1K"),
+            "the element count:\n{out}"
+        );
+        // Finished stats are summarised on the screen, not just offered.
+        assert!(out.contains("mean"), "{out}");
+        assert!(out.contains("zeros"), "{out}");
     }
 }

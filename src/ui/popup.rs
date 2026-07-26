@@ -103,7 +103,10 @@ pub(super) fn render_scroll_popup(
     // the frame (1-row margin top+bottom). The footer takes the last inner row;
     // when the body doesn't fit in the rest, reserve one more for the scroll
     // indicator.
-    let max_box_h = area.height.saturating_sub(2).max(3);
+    // The `.max(3)` keeps a usable box on a short frame, but it must never exceed the
+    // frame itself: on a 2-row terminal it produced a 3-row rect, and a rect past the
+    // buffer is a Ratatui panic rather than a clip.
+    let max_box_h = area.height.saturating_sub(2).max(3).min(area.height);
     let box_h = ((total + 3) as u16).min(max_box_h); // body + footer + 2 borders
     let inner_h = box_h.saturating_sub(2) as usize;
     let overflow = total > inner_h.saturating_sub(1);

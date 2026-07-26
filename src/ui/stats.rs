@@ -474,26 +474,13 @@ impl UI {
             )),
         ];
         let header_len = header.len() as u16;
-        Paragraph::new(header).render(
-            Rect {
-                x: 0,
-                y: 0,
-                width,
-                height: header_len,
-            },
-            frame.buffer_mut(),
-        );
+        Paragraph::new(header).render(crate::ui::fit_rows(area, 0, header_len), frame.buffer_mut());
 
         // Footer pinned above the bottom row, which the caller reserves for the
         // access badge (drawn after this, like the detail / data views).
         let footer_top = height.saturating_sub(footer_len + 1);
         Paragraph::new(footer).render(
-            Rect {
-                x: 0,
-                y: footer_top,
-                width,
-                height: footer_len,
-            },
+            crate::ui::fit_rows(area, footer_top, footer_len),
             frame.buffer_mut(),
         );
 
@@ -513,12 +500,7 @@ impl UI {
         // report stays O(screen), not O(content).
         let window: Vec<Line> = body.iter().skip(scroll).take(visible).cloned().collect();
         Paragraph::new(window).render(
-            Rect {
-                x: 0,
-                y: header_len,
-                width,
-                height: visible as u16,
-            },
+            crate::ui::fit_rows(area, header_len, visible as u16),
             frame.buffer_mut(),
         );
         if overflow {
@@ -528,12 +510,7 @@ impl UI {
                 scroll + visible
             );
             Paragraph::new(Line::from(dim_span(indicator))).render(
-                Rect {
-                    x: 0,
-                    y: header_len + visible as u16,
-                    width,
-                    height: 1,
-                },
+                crate::ui::fit_rows(area, header_len + visible as u16, 1),
                 frame.buffer_mut(),
             );
         }

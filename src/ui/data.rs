@@ -135,10 +135,13 @@ impl UI {
         );
         // Bottom-pin the footer; the sampled content fills the region above it
         // (clipped if it would overflow), like every other view.
-        let footer_len = footer.len() as u16;
         // Reserve the bottom row for the access badge (drawn by render_data_frame),
-        // so the footer's last chip never runs under it.
-        let footer_top = area.height.saturating_sub(footer_len + 1);
+        // so the footer's last chip never runs under it. The footer is *wrapped* to the
+        // terminal width, so on a narrow pane it can be taller than the pane itself —
+        // clamp its height to what's actually there, or the `Paragraph` rect runs past
+        // the buffer and Ratatui panics (a 10×10 terminal did exactly that).
+        let footer_top = area.height.saturating_sub(footer.len() as u16 + 1);
+        let footer_len = (footer.len() as u16).min(area.height.saturating_sub(footer_top));
         Paragraph::new(lines).render(
             Rect {
                 x: 0,
@@ -420,10 +423,13 @@ impl UI {
         );
         // Bottom-pin the footer; the value grid fills the region above it (clipped
         // if it would overflow), like every other view.
-        let footer_len = footer.len() as u16;
         // Reserve the bottom row for the access badge (drawn by render_data_frame),
-        // so the footer's last chip never runs under it.
-        let footer_top = area.height.saturating_sub(footer_len + 1);
+        // so the footer's last chip never runs under it. The footer is *wrapped* to the
+        // terminal width, so on a narrow pane it can be taller than the pane itself —
+        // clamp its height to what's actually there, or the `Paragraph` rect runs past
+        // the buffer and Ratatui panics (a 10×10 terminal did exactly that).
+        let footer_top = area.height.saturating_sub(footer.len() as u16 + 1);
+        let footer_len = (footer.len() as u16).min(area.height.saturating_sub(footer_top));
         Paragraph::new(lines).render(
             Rect {
                 x: 0,
@@ -726,4 +732,298 @@ pub(super) fn render_histogram(
     let used = lines.len().min(max_rows);
     Paragraph::new(lines).render(rect, frame.buffer_mut());
     used
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::tests_support::strip_ansi_codes;
+
+    fn tensor(name: &str, shape: &[usize]) -> TensorInfo {
+        TensorInfo {
+            name: name.into(),
+            dtype: "F32".into(),
+            shape: shape.to_vec(),
+            size_bytes: shape.iter().product::<usize>() * 4,
+            num_elements: shape.iter().product(),
+            storage: crate::tree::Storage::Raw,
+            source_path: "/ckpt/model.safetensors".into(),
+            layout: crate::tree::Layout::None,
+        }
+    }
+
+    /// A 3×3 sample with known values, spanning negative to positive so the ramp and
+    /// the sign column both have something to show.
+    fn sample(mode: SampleMode) -> Sample {
+        let values = vec![
+            vec![-1.0, 0.0, 1.0],
+            vec![0.5, -0.5, 0.25],
+            vec![2.0, -2.0, 0.0],
+        ];
+        let raw = values
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| crate::sample::RawBits {
+                        bits: u64::from((*v as f32).to_bits()),
+                        width: 32,
+                    })
+                    .collect()
+            })
+            .collect();
+        Sample {
+            rows: vec![0, 1, 2],
+            cols: vec![0, 1, 2],
+            values,
+            raw,
+            min: -2.0,
+            max: 2.0,
+            total_rows: 3,
+            total_cols: 3,
+            slices: 1,
+            slice: 0,
+            view: ViewDtype::Stored,
+            overridable: true,
+            mode,
+            display_shape: vec![3, 3],
+            unpacked: None,
+        }
+    }
+
+    fn stats() -> crate::sample::Stats {
+        crate::sample::Stats {
+            count: 9,
+            min: -2.0,
+            max: 2.0,
+            mean: 0.0277,
+            std: 1.1,
+            zeros: 2,
+            nonfinite: 0,
+            elapsed: std::time::Duration::from_millis(7),
+        }
+    }
+
+    fn render(w: u16, h: u16, f: impl FnOnce(&mut Frame)) -> String {
+        strip_ansi_codes(&crate::tui::headless_render(w, h, f).expect("headless render"))
+    }
+
+    #[test]
+    fn the_heatmap_titles_itself_with_the_tensor_and_its_shape() {
+        let t = tensor("model.layers.0.mlp.down_proj.weight", &[3, 3]);
+        let s = sample(SampleMode::Grid);
+        let out = render(120, 24, |f| {
+            UI::render_heatmap(f, &t, &s, StatsView::Ready(&stats()));
+        });
+        assert!(out.contains("Heatmap"), "{out}");
+        assert!(out.contains("down_proj.weight"), "{out}");
+        assert!(out.contains("(3, 3)"), "the shape shows:\n{out}");
+    }
+
+    #[test]
+    fn the_heatmap_reports_the_range_it_is_scaled_over() {
+        let t = tensor("w", &[3, 3]);
+        let s = sample(SampleMode::Grid);
+        // With finished stats the scale is the exact whole-tensor range…
+        let exact = render(120, 24, |f| {
+            UI::render_heatmap(f, &t, &s, StatsView::Ready(&stats()));
+        });
+        assert!(exact.contains('2'), "the range endpoints show:\n{exact}");
+        // …and without them, the sample's own range is used instead of nothing.
+        let pending = render(120, 24, |f| {
+            UI::render_heatmap(f, &t, &s, StatsView::Pending);
+        });
+        assert!(
+            !pending.trim().is_empty(),
+            "a pending scan still renders a map"
+        );
+    }
+
+    #[test]
+    fn the_abs_max_mode_is_labelled_so_a_full_scan_is_obvious() {
+        let t = tensor("w", &[3, 3]);
+        let s = sample(SampleMode::GridMax);
+        let out = render(120, 24, |f| {
+            UI::render_heatmap(f, &t, &s, StatsView::Ready(&stats()));
+        });
+        // GridMax reads every element, unlike the sampled grid — the header has to say
+        // which one produced the picture.
+        assert!(
+            out.contains("max") || out.contains("abs"),
+            "the abs-max mode must be named:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_values_grid_prints_cells_in_every_base() {
+        let t = tensor("w", &[3, 3]);
+        let s = sample(SampleMode::Grid);
+        let dec = render(140, 24, |f| {
+            UI::render_values(
+                f,
+                &t,
+                &s,
+                StatsView::Ready(&stats()),
+                StripeMode::Off,
+                NumBase::Decimal,
+            );
+        });
+        assert!(dec.contains("Values"), "{dec}");
+        assert!(
+            dec.contains("-1.0000") || dec.contains("-1"),
+            "a decimal cell:\n{dec}"
+        );
+
+        let hex = render(140, 24, |f| {
+            UI::render_values(
+                f,
+                &t,
+                &s,
+                StatsView::Ready(&stats()),
+                StripeMode::Off,
+                NumBase::Hex,
+            );
+        });
+        // 1.0f32 is 0x3f800000 — the hex view shows stored bits, not the decimal.
+        assert!(
+            hex.to_lowercase().contains("3f800000"),
+            "a hex cell:\n{hex}"
+        );
+
+        let bin = render(200, 24, |f| {
+            UI::render_values(
+                f,
+                &t,
+                &s,
+                StatsView::Ready(&stats()),
+                StripeMode::Off,
+                NumBase::Binary,
+            );
+        });
+        assert!(bin.contains("00111111"), "a binary cell:\n{bin}");
+    }
+
+    #[test]
+    fn zebra_striping_changes_the_grid_without_changing_the_numbers() {
+        let t = tensor("w", &[3, 3]);
+        let s = sample(SampleMode::Grid);
+        let plain = render(140, 24, |f| {
+            UI::render_values(
+                f,
+                &t,
+                &s,
+                StatsView::Ready(&stats()),
+                StripeMode::Off,
+                NumBase::Decimal,
+            );
+        });
+        let striped = render(140, 24, |f| {
+            UI::render_values(
+                f,
+                &t,
+                &s,
+                StatsView::Ready(&stats()),
+                StripeMode::Rows,
+                NumBase::Decimal,
+            );
+        });
+        // Striping is a background colour, so the *cells* must be identical; only the
+        // footer differs, since it echoes the current mode.
+        let cells = |s: &str| {
+            s.lines()
+                .filter(|l| l.contains("e0") || l.contains("e-1"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !cells(&plain).is_empty(),
+            "no value rows found in:\n{plain}"
+        );
+        assert_eq!(
+            cells(&plain),
+            cells(&striped),
+            "striping must not move or reformat a cell"
+        );
+        assert!(
+            plain.contains("zebra: off"),
+            "the footer names the mode:\n{plain}"
+        );
+        assert!(striped.contains("zebra: rows"), "{striped}");
+    }
+
+    #[test]
+    fn the_grid_says_which_slice_it_is_showing() {
+        let t = tensor("w", &[4, 3, 3]);
+        let mut s = sample(SampleMode::Grid);
+        s.slices = 4;
+        s.slice = 2;
+        let out = render(140, 24, |f| {
+            UI::render_values(
+                f,
+                &t,
+                &s,
+                StatsView::Ready(&stats()),
+                StripeMode::Off,
+                NumBase::Decimal,
+            );
+        });
+        assert!(
+            out.contains('2') && out.contains('4'),
+            "the slice position shows:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_scan_in_progress_is_visible_on_both_views() {
+        let t = tensor("w", &[3, 3]);
+        let s = sample(SampleMode::Grid);
+        let scanning = StatsView::Computing {
+            spinner: '⠋',
+            elapsed: std::time::Duration::from_millis(1500),
+            progress: Some(0.5),
+        };
+        for out in [
+            render(120, 24, |f| {
+                UI::render_heatmap(f, &t, &s, scanning);
+            }),
+            render(140, 24, |f| {
+                UI::render_values(f, &t, &s, scanning, StripeMode::Off, NumBase::Decimal);
+            }),
+        ] {
+            assert!(
+                out.contains("1.5s") || out.contains('⠋'),
+                "the scan shows:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_data_views_survive_a_small_terminal() {
+        let t = tensor("w", &[3, 3]);
+        let s = sample(SampleMode::Grid);
+        // A tiny pane is unusual but reachable, and Ratatui panics on an out-of-bounds
+        // write — so "renders something" has to hold at every size.
+        for (w, h) in [(10u16, 10u16), (24, 12), (48, 20), (80, 6)] {
+            assert!(
+                crate::tui::headless_render(w, h, |f| {
+                    UI::render_heatmap(f, &t, &s, StatsView::Pending);
+                })
+                .is_ok(),
+                "heatmap panicked at {w}x{h}"
+            );
+            assert!(
+                crate::tui::headless_render(w, h, |f| {
+                    UI::render_values(
+                        f,
+                        &t,
+                        &s,
+                        StatsView::Pending,
+                        StripeMode::Cols,
+                        NumBase::Decimal,
+                    );
+                })
+                .is_ok(),
+                "values panicked at {w}x{h}"
+            );
+        }
+    }
 }

@@ -121,12 +121,7 @@ impl UI {
         let body_width = width.saturating_sub(u16::from(scrollbar));
 
         Paragraph::new(lines).render(
-            Rect {
-                x: 0,
-                y: 0,
-                width,
-                height: header_rows as u16,
-            },
+            crate::ui::fit_rows(area, 0, header_rows as u16),
             frame.buffer_mut(),
         );
 
@@ -136,10 +131,8 @@ impl UI {
         }
         Paragraph::new(body).render(
             Rect {
-                x: 0,
-                y: header_rows as u16,
                 width: body_width,
-                height: body_rows as u16,
+                ..crate::ui::fit_rows(area, header_rows as u16, body_rows as u16)
             },
             frame.buffer_mut(),
         );
@@ -149,12 +142,7 @@ impl UI {
         // --- key-hint footer, pinned just above the one-line status bar ---
         let hint_y = height.saturating_sub(1 + hint_rows as u16);
         Paragraph::new(hint_lines).render(
-            Rect {
-                x: 0,
-                y: hint_y,
-                width,
-                height: hint_rows as u16,
-            },
+            crate::ui::fit_rows(area, hint_y, hint_rows as u16),
             frame.buffer_mut(),
         );
 

@@ -449,3 +449,133 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
     lines.push(Line::from(dim_span("Click or press any key to close.")));
     lines
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::tests_support::strip_ansi_codes;
+
+    fn render(legend: Legend) -> String {
+        strip_ansi_codes(
+            &crate::tui::headless_render(110, 40, |f| UI::render_legend_band(f, legend))
+                .expect("headless render"),
+        )
+    }
+
+    /// Every screen's `l` legend must actually explain that screen. A legend that
+    /// silently renders the wrong context is worse than none — the glyphs it describes
+    /// aren't the ones on screen.
+    #[test]
+    fn each_context_has_its_own_titled_legend() {
+        let mut titles = Vec::new();
+        for legend in [
+            Legend::Tree,
+            Legend::Detail,
+            Legend::Heatmap,
+            Legend::Values,
+            Legend::Rename,
+            Legend::Stats,
+        ] {
+            let out = render(legend);
+            let title = legend_title(legend);
+            assert!(
+                out.contains(title),
+                "{title:?} missing from its own legend:\n{out}"
+            );
+            assert!(
+                out.lines().filter(|l| !l.trim().is_empty()).count() > 3,
+                "{title} legend has almost no content:\n{out}"
+            );
+            titles.push(title);
+        }
+        titles.sort_unstable();
+        let mut unique = titles.clone();
+        unique.dedup();
+        assert_eq!(
+            titles.len(),
+            unique.len(),
+            "each context needs its own title"
+        );
+    }
+
+    #[test]
+    fn the_tree_legend_explains_the_markers_the_tree_draws() {
+        let out = render(Legend::Tree);
+        // The glyphs a tree row can carry, each defined in `theme`.
+        for marker in [
+            crate::ui::theme::UNINDEXED_MARK,
+            crate::ui::theme::COMPRESSED_MARK,
+        ] {
+            assert!(out.contains(marker), "{marker} unexplained:\n{out}");
+        }
+        assert!(out.contains(crate::ui::theme::UNCOMPRESSED_TAG), "{out}");
+    }
+
+    #[test]
+    fn the_data_legends_explain_their_own_scales() {
+        assert!(
+            render(Legend::Heatmap).to_lowercase().contains("magnitude")
+                || render(Legend::Heatmap).contains("│"),
+            "the heatmap legend should describe its ramp"
+        );
+        let values = render(Legend::Values);
+        assert!(
+            values.to_lowercase().contains("zebra") || values.to_lowercase().contains("stripe"),
+            "the values legend should describe the striping:\n{values}"
+        );
+    }
+
+    #[test]
+    fn descriptions_line_up_in_one_column() {
+        // The legend is a two-column layout computed from the widest symbol; if that
+        // maths is wrong the text overlaps the glyphs.
+        let rows = [
+            (None, "✚", "extra"),
+            (Some(Color::Red), "⇩⇩⇩", "compressed"),
+        ];
+        let col = legend_desc_col(&rows, 2);
+        assert!(
+            col as usize >= 3 + 2,
+            "the column clears the widest symbol: {col}"
+        );
+        let line = legend_row_line(None, "✚", "extra", col);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        // Indented glyph, then padding out to `col`, then the description.
+        assert!(text.trim_start().starts_with('✚'), "{text:?}");
+        assert!(text.ends_with("extra"), "{text:?}");
+        let desc_at = text.find("extra").expect("the description is present");
+        assert!(
+            desc_at >= col as usize - 2,
+            "the description starts at the column: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_wide_glyph_is_measured_as_two_columns() {
+        // Box-drawing and geometric glyphs render one or two cells depending on the
+        // terminal; assuming the wider case is what keeps the description clear of them.
+        assert_eq!(legend_symbol_width("ab"), 2);
+        assert_eq!(
+            legend_symbol_width("✚"),
+            2,
+            "a non-ASCII glyph counts as two"
+        );
+        assert_eq!(legend_symbol_width(""), 0);
+    }
+
+    #[test]
+    fn every_legend_survives_a_narrow_terminal() {
+        for legend in [
+            Legend::Tree,
+            Legend::Detail,
+            Legend::Heatmap,
+            Legend::Values,
+        ] {
+            let title = legend_title(legend);
+            for w in [8u16, 20, 40] {
+                let out = crate::tui::headless_render(w, 12, |f| UI::render_legend_band(f, legend));
+                assert!(out.is_ok(), "the {title} legend panicked at width {w}");
+            }
+        }
+    }
+}

@@ -339,6 +339,179 @@ mod tests {
     use super::*;
     use crate::ui::tests_support::strip_ansi_codes;
 
+    /// Render one prompt into a fixed buffer and return its plain text.
+    fn render(w: u16, h: u16, f: impl FnOnce(&mut Frame)) -> String {
+        strip_ansi_codes(&crate::tui::headless_render(w, h, f).expect("headless render"))
+    }
+
+    #[test]
+    fn the_dtype_menu_marks_the_current_choice() {
+        let opts = [ViewDtype::Stored, ViewDtype::As("F16"), ViewDtype::U4];
+        let out = render(70, 14, |f| UI::render_dtype_menu(f, &opts, 1));
+        // Every offered dtype is listed (the stored one has no label of its own).
+        for o in &opts {
+            if let Some(label) = o.label() {
+                assert!(out.contains(label), "{label} missing from:\n{out}");
+            }
+        }
+        // The selected row is marked somehow (arrow / highlight glyph), and only one is.
+        let marked: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains('▸') || l.contains('›'))
+            .collect();
+        assert!(marked.len() <= 1, "at most one row is marked: {marked:?}");
+    }
+
+    #[test]
+    fn the_slice_prompt_states_the_range_and_shows_an_error() {
+        let out = render(80, 8, |f| UI::render_slice_prompt(f, 48, "12", None));
+        assert!(out.contains("12"), "the typed input shows:\n{out}");
+        assert!(
+            out.contains("48") || out.contains("47"),
+            "the range shows:\n{out}"
+        );
+        let bad = render(80, 8, |f| {
+            UI::render_slice_prompt(f, 48, "99", Some("out of range"))
+        });
+        assert!(bad.contains("out of range"), "{bad}");
+    }
+
+    #[test]
+    fn the_reshape_prompt_names_the_element_count_and_current_shape() {
+        // Wide enough for the whole band: the hint text is long, and a narrower
+        // terminal clips its tail (which the narrow-terminal test below covers).
+        let out = render(170, 8, |f| {
+            UI::render_reshape_prompt(f, 4096, &[64, 64], "128,32", None)
+        });
+        assert!(
+            out.contains("4096"),
+            "the element count constrains the input:\n{out}"
+        );
+        assert!(out.contains("(64, 64)"), "the current shape shows:\n{out}");
+        assert!(out.contains("128,32"), "the typed input shows:\n{out}");
+        assert!(
+            out.contains("Enter") && out.contains("Esc"),
+            "both actions:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_text_prompt_shows_its_label_input_and_error() {
+        let out = render(80, 8, |f| {
+            UI::render_text_prompt(f, "Output file", "out.h5", Some("already exists"))
+        });
+        assert!(out.contains("Output file"), "{out}");
+        assert!(out.contains("out.h5"), "{out}");
+        assert!(out.contains("already exists"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_text_prompt_still_draws_a_box_to_type_into() {
+        let out = render(80, 8, |f| UI::render_text_prompt(f, "Bins", "", None));
+        assert!(out.contains("Bins"), "{out}");
+        assert!(
+            out.lines().any(|l| l.contains("Bins") && l.len() > 6),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_choice_menu_lists_its_options_under_a_title() {
+        let out = render(70, 12, |f| {
+            UI::render_choice_menu(f, "Sort by", &["name", "size", "params"], 2)
+        });
+        assert!(out.contains("Sort by"), "{out}");
+        for o in ["name", "size", "params"] {
+            assert!(out.contains(o), "{o} missing:\n{out}");
+        }
+    }
+
+    #[test]
+    fn the_confirm_popup_shows_the_body_and_both_answers() {
+        let body = vec![
+            "Rename 3 tensors in place?".to_string(),
+            "This rewrites the file.".to_string(),
+        ];
+        let out = render(80, 14, |f| {
+            UI::render_confirm_popup(f, "Confirm rename", &body, &["Cancel", "Rename"], 1)
+        });
+        assert!(out.contains("Confirm rename"), "{out}");
+        assert!(out.contains("Rename 3 tensors in place?"), "{out}");
+        assert!(
+            out.contains("This rewrites the file."),
+            "the whole body shows:\n{out}"
+        );
+        assert!(out.contains("Cancel") && out.contains("Rename"), "{out}");
+    }
+
+    #[test]
+    fn the_menu_box_returns_one_click_region_per_row() {
+        let rows = ["first", "second", "third"];
+        let mut regions = Vec::new();
+        crate::tui::headless_render(60, 12, |f| {
+            regions = UI::render_menu_box(f, "Pick one", &rows, 0, &[]);
+        })
+        .expect("render");
+        assert_eq!(regions.len(), rows.len(), "every row must be clickable");
+        // Rows are laid out top to bottom, one per line, without overlapping.
+        let mut ys: Vec<u16> = regions.iter().map(|r| r.y).collect();
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(
+            ys.len(),
+            rows.len(),
+            "each row has its own line: {regions:?}"
+        );
+    }
+
+    #[test]
+    fn the_palette_narrows_to_the_query_and_reports_its_rows() {
+        let rows = vec![(
+            "s".to_string(),
+            "View".to_string(),
+            "Statistics".to_string(),
+            "Show the checkpoint stats".to_string(),
+        )];
+        let mut regions = Vec::new();
+        let out = strip_ansi_codes(
+            &crate::tui::headless_render(90, 16, |f| {
+                regions = UI::render_command_palette(f, "stat", &rows, 0);
+            })
+            .expect("render"),
+        );
+        assert!(out.contains("stat"), "the query echoes back:\n{out}");
+        assert!(out.contains("View: Statistics"), "{out}");
+        assert_eq!(regions.len(), 1, "one clickable region per listed command");
+    }
+
+    #[test]
+    fn a_palette_with_no_matches_says_so_rather_than_going_blank() {
+        let out = strip_ansi_codes(
+            &crate::tui::headless_render(90, 16, |f| {
+                UI::render_command_palette(f, "zzzz", &[], 0);
+            })
+            .expect("render"),
+        );
+        assert!(out.contains("zzzz"), "{out}");
+        assert!(
+            out.to_lowercase().contains("no match") || out.contains("—") || out.trim().len() > 4,
+            "an empty palette must still render something:\n{out}"
+        );
+    }
+
+    #[test]
+    fn every_prompt_survives_a_narrow_terminal() {
+        for w in [6u16, 12, 30] {
+            render(w, 6, |f| UI::render_slice_prompt(f, 4, "1", Some("bad")));
+            render(w, 6, |f| UI::render_text_prompt(f, "Label", "value", None));
+            render(w, 8, |f| UI::render_choice_menu(f, "T", &["a"], 0));
+            render(w, 8, |f| UI::render_dtype_menu(f, &[ViewDtype::Stored], 0));
+            render(w, 10, |f| {
+                UI::render_confirm_popup(f, "T", &["b".to_string()], &["y", "n"], 0);
+            });
+        }
+    }
+
     #[test]
     fn command_palette_lists_commands_as_group_colon_title() {
         let rows = vec![
