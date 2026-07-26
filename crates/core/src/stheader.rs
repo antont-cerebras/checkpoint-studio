@@ -74,9 +74,7 @@ pub fn parse_header(
             .and_then(|v| v.as_array())
             .filter(|offsets| offsets.len() == 2)
             .and_then(|offsets| Some((offsets[0].as_u64()?, offsets[1].as_u64()?)));
-        let size_bytes = data_offsets
-            .map(|(start, end)| end.saturating_sub(start) as usize)
-            .unwrap_or(0);
+        let size_bytes = data_offsets.map_or(0, |(start, end)| end.saturating_sub(start) as usize);
         let layout = match data_offsets {
             Some((start, end)) => Layout::ByteRange { start, end },
             None => Layout::None,

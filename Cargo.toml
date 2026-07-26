@@ -6,6 +6,9 @@ repository = "https://github.com/antont-cerebras/checkpoint-studio"
 license = "MIT"
 authors = ["Eric Buehler"]
 description = "CLI utility to inspect and explore .safetensors, .gguf and HDF5 checkpoint files"
+keywords = ["safetensors", "gguf", "hdf5", "checkpoint", "tui"]
+categories = ["command-line-utilities", "development-tools", "visualization"]
+readme = "README.md"
 
 [workspace]
 members = ["crates/core"]
@@ -13,141 +16,185 @@ resolver = "2"
 
 # --- Lints -------------------------------------------------------------------
 #
-# CI runs clippy with `-D warnings`, so everything enabled here is a hard gate.
+# Everything clippy offers as a real diagnostic group is on, at `deny`, plus every rustc
+# warning. CI runs `cargo clippy --workspace --all-targets` with and without
+# `--all-features`, so this file is the gate.
 #
-# `pedantic` and `nursery` are ON as groups, which turns on several hundred lints the
-# codebase already satisfies — that is the point: they now catch REGRESSIONS. The
-# families below are the ones with pre-existing hits; each is allowed explicitly with
-# its count so the debt is visible and can be burned down one line at a time, rather
-# than hidden behind a blanket `allow`.
-#
-# Counts were measured with `--all-targets --features hdf5`.
+# NOT enabled: `clippy::restriction`. It is not a diagnostic group — clippy's own docs say
+# it "is not meant to be enabled as a whole" — and on this tree it produces 27,900 hits
+# that are mostly unsatisfiable or actively wrong here:
+#   * `implicit_return` (6,068) demands `return x;` on every tail expression, which
+#     *contradicts* `needless_return` in `clippy::style`. The two cannot both be satisfied.
+#   * `min_ident_chars` (4,218) bans `i`, `n`, `t`; `question_mark_used` (1,322) bans `?`;
+#     `as_conversions` (1,252) bans `as`; `arithmetic_side_effects` (1,394) bans `+`.
+#   * `non_ascii_literal` (852) bans `▀ ━ ✓ ⠋` — the glyphs this TUI is drawn with.
+#   * `single_call_fn` (503) bans a helper called once, i.e. every extraction that removed
+#     a copy-pasted block.
+# The individually useful ones from that group are enabled by name at the bottom.
 [workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
 
-# Numeric casts. AUDITED (see the histogram/values fixes): every cast was triaged and
-# the real defects fixed — wide-integer histogram bins, the 64-bit value display, GGUF
-# sizes in f32, and two saturating-subtraction sites. What remains is provably safe:
-# Ratatui geometry bounded by the terminal size, bit-shift amounts, masked 3/4-bit
-# indices, pre-validated header lengths, and display/statistics maths. `u64 as usize`
-# is sound because both crates assert a 64-bit target (see lib.rs / main.rs).
-# `float_cmp` is deliberately NOT allowed — its existing sites carry per-function
-# justifications, so a new accidental float comparison still fails the build.
-cast_possible_truncation = "allow"  # 410
-cast_precision_loss = "allow"  # 145
-cast_possible_wrap = "allow"  # 45
-cast_lossless = "allow"  # 45
-cast_sign_loss = "allow"  # 42
-ptr_as_ptr = "allow"  # 24
-borrow_as_ptr = "allow"  # 4
-# Nursery lint whose fix would retype a byte COUNT as f64 just because every use
-# happens to be a ratio; keeping it an integer is the more correct type.
-needless_type_cast = "allow"  # 1
-
-# Documentation polish — worth doing, but it is prose, not correctness.
-too_long_first_doc_paragraph = "allow"  # 109
-missing_errors_doc = "allow"  # 57
-doc_markdown = "allow"  # 54
-missing_panics_doc = "allow"  # 3
-doc_link_code = "allow"  # 1
-
-# Performance/allocation nits. The best candidates to burn down next: each is a small,
-# local change and a few are genuine wasted allocations.
-suboptimal_flops = "allow"  # 5
-redundant_clone = "allow"  # 5
-needless_collect = "allow"  # 4
-needless_pass_by_ref_mut = "allow"  # 4
-assigning_clones = "allow"  # 3
-or_fun_call = "allow"  # 2
-branches_sharing_code = "allow"  # 2
-
-# Style and API-shape opinions. Large counts, no behavioural effect; several
-# (`use_self`, `must_use_candidate`, `missing_const_for_fn`) are near-mechanical if we
-# ever want them.
-use_self = "allow"  # 363
-must_use_candidate = "allow"  # 211
-missing_const_for_fn = "allow"  # 147
-option_if_let_else = "allow"  # 96
-map_unwrap_or = "allow"  # 73
-too_many_lines = "allow"  # 58
-unnested_or_patterns = "allow"  # 55
-semicolon_if_nothing_returned = "allow"  # 48
-redundant_closure_for_method_calls = "allow"  # 45
-format_push_string = "allow"  # 37
-match_same_arms = "allow"  # 33
-unused_self = "allow"  # 30
-items_after_statements = "allow"  # 21
-needless_pass_by_value = "allow"  # 19
-redundant_pub_crate = "allow"  # 14
-struct_excessive_bools = "allow"  # 13
-single_match_else = "allow"  # 11
-unnecessary_wraps = "allow"  # 9
-similar_names = "allow"  # 8
-if_not_else = "allow"  # 7
-manual_let_else = "allow"  # 6
-return_self_not_must_use = "allow"  # 4
-unreadable_literal = "allow"  # 3
-bool_to_int_with_if = "allow"  # 3
-match_wildcard_for_single_variants = "allow"  # 3
-case_sensitive_file_extension_comparisons = "allow"  # 2
-implicit_hasher = "allow"  # 2
-useless_let_if_seq = "allow"  # 2
-fn_params_excessive_bools = "allow"  # 2
-derive_partial_eq_without_eq = "allow"  # 1
-format_collect = "allow"  # 1
-elidable_lifetime_names = "allow"  # 1
-comparison_chain = "allow"  # 1
-
-# Remaining measured families.
-ref_option = "allow"  # 7
-
-# --- Selected `restriction` lints (added in the strictness pass) ---------------
+# --- The families that stay allowed, and why ----------------------------------
 #
-# `restriction` is not meant to be enabled as a group (it contains mutually exclusive
-# opinions), so these are the individual ones worth having, each measured clean on this
-# tree so they catch regressions rather than logging debt.
+# Each of these was measured, triaged, and left off for a stated reason — not a count.
+
+# Numeric casts. AUDITED: every cast was triaged and the real defects fixed — wide-integer
+# histogram bins, the 64-bit value display, GGUF sizes computed in f32, two saturating
+# subtractions. What remains is provably safe: Ratatui geometry bounded by the terminal
+# size, bit-shift amounts, masked 3/4-bit indices, pre-validated header lengths, and
+# display maths. `u64 as usize` is sound because both crates assert a 64-bit target (see
+# the `usize::BITS >= 64` const assert in lib.rs / main.rs). Turning these on would mean
+# ~1,000 `#[allow]`s or `try_from().unwrap_or()` chains that add a panic path each to
+# silence a cast we have already shown cannot lose data.
+#
+# `float_cmp` is deliberately NOT here: its few sites carry per-function justifications, so
+# a NEW accidental float comparison still fails the build.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+cast_sign_loss = "allow"
+
+# `#[must_use]` on 426 functions, most of them small accessors whose result is obviously
+# the point. The lint cannot tell "ignoring this is a bug" from "this is a getter", and the
+# annotation is noise at that density. The cases where ignoring a result IS a bug are
+# covered by returning `Result`, which `unused_must_use` already enforces.
+must_use_candidate = "allow"
+
+# Documentation prose, not correctness: a first paragraph over one line, an undocumented
+# `Err` variant on a function whose error type is a `String` message, an identifier that
+# reads like code but isn't in backticks. Worth doing as writing; not worth gating a build.
+too_long_first_doc_paragraph = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# `Self` vs the concrete name inside an impl, and 200+ functions that *could* be `const`.
+# Both are near-mechanical, but `use_self` fights the places where the concrete name is
+# clearer (a `Foo::new` returning `Foo`), and `missing_const_for_fn` would freeze the
+# implementation of functions we still change.
+use_self = "allow"
+missing_const_for_fn = "allow"
+
+# Directly contradicts rustc's `unreachable_pub`, which is on below: inside a `pub(crate)`
+# module this lint wants `pub`, and `unreachable_pub` then wants `pub(crate)` back. Only one
+# can be satisfied, and `unreachable_pub` is the more useful of the two — it is what makes
+# rustc's `dead_code` analysis work at all in a library crate, where a `pub` item counts as
+# reachable and is therefore never reported as unused.
+redundant_pub_crate = "allow"
+
+# `if let Some(x) = o { a } else { b }` → `o.map_or_else(|| b, |x| a)`. A nursery lint whose
+# suggestion clippy itself marks `MaybeIncorrect` (which is why `--fix` skips it), and the
+# rewrite is a readability regression wherever the `None` branch is the longer of the two:
+# `map_or_else` puts the fallback FIRST, so the common case ends up last. The 22 sites here
+# are mostly `match` on an `Option` with a multi-line arm, where `match` reads better.
+option_if_let_else = "allow"
+
+# A 100-line ceiling on 7 functions that are flat, top-to-bottom report builders — the
+# check runner, the diff renderer, the health reconciler, the stats formatter. They are long
+# because the report has that many sections, not because they hide nested logic, and cutting
+# them at an arbitrary line count would scatter one linear output across helpers that each
+# have one caller.
+too_many_lines = "allow"
+
+# Two versions of `windows-sys` arrive through transitive dependencies (crossterm and
+# terminal_size disagree). Nothing here can pick one, and this crate does not build for
+# Windows anyway.
+multiple_crate_versions = "allow"
+
+# --- Families left allowed after this pass, with the reason for each --------------
+#
+# These are the ones where clippy's fix is either wrong here or a wash. Everything else the
+# groups above report has been fixed; a new hit in any lint NOT listed here fails the build.
+
+# 38 sites, and merging them would make the tables worse. Two thirds are `ui/hints.rs`'s
+# help table, one arm per (screen, key) — several screens legitimately give the same help
+# for the same key, and collapsing those into `(Tree | Files | Layout, Char('c'))` destroys
+# the per-screen enumeration that makes a missing entry visible. The rest is `ui/theme.rs`
+# mapping both a named colour and its indexed twin to one output, which is the same story.
+match_same_arms = "allow"
+
+# 15 methods that read no field. They are on `Explorer` because that is where the screens
+# call them from and where they will grow to need state; making them free functions now
+# would move 15 call sites and invert the grouping for no behavioural gain.
+unused_self = "allow"
+
+# 10 `const`/`use` items after the first statement in a function. Purely notational: an item
+# is in scope for the whole block whatever line it sits on, and each of these sits next to
+# the loop it belongs to, which is where a reader wants it.
+items_after_statements = "allow"
+
+# Taking a `Vec`/`Arc` by value where the body only reads it. Several of these are spawned
+# onto a thread (the value must be owned), and the rest are one-shot builders where the
+# caller has nothing left to do with the value.
+needless_pass_by_value = "allow"
+needless_pass_by_ref_mut = "allow"
+
+# Structs of 4-6 independent switches, each mapping 1:1 to a CLI flag. See `DiffOpts` for
+# the reasoning: the lint's real suggestion is an enum, which only helps when the options
+# are mutually exclusive — and these are not.
+struct_excessive_bools = "allow"
+fn_params_excessive_bools = "allow"
+
+# `&Option<T>` → `Option<&T>` on four internal signatures whose callers all hold an
+# `Option<T>` field; converting at each call site adds `.as_ref()` noise to say nothing.
+ref_option = "allow"
+
+# `let hit = …` next to `let hits = …`. Renaming to satisfy a similarity heuristic makes the
+# names worse, not clearer.
+similar_names = "allow"
+
+# The remaining sites are cfg pairs (`Result`/`Option` is the shared signature of a
+# feature-gated pair, see `read_hdf5_shard`) and the mode driver, where the `Result` is the
+# trait's return type.
+unnecessary_wraps = "allow"
+
+# This IS a CLI: stdout is the product, stderr is where progress goes.
+print_stdout = "allow"
+print_stderr = "allow"
+
+# --- Individually chosen `restriction` lints ----------------------------------
+#
+# The ones from that group that are real diagnostics here, each measured clean so it
+# catches a regression rather than logging debt.
 dbg_macro = "deny"            # a stray `dbg!` in a TUI corrupts the screen
 todo = "deny"
 unimplemented = "deny"
 mem_forget = "deny"
-print_stdout = "allow"        # this IS a CLI; stdout is the product
 verbose_file_reads = "deny"
 lossy_float_literal = "deny"
-# NOT enabled: `rc_buffer`. The static-body cache is `Arc<Vec<u8>>` on purpose — the
-# suggested `Arc<[u8]>` would mean copying every cached response body once to convert it,
-# which is exactly the allocation that cache exists to avoid.
 rest_pat_in_fully_bound_structs = "deny"
-# A panic is a crashed TUI or a dead server, and two of the bugs fixed this week were
-# exactly this class (`decode_prim`'s slice unwrap, GGUF's unbounded allocation).
-#
-# The audit that turned these on found 52 sites in product code and sorted them:
-#   * 6 could actually fire (an empty map, a zero-column view, a truncated header, a
-#     panicked worker thread) — rewritten to propagate or to bind with `let … else`.
-#   * 13 are provable at the site and carry a per-site `#[allow]` with the proof.
-#   * 33 are lifecycle invariants concentrated in `explorer/{mod,modes,load}.rs` — the
-#     driver owns the terminal while a mode runs, `on_enter` resolves-or-leaves — and are
-#     allowed at module scope with the reason. Making those structural (a state type that
-#     cannot be constructed empty) is the follow-up that would delete those allows.
-# Test code is exempt via `cfg_attr(test, allow(...))` at each crate root and an inner
-# attribute in each integration test: an unwrap in a test IS the assertion.
+# A panic is a crashed TUI or a dead server. The audit that turned these on found 52 sites
+# in product code: 6 could actually fire and were rewritten to propagate, 13 carry a
+# per-site proof, and the rest were lifecycle invariants that have since been made
+# structural (see `explorer/`). Test code is exempt at each crate root: an unwrap in a test
+# IS the assertion.
 unwrap_used = "deny"
 expect_used = "deny"
+# NOT enabled: `rc_buffer`. The static-body cache is `Arc<Vec<u8>>` on purpose — the
+# suggested `Arc<[u8]>` would copy every cached response body once to convert it, which is
+# the allocation that cache exists to avoid.
 
 [workspace.lints.rust]
-# Compiler lints beyond the defaults, all measured clean here. Measured and left off:
-# `elided_lifetimes_in_paths` — 144 sites, purely notational (`Foo` vs `Foo<'_>`), so it
-# would be 144 edits of churn for no behavioural gain. (Some were tidied anyway where
-# the surrounding code was already being touched.)
-unused_qualifications = "warn"
+# Every rustc warning is an error. Measured: the default warn set is already clean, so this
+# is a ratchet rather than a cleanup.
+warnings = "deny"
+# Plus the allow-by-default lints worth having, all measured clean.
 unsafe_op_in_unsafe_fn = "deny"
-unused_lifetimes = "warn"
-single_use_lifetimes = "warn"
-unreachable_pub = "warn"
-# NOT enabled: `unsafe_code`. Two places need it and both are justified — the HDF5 LZ4
-# filter registration (FFI into the bundled libhdf5) and the pty test's `openpty`/`ioctl`
-# — so a blanket deny would mean a blanket allow at both, which says less than the
-# per-call safety comments already there.
+unused_qualifications = "deny"
+unused_lifetimes = "deny"
+single_use_lifetimes = "deny"
+unreachable_pub = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_import_braces = "deny"
+# NOT enabled: `unsafe_code`. Two places need it and both are justified — registering the
+# HDF5 LZ4 filter (FFI into the bundled libhdf5) and the pty test's `openpty`/`ioctl` — so a
+# blanket deny would mean a blanket allow at both, which says less than the per-call safety
+# comments already there. `elided_lifetimes_in_paths` is off too: 144 purely notational
+# sites (`Foo` vs `Foo<'_>`).
 
 [dependencies]
 # The frontend-free core: model + readers + views + reports. The TUI/CLI here

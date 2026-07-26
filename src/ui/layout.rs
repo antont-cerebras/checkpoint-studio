@@ -6,6 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
+use std::fmt::Write as _;
 
 use crate::utils::{format_shape, format_size};
 
@@ -202,12 +203,12 @@ impl UI {
                 spans.push(Span::styled(name, name_style));
                 let mut detail = String::new();
                 if let SegmentKind::Tensor { dtype, shape } = &s.kind {
-                    detail.push_str(&format!("  {dtype}"));
+                    let _ = write!(detail, "  {dtype}");
                     if !shape.is_empty() {
-                        detail.push_str(&format!(" {}", format_shape(shape)));
+                        let _ = write!(detail, " {}", format_shape(shape));
                     }
                 }
-                detail.push_str(&format!("  {}", format_size(s.len() as usize)));
+                let _ = write!(detail, "  {}", format_size(s.len() as usize));
                 spans.push(Span::styled(detail, if selected_row { sel } else { dim }));
             } else if s.kind == SegmentKind::Header {
                 // The header band's rows list its `__metadata__` entries tree-like.

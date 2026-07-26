@@ -162,7 +162,7 @@ impl Explorer {
             }
             Err(_) => {
                 let _ = term.draw(|f| {
-                    UI::render_message(f, "Statistics unavailable", "the scan thread panicked")
+                    UI::render_message(f, "Statistics unavailable", "the scan thread panicked");
                 });
                 let _ = event::read();
                 ScanOutcome::Completed
@@ -185,8 +185,7 @@ impl Explorer {
             } else if src.ends_with(".safetensors") {
                 let dir = src
                     .rsplit_once('/')
-                    .map(|(d, _)| d.to_string())
-                    .unwrap_or_else(|| ".".to_string());
+                    .map_or_else(|| ".".to_string(), |(d, _)| d.to_string());
                 RemoteBrowse::Sftp(dir)
             } else {
                 RemoteBrowse::Sftp(src.trim_end_matches('/').to_string())
@@ -366,7 +365,7 @@ impl Explorer {
         let mut s3_meta: Option<crate::remote::S3Meta> = None;
         for file_path in &self.files {
             let as_str = file_path.to_string_lossy().into_owned();
-            let bars = crate::progress::Bars::start(vec![as_str.clone()]);
+            let bars = crate::progress::Bars::start(std::slice::from_ref(&as_str));
             let progress = bars.progress(0);
             // Fetch the S3 object metadata up front for an `s3://` source (checksums
             // /ETags/tags — a HEAD per object), so the stats report's S3 section is
@@ -497,7 +496,11 @@ impl Explorer {
     pub(super) fn health_alert(&self) -> Option<crate::ui::HealthAlert> {
         if self.health_reports.is_empty() {
             None
-        } else if self.health_reports.iter().any(|r| r.has_errors()) {
+        } else if self
+            .health_reports
+            .iter()
+            .any(checkpoint_studio_core::health::HealthReport::has_errors)
+        {
             Some(crate::ui::HealthAlert::Error)
         } else {
             Some(crate::ui::HealthAlert::Warning)
@@ -536,7 +539,7 @@ impl Explorer {
             .index_specs
             .iter()
             .map(|spec| crate::health::check_loaded(spec, &tensors))
-            .filter(|r| r.has_issues())
+            .filter(checkpoint_studio_core::health::HealthReport::has_issues)
             .collect();
         self.health_reports.extend(local);
         self.unindexed = Self::unindexed_files(&self.health_reports);
@@ -590,7 +593,7 @@ impl Explorer {
             };
             if !matches!(
                 path.extension().and_then(|s| s.to_str()),
-                Some("h5") | Some("hdf5")
+                Some("h5" | "hdf5")
             ) {
                 return false;
             }

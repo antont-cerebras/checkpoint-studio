@@ -604,8 +604,9 @@ fn compact_node(node: TreeNode) -> TreeNode {
                     label: Some(format!("{name}.{seg}")),
                 };
             }
-            // Anything else (metadata): leave the group intact.
-            other => children.push(other),
+            // Metadata: leave the group intact. Named rather than `_` so adding a
+            // node kind is a compile error here instead of silently falling through.
+            other @ TreeNode::Metadata { .. } => children.push(other),
         }
     }
     TreeNode::Group {
@@ -659,7 +660,7 @@ mod tests {
             source_path: "/ckpt/model-00001.safetensors".into(),
             layout: Layout::ByteRange {
                 start: 0,
-                end: 90177536,
+                end: 90_177_536,
             },
         };
         let json = serde_json::to_string(&t).unwrap();
@@ -671,7 +672,7 @@ mod tests {
             back.layout,
             Layout::ByteRange {
                 start: 0,
-                end: 90177536
+                end: 90_177_536
             }
         ));
         let m = MetadataInfo {
@@ -709,7 +710,7 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!(
                     "no group '{name}' in {:?}",
-                    nodes.iter().map(|n| n.name()).collect::<Vec<_>>()
+                    nodes.iter().map(TreeNode::name).collect::<Vec<_>>()
                 )
             })
     }
@@ -829,7 +830,7 @@ mod tests {
         // The per-tensor metadata sits beside its tensor (the `a`→`b` chain
         // compacts to one `a.b` group holding both tensors and the metadata).
         let ab = group(&tree, "a.b");
-        let mut names: Vec<&str> = ab.iter().map(|n| n.name()).collect();
+        let mut names: Vec<&str> = ab.iter().map(TreeNode::name).collect();
         names.sort_unstable();
         assert_eq!(
             names,

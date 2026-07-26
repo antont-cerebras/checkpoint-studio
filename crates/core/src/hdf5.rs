@@ -2,7 +2,7 @@
 //!
 //! These are plain HDF5 files where every top-level dataset is one tensor and
 //! its link name is the URL-quoted tensor name (so `/` in a name is escaped as
-//! `%2F`; `.` is left as-is, matching PyTorch state-dict names). The dataset's
+//! `%2F`; `.` is left as-is, matching `PyTorch` state-dict names). The dataset's
 //! own dataspace and datatype give the shape and dtype — we never read the
 //! (possibly compressed, possibly huge) data itself. Datasets are often chunked
 //! and gzip-compressed, so we also report the on-disk (compressed) size.
@@ -70,8 +70,7 @@ fn dataset_info(file: &hdf5_metno::File, key: &str, source_path: &str) -> Option
             let name = dt
                 .to_descriptor()
                 .ok()
-                .map(|d| dtype_name(&d))
-                .unwrap_or_else(|| "?".to_string());
+                .map_or_else(|| "?".to_string(), |d| dtype_name(&d));
             (name, item)
         }
         Err(_) => ("?".to_string(), 0),

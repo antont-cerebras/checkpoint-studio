@@ -624,7 +624,7 @@ impl Session {
 
     /// The checkpoint stats report, using the model's own disk usage (local reads).
     pub fn stats(&mut self) -> &CheckpointStats {
-        let disk = self.model.as_ref().and_then(|m| m.disk_usage());
+        let disk = self.model.as_ref().and_then(Checkpoint::disk_usage);
         self.stats_with_disk(disk)
     }
 }

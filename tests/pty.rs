@@ -166,11 +166,11 @@ fn openpty(rows: u16, cols: u16) -> (OwnedFd, OwnedFd) {
     // Safety: both fds are out-params, and `size` is a valid winsize.
     let rc = unsafe {
         libc::openpty(
-            &mut master,
-            &mut slave,
+            &raw mut master,
+            &raw mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &size,
+            &raw const size,
         )
     };
     assert_eq!(rc, 0, "openpty failed");
@@ -185,7 +185,7 @@ fn readable(fd: &OwnedFd, millis: i32) -> bool {
         revents: 0,
     };
     // Safety: one valid pollfd.
-    unsafe { libc::poll(&mut p, 1, millis) > 0 }
+    unsafe { libc::poll(&raw mut p, 1, millis) > 0 }
 }
 
 /// Drop all whitespace, for comparing against a cursor-positioned screen.

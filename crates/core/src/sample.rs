@@ -116,7 +116,7 @@ impl PackingSchema {
 ///   dtype — e.g. show a `BF16`-tagged tensor as `F16` (both 16-bit). No shape
 ///   change.
 /// * The 4-bit views ([`ViewDtype::U4`] / [`ViewDtype::I4`]) handle quantized
-///   weights stored inside a wider container (e.g. gpt-oss MoE: 4-bit values in
+///   weights stored inside a wider container (e.g. gpt-oss `MoE`: 4-bit values in
 ///   a `bf16`/`f16` slot). They unpack every nibble densely (a 16-bit slot
 ///   yields four values, expanding the last dimension).
 /// * [`ViewDtype::Unpacked`] applies a fused-MoE codebook [`PackingSchema`] (read
@@ -259,8 +259,8 @@ impl ViewDtype {
     /// produce, used to size cells before the exact value range is known.
     fn int_max_digits(self, stored: &str) -> usize {
         let dt = match self {
-            ViewDtype::U4 => return 2,       // 0..=15
-            ViewDtype::I4 => return 2,       // -8..=7
+            // Both 4-bit views are two digits wide: 0..=15 and -8..=7.
+            ViewDtype::U4 | ViewDtype::I4 => return 2,
             ViewDtype::Unpacked => return 5, // up to a 16-bit field (65535); range shrinks it
             ViewDtype::As(dt) => dt,
             ViewDtype::Stored => stored,
@@ -289,9 +289,7 @@ impl ViewDtype {
     /// dimension scaled by the packing factor. Unchanged unless this is a
     /// packed 4-bit view (which unpacks several values per stored container).
     pub fn logical_shape(self, shape: &[usize], stored_dtype: &str) -> Vec<usize> {
-        let packing = item_size(stored_dtype)
-            .map(|b| self.packing(b))
-            .unwrap_or(1);
+        let packing = item_size(stored_dtype).map_or(1, |b| self.packing(b));
         let mut shape = shape.to_vec();
         if packing > 1
             && let Some(last) = shape.last_mut()
@@ -689,7 +687,7 @@ pub fn sample_tensor_with(
     // unmerge instead expands the *first* (expert) dimension, so it keeps
     // `packing == 1` (one value per word) and grows the slice count below.
     let item = item_size(&t.dtype);
-    let packing = item.map(|bytes| view.packing(bytes)).unwrap_or(1);
+    let packing = item.map_or(1, |bytes| view.packing(bytes));
 
     // Size-1 dimensions don't change the flat layout, so we fold rows/cols/slices
     // from the squeezed shape (region reads below still use the real shape — flat
@@ -858,6 +856,7 @@ fn grid_absmax(
     unpack: Option<&PackingSchema>,
     field: usize,
 ) -> Result<AbsMaxGrid, String> {
+    const CHUNK_ROWS: usize = 512;
     let grid_rows = max_rows.min(total_rows).max(1);
     let grid_cols = max_cols.min(total_cols).max(1);
     // Contiguous block boundary `b` of `g` over `n` — covers `0..n` exactly.
@@ -877,7 +876,6 @@ fn grid_absmax(
     // NEG_INFINITY marks an untouched cell; any finite `|v|` (≥ 0) beats it.
     let mut values = vec![vec![f64::NEG_INFINITY; grid_cols]; grid_rows];
     let mut gmax = 0.0f64;
-    const CHUNK_ROWS: usize = 512;
     let mut r0 = 0;
     while r0 < total_rows {
         let r1 = (r0 + CHUNK_ROWS).min(total_rows);
@@ -1216,7 +1214,7 @@ impl Acc {
         self.finite += 1;
         let delta = v - self.mean;
         self.mean += delta / self.finite as f64;
-        self.m2 += delta * (v - self.mean);
+        self.m2 = delta.mul_add(v - self.mean, self.m2);
     }
 
     fn merge(a: Acc, b: Acc) -> Acc {
@@ -1546,13 +1544,13 @@ fn gather_region(
     want: &[Range<usize>],
     item: usize,
 ) -> Vec<u8> {
-    let total: usize = want.iter().map(|r| r.len()).product();
+    let total: usize = want.iter().map(ExactSizeIterator::len).product();
     let n = src_ranges.len();
     // Nothing to gather if any dimension is empty. The odometer below always copies at
     // least one last-dim span before it can notice, so a tensor with a zero dimension —
     // legal in safetensors, and what a truncated or hostile header can claim — would read
     // past the end of `src` and panic.
-    if want.iter().any(|r| r.is_empty()) {
+    if want.iter().any(Range::is_empty) {
         return Vec::new();
     }
     if n == 0 {
@@ -2255,7 +2253,7 @@ fn read_sampled(
         None => view.bit_width(dtype) as u8,
     };
     let mut values = Vec::with_capacity(rows.len());
-    let mut raws = Vec::with_capacity(rows.len());
+    let mut raw_rows = Vec::with_capacity(rows.len());
     for ((&r, &start), buf) in rows.iter().zip(&starts).zip(bufs) {
         let row_base = base + r * total_cols;
         let mut vrow = Vec::with_capacity(cols.len());
@@ -2263,27 +2261,23 @@ fn read_sampled(
         for &c in cols {
             let flat = row_base + c;
             let off = (flat / packing - start) * item;
-            match buf.get(off..off + item) {
-                Some(cont) => match unpack {
-                    Some(s) => {
-                        vrow.push(decode_field(cont, s, field));
-                        rrow.push(raw_bits_field(cont, s, field));
-                    }
-                    None => {
-                        vrow.push(decode_view(view, dtype, cont, flat % packing));
-                        rrow.push(raw_bits(view, cont, flat % packing));
-                    }
-                },
-                None => {
-                    vrow.push(f64::NAN);
-                    rrow.push(RawBits { bits: 0, width });
+            if let Some(cont) = buf.get(off..off + item) {
+                if let Some(s) = unpack {
+                    vrow.push(decode_field(cont, s, field));
+                    rrow.push(raw_bits_field(cont, s, field));
+                } else {
+                    vrow.push(decode_view(view, dtype, cont, flat % packing));
+                    rrow.push(raw_bits(view, cont, flat % packing));
                 }
+            } else {
+                vrow.push(f64::NAN);
+                rrow.push(RawBits { bits: 0, width });
             }
         }
         values.push(vrow);
-        raws.push(rrow);
+        raw_rows.push(rrow);
     }
-    Ok((values, raws))
+    Ok((values, raw_rows))
 }
 
 /// Memory-mapped reader for a safetensors tensor.
@@ -2305,7 +2299,7 @@ impl Backing {
 }
 
 /// Reader for a tensor that is one contiguous little-endian row-major blob.
-/// Serves safetensors, NumPy `.npy`, and (decompressed) `.npz` entries; the
+/// Serves safetensors, `NumPy` `.npy`, and (decompressed) `.npz` entries; the
 /// region/scan logic is identical once the backing bytes and data range are set.
 struct BlobReader {
     backing: Backing,
@@ -2484,7 +2478,7 @@ fn with_hdf5_block_bytes<R>(
                 Some(s) if cfg!(target_endian = "little") => {
                     let bytes = unsafe {
                         std::slice::from_raw_parts(
-                            s.as_ptr() as *const u8,
+                            s.as_ptr().cast::<u8>(),
                             std::mem::size_of_val(s),
                         )
                     };
@@ -2599,7 +2593,7 @@ impl TensorReader for Hdf5Reader {
                 lo..hi
             })
             .collect();
-        let bbox_elems: usize = bbox.iter().map(|r| r.len()).product();
+        let bbox_elems: usize = bbox.iter().map(ExactSizeIterator::len).product();
         if bbox_elems.saturating_mul(self.item) > BUDGET_BYTES {
             return regions.iter().map(|r| self.read_region(r)).collect();
         }
@@ -2734,6 +2728,7 @@ mod tests {
     #[test]
     #[ignore = "manual benchmark"]
     fn window_pan_open_cost() {
+        const ITERS: usize = 60;
         use std::time::Instant;
         let dir = std::env::temp_dir().join("checkpoint_studio_bench_pan");
         let _ = std::fs::create_dir_all(&dir);
@@ -2773,7 +2768,6 @@ mod tests {
             layout: Layout::None,
         };
 
-        const ITERS: usize = 60;
         // (A) open-only, to isolate File::open + member_names + dataset open.
         let t0 = Instant::now();
         for _ in 0..ITERS {
@@ -3203,11 +3197,11 @@ mod tests {
     #[test]
     #[ignore = "manual benchmark; set BENCH_FILE and BENCH_TENSOR"]
     fn seq_vs_parallel_accumulation() {
+        use std::io::Read as _;
         let path = std::env::var("BENCH_FILE").expect("set BENCH_FILE");
         let name = std::env::var("BENCH_TENSOR").expect("set BENCH_TENSOR");
 
         // Parse the safetensors header to build a TensorInfo for `name`.
-        use std::io::Read;
         let mut f = std::fs::File::open(&path).unwrap();
         let mut len = [0u8; 8];
         f.read_exact(&mut len).unwrap();
@@ -3231,7 +3225,7 @@ mod tests {
             size_bytes: (e - s) as usize,
             num_elements: shape.iter().product(),
             storage: crate::tree::Storage::Unknown,
-            source_path: path.clone(),
+            source_path: path,
             layout: Layout::ByteRange { start: s, end: e },
         };
 
@@ -3256,8 +3250,8 @@ mod tests {
         // min/max are order-independent (exact); mean/std differ only by
         // floating-point summation order, so allow a tiny relative slack.
         assert_eq!((seq.min, seq.max), (par.min, par.max));
-        assert!((seq.mean - par.mean).abs() <= seq.mean.abs() * 1e-9 + 1e-12);
-        assert!((seq.std - par.std).abs() <= seq.std.abs() * 1e-9 + 1e-12);
+        assert!((seq.mean - par.mean).abs() <= seq.mean.abs().mul_add(1e-9, 1e-12));
+        assert!((seq.std - par.std).abs() <= seq.std.abs().mul_add(1e-9, 1e-12));
     }
 
     #[test]

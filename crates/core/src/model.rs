@@ -298,14 +298,14 @@ mod tests {
                 tensors: vec![TensorInfo {
                     name: "model.embed_tokens.weight".into(),
                     dtype: "BF16".into(),
-                    shape: vec![152064, 4096],
-                    size_bytes: 152064 * 4096 * 2,
-                    num_elements: 152064 * 4096,
+                    shape: vec![152_064, 4096],
+                    size_bytes: 152_064 * 4096 * 2,
+                    num_elements: 152_064 * 4096,
                     storage: Storage::Unknown,
                     source_path: "net004:/opt/ckpt/model-00001-of-00002.safetensors".into(),
                     layout: Layout::ByteRange {
                         start: 0,
-                        end: 1245708288,
+                        end: 1_245_708_288,
                     },
                 }],
                 metadata: vec![MetadataInfo {

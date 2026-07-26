@@ -48,7 +48,9 @@ pub(super) fn to_yansi(color: Color) -> yansi::Color {
         Color::White | Color::Indexed(15) => Y::White,
         Color::Indexed(n) => Y::Fixed(n),
         Color::Rgb(r, g, b) => Y::Rgb(r, g, b),
-        _ => Y::Primary,
+        // Reset and the dark neutrals have no yansi twin; anything NEW in ratatui's
+        // `Color` should be a compile error here rather than a silent Primary.
+        Color::Reset => Y::Primary,
     }
 }
 
@@ -99,6 +101,6 @@ pub(super) fn heat_color(t: f64) -> Color {
     let t = t.clamp(0.0, 1.0);
     let r = (t * 5.0).round() as u8;
     let b = ((1.0 - t) * 5.0).round() as u8;
-    let g = ((1.0 - (t - 0.5).abs() * 2.0) * 5.0).round() as u8;
+    let g = ((t - 0.5).abs().mul_add(-2.0, 1.0) * 5.0).round() as u8;
     Color::Indexed(16 + 36 * r + 6 * g + b)
 }

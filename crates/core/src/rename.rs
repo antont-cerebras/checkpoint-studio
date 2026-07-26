@@ -25,6 +25,7 @@ use serde_json::{Map, Value};
 
 use crate::diff::NameMap;
 use crate::safelayout;
+use std::fmt::Write as _;
 
 /// The conventional index filename for a sharded safetensors checkpoint.
 const INDEX_NAME: &str = "model.safetensors.index.json";
@@ -314,6 +315,10 @@ pub fn load(path: &Path) -> Result<Loaded> {
         })
     };
     let headers: Vec<ShardHeader> = std::thread::scope(|scope| {
+        // The `collect` is load-bearing: it spawns every reader before any `join` below.
+        // Chaining the iterator instead would join each handle as it is created, reading
+        // the shards one at a time — the opposite of the point.
+        #[allow(clippy::needless_collect)]
         let handles: Vec<_> = target
             .shards
             .iter()
@@ -870,7 +875,7 @@ pub fn rule_from_fields(
                         format!("unknown placeholder {{{tok}}} — the source has: {avail}")
                     }
                 })?;
-                replacement.push_str(&format!("${{{g}}}"));
+                let _ = write!(replacement, "${{{g}}}");
                 i += 1 + rel + 1;
             }
             '$' => {

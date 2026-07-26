@@ -66,7 +66,7 @@ pub(crate) fn tree(s: &WebState) -> Reply {
         tensor_count: s.tensors.len(),
         params: s.tensors.iter().map(|t| t.num_elements).sum(),
         total_size: s.tensors.iter().map(|t| t.size_bytes).sum(),
-        stored_size: s.tensors.iter().map(|t| t.on_disk_size()).sum(),
+        stored_size: s.tensors.iter().map(TensorInfo::on_disk_size).sum(),
     };
     ok(json!({
         "root": s.root,
@@ -84,7 +84,7 @@ pub(crate) fn files(s: &WebState) -> Reply {
 /// client masks its tree to them. `active:false` for an empty query (show all); a
 /// malformed query is a `400` whose message the filter bar shows inline.
 pub(crate) fn filter(s: &WebState, q: &Query) -> Reply {
-    let query = q.get("q").map(String::as_str).unwrap_or("");
+    let query = q.get("q").map_or("", String::as_str);
     match crate::tensorfilter::TensorFilter::parse(query) {
         Ok(f) if !f.is_active() => ok(json!({ "active": false })),
         Ok(f) => {
@@ -105,7 +105,7 @@ pub(crate) fn filter(s: &WebState, q: &Query) -> Reply {
 /// with per-family count + uniform dtype/shape + total params/bytes — a "what's in
 /// here, per layer / per expert" summary (same collapsing as `diff`).
 pub(crate) fn schema(s: &WebState, q: &Query) -> Reply {
-    let query = q.get("q").map(String::as_str).unwrap_or("");
+    let query = q.get("q").map_or("", String::as_str);
     let filter = match crate::tensorfilter::TensorFilter::parse(query) {
         Ok(f) => f,
         Err(e) => return err(400, e.to_string()),
@@ -243,7 +243,7 @@ pub(crate) fn tensor_sample(s: &WebState, q: &Query) -> Reply {
         _ => SampleMode::Grid,
     };
     let schema = s.schemas.get(name_of(q));
-    let include_raw = matches!(q.get("raw").map(String::as_str), Some("1") | Some("true"));
+    let include_raw = matches!(q.get("raw").map(String::as_str), Some("1" | "true"));
     match sample::sample_tensor(t, rows, cols, slice, view, mode, schema) {
         Ok(sample) => ok(SampleDto::from_sample(&sample, &t.dtype, include_raw)),
         Err(e) => err(500, e),
@@ -291,7 +291,7 @@ fn scan_stats(s: &WebState, t: &TensorInfo, view: ViewDtype) -> Result<StatsDto,
         .get(&key)
         .cloned();
     if let Some(hit) = hit {
-        return Ok(hit.clone());
+        return Ok(hit);
     }
     let (cancel, pause) = (AtomicBool::new(false), AtomicBool::new(false));
     let schema = s.schemas.get(&t.name);
@@ -337,7 +337,7 @@ fn view_of(q: &Query) -> Result<ViewDtype, Reply> {
 }
 
 fn name_of(q: &Query) -> &str {
-    q.get("name").map(String::as_str).unwrap_or("")
+    q.get("name").map_or("", String::as_str)
 }
 
 fn num<T: std::str::FromStr>(q: &Query, key: &str, default: T) -> T {

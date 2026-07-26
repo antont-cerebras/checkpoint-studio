@@ -19,8 +19,9 @@ pub enum DataLayout {
 }
 
 impl DataLayout {
-    /// The next layout in the `e` cycle: Overview → OverviewMax → Edges → Window →
+    /// The next layout in the `e` cycle: Overview → `OverviewMax` → Edges → Window →
     /// Overview.
+    #[must_use]
     pub fn next(self) -> Self {
         match self {
             DataLayout::Overview => DataLayout::OverviewMax,
@@ -43,6 +44,7 @@ pub enum StripeMode {
 
 impl StripeMode {
     /// The next mode in the `z` cycle: rows → cols → off → rows.
+    #[must_use]
     pub fn next(self) -> Self {
         match self {
             StripeMode::Rows => StripeMode::Cols,
@@ -79,6 +81,7 @@ pub enum NumBase {
 
 impl NumBase {
     /// The next base in the `b` cycle: dec → hex → oct → bin → dec.
+    #[must_use]
     pub fn next(self) -> Self {
         match self {
             NumBase::Decimal => NumBase::Hex,

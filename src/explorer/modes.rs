@@ -393,9 +393,8 @@ impl Mode for LayoutMode {
         ex: &mut Explorer,
         term: &mut crate::tui::LiveTerminal,
     ) -> PaletteResult {
-        let map = match &self.map {
-            Ok(m) => m,
-            Err(_) => return PaletteResult::Handled,
+        let Ok(map) = &self.map else {
+            return PaletteResult::Handled;
         };
         let Some(cmd) = ex.layout_command_palette(term, map, self.selected, self.scroll) else {
             return PaletteResult::Handled;
@@ -1334,7 +1333,7 @@ impl Mode for RenameMode2 {
             // `^S` copies the whole screen (bare `c` types into a field here, so
             // copy-screen is a Ctrl key in the editor).
             KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.do_copy_screen()
+                self.do_copy_screen();
             }
             // `^L` shows the legend (bare `l` types into a field here).
             KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1741,7 +1740,7 @@ impl Mode for DetailMode {
                     self.unindexed,
                 );
             }
-            KeyCode::Char('b') | KeyCode::Char('B') => {
+            KeyCode::Char('b' | 'B') => {
                 let (overridable, unindexed) = (self.overridable, self.unindexed);
                 let stats = ex.cached_stats(&tensor, view);
                 let stats_view = self.stats_view(&stats);
@@ -1787,7 +1786,7 @@ impl Mode for DetailMode {
                     );
                 }
             }
-            KeyCode::Char('s') | KeyCode::Char('S') => {
+            KeyCode::Char('s' | 'S') => {
                 // `s` is a no-op once the stats are cached — say so rather than
                 // silently doing nothing (a key that appears not to work).
                 if ex.cached_stats(&tensor, view).is_some() {
@@ -1813,7 +1812,7 @@ impl Mode for DetailMode {
                     });
                 }
             }
-            KeyCode::Char('d') | KeyCode::Char('D') if self.overridable => {
+            KeyCode::Char('d' | 'D') if self.overridable => {
                 if let Some(chosen) = ex.prompt_dtype(term, &tensor, DtypePreview::Detail) {
                     let def = ex.default_view(&tensor.name);
                     let mut overrides = ex.data_view.dtype_overrides.borrow_mut();
@@ -1824,7 +1823,7 @@ impl Mode for DetailMode {
                     }
                 }
             }
-            KeyCode::Char('r') | KeyCode::Char('R') if self.overridable => {
+            KeyCode::Char('r' | 'R') if self.overridable => {
                 let current = ex
                     .data_view
                     .shape_overrides
@@ -2047,10 +2046,7 @@ impl Mode for StatsMode {
             }
             // Copy the whole screen's text at the live terminal size.
             KeyCode::Char('c') => {
-                let (w, h) = term
-                    .size()
-                    .map(|s| (s.width, s.height))
-                    .unwrap_or((120, 40));
+                let (w, h) = term.size().map_or((120, 40), |s| (s.width, s.height));
                 let stats = self.stats(ex);
                 let (scroll, shards_expanded) = (self.scroll, self.shards_expanded);
                 if let Ok(text) = crate::tui::headless_render(w, h, |f| {
@@ -2069,7 +2065,7 @@ impl Mode for StatsMode {
             KeyCode::Down => self.scroll = (self.scroll + 1).min(self.scroll_max.get()),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(SCROLL_PAGE),
             KeyCode::PageDown => {
-                self.scroll = (self.scroll + SCROLL_PAGE).min(self.scroll_max.get())
+                self.scroll = (self.scroll + SCROLL_PAGE).min(self.scroll_max.get());
             }
             KeyCode::Home => self.scroll = 0,
             KeyCode::End => self.scroll = self.scroll_max.get(),
@@ -2308,15 +2304,15 @@ impl Mode for DataMode {
         match code {
             KeyCode::Char('m') => self.repr = Representation::Heatmap,
             KeyCode::Char('v') => self.repr = Representation::Values,
-            KeyCode::Char('e') | KeyCode::Char('E') => ex
+            KeyCode::Char('e' | 'E') => ex
                 .data_view
                 .data_view_layout
                 .set(ex.data_view.data_view_layout.get().next()),
-            KeyCode::Char('z') | KeyCode::Char('Z') => ex
+            KeyCode::Char('z' | 'Z') => ex
                 .data_view
                 .data_view_stripe
                 .set(ex.data_view.data_view_stripe.get().next()),
-            KeyCode::Char('b') | KeyCode::Char('B') => ex
+            KeyCode::Char('b' | 'B') => ex
                 .data_view
                 .data_view_base
                 .set(ex.data_view.data_view_base.get().next()),
@@ -2368,7 +2364,7 @@ impl Mode for DataMode {
             KeyCode::End if window => ex.data_view.data_view_win_col.set(usize::MAX),
             KeyCode::PageUp if window => ex.data_view.data_view_win_row.set(0),
             KeyCode::PageDown if window => ex.data_view.data_view_win_row.set(usize::MAX),
-            KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
+            KeyCode::Char('d' | 'D') if overridable => {
                 if let Some(chosen) = ex.prompt_dtype(
                     term,
                     &tensor,
@@ -2387,7 +2383,7 @@ impl Mode for DataMode {
                     }
                 }
             }
-            KeyCode::Char('r') | KeyCode::Char('R') if overridable => {
+            KeyCode::Char('r' | 'R') if overridable => {
                 let current = ex
                     .data_view
                     .shape_overrides
@@ -2436,10 +2432,10 @@ impl Mode for DataMode {
                 .slice
                 .set((self.slice.get() + slices - slice_step(slices)) % slices),
             KeyCode::Char(']') | KeyCode::Right if slices > 1 => {
-                self.slice.set((self.slice.get() + 1) % slices)
+                self.slice.set((self.slice.get() + 1) % slices);
             }
             KeyCode::Char('[') | KeyCode::Left if slices > 1 => {
-                self.slice.set((self.slice.get() + slices - 1) % slices)
+                self.slice.set((self.slice.get() + slices - 1) % slices);
             }
             KeyCode::Char('c') => {
                 let stats = ex.cached_stats(&tensor, view);
@@ -2935,7 +2931,7 @@ mod tests {
         ] {
             let (mut ex, mut term) = loaded();
             let nav = ex.run_command(cmd, &mut term);
-            let where_to = nav.map_or("stay".to_string(), |n| outcome(&Outcome::Leave(n)));
+            let where_to = nav.map_or_else(|| "stay".to_string(), |n| outcome(&Outcome::Leave(n)));
             assert!(!where_to.is_empty(), "{cmd:?} produced no outcome");
         }
         // The navigating ones must actually navigate, not silently stay.
@@ -3165,7 +3161,7 @@ mod tests {
         draw_mode("the file browser", &files, &ex);
 
         let path = ex.files[0].to_string_lossy().to_string();
-        let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(512);
+        let total = std::fs::metadata(&path).map_or(512, |m| m.len());
         let map = crate::safelayout::from_tensors(&path, total, 0, ex.tensors(), ex.metadata());
         let mut layout = LayoutMode::new(path, Ok(map), 0, 0);
         layout.on_enter(&mut ex, &mut term).unwrap();
@@ -3193,12 +3189,7 @@ mod tests {
         detail.pre_draw(&mut ex, &mut term);
         draw_mode("the detail screen", &detail, &ex);
 
-        let mut data = DataMode::new(
-            tensor.clone(),
-            Representation::Heatmap,
-            0,
-            Interaction::Interactive,
-        );
+        let mut data = DataMode::new(tensor, Representation::Heatmap, 0, Interaction::Interactive);
         data.on_enter(&mut ex, &mut term).unwrap();
         data.pre_draw(&mut ex, &mut term);
         draw_mode("the heatmap", &data, &ex);

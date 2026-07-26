@@ -64,10 +64,10 @@ fn common_root(files: &[PathBuf]) -> PathBuf {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
         many => {
             // Longest shared directory prefix by component.
-            let first = many[0].parent().unwrap_or(Path::new("."));
+            let first = many[0].parent().unwrap_or_else(|| Path::new("."));
             let mut common = first.to_path_buf();
             for f in &many[1..] {
-                let p = f.parent().unwrap_or(Path::new("."));
+                let p = f.parent().unwrap_or_else(|| Path::new("."));
                 while !p.starts_with(&common) {
                     if !common.pop() {
                         return PathBuf::from(".");
@@ -168,6 +168,10 @@ fn block_bytes(_m: &std::fs::Metadata) -> u64 {
 }
 
 #[cfg(unix)]
+// The `Option` is the shared signature of a cfg pair: off Unix there is no mode to
+// report and the sibling below returns `None`. Unwrapping it here would mean two
+// different return types for one call site.
+#[allow(clippy::unnecessary_wraps)]
 fn unix_mode(m: &std::fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
     Some(m.mode())
@@ -190,6 +194,10 @@ fn nlink(_m: &std::fs::Metadata) -> u64 {
 
 /// The (followed) inode number (`st_ino`), for the on-disk dedup; `None` off-Unix.
 #[cfg(unix)]
+// The `Option` is the shared signature of a cfg pair: off Unix there is no inode to
+// report and the sibling below returns `None`. Unwrapping it here would mean two
+// different return types for one call site.
+#[allow(clippy::unnecessary_wraps)]
 fn inode_of(m: &std::fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     Some(m.ino())
@@ -214,7 +222,7 @@ fn read_shard_header(file_path: &Path) -> Result<Option<ShardHeader>> {
         Some("safetensors") => {
             let mut file = std::fs::File::open(file_path)
                 .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
-            let total_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let total_len = file.metadata().map_or(0, |m| m.len());
             let mut len_buf = [0u8; 8];
             file.read_exact(&mut len_buf).with_context(|| {
                 format!("Failed to read header length: {}", file_path.display())
@@ -246,7 +254,7 @@ fn read_shard_header(file_path: &Path) -> Result<Option<ShardHeader>> {
         }
         // Recognized HDF5 by extension, OR an extensionless file whose magic says
         // HDF5 (Cerebras checkpoints are often written without an extension).
-        Some("h5") | Some("hdf5") => read_hdf5_shard(file_path, source_path),
+        Some("h5" | "hdf5") => read_hdf5_shard(file_path, source_path),
         other if other != Some("safetensors") && looks_like_hdf5(file_path) => {
             read_hdf5_shard(file_path, source_path)
         }
@@ -255,6 +263,11 @@ fn read_shard_header(file_path: &Path) -> Result<Option<ShardHeader>> {
 }
 
 /// Read an HDF5 shard header (a no-op returning `None` when the `hdf5` feature is off).
+///
+/// The `Result` is the signature of a cfg pair, as with `unix_mode` above: with the feature
+/// on, the HDF5 read can fail; with it off the body is a stub that cannot. One call site,
+/// so one return type.
+#[allow(clippy::unnecessary_wraps)]
 fn read_hdf5_shard(file_path: &Path, source_path: String) -> Result<Option<ShardHeader>> {
     #[cfg(feature = "hdf5")]
     {
@@ -288,7 +301,7 @@ fn shard(
     tensors: Vec<TensorInfo>,
     metadata: Vec<MetadataInfo>,
 ) -> ShardHeader {
-    let total_len = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+    let total_len = std::fs::metadata(file_path).map_or(0, |m| m.len());
     ShardHeader {
         path: source_path,
         total_len,
@@ -357,7 +370,7 @@ fn read_gguf(file_path: &Path, source_path: &str) -> Result<(Vec<TensorInfo>, Ve
 fn read_numpy(file_path: &Path, source_path: &str) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
     let mut file = std::fs::File::open(file_path)
         .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
-    let total_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let total_len = file.metadata().map_or(0, |m| m.len());
     let name = file_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -459,8 +472,7 @@ fn absolute_path(p: &Path) -> String {
         p.to_string_lossy().into_owned()
     } else {
         std::env::current_dir()
-            .map(|cwd| cwd.join(p))
-            .unwrap_or_else(|_| p.to_path_buf())
+            .map_or_else(|_| p.to_path_buf(), |cwd| cwd.join(p))
             .to_string_lossy()
             .into_owned()
     }

@@ -6,6 +6,7 @@
 //! *before* starting the bars.
 
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -36,7 +37,7 @@ pub struct LoadProgress {
 pub enum Unit {
     Shards,
     Tensors,
-    /// S3 objects being HEADed for their metadata (the `diff` s3-vs-s3 phase).
+    /// S3 objects being `HEADed` for their metadata (the `diff` s3-vs-s3 phase).
     S3Objects,
     /// Tensors compared value-by-value (the remote `diff --values`/`--histogram`
     /// phase, computed on the ssh proxy).
@@ -72,7 +73,7 @@ pub enum Stage {
     Shards,
     /// Reading the tensor metadata out of the opened checkpoint.
     Tensors,
-    /// HEADing each S3 object for its *storage* facts — size on S3, ETag, checksum,
+    /// `HEADing` each S3 object for its *storage* facts — size on S3, `ETag`, checksum,
     /// date, tags — which the checkpoint index doesn't carry. Not a second read of the
     /// tensor metadata: that came from the one `__METADATA__` object during
     /// [`Stage::Index`].
@@ -247,7 +248,7 @@ pub struct Bars {
 
 impl Bars {
     /// Reserve one bar per label and (on a terminal) start animating them.
-    pub fn start(labels: Vec<String>) -> Bars {
+    pub fn start(labels: &[String]) -> Bars {
         let n = labels.len();
         let states: Vec<_> = (0..n).map(|_| Arc::new(AtomicU8::new(RUNNING))).collect();
         let durations: Vec<_> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
@@ -513,7 +514,7 @@ fn render_line(v: &BarView, frame: usize, cols: usize) -> String {
 }
 
 fn spawn(
-    labels: Vec<String>,
+    labels: &[String],
     states: Vec<Arc<AtomicU8>>,
     durations: Vec<Arc<AtomicU64>>,
     progress: Vec<Arc<LoadProgress>>,
@@ -543,7 +544,7 @@ fn spawn(
             // write, so the terminal never renders a half-drawn frame (writing each
             // line separately to the unbuffered stderr is what makes it flicker).
             let mut frame = String::with_capacity(n * 96);
-            frame.push_str(&format!("\x1b[{n}A")); // back up to the first reserved line
+            let _ = write!(frame, "\x1b[{n}A"); // back up to the first reserved line
             for (k, &st) in now.iter().enumerate() {
                 // A `[███░░░] done/total` bar once the total is known (e.g. after a
                 // remote dir is listed); until then just the spinner + timer.
@@ -721,7 +722,7 @@ mod tests {
         out
     }
 
-    fn view<'a>(label: &'a str, state: u8) -> BarView<'a> {
+    fn view(label: &str, state: u8) -> BarView<'_> {
         BarView {
             label,
             state,

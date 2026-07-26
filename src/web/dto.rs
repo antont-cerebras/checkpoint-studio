@@ -105,7 +105,7 @@ impl From<&Stats> for StatsDto {
 /// A sampled value grid (`sample::Sample`) — the heatmap / slice payload. Raw
 /// stored bits are included only when asked for (the hex/oct/bin value view): each
 /// cell as a zero-padded hex string of `raw_width` bits, so the client can reformat
-/// to any base via BigInt without u64 precision loss.
+/// to any base via `BigInt` without u64 precision loss.
 #[derive(Serialize)]
 pub(crate) struct SampleDto {
     pub rows: Vec<usize>,
@@ -123,7 +123,7 @@ pub(crate) struct SampleDto {
     pub overridable: bool,
     /// Whether these values are integers, and if so whether they're signed. JSON
     /// numbers are f64, which cannot carry a 64-bit integer exactly — so for an
-    /// integer view the client formats the decimal from `raw` via BigInt (as it
+    /// integer view the client formats the decimal from `raw` via `BigInt` (as it
     /// already does for hex/oct/bin) rather than from the lossy `values`.
     pub integer: bool,
     pub signed: bool,

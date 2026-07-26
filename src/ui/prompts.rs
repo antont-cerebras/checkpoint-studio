@@ -379,7 +379,7 @@ mod tests {
             "the range shows:\n{out}"
         );
         let bad = render(80, 8, |f| {
-            UI::render_slice_prompt(f, 48, "99", Some("out of range"))
+            UI::render_slice_prompt(f, 48, "99", Some("out of range"));
         });
         assert!(bad.contains("out of range"), "{bad}");
     }
@@ -389,7 +389,7 @@ mod tests {
         // Wide enough for the whole band: the hint text is long, and a narrower
         // terminal clips its tail (which the narrow-terminal test below covers).
         let out = render(170, 8, |f| {
-            UI::render_reshape_prompt(f, 4096, &[64, 64], "128,32", None)
+            UI::render_reshape_prompt(f, 4096, &[64, 64], "128,32", None);
         });
         assert!(
             out.contains("4096"),
@@ -406,7 +406,7 @@ mod tests {
     #[test]
     fn the_text_prompt_shows_its_label_input_and_error() {
         let out = render(80, 8, |f| {
-            UI::render_text_prompt(f, "Output file", "out.h5", Some("already exists"))
+            UI::render_text_prompt(f, "Output file", "out.h5", Some("already exists"));
         });
         assert!(out.contains("Output file"), "{out}");
         assert!(out.contains("out.h5"), "{out}");
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn the_choice_menu_lists_its_options_under_a_title() {
         let out = render(70, 12, |f| {
-            UI::render_choice_menu(f, "Sort by", &["name", "size", "params"], 2)
+            UI::render_choice_menu(f, "Sort by", &["name", "size", "params"], 2);
         });
         assert!(out.contains("Sort by"), "{out}");
         for o in ["name", "size", "params"] {
@@ -441,7 +441,7 @@ mod tests {
             "This rewrites the file.".to_string(),
         ];
         let out = render(80, 14, |f| {
-            UI::render_confirm_popup(f, "Confirm rename", &body, &["Cancel", "Rename"], 1)
+            UI::render_confirm_popup(f, "Confirm rename", &body, &["Cancel", "Rename"], 1);
         });
         assert!(out.contains("Confirm rename"), "{out}");
         assert!(out.contains("Rename 3 tensors in place?"), "{out}");

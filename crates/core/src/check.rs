@@ -207,11 +207,7 @@ impl CheckReport {
     /// `diff`-style: `1` when the checkpoint is unhealthy, else `0`. Errors
     /// always count; warnings only when `strict`.
     pub fn exit_code(&self, strict: bool) -> i32 {
-        if self.errors() > 0 || (strict && self.warnings() > 0) {
-            1
-        } else {
-            0
-        }
+        i32::from(self.errors() > 0 || (strict && self.warnings() > 0))
     }
 }
 
@@ -301,7 +297,7 @@ impl CheckpointFormat {
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StorageCheck {
-    /// safetensors / NumPy: contiguous byte-range integrity.
+    /// safetensors / `NumPy`: contiguous byte-range integrity.
     ByteRanges(CheckResult),
     /// HDF5: chunk/dtype integrity.
     Hdf5(CheckResult),
@@ -785,7 +781,14 @@ fn check_hdf5(tensors: &[TensorInfo]) -> CheckResult {
 
     let hdf5: Vec<&TensorInfo> = tensors
         .iter()
-        .filter(|t| t.source_path.ends_with(".hdf5") || t.source_path.ends_with(".h5"))
+        .filter(|t| {
+            // By extension, case-insensitively: `.HDF5` off a Windows share is still HDF5,
+            // and a file merely *named* `…h5` is not.
+            std::path::Path::new(&t.source_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("hdf5") || e.eq_ignore_ascii_case("h5"))
+        })
         .collect();
     if hdf5.is_empty() {
         return CheckResult::na(ID, TITLE, NOTE);
@@ -1058,7 +1061,7 @@ fn detected_layer_count(tensors: &[TensorInfo]) -> Option<usize> {
     chosen.1.iter().next_back().map(|&m| m + 1)
 }
 
-/// The expert index in a MoE tensor name — the segment right after `experts`, as
+/// The expert index in a `MoE` tensor name — the segment right after `experts`, as
 /// in `…mlp.experts.<e>.down_proj.weight`. `None` when the name has no expert.
 pub(crate) fn expert_index(name: &str) -> Option<usize> {
     let parts: Vec<&str> = name.split('.').collect();
@@ -1066,7 +1069,7 @@ pub(crate) fn expert_index(name: &str) -> Option<usize> {
     parts.get(pos + 1)?.parse().ok()
 }
 
-/// The projection category of an MoE expert tensor — the `.`-segment ending in
+/// The projection category of an `MoE` expert tensor — the `.`-segment ending in
 /// `_proj` (`down_proj` / `gate_proj` / `up_proj` / `gate_up_proj`), normalising the
 /// double-underscore fusion `gate_proj__up_proj` to `gate_up_proj`. `None` when no
 /// segment names a projection (e.g. a per-expert bias/scale with no `_proj` part).
@@ -1440,7 +1443,7 @@ fn check_values(
     filter: &NameFilter,
     jobs: usize,
 ) -> CheckResult {
-    let bars = crate::progress::Bars::start(vec!["scanning tensor data".to_string()]);
+    let bars = crate::progress::Bars::start(&["scanning tensor data".to_string()]);
     let fallback = LoadProgress::new();
     let progress = bars.progress(0);
     // Never cancelled from the CLI — cancellation is a TUI affordance.
@@ -1495,8 +1498,10 @@ pub fn scan_values(
     let mut findings = rayon::ThreadPoolBuilder::new()
         .num_threads(jobs.max(1))
         .build()
-        .map(|pool| pool.install(|| scan_par(&targets, &schemas, &pause, cancel, progress)))
-        .unwrap_or_else(|_| scan_par(&targets, &schemas, &pause, cancel, progress));
+        .map_or_else(
+            |_| scan_par(&targets, &schemas, &pause, cancel, progress),
+            |pool| pool.install(|| scan_par(&targets, &schemas, &pause, cancel, progress)),
+        );
     findings.sort_by(sort_key);
     let mut result = CheckResult::done(ID, TITLE, NOTE, findings);
     result.set_elapsed(started.elapsed());
@@ -1587,7 +1592,8 @@ fn fmt_indices(idx: &[usize]) -> String {
         if start == end {
             out.push_str(&start.to_string());
         } else {
-            out.push_str(&format!("{start}–{end}"));
+            use std::fmt::Write as _;
+            let _ = write!(out, "{start}–{end}");
         }
         i += 1;
     }
@@ -1975,7 +1981,7 @@ mod tests {
         assert_eq!(with_error.exit_code(true), 1);
     }
 
-    /// A 2-layer, 2-expert MoE stack with an untied head and matching embedding.
+    /// A 2-layer, 2-expert `MoE` stack with an untied head and matching embedding.
     fn moe_tensors() -> Vec<TensorInfo> {
         let mut tensors = Vec::new();
         for l in [0, 1] {

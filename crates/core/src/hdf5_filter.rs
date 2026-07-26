@@ -28,13 +28,13 @@ pub(crate) unsafe fn install_output(
     out: &[u8],
 ) -> usize {
     unsafe {
-        let p = H5allocate_memory(out.len().max(1), 0) as *mut u8;
+        let p = H5allocate_memory(out.len().max(1), 0).cast::<u8>();
         if p.is_null() {
             return 0;
         }
         std::ptr::copy_nonoverlapping(out.as_ptr(), p, out.len());
         H5free_memory(*buf);
-        *buf = p as *mut c_void;
+        *buf = p.cast::<c_void>();
         *buf_size = out.len();
         out.len()
     }

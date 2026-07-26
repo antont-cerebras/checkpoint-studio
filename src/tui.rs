@@ -106,10 +106,10 @@ pub(crate) fn restore(_terminal: &mut LiveTerminal) -> Result<()> {
             pfd.revents = 0;
             // A short gap with no input means the terminal has settled (the
             // disable took hold and the link drained); then we're done.
-            if libc::poll(&mut pfd, 1, 60) <= 0 {
+            if libc::poll(&raw mut pfd, 1, 60) <= 0 {
                 break;
             }
-            if libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) <= 0 {
+            if libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) <= 0 {
                 break;
             }
             if start.elapsed() > Duration::from_millis(1200) {
@@ -164,7 +164,7 @@ pub(crate) fn buffer_to_string(buffer: &Buffer) -> String {
         }
         lines.push(line);
     }
-    while lines.last().is_some_and(|l| l.is_empty()) {
+    while lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }
     lines.join("\n")

@@ -211,9 +211,10 @@ fn local_list(dir: &Path) -> Vec<DirEntry> {
 /// The label for the root directory node — its final component, or the whole
 /// path when it has none (e.g. `/`).
 fn root_name(root: &Path) -> String {
-    root.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+    root.file_name().map_or_else(
+        || root.to_string_lossy().into_owned(),
+        |s| s.to_string_lossy().into_owned(),
+    )
 }
 
 fn build_dir(

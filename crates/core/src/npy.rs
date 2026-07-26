@@ -1,4 +1,4 @@
-//! Parsing for the NumPy `.npy` array format (also the payload of each entry in
+//! Parsing for the `NumPy` `.npy` array format (also the payload of each entry in
 //! a `.npz` archive). A `.npy` file is a small header — a 6-byte magic, a 2-byte
 //! version, a 2- or 4-byte header length, then an ASCII Python-dict describing
 //! the array — followed by the raw elements in C (row-major) order, exactly the
@@ -62,7 +62,7 @@ pub fn parse_header(r: &mut impl Read) -> Result<NpyHeader, String> {
     })
 }
 
-/// Map a NumPy dtype descriptor (array-interface `typestr`, e.g. `<f4`, `|u1`,
+/// Map a `NumPy` dtype descriptor (array-interface `typestr`, e.g. `<f4`, `|u1`,
 /// `=i8`) to the explorer's dtype name. Rejects big-endian multi-byte types
 /// (the decoders assume little-endian) and non-numeric kinds.
 pub fn map_descr(descr: &str) -> Result<String, String> {

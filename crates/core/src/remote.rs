@@ -117,7 +117,7 @@ impl S3Meta {
 /// read that only wants tensor names/shapes skips it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectMeta {
-    /// HEAD every object: sizes, ETags, checksums, dates, tags — and the cross-check.
+    /// HEAD every object: sizes, `ETags`, checksums, dates, tags — and the cross-check.
     Fetch,
     /// Tensor metadata only.
     Skip,
@@ -402,7 +402,7 @@ impl RemoteRead {
         let mut password = None;
         let session = self.open_with(&mut password)?;
         eprintln!("checkpoint-studio: reading tensor metadata over ssh …");
-        let bars = crate::progress::Bars::start(vec![src.to_string()]);
+        let bars = crate::progress::Bars::start(&[src.to_string()]);
         let progress = bars.progress(0);
         // A structure-only read (`--print-model`, the diff's local-side helper): no
         // S3 section to fill and no cross-check to report, so skip the per-object HEADs.
@@ -442,7 +442,7 @@ impl RemoteRead {
         let mut password = None;
         let session = self.open_with(&mut password)?;
         eprintln!("checkpoint-studio: reading tensor metadata over ssh …");
-        let bars = crate::progress::Bars::start(vec![src.to_string()]);
+        let bars = crate::progress::Bars::start(&[src.to_string()]);
         let progress = bars.progress(0);
         let out = self.read(&session, src, &password, progress.as_deref(), objects, None);
         bars.finish(0, out.is_ok());
@@ -546,13 +546,13 @@ impl RemoteRead {
                 s3: objects.wanted().then_some(s3),
             })
         } else {
-            self.read_dir(session, src, password, progress)
+            self.read_dir(session, src, password.as_ref(), progress)
         }
     }
 
     /// A remote safetensors directory/file over SFTP. Its shards' headers are read
     /// **in parallel** across a pool of sessions — `session` plus up to
-    /// [`MAX_SHARD_SESSIONS`]`- 1` more opened here (reusing `password`, so no extra
+    /// one fewer than [`MAX_SHARD_SESSIONS`] more opened here (reusing `password`, so no extra
     /// prompt) — sharing one **work-stealing** shard counter, then merged in shard
     /// order deduped by name.
     ///
@@ -566,7 +566,7 @@ impl RemoteRead {
         &self,
         session: &RemoteSession,
         path: &str,
-        password: &Option<String>,
+        password: Option<&String>,
         progress: Option<&LoadProgress>,
     ) -> Result<RemoteCheckpoint> {
         use std::sync::atomic::AtomicUsize;
@@ -605,7 +605,7 @@ impl RemoteRead {
             // Extra sessions connect in parallel, then join the same queue.
             for _ in 1..workers {
                 handles.push(s.spawn(move || {
-                    let mut pw = password.clone();
+                    let mut pw = password.cloned();
                     match self.open_with(&mut pw) {
                         Ok(extra) => extra.read_shards(files, displays, next, progress),
                         Err(_) => Ok(Vec::new()), // one fewer reader; others cover it
@@ -1174,7 +1174,10 @@ fn parse_dump(
                         .collect()
                 })
                 .unwrap_or_default();
-            let itemsize = item.get("itemsize").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+            let itemsize = item
+                .get("itemsize")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
             let num_elements: usize = shape.iter().product();
             tensors.push(TensorInfo {
                 name,
@@ -1601,7 +1604,10 @@ fn parse_s3_meta(v: &serde_json::Value) -> S3Meta {
                         });
                     Some(S3Object {
                         key,
-                        size: o.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
+                        size: o
+                            .get("size")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
                         etag: o
                             .get("etag")
                             .and_then(|x| x.as_str())
@@ -2171,7 +2177,7 @@ mod tests {
                 assert_eq!(lo, -1.0);
                 assert_eq!(hi, 1.0);
             }
-            _ => panic!("expected Range bins"),
+            crate::sample::HistBins::IntBins { .. } => panic!("expected Range bins"),
         }
         // The summary shift is present alongside the full data.
         assert_eq!(m["w"].hist_shift, Some((0.5, 2)));
@@ -2285,7 +2291,7 @@ mod tests {
         ],"metadata":[{"name":"format","value":"pt","value_type":"string"}]}"#;
         let (t, m, s3) = parse_dump(json, "lab@host:/opt/models/ckpt").unwrap();
         assert_eq!(t[0].dtype, "BF16");
-        assert_eq!(t[0].shape, vec![151936, 2048]);
+        assert_eq!(t[0].shape, vec![151_936, 2048]);
         assert_eq!(t[0].source_path, "lab@host:/opt/models/ckpt");
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "format");

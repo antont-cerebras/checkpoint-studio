@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn the_export_band_shows_the_written_path() {
         let out = render(80, 8, |f| {
-            UI::render_export_band(f, "wrote /tmp/report.txt")
+            UI::render_export_band(f, "wrote /tmp/report.txt");
         });
         assert!(out.contains("/tmp/report.txt"), "{out}");
     }

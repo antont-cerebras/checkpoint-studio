@@ -6,6 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::fmt::Write as _;
 
 use super::UI;
 use super::palette;
@@ -69,7 +70,7 @@ impl UI {
             };
             // The value scan carries its wall-clock time (like the CLI bar).
             if let Some(d) = r.elapsed() {
-                trailer_text.push_str(&format!("  ({})", fmt_elapsed(d)));
+                let _ = write!(trailer_text, "  ({})", fmt_elapsed(d));
             }
             let trailer = sty(trailer_text, Style::default().fg(palette::DIM));
             lines.push(check_row(

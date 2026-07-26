@@ -185,7 +185,7 @@ impl UI {
                 config.scroll_offset,
             )
             .is_some();
-        let body_width = width.saturating_sub(if scrollbar { 1 } else { 0 });
+        let body_width = width.saturating_sub(u16::from(scrollbar));
 
         // Header (title, hint(s), rule) spans the full width.
         Paragraph::new(lines).render(
@@ -473,14 +473,14 @@ fn tree_node_line(
                 Some(n) => format!("≡ {n}, "),
                 None => String::new(),
             };
-            let size_field = if stored_size != total_size {
+            let size_field = if stored_size == total_size {
+                format_size(*total_size)
+            } else {
                 format!(
                     "{} {SIZE_ARROW} {}",
                     format_size(*total_size),
                     format_size(*stored_size)
                 )
-            } else {
-                format_size(*total_size)
             };
             s.push(tree_span(selected, palette::ACCENT, arrow));
             s.push(tree_span(selected, Color::Reset, " "));

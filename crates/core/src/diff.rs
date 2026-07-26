@@ -29,7 +29,14 @@ const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
 /// Rendering options for the diff output.
+///
+/// Six flags, over clippy's threshold of three. They stay flags because they are genuinely
+/// independent switches rather than a state with named alternatives: any combination is
+/// valid and each maps 1:1 to a CLI flag. Grouping them into sub-structs to satisfy the
+/// lint would add a layer that means nothing — the alternative the lint is really asking
+/// for (an enum) only helps when the options are mutually exclusive, and these are not.
 #[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct DiffOpts {
     /// Colorize with ANSI escapes (removed in red, added in green; for a changed
     /// tensor only the dtype/shape token that differs).
@@ -228,18 +235,17 @@ fn group_entries<K: Clone + Eq + std::hash::Hash>(items: &[(String, K)]) -> Vec<
     let mut groups: Vec<Group<K>> = Vec::new();
     for (name, key) in items {
         let (template, idx) = templatize(name);
-        let gi = match index.get(&(template.clone(), key.clone())) {
-            Some(&i) => i,
-            None => {
-                index.insert((template.clone(), key.clone()), groups.len());
-                groups.push(Group {
-                    template,
-                    indices: vec![Vec::new(); idx.len()],
-                    count: 0,
-                    key: key.clone(),
-                });
-                groups.len() - 1
-            }
+        let gi = if let Some(&i) = index.get(&(template.clone(), key.clone())) {
+            i
+        } else {
+            index.insert((template.clone(), key.clone()), groups.len());
+            groups.push(Group {
+                template,
+                indices: vec![Vec::new(); idx.len()],
+                count: 0,
+                key: key.clone(),
+            });
+            groups.len() - 1
         };
         let g = &mut groups[gi];
         g.count += 1;
@@ -449,7 +455,9 @@ fn merge_values(acc: Option<ValueDiff>, next: Option<ValueDiff>) -> Option<Value
         (Some(a), Some(b)) => {
             let elements = a.elements + b.elements;
             let mean_abs = if elements > 0 {
-                (a.mean_abs * a.elements as f64 + b.mean_abs * b.elements as f64) / elements as f64
+                b.mean_abs
+                    .mul_add(b.elements as f64, a.mean_abs * a.elements as f64)
+                    / elements as f64
             } else {
                 0.0
             };
@@ -478,22 +486,21 @@ fn group_changed(items: &[TensorChange], group: bool) -> Vec<ChangedGroup> {
         } else {
             (c.name.clone(), c.old.clone(), c.new.clone())
         };
-        let gi = match index.get(&bucket) {
-            Some(&i) => i,
-            None => {
-                index.insert(bucket, groups.len());
-                groups.push(ChangedGroup {
-                    template,
-                    indices: vec![Vec::new(); idx.len()],
-                    count: 0,
-                    old: c.old.clone(),
-                    new: c.new.clone(),
-                    values: None,
-                    hist_tvds: Vec::new(),
-                    hist_bins: 0,
-                });
-                groups.len() - 1
-            }
+        let gi = if let Some(&i) = index.get(&bucket) {
+            i
+        } else {
+            index.insert(bucket, groups.len());
+            groups.push(ChangedGroup {
+                template,
+                indices: vec![Vec::new(); idx.len()],
+                count: 0,
+                old: c.old.clone(),
+                new: c.new.clone(),
+                values: None,
+                hist_tvds: Vec::new(),
+                hist_bins: 0,
+            });
+            groups.len() - 1
         };
         let g = &mut groups[gi];
         g.count += 1;
@@ -958,7 +965,7 @@ impl DiffReport {
     /// True when anything was added, removed, or changed — drives the exit code
     /// (`1` like `diff`, vs `0` when the two checkpoints are structurally identical).
     /// `count_s3` folds in whole-prefix S3 object-metadata material changes (a
-    /// re-uploaded object, a differing ETag, …); pass `false` when a `--name` filter
+    /// re-uploaded object, a differing `ETag`, …); pass `false` when a `--name` filter
     /// scoped the diff to a subset of tensors, since the S3 comparison is
     /// whole-prefix and thus out of that scope — exactly like the metadata section,
     /// which is likewise "not compared (filtered subset)". Timestamp-only S3 deltas
@@ -1182,7 +1189,15 @@ impl DiffReport {
                 let (old, new) = (&g.key.0, &g.key.1);
                 let name = display_name(&g.template, &g.indices);
                 let suffix = count_suffix(g.count);
-                if old.value != new.value {
+                if old.value == new.value {
+                    // Same value, different declared type.
+                    let _ = writeln!(
+                        s,
+                        "  ~ {name} (type {} → {}){suffix}",
+                        paint(&old.value_type, opts.color, RED),
+                        paint(&new.value_type, opts.color, GREEN),
+                    );
+                } else {
                     // Prefer a git-style line diff for long values: JSON is
                     // pretty-printed first (so even a minified one-liner diffs
                     // line-by-line), else any already-multi-line value is diffed
@@ -1214,14 +1229,6 @@ impl DiffReport {
                             paint(&n, opts.color, GREEN),
                         );
                     }
-                } else {
-                    // Same value, different declared type.
-                    let _ = writeln!(
-                        s,
-                        "  ~ {name} (type {} → {}){suffix}",
-                        paint(&old.value_type, opts.color, RED),
-                        paint(&new.value_type, opts.color, GREEN),
-                    );
                 }
             }
         } else {
@@ -1432,8 +1439,8 @@ pub struct S3Scope {
     pub matched: usize,
     /// …of which had an additional checksum on **both** sides (so it was compared).
     pub checksum_both: usize,
-    /// …whose ETag is a multipart composite (`<md5>-<parts>`) rather than a plain
-    /// single-part MD5 — determines how much a matching ETag proves (see the report's
+    /// …whose `ETag` is a multipart composite (`<md5>-<parts>`) rather than a plain
+    /// single-part MD5 — determines how much a matching `ETag` proves (see the report's
     /// confidence note).
     pub etag_multipart: usize,
     /// …of which carried any user metadata on either side.
@@ -1443,8 +1450,8 @@ pub struct S3Scope {
     pub tags_compared: bool,
 }
 
-/// Whether an S3 ETag is a **multipart** upload's composite tag (`<hex>-<parts>`)
-/// rather than a single-part object's plain MD5. A multipart ETag isn't a content
+/// Whether an S3 `ETag` is a **multipart** upload's composite tag (`<hex>-<parts>`)
+/// rather than a single-part object's plain MD5. A multipart `ETag` isn't a content
 /// hash — it depends on the part size — so a matching one implies identical content
 /// only when the part layout also matches.
 pub fn is_multipart_etag(etag: &str) -> bool {
@@ -1894,7 +1901,7 @@ fn bin_label(bins: HistBins, i: usize, n: usize) -> String {
         }
         HistBins::Range { lo, hi } => {
             let w = if n > 0 { (hi - lo) / n as f64 } else { 0.0 };
-            fmt_delta(lo + i as f64 * w)
+            fmt_delta((i as f64).mul_add(w, lo))
         }
     }
 }
@@ -3178,7 +3185,7 @@ mod tests {
         assert_eq!(fmt_delta(0.0), "0");
         assert_eq!(fmt_delta(7.0), "7");
         assert_eq!(fmt_delta(0.5), "0.5");
-        assert_eq!(fmt_delta(0.001953125), "0.001953");
+        assert_eq!(fmt_delta(0.001_953_125), "0.001953");
         assert_eq!(fmt_delta(1e-8), "1.000e-8");
     }
 
@@ -3322,7 +3329,7 @@ mod tests {
     #[test]
     fn filter_names_exact() {
         let f = TensorFilter {
-            names_exact: Some(["a.w", "b.w"].iter().map(|s| s.to_string()).collect()),
+            names_exact: Some(["a.w", "b.w"].iter().map(ToString::to_string).collect()),
             ..Default::default()
         };
         let s = sig("F16", &[2]);

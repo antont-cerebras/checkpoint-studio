@@ -144,7 +144,7 @@ pub(super) fn render_scroll_popup(
             indicator
                 .as_deref()
                 .map(str::chars)
-                .map_or(0, |c| c.count()),
+                .map_or(0, Iterator::count),
         );
     let box_w = ((inner_w + 4) as u16).min(area.width); // 2 borders + 2 padding
 
@@ -223,7 +223,7 @@ pub(super) fn render_hover_bubble(
     if lines.is_empty() {
         return;
     }
-    let title_w = title.map(|t| t.chars().count() + 2).unwrap_or(0);
+    let title_w = title.map_or(0, |t| t.chars().count() + 2);
     let inner_w = lines
         .iter()
         .map(Line::width)

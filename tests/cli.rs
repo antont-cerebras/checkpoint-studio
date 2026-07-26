@@ -85,7 +85,7 @@ fn write_fixture(path: &str) {
 // browser's listing of the main fixture directory (`cli__files_view`).
 const FIXTURE_MOE: &str = "tests/fixtures_moe/tiny_moe.safetensors";
 
-/// A small MoE checkpoint with 8 transformer layers — each with attention
+/// A small `MoE` checkpoint with 8 transformer layers — each with attention
 /// (q/k/v/o), two experts (down/gate/up), and two norms — sized so the per-layer
 /// graphs actually show shape (attention grows with depth, so the size / params
 /// sparklines ramp up; experts dominate the composition chart).
@@ -171,7 +171,7 @@ fn ensure_fixture() {
     ONCE.call_once(|| write_fixture(FIXTURE));
 }
 
-/// Generate the multi-layer MoE fixture once.
+/// Generate the multi-layer `MoE` fixture once.
 fn ensure_moe_fixture() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| write_moe_fixture(FIXTURE_MOE));
@@ -306,7 +306,7 @@ fn stats_popup() {
     settings().bind(|| insta::assert_snapshot!(plain(&["--stats"])));
 }
 
-/// The per-layer graphs on a multi-layer MoE checkpoint — so the sparkline shape
+/// The per-layer graphs on a multi-layer `MoE` checkpoint — so the sparkline shape
 /// (attention ramps with depth) and the stacked composition bands are asserted,
 /// not just the degenerate single-layer case of the main fixture.
 #[test]
@@ -477,7 +477,7 @@ fn print_tensors_json_verbose() {
 #[test]
 fn plain_detail_u16() {
     settings().bind(|| {
-        insta::assert_snapshot!(plain(&["--tensor", "model.layers.0.mlp.down_proj.weight"]))
+        insta::assert_snapshot!(plain(&["--tensor", "model.layers.0.mlp.down_proj.weight"]));
     });
 }
 
@@ -493,7 +493,7 @@ fn plain_values_u16() {
             "--tensor",
             "model.layers.0.mlp.down_proj.weight",
             "--values"
-        ]))
+        ]));
     });
 }
 
@@ -504,7 +504,7 @@ fn plain_histogram_u16() {
             "--tensor",
             "model.layers.0.mlp.down_proj.weight",
             "--histogram"
-        ]))
+        ]));
     });
 }
 
@@ -631,6 +631,7 @@ fn hdf5_without_feature_errors() {
 #[cfg(feature = "hdf5")]
 mod hdf5 {
     use super::{run_plain, settings};
+    use std::fmt::Write as _;
 
     const H5: &str = "tests/fixtures/tiny.hdf5";
     const MOE: &str = "model.layers.0.block_sparse_moe.experts";
@@ -659,7 +660,7 @@ mod hdf5 {
     #[test]
     fn detail_per_tensor_schema() {
         settings().bind(|| {
-            insta::assert_snapshot!(plain(&["--tensor", "model.layers.0.custom_proj.weight"]))
+            insta::assert_snapshot!(plain(&["--tensor", "model.layers.0.custom_proj.weight"]));
         });
     }
 
@@ -777,7 +778,7 @@ mod hdf5 {
         }
     }
 
-    /// The `s` popup on a compressed MoE checkpoint: exercises the compression
+    /// The `s` popup on a compressed `MoE` checkpoint: exercises the compression
     /// ratio (on-disk vs. logical) and the fused-experts section.
     #[test]
     fn stats_popup() {
@@ -812,7 +813,7 @@ mod hdf5 {
             let mut a = vec![H5];
             a.extend_from_slice(args);
             a.push("--emit-command");
-            out.push_str(&format!("{label}: {}\n", super::run_bin(&a).trim()));
+            let _ = writeln!(out, "{label}: {}", super::run_bin(&a).trim());
         }
         settings().bind(|| insta::assert_snapshot!(out));
     }
@@ -1593,7 +1594,7 @@ fn repack_writes_a_new_hdf5_and_leaves_the_original_alone() {
     let _ = std::fs::remove_file(&out_path);
 }
 
-/// A sharded checkpoint directory with an index — the layout every real HuggingFace
+/// A sharded checkpoint directory with an index — the layout every real `HuggingFace`
 /// model uses, and the one load path the single-file fixture never takes (index
 /// parsing, multi-shard grouping, and the index-vs-files health reconcile).
 fn write_sharded(dir: &Path) {

@@ -435,10 +435,10 @@ mod small_terminal {
             UI::render_notice_box(f, "metadata-only — data views need the file locally");
         });
         draw("the copied flash", |f| {
-            UI::render_copied_flash(f, "the tensor name")
+            UI::render_copied_flash(f, "the tensor name");
         });
         draw("a message", |f| {
-            UI::render_message(f, "Title", "A message body")
+            UI::render_message(f, "Title", "A message body");
         });
     }
 }

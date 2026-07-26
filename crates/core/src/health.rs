@@ -112,10 +112,7 @@ pub fn check_loaded(spec: &IndexSpec, tensors: &[TensorInfo]) -> HealthReport {
     let mut present_by_file: HashMap<String, BTreeSet<String>> = HashMap::new();
     for t in tensors {
         let path = Path::new(&t.source_path);
-        let in_dir = path
-            .parent()
-            .map(|p| p == abs_dir || p == spec.dir)
-            .unwrap_or(false);
+        let in_dir = path.parent().is_some_and(|p| p == abs_dir || p == spec.dir);
         if !in_dir {
             continue;
         }
@@ -141,11 +138,11 @@ pub fn check_loaded(spec: &IndexSpec, tensors: &[TensorInfo]) -> HealthReport {
 /// the tensor names present in each file (from the already-parsed headers), report
 /// the file- and tensor-level mismatches. No I/O — both callers supply the pieces
 /// from data they've already read, so a header is never read twice.
-pub fn reconcile(
+pub fn reconcile<S: std::hash::BuildHasher>(
     index_path: &str,
-    weight_map: &HashMap<String, String>,
+    weight_map: &HashMap<String, String, S>,
     actual: &BTreeSet<String>,
-    present_by_file: &HashMap<String, BTreeSet<String>>,
+    present_by_file: &HashMap<String, BTreeSet<String>, S>,
 ) -> HealthReport {
     let referenced: BTreeSet<String> = weight_map.values().cloned().collect();
 
@@ -199,7 +196,7 @@ pub fn reconcile(
 /// single `__METADATA__` index (which is what a load reads) and again into the
 /// tensor's own object as `x-amz-meta-metadata` (which is what the storage layer
 /// sees). We already fetch both — the object metadata comes back with the sizes and
-/// ETags the stats screen shows — so agreement is free to verify, and disagreement
+/// `ETags` the stats screen shows — so agreement is free to verify, and disagreement
 /// means one of the two is stale: the index would then describe a tensor that isn't
 /// what the bytes actually are.
 ///
@@ -579,9 +576,9 @@ mod tests {
         let report = |missing_f: &[&str], extra_f: &[&str], missing_t: &[&str]| HealthReport {
             kind: HealthKind::IndexVsFiles,
             index_path: "idx".into(),
-            missing_files: missing_f.iter().map(|s| s.to_string()).collect(),
-            extra_files: extra_f.iter().map(|s| s.to_string()).collect(),
-            missing_tensors: missing_t.iter().map(|s| s.to_string()).collect(),
+            missing_files: missing_f.iter().map(ToString::to_string).collect(),
+            extra_files: extra_f.iter().map(ToString::to_string).collect(),
+            missing_tensors: missing_t.iter().map(ToString::to_string).collect(),
             extra_tensors: Vec::new(),
             mismatched_tensors: Vec::new(),
             unverified_tensors: Vec::new(),

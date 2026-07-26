@@ -221,7 +221,7 @@ pub(crate) fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str>
         (Tree, Tab) => "Switch to the file browser — the checkpoint's directory.",
         (Files, Tab) => "Switch back to the tensor tree.",
         // safetensors layout map.
-        (Layout, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
+        (Layout, Char(' ' | ':')) => "Open the command palette — search and run any command.",
         (Layout, Tab) => "Switch back to the tensor tree.",
         (Layout, Up | Down) => "Move the selection to the previous / next segment.",
         (Layout, PageUp | PageDown) => "Move the selection by one screenful.",
@@ -233,7 +233,7 @@ pub(crate) fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str>
         (Files, KeyCode::Enter) => {
             "Expand a directory, open a checkpoint file, or preview a text / JSON sidecar."
         }
-        (Files, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
+        (Files, Char(' ' | ':')) => "Open the command palette — search and run any command.",
         (Files, Char('f')) => "Copy the selected file's path.",
         // Tree navigation.
         (Tree, Up | Down) if shift => "Jump to the previous / next sibling at this depth.",
@@ -241,7 +241,7 @@ pub(crate) fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str>
         (Tree, Left | Right) => "Collapse to the parent group, or step into the child.",
         (Tree, PageUp | PageDown) => "Scroll the tree by one screenful.",
         (Tree, KeyCode::Enter) => "Open the selected tensor, or expand / collapse a group.",
-        (Tree, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
+        (Tree, Char(' ' | ':')) => "Open the command palette — search and run any command.",
         (Tree, Char('e' | 'E')) => "Expand every group in the tree.",
         (Tree, Char('c' | 'C')) => "Collapse every group in the tree.",
         (Tree, Char('/')) => "Search: filter tensors by name as you type.",
@@ -258,7 +258,7 @@ pub(crate) fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str>
         }
         (Tree, Char('q')) => "Quit the explorer.",
         // Detail screen.
-        (Detail, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
+        (Detail, Char(' ' | ':')) => "Open the command palette — search and run any command.",
         (Detail | Data, Char('m')) => "Show the tensor as a heatmap.",
         (Detail | Data, Char('v')) => "Show the tensor as a grid of numeric values.",
         (Detail, Char('h')) => "Compute and show the value histogram.",
@@ -267,35 +267,33 @@ pub(crate) fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str>
         (Detail | Data, Char('d')) => "Reinterpret the stored dtype (e.g. u4, i4, bf16, f32).",
         (Detail | Data, Char('r' | 'R')) => "Reshape the tensor's dimensions (row-major).",
         // Data view.
-        (Data, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
+        (Data, Char(' ' | ':')) => "Open the command palette — search and run any command.",
         (Data, Char('e' | 'E')) => "Cycle the layout: overview → abs-max → edges → window.",
         (Data, Char('z' | 'Z')) => "Cycle zebra striping: rows → columns → off.",
         (Data, Char('b' | 'B')) => "Cycle the numeral base: dec → hex → oct → bin.",
-        (Data, Char(']') | Char('[')) => "Step to the next / previous slice.",
+        (Data, Char(']' | '[')) => "Step to the next / previous slice.",
         (Data, Up | Down | Left | Right) => {
             "Pan the view (Shift = one screenful, Ctrl = to the edge)."
         }
         // Rename editor — palette commands, keyed by their registry sentinel char
         // (the palette maps each to `KeyCode::Char(sentinel)`; see `RENAME_COMMANDS`).
-        (Rename, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
-        (Rename, Char('r') | Char('\u{12}')) => {
+        (Rename, Char(' ' | ':')) => "Open the command palette — search and run any command.",
+        (Rename, Char('r' | '\u{12}')) => {
             "Apply the rename in place (asks for confirmation first)."
         }
         (Rename, Char('\r')) => "Move to the next field (past the last field, add a new rule).",
         (Rename, Char('\u{e}')) => "Add another source → new-name rule.",
         (Rename, Char('\u{4}')) => "Remove the focused rule.",
-        (Rename, Char('y') | Char('\u{19}')) => {
-            "Copy the CLI command that reopens this rename editor."
-        }
-        (Rename, Char('a') | Char('\u{1}')) => {
+        (Rename, Char('y' | '\u{19}')) => "Copy the CLI command that reopens this rename editor.",
+        (Rename, Char('a' | '\u{1}')) => {
             "Copy the `convert --map` command that applies this rename non-interactively."
         }
-        (Rename, Char('s') | Char('\u{13}')) => "Copy the whole screen's text to the clipboard.",
-        (Rename, Char('l') | Char('\u{c}')) => "Show the legend for the rename editor's symbols.",
+        (Rename, Char('s' | '\u{13}')) => "Copy the whole screen's text to the clipboard.",
+        (Rename, Char('l' | '\u{c}')) => "Show the legend for the rename editor's symbols.",
         (Rename, Char('\u{1b}')) => "Go back to the previous view.",
         (Rename, Char('\u{3}')) => "Quit the explorer.",
         // Checkpoint stats (full-screen).
-        (Stats, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
+        (Stats, Char(' ' | ':')) => "Open the command palette — search and run any command.",
         (Stats, Up | Down) => "Scroll the report up / down one line.",
         (Stats, PageUp | PageDown) => "Scroll the report by one screenful.",
         (Stats, Char('f')) => "Fold / expand the per-shard on-disk breakdown.",

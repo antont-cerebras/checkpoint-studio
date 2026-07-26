@@ -121,9 +121,7 @@ fn build_sample(
     if e == 0 || inner == 0 {
         return None;
     }
-    let (fe, foff) = first
-        .map(|(e, o, _, _)| (e as usize, o as usize))
-        .unwrap_or((0, 0));
+    let (fe, foff) = first.map_or((0, 0), |(e, o, _, _)| (e as usize, o as usize));
     let e0 = fe.saturating_sub(6);
     let off0 = foff.saturating_sub(16);
     let e1 = (e0 + 16).min(e);
@@ -297,15 +295,14 @@ fn aux_local(
     let (Some(o), Some(n)) = (old, new) else {
         return ax;
     };
-    let (oa, na) = match (
+    // Couldn't read one side — leave it marked present but uncompared.
+    let (Ok(oa), Ok(na)) = (
         crate::sample::read_all_f64(o),
         crate::sample::read_all_f64(n),
-    ) {
-        (Ok(a), Ok(b)) => (a, b),
-        // Couldn't read one side — leave it marked present but uncompared.
-        _ => return ax,
+    ) else {
+        return ax;
     };
-    ax.shape = n.shape.clone();
+    ax.shape.clone_from(&n.shape);
     if o.shape != n.shape {
         ax.shape_mismatch = Some((o.shape.clone(), n.shape.clone()));
         return ax;
@@ -649,7 +646,7 @@ mod tests {
         // An unreadable side reports the read error rather than proceeding.
         let missing = TensorInfo {
             source_path: dir.join("gone.safetensors").to_string_lossy().into_owned(),
-            ..old.clone()
+            ..old
         };
         assert!(
             verify_local(&missing, &short, 5, 3, aux, aux)

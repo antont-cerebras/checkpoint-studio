@@ -34,7 +34,7 @@ pub fn register() {
             id: ZSTD_FILTER_ID,
             encoder_present: 1,
             decoder_present: 1,
-            name: FILTER_NAME.as_ptr() as *const c_char,
+            name: FILTER_NAME.as_ptr().cast::<c_char>(),
             can_apply: None,
             set_local: None,
             filter: Some(zstd_filter),

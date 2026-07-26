@@ -5,6 +5,10 @@ edition = "2024"
 repository = "https://github.com/antont-cerebras/checkpoint-studio"
 license = "MIT"
 description = "Frontend-free core of checkpoint-studio: the serializable checkpoint model, readers (local + SSH/S3), derived views, and reports."
+keywords = ["safetensors", "gguf", "hdf5", "checkpoint", "machine-learning"]
+categories = ["data-structures", "parser-implementations", "science"]
+# The workspace README covers both crates; this one has no separate front page.
+readme = "../../README.md"
 
 [dependencies]
 anyhow = "1.0"

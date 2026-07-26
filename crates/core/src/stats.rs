@@ -242,7 +242,7 @@ impl PerLayerStats {
     }
 }
 
-/// How MoE experts are laid out on disk — and, folded in, the per-layer expert
+/// How `MoE` experts are laid out on disk — and, folded in, the per-layer expert
 /// count. Unfused storage names each expert (`…experts.<e>.…`), so the count is
 /// **always** known (highest index + 1); fused storage stacks them, where the
 /// count can be underivable (no config, no usable shape) — hence the `Option`
@@ -279,13 +279,13 @@ pub struct ExpertCategory {
     pub bytes: usize,
 }
 
-/// MoE expert structure — present only when the checkpoint has experts.
+/// `MoE` expert structure — present only when the checkpoint has experts.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExpertStats {
     /// Storage kind + the per-layer expert count (see [`ExpertLayout`]).
     pub layout: ExpertLayout,
     /// gate & up projections combined into one tensor (`gate_up_proj` /
-    /// `gate_proj__up_proj`), a common MoE fusion.
+    /// `gate_proj__up_proj`), a common `MoE` fusion.
     pub gate_up_fused: bool,
     /// Total parameters across all experts (every layer).
     pub params: usize,
@@ -294,7 +294,7 @@ pub struct ExpertStats {
     /// Layers that carry experts — the divisor (with `per_layer`) for a single
     /// expert's average.
     pub layers: usize,
-    /// Per-projection breakdown (down/gate/up/gate_up), in that canonical order.
+    /// Per-projection breakdown (`down/gate/up/gate_up`), in that canonical order.
     pub by_category: Vec<ExpertCategory>,
 }
 
@@ -445,7 +445,7 @@ impl S3Stats {
         self.objects.iter().map(|o| o.size).sum()
     }
 
-    /// Objects that reported an ETag.
+    /// Objects that reported an `ETag`.
     pub fn etags(&self) -> usize {
         self.objects.iter().filter(|o| !o.etag.is_empty()).count()
     }
@@ -583,7 +583,7 @@ impl CheckpointStats {
             largest: sized.last().map(named),
             smallest: sized.first().map(named),
             mean: logical_bytes.checked_div(sized.len()).unwrap_or(0),
-            median: sized.get(sized.len() / 2).map(|&(_, s)| s).unwrap_or(0),
+            median: sized.get(sized.len() / 2).map_or(0, |&(_, s)| s),
         };
 
         let largest = tensors
@@ -602,9 +602,9 @@ impl CheckpointStats {
             });
         let mean_bytes = logical_bytes.checked_div(n_tensors).unwrap_or(0);
         let median_bytes = {
-            let mut sizes: Vec<usize> = tensors.iter().map(|t| t.size_bytes).collect();
-            sizes.sort_unstable();
-            sizes.get(sizes.len() / 2).copied().unwrap_or(0)
+            let mut by_size: Vec<usize> = tensors.iter().map(|t| t.size_bytes).collect();
+            by_size.sort_unstable();
+            by_size.get(by_size.len() / 2).copied().unwrap_or(0)
         };
 
         // dtype breakdown, biggest byte-share first (ties broken by name).
@@ -647,6 +647,7 @@ impl CheckpointStats {
     /// Attach the underlying S3 objects (an `s3://` cstorch source only) — kept out
     /// of [`Self::compute`] so its many local/test call sites don't churn. Sets the
     /// S3 footprint; a `None` leaves any disk footprint from `compute` intact.
+    #[must_use]
     pub fn with_s3(mut self, s3: Option<S3Stats>) -> Self {
         if let Some(s3) = s3 {
             self.footprint = Some(StorageFootprint::S3(s3));
@@ -930,11 +931,6 @@ impl CheckpointStats {
             // Per-shard breakdown, folded away by default (a many-shard model is
             // otherwise a wall of rows) and only for shards the filesystem shrank.
             if d.shards.len() > 1 {
-                let savers: Vec<&ShardDisk> = d
-                    .shards
-                    .iter()
-                    .filter(|s| has_saving(s.apparent, s.allocated))
-                    .collect();
                 if shards_expanded {
                     // Unfolding shows *every* shard (savers and not) — the folded
                     // summary already gave the "N of M smaller" headline, so the
@@ -950,9 +946,15 @@ impl CheckpointStats {
                         ));
                     }
                 } else {
+                    // Counted here rather than collected above: the expanded branch
+                    // lists every shard and never needs the filtered set.
+                    let savers = d
+                        .shards
+                        .iter()
+                        .filter(|s| has_saving(s.apparent, s.allocated))
+                        .count();
                     out.push(format!(
-                        "  ▸ per-shard breakdown ({} of {} smaller)",
-                        savers.len(),
+                        "  ▸ per-shard breakdown ({savers} of {} smaller)",
                         d.shards.len()
                     ));
                 }
@@ -983,7 +985,7 @@ pub fn ratio_phrase(apparent: u64, allocated: u64) -> String {
 
 /// The S3 section's "Checksums" value: stored-checksum coverage by algorithm
 /// (e.g. "126 with SHA256"), or a note that none were stored (so object equality
-/// would rest on the ETag alone). Shared by the plain + styled reports.
+/// would rest on the `ETag` alone). Shared by the plain + styled reports.
 pub fn s3_checksums_phrase(s3: &S3Stats) -> String {
     let by_algo = s3.checksums();
     if by_algo.is_empty() {
@@ -1031,7 +1033,7 @@ pub fn s3_modified_phrase(s3: &S3Stats) -> Option<String> {
     })
 }
 
-/// One S3 object's detail tail (size + full ETag + full checksum) for the
+/// One S3 object's detail tail (size + full `ETag` + full checksum) for the
 /// per-object breakdown, shared by the plain + styled reports. Hashes are shown in
 /// full (not abbreviated) — they're the whole point of the row, and the report
 /// scrolls / the `r` copy carries them verbatim.
@@ -1091,7 +1093,7 @@ fn is_expert(name: &str) -> bool {
     name.split('.').any(|s| s == "experts")
 }
 
-/// Aggregate MoE expert structure, or `None` for a dense checkpoint.
+/// Aggregate `MoE` expert structure, or `None` for a dense checkpoint.
 fn expert_stats(
     tensors: &[TensorInfo],
     config: Option<&crate::config::ModelConfig>,

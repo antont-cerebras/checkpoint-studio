@@ -44,11 +44,17 @@ jobs:
       # crate's own targets — including its ~340 tests, most of the test code in the
       # project — were never linted at all. Adding it surfaced 59 real lint errors that
       # had accumulated unseen.
+      #
+      # No `-- -D warnings`: a lint level on the command line OVERRIDES the `[lints]` table,
+      # so passing it would defeat every documented `allow` in Cargo.toml and fail on the
+      # families deliberately left off. The table sets `deny` itself — `clippy::all`,
+      # `pedantic`, `nursery`, `cargo`, and rustc's `warnings` — so plain `clippy` is the
+      # stricter gate here, not the looser one.
       - name: Lint with clippy (default features)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets
 
       - name: Lint with clippy (all features)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features
 
       # Build both configurations in release mode
       - name: Build (default features)

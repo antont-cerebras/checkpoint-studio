@@ -213,7 +213,7 @@ pub(crate) fn bind(host: IpAddr, port: u16) -> Result<tiny_http::Server> {
         Err(e) if port != 0 => {
             let server = tiny_http::Server::http(SocketAddr::new(host, 0))
                 .map_err(|e2| anyhow::anyhow!("failed to start web server on {host}: {e2}"))?;
-            let freed = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
+            let freed = server.server_addr().to_ip().map_or(0, |a| a.port());
             eprintln!(
                 "checkpoint-studio: port {port} is already in use ({e}) — serving on free \
                  port {freed} instead (use --port to pick another, or free {port} first)."
@@ -240,7 +240,7 @@ pub(crate) fn serve_on(
     state: Arc<WebState>,
     host: IpAddr,
 ) -> Result<()> {
-    let bound = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
+    let bound = server.server_addr().to_ip().map_or(0, |a| a.port());
     // Print a URL the browser can actually reach: a wildcard bind (0.0.0.0 / ::)
     // isn't clickable, so show this host's FQDN instead of the bind address.
     let display = if host.is_unspecified() {
@@ -255,8 +255,7 @@ pub(crate) fn serve_on(
     // while another worker is inside a multi-second tensor scan.
     let server = Arc::new(server);
     let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+        .map_or(4, std::num::NonZero::get)
         .clamp(2, 8);
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {

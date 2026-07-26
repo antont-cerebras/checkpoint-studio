@@ -6,9 +6,8 @@
 //! JSON shapes back the one-shot CLI exports, the clipboard copy, and the export menu's
 //! preview pane.
 
-#[allow(clippy::wildcard_imports)] // a submodule of the module it was split from
 use super::*;
-
+#[allow(clippy::wildcard_imports)] // a submodule of the module it was split from
 impl Explorer {
     /// The whole tree as text — every group and tensor in the browser's row
     /// layout, fully expanded regardless of the live collapse state, with no
@@ -27,7 +26,7 @@ impl Explorer {
             if detail == TreeDetail::Full
                 && let TreeNode::Tensor { info, .. } = node
             {
-                line.push_str(&format!("  ← {}", file_basename(&info.source_path)));
+                let _ = write!(line, "  ← {}", file_basename(&info.source_path));
             }
             out.push(line);
             if let TreeNode::Group { children, .. } = node {
@@ -64,7 +63,7 @@ impl Explorer {
                 let line = crate::ui::tensor_list_line(t, &self.unindexed, &self.packing_schemas);
                 let mut text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 if detail == TreeDetail::Full {
-                    text.push_str(&format!("  ← {}", file_basename(&t.source_path)));
+                    let _ = write!(text, "  ← {}", file_basename(&t.source_path));
                 }
                 text
             })

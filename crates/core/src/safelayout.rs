@@ -96,10 +96,10 @@ pub fn parse(path: &Path) -> Result<LayoutMap, String> {
     let mut json = vec![0u8; n as usize];
     file.read_exact(&mut json)
         .map_err(|_| "truncated safetensors header".to_string())?;
-    let name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let name = path.file_name().map_or_else(
+        || path.to_string_lossy().into_owned(),
+        |s| s.to_string_lossy().into_owned(),
+    );
     parse_from(&name, total_len, &json)
 }
 
@@ -136,10 +136,7 @@ pub fn parse_from(name: &str, total_len: u64, header_json: &[u8]) -> Result<Layo
                     .map(|(k, v)| {
                         // safetensors metadata is string→string; keep a string
                         // for anything else (its compact JSON form).
-                        let val = v
-                            .as_str()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| v.to_string());
+                        let val = v.as_str().map_or_else(|| v.to_string(), str::to_string);
                         (k.clone(), val)
                     })
                     .collect();
@@ -147,9 +144,8 @@ pub fn parse_from(name: &str, total_len: u64, header_json: &[u8]) -> Result<Layo
             }
             continue;
         }
-        let e = match entry.as_object() {
-            Some(e) => e,
-            None => continue,
+        let Some(e) = entry.as_object() else {
+            continue;
         };
         let dtype = e
             .get("dtype")

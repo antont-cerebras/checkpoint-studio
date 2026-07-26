@@ -8,6 +8,7 @@ use crossterm::{
 };
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
+use std::fmt::Write as _;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap, HashSet},
@@ -1314,7 +1315,7 @@ impl Explorer {
         // checkpoint (tensor count, parameters and size), so the tree reads
         // top-down from one place instead of from a separate footer.
         let total_size = self.tensors().iter().map(|t| t.size_bytes).sum();
-        let stored_size = self.tensors().iter().map(|t| t.on_disk_size()).sum();
+        let stored_size = self.tensors().iter().map(TensorInfo::on_disk_size).sum();
         let root = TreeNode::Group {
             name: self.root_label(),
             children,
@@ -1332,9 +1333,10 @@ impl Explorer {
     /// otherwise the shared parent directory's name (or "checkpoint").
     fn root_label(&self) -> String {
         let basename = |p: &Path| {
-            p.file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "checkpoint".to_string())
+            p.file_name().map_or_else(
+                || "checkpoint".to_string(),
+                |s| s.to_string_lossy().into_owned(),
+            )
         };
         match self.files.split_first() {
             None => "checkpoint".to_string(),
@@ -1342,8 +1344,7 @@ impl Explorer {
             Some((first, _)) => {
                 let dir = first.parent();
                 if dir.is_some() && self.files.iter().all(|f| f.parent() == dir) {
-                    dir.map(basename)
-                        .unwrap_or_else(|| "checkpoint".to_string())
+                    dir.map_or_else(|| "checkpoint".to_string(), basename)
                 } else {
                     "checkpoint".to_string()
                 }
@@ -2341,7 +2342,11 @@ impl Explorer {
     /// tensors from the full session (so the filter can be edited/cleared live) and
     /// hands it to the kernel, or clears the filter when none is active.
     fn refresh_filter(&mut self) {
-        let Some(filter) = self.tensor_filter.clone().filter(|f| f.is_active()) else {
+        let Some(filter) = self
+            .tensor_filter
+            .clone()
+            .filter(checkpoint_studio_core::tensorfilter::TensorFilter::is_active)
+        else {
             self.tree_state.clear_filter();
             return;
         };
@@ -2634,9 +2639,7 @@ impl Explorer {
 
             // Space / `:` opens the command palette (unless the mode takes it as
             // input — the tree while searching).
-            if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char(':'))
-                && mode.palette_on_space(self)
-            {
+            if matches!(key.code, KeyCode::Char(' ' | ':')) && mode.palette_on_space(self) {
                 match mode.open_palette(self, term) {
                     PaletteResult::Nav(n) => break n,
                     PaletteResult::CopyCommand => self.do_copy_command(mode, term),
@@ -2859,7 +2862,7 @@ impl Explorer {
     fn command_palette(&mut self, term: &mut crate::tui::LiveTerminal) -> Option<Cmd> {
         let entries = self.available_commands();
         self.run_palette(term, entries, HelpCtx::Tree, |s, f| {
-            s.render_tree_frame(f, true)
+            s.render_tree_frame(f, true);
         })
     }
 
@@ -2868,7 +2871,7 @@ impl Explorer {
     fn file_command_palette(&mut self, term: &mut crate::tui::LiveTerminal) -> Option<FileCmd> {
         let entries = self.available_file_commands();
         self.run_palette(term, entries, HelpCtx::Files, |s, f| {
-            s.render_files_frame(f, true)
+            s.render_files_frame(f, true);
         })
     }
 
@@ -3015,8 +3018,7 @@ impl Explorer {
     /// The remote host label for display (`host` from `--ssh-proxy`), or `remote`.
     fn remote_host_label(&self) -> String {
         self.remote_read()
-            .map(|r| r.host.clone())
-            .unwrap_or_else(|| "remote".to_string())
+            .map_or_else(|| "remote".to_string(), |r| r.host.clone())
     }
 
     /// Build the file browser's directory tree for the current source: a local
@@ -3037,8 +3039,7 @@ impl Explorer {
                         let full = root.join(&fe.rel_path);
                         let parent = full
                             .parent()
-                            .map(Path::to_path_buf)
-                            .unwrap_or_else(|| root.clone());
+                            .map_or_else(|| root.clone(), Path::to_path_buf);
                         let entry = if fe.is_dir() {
                             crate::filetree::DirEntry::Directory {
                                 name: fe.name.clone(),
@@ -3582,8 +3583,7 @@ impl Explorer {
                 .to_string(),
             _ => Path::new(path)
                 .strip_prefix(&self.browse_root)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| path.to_string()),
+                .map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned()),
         };
         parts.push(shell_quote(&rel));
         if let Some(name) = select {
@@ -3608,38 +3608,35 @@ impl Explorer {
         &self,
         path: &str,
     ) -> std::result::Result<crate::safelayout::LayoutMap, String> {
-        match self.remote_browse() {
-            Some(RemoteBrowse::Sftp(_)) => {
-                let (total_len, header) = self
-                    .with_remote_session(|s| s.read_header_sized(path))
-                    .map_err(|e| format!("{e:#}"))?;
-                let name = path.rsplit('/').next().unwrap_or(path);
-                crate::safelayout::parse_from(name, total_len, &header)
-            }
-            _ => {
-                // Local: build from the cached shard header (no file read) when the
-                // requested file is one of the loaded shards. Otherwise (a file not
-                // in the model) fall back to reading its header.
-                if let Some(cp) = self.checkpoint() {
-                    let want = Path::new(path).file_name();
-                    if want.is_some()
-                        && let Some(sh) = cp
-                            .shards
-                            .iter()
-                            .find(|s| Path::new(&s.path).file_name() == want)
-                    {
-                        let name = want.and_then(|n| n.to_str()).unwrap_or(path);
-                        return Ok(crate::safelayout::from_tensors(
-                            name,
-                            sh.total_len,
-                            sh.header_len,
-                            &sh.tensors,
-                            &sh.metadata,
-                        ));
-                    }
+        if let Some(RemoteBrowse::Sftp(_)) = self.remote_browse() {
+            let (total_len, header) = self
+                .with_remote_session(|s| s.read_header_sized(path))
+                .map_err(|e| format!("{e:#}"))?;
+            let name = path.rsplit('/').next().unwrap_or(path);
+            crate::safelayout::parse_from(name, total_len, &header)
+        } else {
+            // Local: build from the cached shard header (no file read) when the
+            // requested file is one of the loaded shards. Otherwise (a file not
+            // in the model) fall back to reading its header.
+            if let Some(cp) = self.checkpoint() {
+                let want = Path::new(path).file_name();
+                if want.is_some()
+                    && let Some(sh) = cp
+                        .shards
+                        .iter()
+                        .find(|s| Path::new(&s.path).file_name() == want)
+                {
+                    let name = want.and_then(|n| n.to_str()).unwrap_or(path);
+                    return Ok(crate::safelayout::from_tensors(
+                        name,
+                        sh.total_len,
+                        sh.header_len,
+                        &sh.tensors,
+                        &sh.metadata,
+                    ));
                 }
-                crate::safelayout::parse(Path::new(path)).map_err(|e| format!("{e:#}"))
             }
+            crate::safelayout::parse(Path::new(path)).map_err(|e| format!("{e:#}"))
         }
     }
 
@@ -3747,7 +3744,7 @@ impl Explorer {
                 match json_lines {
                     Some(json_lines) => lines.extend(json_lines),
                     None => {
-                        lines.extend(json.lines().map(|l| Line::from(Span::raw(l.to_string()))))
+                        lines.extend(json.lines().map(|l| Line::from(Span::raw(l.to_string()))));
                     }
                 }
                 if truncated {
@@ -3917,12 +3914,13 @@ impl Explorer {
                     }
                     // Files sharing a directory show + copy that directory; files
                     // that don't show a span and copy the first (nothing shared).
-                    n => match common_dir(&files) {
-                        Some(dir) => SelectionView {
-                            status: ("▸", format!("{n} files in {dir}"), String::new()),
-                            copy_path: Some(dir),
-                        },
-                        None => {
+                    n => {
+                        if let Some(dir) = common_dir(&files) {
+                            SelectionView {
+                                status: ("▸", format!("{n} files in {dir}"), String::new()),
+                                copy_path: Some(dir),
+                            }
+                        } else {
                             // Both ends of the set, or (for an empty one) empty names —
                             // the count in the message is what carries the information.
                             let first = files.iter().next().cloned().unwrap_or_default();
@@ -3937,7 +3935,7 @@ impl Explorer {
                                 copy_path: Some(first),
                             }
                         }
-                    },
+                    }
                 }
             }
             // The full metadata path on the first line (the tree row shows only
@@ -3988,7 +3986,7 @@ impl Explorer {
     /// One screenful of tree rows, used to size a PageUp/PageDown jump so it
     /// matches what's currently visible.
     fn page_rows(&self) -> usize {
-        let height = terminal::size().map(|(_, h)| h).unwrap_or(40);
+        let height = terminal::size().map_or(40, |(_, h)| h);
         UI::visible_tree_rows(height)
     }
 
@@ -4048,8 +4046,7 @@ impl Explorer {
                 .query
                 .char_indices()
                 .nth(s.cursor)
-                .map(|(b, _)| b)
-                .unwrap_or(s.query.len());
+                .map_or(s.query.len(), |(b, _)| b);
             s.query.insert(byte, c);
             s.cursor += 1;
         }
@@ -4071,8 +4068,7 @@ impl Explorer {
                 .query
                 .char_indices()
                 .nth(s.cursor - 1)
-                .map(|(b, _)| b)
-                .unwrap_or(0);
+                .map_or(0, |(b, _)| b);
             s.query.remove(byte);
             s.cursor -= 1;
         }
@@ -4542,7 +4538,7 @@ impl Explorer {
                         Some(snap),
                         scanning,
                         overlay,
-                    )
+                    );
                 });
             });
         }
@@ -4906,7 +4902,7 @@ impl Explorer {
                 Ok(Event::Key(KeyEvent { code, .. })) => match code {
                     KeyCode::Right | KeyCode::Char('d') => idx = (idx + 1) % options.len(),
                     KeyCode::Left | KeyCode::Char('D') => {
-                        idx = (idx + options.len() - 1) % options.len()
+                        idx = (idx + options.len() - 1) % options.len();
                     }
                     KeyCode::Enter => return Some(options[idx]),
                     KeyCode::Esc => return None,
@@ -4937,7 +4933,7 @@ impl Explorer {
         let mut input = current
             .map(|s| {
                 s.iter()
-                    .map(|d| d.to_string())
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             })
@@ -4953,7 +4949,7 @@ impl Explorer {
                         &tensor.shape,
                         &input,
                         error.as_deref(),
-                    )
+                    );
                 })
                 .is_err()
             {
@@ -5178,7 +5174,7 @@ impl Explorer {
                     f,
                     "Repack unavailable",
                     "Repacking is available only for a single HDF5 checkpoint (.h5/.hdf5).",
-                )
+                );
             });
             let _ = event::read();
             return;
@@ -5430,7 +5426,7 @@ impl Explorer {
                 f,
                 "Repack unavailable",
                 "Rebuild with `--features hdf5` to enable repacking.",
-            )
+            );
         });
         let _ = event::read();
     }
@@ -5602,10 +5598,7 @@ impl Explorer {
                         // at the live terminal size so the popup lands where it does
                         // on screen (a fixed size would misplace the centred box).
                         KeyCode::Char('c') => {
-                            let (w, h) = term
-                                .size()
-                                .map(|s| (s.width, s.height))
-                                .unwrap_or((120, 40));
+                            let (w, h) = term.size().map_or((120, 40), |s| (s.width, s.height));
                             let screen = crate::tui::headless_render(w, h, |f| {
                                 self.render_tree_frame(f, false);
                                 UI::render_check_report(
@@ -5657,10 +5650,10 @@ impl Explorer {
                 }
                 // The wheel scrolls the report body.
                 Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::ScrollUp) => {
-                    scroll = scroll.saturating_sub(WHEEL_STEP)
+                    scroll = scroll.saturating_sub(WHEEL_STEP);
                 }
                 Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::ScrollDown) => {
-                    scroll = (scroll + WHEEL_STEP).min(scroll_max)
+                    scroll = (scroll + WHEEL_STEP).min(scroll_max);
                 }
                 // Motion refreshes the hover bubbles behind the popup, so they
                 // stay live; drag/resize are ignored.
@@ -5710,7 +5703,9 @@ impl Explorer {
 
     /// Total element (parameter) count across the canonical tensors.
     fn total_parameters(&self) -> usize {
-        self.session.as_ref().map_or(0, |s| s.total_parameters())
+        self.session
+            .as_ref()
+            .map_or(0, checkpoint_studio_core::kernel::Session::total_parameters)
     }
 
     fn disk_usage(&self) -> Option<crate::stats::DiskUsage> {
@@ -5749,9 +5744,7 @@ impl Explorer {
         let metadata = self.metadata().to_vec();
         let progress = Arc::new(crate::progress::LoadProgress::new());
         let cancel = Arc::new(AtomicBool::new(false));
-        let jobs = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let jobs = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         let (tx, rx) = std::sync::mpsc::channel();
         {
             let (p, c) = (Arc::clone(&progress), Arc::clone(&cancel));
@@ -6159,7 +6152,7 @@ impl RenameMode {
         let cur = self.cursor;
         {
             let f = self.field();
-            let byte = f.char_indices().nth(cur).map(|(b, _)| b).unwrap_or(f.len());
+            let byte = f.char_indices().nth(cur).map_or(f.len(), |(b, _)| b);
             f.insert(byte, c);
         }
         self.cursor += 1;
@@ -6246,7 +6239,7 @@ impl RenameMode {
     }
 
     /// Move the dropdown's highlight by `delta`, wrapping over `n` candidates (as
-    /// prompt_toolkit / pgcli do). A no-op when the menu is closed or empty.
+    /// `prompt_toolkit` / pgcli do). A no-op when the menu is closed or empty.
     fn menu_move(&mut self, delta: isize, n: usize) {
         if n == 0 {
             return;
@@ -6292,7 +6285,7 @@ impl RenameMode {
         if on_target {
             pair.target = text;
         } else {
-            pair.source = text.clone();
+            pair.source.clone_from(&text);
             if pair.target.trim().is_empty() {
                 pair.target = text;
             }
@@ -6312,7 +6305,7 @@ impl RenameMode {
             match (p.source.trim().is_empty(), p.target.trim().is_empty()) {
                 (true, true) => {} // blank pair — ignored
                 (false, false) => {
-                    rules.push(crate::rename::rule_from_fields(&p.source, &p.target)?)
+                    rules.push(crate::rename::rule_from_fields(&p.source, &p.target)?);
                 }
                 _ => notes.push(format!(
                     "rule {}: fill both the source and the new name",
@@ -6507,7 +6500,7 @@ fn files_dismiss_footer() -> Line<'static> {
 /// Read up to `cap` bytes of `path` as UTF-8, returning `(text, truncated)`.
 /// A non-UTF-8 file yields an error message the caller shows in an info pop-up.
 fn read_text_capped(path: &Path, cap: u64) -> Result<(String, bool), String> {
-    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let len = std::fs::metadata(path).map_or(0, |m| m.len());
     let f = File::open(path).map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     f.take(cap)
@@ -6563,13 +6556,14 @@ fn layout_to_text(map: &crate::safelayout::LayoutMap) -> String {
             }
             _ => String::new(),
         };
-        out.push_str(&format!(
-            "{:#014x}  {:>10}  {}{}\n",
+        let _ = writeln!(
+            out,
+            "{:#014x}  {:>10}  {}{}",
             s.start,
             format_size(s.len() as usize),
             s.name,
             detail
-        ));
+        );
     }
     out
 }
@@ -6604,7 +6598,7 @@ fn common_dir(paths: &BTreeSet<String>) -> Option<String> {
 /// Parse a shape-override entry — dimensions separated by `,`, space, or `x`
 /// (e.g. `10, 100` / `10x100`) — validating that the product equals `elements`
 /// (the tensor's element count). One dimension may be a wildcard (`-1`, `*`, or
-/// `_`), inferred from the count (like NumPy's `reshape(-1, …)`).
+/// `_`), inferred from the count (like `NumPy`'s `reshape(-1, …)`).
 fn parse_shape_input(input: &str, elements: usize) -> Result<Vec<usize>, String> {
     let tokens: Vec<&str> = input
         .split(|c: char| c == ',' || c == 'x' || c.is_whitespace())
@@ -6651,7 +6645,7 @@ fn parse_shape_input(input: &str, elements: usize) -> Result<Vec<usize>, String>
 }
 
 /// Whether a tensor's dtype can be reinterpreted — formats whose raw stored
-/// bytes we read ourselves (safetensors, NumPy, HDF5).
+/// bytes we read ourselves (safetensors, `NumPy`, HDF5).
 fn dtype_overridable(tensor: &TensorInfo) -> bool {
     matches!(
         Path::new(&tensor.source_path)
@@ -6785,8 +6779,7 @@ fn absolute_path(path: &Path) -> String {
 fn file_name(path: &str) -> String {
     Path::new(path)
         .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
+        .map_or_else(|| path.to_string(), |s| s.to_string_lossy().into_owned())
 }
 
 /// Collect the distinct source files of every tensor under `node`.
@@ -7238,7 +7231,7 @@ mod tests {
         let mut perms = std::fs::metadata(&f).unwrap().permissions();
         perms.set_readonly(true);
         std::fs::set_permissions(&f, perms.clone()).unwrap();
-        let ro = Explorer::new(vec![f.clone()], Vec::new(), None, false);
+        let ro = Explorer::new(vec![f], Vec::new(), None, false);
         assert!(ro.rename_target().is_some(), "still local safetensors");
         assert!(
             !ro.can_rename(),
@@ -7561,7 +7554,7 @@ mod tests {
             "model.embed_tokens.weight",
         ]
         .iter()
-        .map(|s| s.to_string())
+        .map(ToString::to_string)
         .collect();
 
         // Autocomplete matches the deduped, *generalized* schemas — number-agnostic,
@@ -7622,7 +7615,7 @@ mod tests {
             "model.layers.0.mlp.up_proj.weight",
         ]
         .iter()
-        .map(|s| s.to_string())
+        .map(ToString::to_string)
         .collect();
         let schemas: Vec<(String, usize)> = {
             let mut seen = HashSet::new();

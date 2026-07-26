@@ -456,16 +456,18 @@ impl UI {
 
         // The autocomplete dropdown floats over everything, anchored just below the
         // focused field (when it's on-screen) — drawn last so nothing overpaints it.
-        let mut menu_rects = Vec::new();
-        if view.menu_open && !view.completions.is_empty() && focus_line < editor_h as usize {
-            menu_rects = render_completion_menu(
-                frame,
-                RENAME_MENU_X,
-                header_h + focus_line as u16,
-                view.completions,
-                view.menu_sel,
-            );
-        }
+        let menu_rects =
+            if view.menu_open && !view.completions.is_empty() && focus_line < editor_h as usize {
+                render_completion_menu(
+                    frame,
+                    RENAME_MENU_X,
+                    header_h + focus_line as u16,
+                    view.completions,
+                    view.menu_sel,
+                )
+            } else {
+                Vec::new()
+            };
 
         (max_scroll, chips, clicks, menu_rects, vscroll)
     }

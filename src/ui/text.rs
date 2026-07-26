@@ -19,14 +19,14 @@ pub(super) fn wrap_help(text: &str, width: usize) -> Vec<Line<'static>> {
     let mut cur = String::new();
     for word in text.split_whitespace() {
         if cur.is_empty() {
-            cur.push_str(word);
+            // First word on the line: nothing to separate it from.
         } else if cur.chars().count() + 1 + word.chars().count() <= width {
             cur.push(' ');
-            cur.push_str(word);
         } else {
+            // Doesn't fit — start a new line with this word.
             lines.push(Line::from(std::mem::take(&mut cur)));
-            cur.push_str(word);
         }
+        cur.push_str(word);
     }
     if !cur.is_empty() {
         lines.push(Line::from(cur));

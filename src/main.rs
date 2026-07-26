@@ -33,6 +33,7 @@ mod web;
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -602,7 +603,7 @@ enum Command {
         #[arg(long = "no-color")]
         no_color: bool,
         /// Only diff tensors whose name matches this glob (e.g.
-        /// '*.mlp.down_proj.weight', 'model.layers.*'). Repeatable — a tensor
+        /// '*.`mlp.down_proj.weight`', 'model.layers.*'). Repeatable — a tensor
         /// passes if it matches ANY; prefix with ! to exclude ('!*.bias' =
         /// everything but biases). Scopes the whole diff (structural + values)
         /// to the matching subset; metadata is not compared.
@@ -645,8 +646,8 @@ enum Command {
         /// removed+added. Format 'REGEX=>REPLACEMENT' (regex, with $1 captures);
         /// repeatable, and rules apply in order. E.g. to diff a gpt-oss checkpoint
         /// against a block_sparse_moe-named one:
-        ///   --map '\.mlp\.experts\.=>.block_sparse_moe.experts.'
-        ///   --map 'experts\.(down|gate_up)_proj$=>experts.${1}_proj.weight'
+        ///   --map '\.mlp\.experts\.=>.`block_sparse_moe.experts`.'
+        ///   --map 'experts\.(`down|gate_up`)_proj$=>experts.${1}_proj.weight'
         #[arg(long = "map", value_name = "REGEX=>REPL")]
         map: Vec<String>,
         /// Load rename rules from a file (see --map), merged after any --map. A
@@ -713,7 +714,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::default(), value_name = "FORMAT")]
         format: Format,
         /// Never colorize the output (also off when stdout isn't a terminal, or
-        /// when NO_COLOR is set).
+        /// when `NO_COLOR` is set).
         #[arg(long = "no-color")]
         no_color: bool,
         /// Check a remote checkpoint's structure over SSH on [USER@]HOST (which
@@ -732,7 +733,7 @@ enum Command {
     ///
     /// The server supplies the checkpoint as JSON (the data); the browser owns the
     /// view state. It binds all interfaces by default and prints a URL using this
-    /// machine's hostname (e.g. http://your-vm.example.com:8080/), so you can open
+    /// machine's hostname (e.g. <http://your-vm.example.com:8080>/), so you can open
     /// it from another machine's browser with no tunnel. Local checkpoints only.
     Web {
         /// The checkpoint to serve — a file, directory, or glob (shards merge into
@@ -889,9 +890,7 @@ fn main() -> Result<()> {
             let view = dtype.unwrap_or(sample::ViewDtype::Stored);
             // Default parallelism = logical CPUs; `--jobs 0` is treated as 1.
             let jobs = jobs.filter(|&j| j > 0).unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
             });
             let started = std::time::Instant::now();
             let code = run_diff(
@@ -944,9 +943,7 @@ fn main() -> Result<()> {
             ssh_venv,
         }) => {
             let jobs = jobs.filter(|&j| j > 0).unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
             });
             let (paths, remote) = resolve_remote_sources(&paths, ssh_proxy, ssh_venv, &cfg)?;
             let remote = remote.map(|(host, venv)| remote::RemoteRead::new(host, venv));
@@ -1031,7 +1028,7 @@ fn run_check(
             let mut password: Option<String> = None;
             let session = r.open_with(&mut password)?;
             eprintln!("checkpoint-studio check: reading tensor metadata over ssh …");
-            let bars = progress::Bars::start(vec![src.clone()]);
+            let bars = progress::Bars::start(std::slice::from_ref(&src));
             let progress = bars.progress(0);
             // `check` fetches the S3 object metadata (an extra HEAD per object) on
             // purpose: cross-checking it against the checkpoint index is one of the
@@ -1085,7 +1082,7 @@ fn run_check(
             let health: Vec<health::HealthReport> = index_specs
                 .iter()
                 .map(|spec| health::check_loaded(spec, &tensors))
-                .filter(|r| r.has_issues())
+                .filter(health::HealthReport::has_issues)
                 .collect();
             let label = paths
                 .iter()
@@ -1131,7 +1128,7 @@ fn run_check(
 /// Compare two checkpoints' structure and print the summary. Returns the process
 /// exit code: `0` identical, `1` differences found, `2` trouble (unreadable path).
 /// Whether to colorize the diff: off when `--no-color`, when `NO_COLOR` is set
-/// (https://no-color.org), or when stdout isn't a terminal (so pipes stay clean).
+/// (<https://no-color.org>), or when stdout isn't a terminal (so pipes stay clean).
 fn color_enabled(no_color: bool) -> bool {
     use std::io::IsTerminal;
     !no_color && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
@@ -1388,7 +1385,7 @@ fn draw_block(lines: &[String], prev_lines: &mut usize) {
     use std::io::Write;
     let mut out = String::new();
     if *prev_lines > 0 {
-        out.push_str(&format!("\x1b[{prev_lines}A")); // up to the block's first line
+        let _ = write!(out, "\x1b[{prev_lines}A"); // up to the block's first line
     }
     out.push_str("\r\x1b[0J"); // column 0, clear to end of screen
     out.push_str(&lines.join("\n"));
@@ -1572,9 +1569,10 @@ fn resolve_remote_sources(
     let stripped: Vec<PathBuf> = paths.iter().map(|p| strip_config_proxy_prefix(p)).collect();
     let remote = resolve_ssh_proxy(proxy, venv, cfg, needs_proxy);
     if prefixed && remote.is_none() {
-        let where_ = cli_config::CliConfig::path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "the config file".to_string());
+        let where_ = cli_config::CliConfig::path().map_or_else(
+            || "the config file".to_string(),
+            |p| p.display().to_string(),
+        );
         anyhow::bail!(
             "`:PATH` reads over the SSH proxy, but none is configured — \
              set `ssh_proxy` in {where_}, or pass --ssh-proxy <HOST>"
@@ -1670,7 +1668,7 @@ fn run_diff(
                 "checkpoint-studio diff: reading each checkpoint's tensor list over ssh \
                  (names/dtypes/shapes only — no tensor data is transferred) …"
             );
-            let bars = progress::Bars::start(vec![old_str.to_string(), new_str.to_string()]);
+            let bars = progress::Bars::start(&[old_str.to_string(), new_str.to_string()]);
             // If one side fails to load, there's no point finishing the *other*
             // side's (slow) S3-object-metadata scan — the diff can't proceed. A
             // failing read trips this flag; the sibling's read loop checks it between
@@ -2250,10 +2248,10 @@ fn run_diff(
     }
     // Auto-detected sparse-packed expert weights (`--values`): their index / value
     // comparison prints its own section and contributes to the exit code.
-    let sparse_differs = if !sparse_pairs.is_empty() {
-        render_auto_sparse(&sparse_pairs, &sparse_results) == 1
-    } else {
+    let sparse_differs = if sparse_pairs.is_empty() {
         false
+    } else {
+        render_auto_sparse(&sparse_pairs, &sparse_results) == 1
     };
     // Under a `--name` filter the exit code reflects the compared tensor subset
     // only; whole-prefix S3 object-metadata deltas (e.g. a re-uploaded `__METADATA__`
@@ -2507,7 +2505,7 @@ fn fetch_remote_repack(
     // One standard progress bar per read tensor (weight + sibling codebook/qscale),
     // labelled by the *new* name, each filling over its (old + new) S3 byte size as
     // the proxy streams the two sides.
-    let bars = progress::Bars::start(bar_labels.to_vec());
+    let bars = progress::Bars::start(bar_labels);
     let index: HashMap<&str, usize> = bar_labels
         .iter()
         .enumerate()
@@ -2515,7 +2513,7 @@ fn fetch_remote_repack(
         .collect();
     let finished = std::cell::RefCell::new(vec![false; bar_labels.len()]);
     let out = r.verify_repack(&session, old_uri, new_uri, pairs, bits, auto_sparse, |ev| {
-        drive_bars(&bars, &index, &finished, ev)
+        drive_bars(&bars, &index, &finished, ev);
     });
     // Settle any bar that never got a Done (a fatal mid-run error) so the animation
     // thread sees every bar finished and `join` returns.
@@ -2828,7 +2826,7 @@ fn print_repack_sample(rr: &remote::RepackResult, red: &str, dim: &str, reset: &
     if rows == 0 {
         return;
     }
-    let cols = s.old.first().map(|r| r.len()).unwrap_or(0);
+    let cols = s.old.first().map_or(0, Vec::len);
     println!(
         "      {dim}decoded index slice — experts {}..{} (rows) × offset {}..{} (cols); \
          cells that differ are red in both grids:{reset}",
@@ -2846,10 +2844,10 @@ fn print_repack_sample(rr: &remote::RepackResult, red: &str, dim: &str, reset: &
                 .iter()
                 .enumerate()
                 .map(|(j, v)| {
-                    if brow.get(j) != Some(v) {
-                        format!(" {red}{v}{reset}")
-                    } else {
+                    if brow.get(j) == Some(v) {
                         format!(" {v}")
+                    } else {
+                        format!(" {red}{v}{reset}")
                     }
                 })
                 .collect();
@@ -2987,7 +2985,7 @@ fn fetch_remote_value_diff(
     // One standard progress bar per compared tensor, each filling over its
     // (old + new) S3 byte size as the proxy streams the two sides (the values are
     // still compared on the proxy — only the byte counts and result cross ssh).
-    let bars = progress::Bars::start(pairs.iter().map(|(_, n)| n.clone()).collect());
+    let bars = progress::Bars::start(&pairs.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>());
     let index: HashMap<&str, usize> = pairs
         .iter()
         .enumerate()
@@ -2995,7 +2993,7 @@ fn fetch_remote_value_diff(
         .collect();
     let finished = std::cell::RefCell::new(vec![false; pairs.len()]);
     let out = r.value_diff(&session, old_uri, new_uri, pairs, vopts, |ev| {
-        drive_bars(&bars, &index, &finished, ev)
+        drive_bars(&bars, &index, &finished, ev);
     });
     for (i, done) in finished.borrow().iter().enumerate() {
         if !done {
@@ -3034,7 +3032,7 @@ fn fetch_remote_value_diff(
 }
 
 /// Whether two S3 object sets are byte-identical: the same `(key, ETag, size)` for
-/// every object (order-independent, non-empty). An ETag is a content hash, so equal
+/// every object (order-independent, non-empty). An `ETag` is a content hash, so equal
 /// key+ETag ⇒ identical bytes ⇒ identical tensor values — letting a value diff skip
 /// the data read entirely (e.g. a checkpoint vs. itself or an unchanged copy).
 fn s3_objects_identical(a: &remote::S3Meta, b: &remote::S3Meta) -> bool {

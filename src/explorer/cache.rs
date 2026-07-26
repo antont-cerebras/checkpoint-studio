@@ -89,7 +89,7 @@ pub(super) fn poll_stats_scan(
     let finished = slot
         .as_ref()
         .and_then(|j| j.handle.as_ref())
-        .is_some_and(|h| h.is_finished());
+        .is_some_and(std::thread::JoinHandle::is_finished);
     if finished
         && let Some(mut job) = slot.take()
         && let Some(h) = job.handle.take()

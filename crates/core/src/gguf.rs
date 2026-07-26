@@ -50,7 +50,7 @@ pub enum GGUFValue {
 /// GGML tensor types from llama.cpp
 /// Includes all quantization formats
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GGMLType {
     F32 = 0,
     F16 = 1,
@@ -145,8 +145,9 @@ impl GGMLType {
             GGMLType::Q8_1 => (36, 32),
 
             // K‑quants (super‑block of 256 weights); bytes = bpw * 256 / 8
-            GGMLType::Q2_K => (84, 256),  // 2.625  bpw
-            GGMLType::Q3_K => (110, 256), // 3.4375 bpw
+            GGMLType::Q2_K => (84, 256), // 2.625  bpw
+            // Q3_K and IQ3_S share a block layout (3.4375 bpw), hence one arm.
+            GGMLType::Q3_K | GGMLType::IQ3_S => (110, 256),
             GGMLType::Q4_K => (144, 256), // 4.5    bpw
             GGMLType::Q5_K => (176, 256), // 5.5    bpw
             GGMLType::Q6_K => (210, 256), // 6.5625 bpw
@@ -159,7 +160,6 @@ impl GGMLType {
             GGMLType::IQ2_XS => (74, 256),  // 2.3125 bpw
             GGMLType::IQ2_S => (80, 256),   // 2.5    bpw
             GGMLType::IQ3_XXS => (98, 256), // 3.0625 bpw
-            GGMLType::IQ3_S => (110, 256),  // 3.4375 bpw
             GGMLType::IQ4_NL => (17, 32),   // 4.25   bpw
             GGMLType::IQ4_XS => (136, 256), // 4.25   bpw
             // 1.58 bpw doesn't land on a whole byte per 256, so keep the exact ratio
@@ -303,7 +303,7 @@ impl GGUFFile {
         let header = Self::read_header(&mut cursor)?;
 
         // Validate magic number
-        if header.magic != 0x46554747 {
+        if header.magic != 0x4655_4747 {
             return Err(anyhow::anyhow!("Invalid GGUF magic number"));
         }
 
@@ -408,7 +408,7 @@ impl GGUFFile {
     /// The length is read *from the file*, so a corrupt or truncated GGUF can claim a
     /// string of exabytes — and `vec![0u8; len]` on that aborts the process (an
     /// allocation failure isn't a catchable error). GGUF files arrive as user downloads
-    /// from HuggingFace, so a half-downloaded one is ordinary input and must produce an
+    /// from `HuggingFace`, so a half-downloaded one is ordinary input and must produce an
     /// error, not a dead process. Check the claim against the bytes actually left
     /// before allocating.
     fn read_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {
@@ -668,7 +668,7 @@ mod tests {
     }
 
     /// A truncated file must produce an error at every cut point — not a panic. These
-    /// files come from users and from HuggingFace; a half-downloaded one is ordinary.
+    /// files come from users and from `HuggingFace`; a half-downloaded one is ordinary.
     #[test]
     fn a_truncated_file_errors_at_every_cut_point() {
         let mut g = Gguf::default();
@@ -839,7 +839,7 @@ mod tests {
         );
         // Nested arrays render through the same rule.
         assert_eq!(
-            Array(vec![small.clone(), six]).to_string(),
+            Array(vec![small, six]).to_string(),
             "[[1, 2, 3], [1, 2, ..., 6 (6)]]"
         );
     }

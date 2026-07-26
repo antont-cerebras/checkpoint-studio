@@ -6,6 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
+use std::fmt::Write as _;
 
 use crate::sample::{HistBins, Histogram, Sample, SampleMode};
 use crate::tree::TensorInfo;
@@ -248,11 +249,11 @@ impl UI {
             lines.push(Line::from(Span::styled(bot.trim_end().to_string(), dim)));
         } else {
             let mut header = String::new();
-            header.push_str(&format!("{:>lw$}", ""));
+            let _ = write!(header, "{:>lw$}", "");
             for (j, &c) in sample.cols.iter().enumerate() {
-                header.push_str(&format!("{c:>cw$}"));
+                let _ = write!(header, "{c:>cw$}");
                 if Some(j) == col_gap {
-                    header.push_str(&format!("{:>cw$}", "⋯"));
+                    let _ = write!(header, "{:>cw$}", "⋯");
                 }
             }
             lines.push(Line::from(Span::styled(header, dim)));
@@ -330,11 +331,11 @@ impl UI {
             // Dotted row marking the rows skipped after the gap.
             if Some(i) == row_gap {
                 let mut s = String::new();
-                s.push_str(&format!("{:>lw$}", "⋮"));
+                let _ = write!(s, "{:>lw$}", "⋮");
                 for j in 0..row.len() {
-                    s.push_str(&format!("{:>cw$}", "⋮"));
+                    let _ = write!(s, "{:>cw$}", "⋮");
                     if Some(j) == col_gap {
-                        s.push_str(&format!("{:>cw$}", "⋱"));
+                        let _ = write!(s, "{:>cw$}", "⋱");
                     }
                 }
                 lines.push(Line::from(Span::styled(s, dim)));
@@ -604,9 +605,9 @@ pub(super) fn render_histogram(
     if let Some((spinner, elapsed, progress)) = scanning {
         let mut s = format!("   {spinner} scanning");
         if let Some(p) = progress {
-            s.push_str(&format!(" {:.0}%", p * 100.0));
+            let _ = write!(s, " {:.0}%", p * 100.0);
         }
-        s.push_str(&format!(" ({:.1}s)", elapsed.as_secs_f64()));
+        let _ = write!(s, " ({:.1}s)", elapsed.as_secs_f64());
         head.push(Span::styled(s, Style::default().fg(palette::ACCENT)));
     } else if !hist.elapsed.is_zero() {
         head.push(dim_span(format!("  ({})", fmt_duration(hist.elapsed))));

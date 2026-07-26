@@ -395,18 +395,18 @@ impl UI {
             // model is otherwise a wall of rows); a click on this line or `f`
             // toggles it. Only shards the filesystem actually shrank are listed.
             if d.shards.len() > 1 {
-                let savers: Vec<&crate::stats::ShardDisk> = d
+                let savers = d
                     .shards
                     .iter()
                     .filter(|sh| crate::stats::has_saving(sh.apparent, sh.allocated))
-                    .collect();
+                    .count();
                 let arrow = if shards_expanded { "▾" } else { "▸" };
                 // The `f` hint lives in the footer with the other keys; the toggle
                 // itself just labels the breakdown (and, folded, the saver count).
                 let tail = if shards_expanded {
                     String::new()
                 } else {
-                    format!("  ({} of {} smaller)", savers.len(), d.shards.len())
+                    format!("  ({savers} of {} smaller)", d.shards.len())
                 };
                 fold_line = Some(lines.len());
                 lines.push(Line::from(vec![

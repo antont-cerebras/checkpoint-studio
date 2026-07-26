@@ -10,17 +10,14 @@ fn walk(g: &Group, want: Option<&str>) {
             continue;
         }
         let shape = ds.shape();
-        let logical: usize =
-            shape.iter().product::<usize>() * ds.dtype().map(|d| d.size()).unwrap_or(0);
+        // Only ever printed as GiB, so keep it in the unit it is displayed in.
+        let logical = (shape.iter().product::<usize>() * ds.dtype().map_or(0, |d| d.size())) as f64;
         let stored = ds.storage_size() as usize;
         let chunk = ds.chunk();
         let filters: Vec<String> = ds.filters().iter().map(|f| format!("{f:?}")).collect();
         println!("{name}");
         println!("  shape        {shape:?}");
-        println!(
-            "  dtype size   {} B",
-            ds.dtype().map(|d| d.size()).unwrap_or(0)
-        );
+        println!("  dtype size   {} B", ds.dtype().map_or(0, |d| d.size()));
         println!(
             "  chunk        {chunk:?}  (num_chunks {:?})",
             ds.num_chunks()
@@ -28,10 +25,10 @@ fn walk(g: &Group, want: Option<&str>) {
         println!("  filters      {filters:?}");
         println!(
             "  logical {:.2} GiB  on-disk {:.2} GiB  ratio {:.2}x",
-            logical as f64 / (1u64 << 30) as f64,
+            logical / (1u64 << 30) as f64,
             stored as f64 / (1u64 << 30) as f64,
             if stored > 0 {
-                logical as f64 / stored as f64
+                logical / stored as f64
             } else {
                 0.0
             }
@@ -47,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(path) = args.get(1) else {
         return Err("usage: h5layout <file> [name-substr]".into());
     };
-    let want = args.get(2).map(|s| s.as_str());
+    let want = args.get(2).map(String::as_str);
     let f = File::open(path)?;
     walk(&f, want);
     Ok(())

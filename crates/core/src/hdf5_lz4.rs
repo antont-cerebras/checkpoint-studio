@@ -52,7 +52,7 @@ pub fn register() {
             id: LZ4_FILTER_ID,
             encoder_present: 1,
             decoder_present: 1,
-            name: FILTER_NAME.as_ptr() as *const c_char,
+            name: FILTER_NAME.as_ptr().cast::<c_char>(),
             can_apply: None,
             set_local: None,
             filter: Some(lz4_filter),
@@ -68,7 +68,7 @@ pub fn register() {
 /// libhdf5 filter callback: decompress (reverse) or compress (forward) the chunk
 /// in `*buf`. A `0` return tells libhdf5 the filter failed (surfaced as a normal
 /// read/write error). Untrusted file bytes must not unwind into C, so the body
-/// runs under `catch_unwind` (pointers passed as integers to stay UnwindSafe).
+/// runs under `catch_unwind` (pointers passed as integers to stay `UnwindSafe`).
 unsafe extern "C" fn lz4_filter(
     flags: c_uint,
     _cd_nelmts: usize,
@@ -165,19 +165,19 @@ unsafe fn decompress(nbytes: usize, buf: *mut *mut c_void, buf_size: *mut usize)
 
         // Allocate the result with HDF5's own allocator so the pipeline can free
         // it; decode straight into it (no extra copy).
-        let out_ptr = H5allocate_memory(total, 0) as *mut u8;
+        let out_ptr = H5allocate_memory(total, 0).cast::<u8>();
         if out_ptr.is_null() {
             return None;
         }
         let out = std::slice::from_raw_parts_mut(out_ptr, total);
         if !decode_into(input, out) {
-            H5free_memory(out_ptr as *mut c_void);
+            H5free_memory(out_ptr.cast::<c_void>());
             return None;
         }
 
         // Swap our buffer in for the compressed one HDF5 handed us.
         H5free_memory(*buf);
-        *buf = out_ptr as *mut c_void;
+        *buf = out_ptr.cast::<c_void>();
         *buf_size = total;
         Some(total)
     }
@@ -260,7 +260,7 @@ mod tests {
     fn decodes_stored_uncompressed_blocks() {
         // Pseudo-random, incompressible data is stored verbatim (clen == block).
         let data: Vec<u8> = (0..5000u32)
-            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
             .collect();
         roundtrip(&data, 1024);
     }

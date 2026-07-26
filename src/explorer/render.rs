@@ -95,7 +95,7 @@ impl Explorer {
                 histogram,
                 None,
                 overlay,
-            )
+            );
         })
     }
 

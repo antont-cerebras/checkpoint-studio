@@ -11,7 +11,7 @@ use super::theme::to_yansi;
 /// the same colors as the rest of the UI: keys in the structural cyan accent
 /// (like tree groups), numbers in the amber dtype color, strings green, and the
 /// `{}`/`[]` brackets in the normal foreground — the same contrast as the commas
-/// and other punctuation colored_json leaves unstyled — while the colons stay
+/// and other punctuation `colored_json` leaves unstyled — while the colons stay
 /// dimmed so key/value separators recede behind the values.
 fn json_styler() -> colored_json::Styler {
     let dim = to_yansi(palette::DIM).foreground();

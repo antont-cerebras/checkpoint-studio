@@ -28,6 +28,7 @@ use ssh2::{CheckResult, KnownHostFileKind, Session};
 
 use crate::filetree::DirEntry;
 use crate::tree::{MetadataInfo, TensorInfo};
+use std::fmt::Write as _;
 
 /// What one pass over a remote directory (one `readdir`, one index read) yields:
 /// the shard read order plus the pieces the index health check needs — so the
@@ -288,7 +289,7 @@ impl RemoteSession {
                 // A symlink (S_IFLNK) is sized by a follow-up `stat -L`; the link's
                 // own size is a fallback if that can't run (broken link / no GNU
                 // stat). It stays a leaf, so it's never descended.
-                let is_symlink = st.perm.is_some_and(|m| m & 0o170000 == 0o120000);
+                let is_symlink = st.perm.is_some_and(|m| m & 0o170_000 == 0o120_000);
                 if is_symlink {
                     links.push((dir.clone(), rows.len(), full));
                     // Pushed as a File leaf with a fallback size; the follow-up
@@ -345,10 +346,10 @@ impl RemoteSession {
         if paths.is_empty() {
             return out;
         }
-        let args: String = paths
-            .iter()
-            .map(|p| format!(" {}", shell_single_quote(p)))
-            .collect();
+        let args = paths.iter().fold(String::new(), |mut acc, p| {
+            let _ = write!(acc, " {}", shell_single_quote(p));
+            acc
+        });
         // `-L` follows links; `%s` size · `%b` blocks · `%B` block-size · `%F` type
         // · `%n` the path as given (tab-separated so a spaced type like "regular
         // file" stays one field, and a path with spaces is the whole last field).
@@ -447,9 +448,7 @@ fn default_user() -> String {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
 }
 
 /// Verify the presented host key against `~/.ssh/known_hosts`. Refuses to proceed
@@ -518,14 +517,13 @@ fn authenticate(
         .auth_methods(user)
         .unwrap_or("password,keyboard-interactive");
     if methods.contains("password") {
-        let pw = match password {
-            Some(p) => p.clone(),
-            None => {
-                let pw = rpassword::prompt_password(format!("{user}@{host}'s password: "))
-                    .context("reading password")?;
-                reset_prompt_column();
-                pw
-            }
+        let pw = if let Some(p) = password {
+            p.clone()
+        } else {
+            let pw = rpassword::prompt_password(format!("{user}@{host}'s password: "))
+                .context("reading password")?;
+            reset_prompt_column();
+            pw
         };
         if session.userauth_password(user, &pw).is_ok() && session.authenticated() {
             *password = Some(pw);
@@ -606,6 +604,10 @@ impl ssh2::KeyboardInteractivePrompt for Prompter<'_> {
 /// try to open files that aren't there. So index entries are kept only when the
 /// listing confirms them; when the directory can't be listed at all, the index is
 /// trusted as the only signal we have.
+// Returns `Result` because every caller treats a listing failure as a read error, and
+// because the fallible branches below (`readdir`, the index parse) are what this exists to
+// wrap — the early single-file return is the one path that cannot fail.
+#[allow(clippy::unnecessary_wraps)]
 fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<ShardListing> {
     if path.ends_with(".safetensors") {
         return Ok(ShardListing {
@@ -883,7 +885,7 @@ mod tests {
     }
 
     fn v(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
+        items.iter().map(ToString::to_string).collect()
     }
 
     #[test]

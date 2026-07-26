@@ -50,12 +50,14 @@ impl Report {
             0.0
         };
         // Relative to the source's existing on-disk size.
-        let change = if self.out_bytes < self.in_bytes {
-            format!("{:.0}% smaller ({:.2}×)", -pct, self.ratio())
-        } else if self.out_bytes > self.in_bytes {
-            format!("{pct:.0}% LARGER — the source compressed better")
-        } else {
-            "same size".to_string()
+        let change = match self.out_bytes.cmp(&self.in_bytes) {
+            std::cmp::Ordering::Less => {
+                format!("{:.0}% smaller ({:.2}×)", -pct, self.ratio())
+            }
+            std::cmp::Ordering::Greater => {
+                format!("{pct:.0}% LARGER — the source compressed better")
+            }
+            std::cmp::Ordering::Equal => "same size".to_string(),
         };
         let from = match self.source_codec {
             Some(c) => c.label(),
@@ -163,8 +165,8 @@ pub fn convert_hdf5(
     Ok(Report {
         tensors,
         skipped,
-        in_bytes: std::fs::metadata(input).map(|m| m.len()).unwrap_or(0),
-        out_bytes: std::fs::metadata(output).map(|m| m.len()).unwrap_or(0),
+        in_bytes: std::fs::metadata(input).map_or(0, |m| m.len()),
+        out_bytes: std::fs::metadata(output).map_or(0, |m| m.len()),
         logical_bytes,
         source_codec: if mixed { None } else { source_codec },
     })
@@ -211,13 +213,11 @@ fn copy_dataset(
 ) -> Result<Option<u64>> {
     let shape = ds.shape();
     let chunk = ds.chunk();
-    let dtype = match ds.dtype() {
-        Ok(dt) => dt,
-        Err(_) => return Ok(None),
+    let Ok(dtype) = ds.dtype() else {
+        return Ok(None);
     };
-    let descr = match dtype.to_descriptor() {
-        Ok(d) => d,
-        Err(_) => return Ok(None),
+    let Ok(descr) = dtype.to_descriptor() else {
+        return Ok(None);
     };
     let logical = (shape.iter().product::<usize>() * dtype.size()) as u64;
 

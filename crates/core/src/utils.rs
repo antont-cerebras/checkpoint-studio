@@ -45,9 +45,7 @@ pub fn parse_size(s: &str) -> Result<usize, String> {
 /// formatters (diff, progress bars) can fit the terminal without depending on the
 /// full crossterm terminal layer.
 pub fn term_width(fallback: usize) -> usize {
-    terminal_size::terminal_size()
-        .map(|(w, _)| w.0 as usize)
-        .unwrap_or(fallback)
+    terminal_size::terminal_size().map_or(fallback, |(w, _)| w.0 as usize)
 }
 
 // The display formatters below are duplicated in the web client
@@ -62,7 +60,7 @@ pub fn format_shape(shape: &[usize]) -> String {
         "({})",
         shape
             .iter()
-            .map(|x| x.to_string())
+            .map(usize::to_string)
             .collect::<Vec<_>>()
             .join(", ")
     )
