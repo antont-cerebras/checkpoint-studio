@@ -819,6 +819,49 @@ mod tests {
         assert!(parse_stat_line("x\ty\tz\tregular file\t/p").is_none());
     }
 
+    /// A remote path reaches a shell in `stat_paths`' command line, so this quoting is
+    /// the boundary between "a checkpoint directory with a space in it" and running
+    /// whatever a filename says.
+    ///
+    /// Checked by round-tripping through a real `/bin/sh` rather than by asserting on
+    /// the escaped shape: `\'` sequences are easy to eyeball wrongly (my first attempt
+    /// at this test rejected correctly-escaped output), and what actually matters is
+    /// that the shell hands the argument back byte for byte and runs nothing else.
+    #[test]
+    fn shell_quoting_round_trips_through_a_real_shell() {
+        let echoed = |arg: &str| -> String {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf %s {arg}"))
+                .output()
+                .expect("/bin/sh runs");
+            assert!(out.status.success(), "sh failed on {arg}");
+            String::from_utf8(out.stdout).expect("printf writes what it was given")
+        };
+
+        for path in [
+            "/ckpt/model.safetensors",
+            "/my ckpt/a b",
+            "/tmp/x'; rm -rf /; echo '", // close the quote and inject a command
+            "it's a checkpoint",
+            "$(id)",
+            "`id`",
+            "a$b;c|d&e>f*g",
+            "\\backslash",
+            "--not-a-flag",
+        ] {
+            assert_eq!(
+                echoed(&shell_single_quote(path)),
+                path,
+                "the shell must hand back {path:?} unchanged"
+            );
+        }
+
+        // Byte-for-byte equality is the whole proof: had the shell run any of the
+        // injected commands, `printf` would have been handed different arguments and the
+        // output could not have matched the input.
+    }
+
     #[test]
     fn parses_targets() {
         assert_eq!(
