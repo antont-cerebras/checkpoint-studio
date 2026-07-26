@@ -34,7 +34,7 @@ try:
     cli = boto3.client("s3")
     objects, tok = [], None
     while True:
-        kw = {"Bucket": bucket, "Prefix": prefix}
+        kw: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
         if tok: kw["ContinuationToken"] = tok
         resp = cli.list_objects_v2(**kw)
         for it in resp.get("Contents", []):

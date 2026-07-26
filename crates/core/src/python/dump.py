@@ -55,7 +55,7 @@ def probe_s3(src: str) -> dict[str, Any]:
         total = empty = nbytes = 0
         meta_key = None; meta_empty = False; sample = []; tok = None
         while True:
-            kw = {"Bucket": bucket, "Prefix": prefix}
+            kw: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
             if tok: kw["ContinuationToken"] = tok
             resp = cli.list_objects_v2(**kw)
             for it in resp.get("Contents", []):
@@ -116,7 +116,7 @@ if WANT_S3:
         cli = boto3.client("s3", config=Config(max_pool_connections=S3_WORKERS + 4))
         keys, tok = [], None
         while True:
-            kw = {"Bucket": bucket, "Prefix": prefix}
+            kw: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
             if tok: kw["ContinuationToken"] = tok
             resp = cli.list_objects_v2(**kw)
             keys.extend(it["Key"] for it in resp.get("Contents", []))

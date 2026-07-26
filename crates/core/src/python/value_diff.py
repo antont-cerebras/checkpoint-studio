@@ -59,10 +59,10 @@ try:
     new_sd = cstorch.load(NEW, map_location=None)
 except Exception as e:
     emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
-def to_f64(rt: Any, i: int | None, j: int | None) -> Any:
+def to_f64(rt: torch.Tensor, i: int | None, j: int | None) -> np.ndarray[Any, Any]:
     sl = rt if i is None else rt[i:j]
     return sl.to(torch.float64).numpy().reshape(-1)
-def span_range(rt: Any, i: int | None, j: int | None) -> tuple[float, float] | None:
+def span_range(rt: torch.Tensor, i: int | None, j: int | None) -> tuple[float, float] | None:
     """Finite min/max of one span WITHOUT widening it to float64.
 
     The histogram needs the global range before it can bin, which used to cost a whole
@@ -122,7 +122,7 @@ def stream_raw(p: Obj, on: Callable[[int], object]) -> bytearray:
         if not c: break
         buf += c; on(len(buf))
     return buf
-def decode_tensor(buf: bytearray, p: Obj) -> Any:
+def decode_tensor(buf: bytearray, p: Obj) -> torch.Tensor:
     raw = zstandard.decompress(bytes(buf)) if p.compressed else buf
     return torch.frombuffer(bytearray(raw), dtype=p.dtype).reshape(p.shape)
 total = len(PAIRS)
@@ -132,7 +132,7 @@ compared = 0
 def work(idx: int) -> int:
     oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
     stat("start\t%d\t%d\t%s" % (idx + 1, total, nname))
-    res = {"name": nname}
+    res: dict[str, Any] = {"name": nname}
     tb = 0
     try:
         a = old_sd[oname]; b = new_sd[nname]
@@ -225,7 +225,7 @@ def work(idx: int) -> int:
             if ot == 0 and nt == 0: tvd = 0.0
             elif ot == 0 or nt == 0: tvd = 1.0
             else: tvd = 0.5 * float(np.abs(oc.astype(np.float64) / ot - nc.astype(np.float64) / nt).sum())
-            h = {"tvd": tvd, "n": int(n)}
+            h: dict[str, Any] = {"tvd": tvd, "n": int(n)}
             if FULL_HIST:
                 h["lo"] = lo_c; h["hi"] = hi_c
                 h["old"] = [int(x) for x in oc.tolist()]; h["new"] = [int(x) for x in nc.tolist()]

@@ -42,10 +42,13 @@ fn walk(g: &Group, want: Option<&str>) {
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).expect("usage: h5layout <file> [name-substr]");
+    let Some(path) = args.get(1) else {
+        return Err("usage: h5layout <file> [name-substr]".into());
+    };
     let want = args.get(2).map(|s| s.as_str());
-    let f = File::open(path).expect("open");
+    let f = File::open(path)?;
     walk(&f, want);
+    Ok(())
 }

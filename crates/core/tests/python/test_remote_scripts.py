@@ -115,33 +115,48 @@ class FakeDate:
         return "2026-06-26T10:00:00+00:00"
 
 
+class FakeModule(types.ModuleType):
+    """A stand-in module whose attributes are supplied at construction.
+
+    `types.ModuleType` declares no attributes of its own, so `mod.client = ...` is an
+    error to every type checker — and each wants a differently-spelled suppression
+    comment (ty does not honour mypy's `# type: ignore[attr-defined]`). Filling
+    `__dict__` is what the import system reads anyway, so this needs no suppression at
+    all, and it keeps each fake below to one expression.
+
+    Setting `__getattr__` through it works too: PEP 562 looks that name up in the
+    module's `__dict__`, which is how `test_an_import_failure_...` makes every attribute
+    raise.
+    """
+
+    def __init__(self, name: str, **attrs: Any) -> None:
+        super().__init__(name)
+        self.__dict__.update(attrs)
+
+
 def fake_boto3(client: FakeS3Client) -> types.ModuleType:
-    mod = types.ModuleType("boto3")
-    mod.client = lambda *_a, **_k: client  # type: ignore[attr-defined]
-    return mod
+    def make_client(*_a: Any, **_k: Any) -> FakeS3Client:
+        return client
+
+    return FakeModule("boto3", client=make_client)
 
 
 def fake_botocore() -> tuple[types.ModuleType, types.ModuleType]:
-    botocore = types.ModuleType("botocore")
-    config = types.ModuleType("botocore.config")
-    config.Config = lambda **_k: None  # type: ignore[attr-defined]
-    botocore.config = config  # type: ignore[attr-defined]
-    return botocore, config
+    def config_ctor(**_k: Any) -> None:
+        return None
+
+    config = FakeModule("botocore.config", Config=config_ctor)
+    return FakeModule("botocore", config=config), config
 
 
 def fake_cstorch(state: dict[str, Any] | None, *, fail: bool = False) -> types.ModuleType:
-    cerebras = types.ModuleType("cerebras")
-    pytorch = types.ModuleType("cerebras.pytorch")
-
     def load(_src: str, **_kw: Any) -> dict[str, Any]:
         if fail:
             raise RuntimeError("dill barfed")
         assert state is not None
         return state
 
-    pytorch.load = load  # type: ignore[attr-defined]
-    cerebras.pytorch = pytorch  # type: ignore[attr-defined]
-    return cerebras
+    return FakeModule("cerebras", pytorch=FakeModule("cerebras.pytorch", load=load))
 
 
 # ------------------------------------------------------------------- harness ----
@@ -259,12 +274,10 @@ class DumpScript(unittest.TestCase):
         self.assertTrue(probe["metadata_empty"])
 
     def test_an_import_failure_names_the_missing_package(self) -> None:
-        broken = types.ModuleType("cerebras")
-
         def explode(_name: str, *_a: Any, **_k: Any) -> Any:
             raise ImportError("No module named cerebras.pytorch")
 
-        broken.__getattr__ = explode  # type: ignore[attr-defined]
+        broken = FakeModule("cerebras", __getattr__=explode)
         lines = run_script("dump.py", DUMP_PARAMS, {"cerebras": broken})
         self.assertIn("import cerebras.pytorch failed", meta(lines)["error"])
 
@@ -353,12 +366,10 @@ class ListObjectsScript(unittest.TestCase):
         self.assertEqual(client.heads, 0, "listing must not HEAD anything")
 
     def test_a_boto3_failure_is_reported_as_json(self) -> None:
-        broken = types.ModuleType("boto3")
-
         def explode(*_a: Any, **_k: Any) -> Any:
             raise RuntimeError("no credentials")
 
-        broken.client = explode  # type: ignore[attr-defined]
+        broken = FakeModule("boto3", client=explode)
         lines = run_script(
             "list_objects.py",
             {"uri": "s3://bucket/ckpt", "sentinel": SENTINEL},

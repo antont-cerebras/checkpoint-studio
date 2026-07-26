@@ -94,28 +94,24 @@ max-complexity = 15
 # that is what they are for.
 "{gen_demo,record_demo}.py" = ["S101", "S311", "S603", "S606", "S607", "S110", "S108"]
 
-[tool.pyright]
-include = [
-  "crates/core/src/python",
-  "crates/core/tests/python",
-  "gen_demo.py",
-  "record_demo.py",
-]
-# Globs, and `target` matters a lot: it holds gigabytes of build artifacts and
-# walking it made a project-wide run take minutes instead of seconds.
-exclude = ["**/target", "**/node_modules", "web", "target"]
-pythonVersion = "3.9"
-typeCheckingMode = "standard"
-# cerebras.pytorch only exists inside the cluster venv, and numpy/boto3 aren't
-# installed in CI — so don't fail on the imports themselves. Everything else
-# (undefined names, bad arity, unreachable code) is still checked.
-reportMissingImports = false
-reportMissingModuleSource = false
+# There is deliberately no `[tool.pyright]` table here: pyright reads pyrightconfig.json
+# in preference to pyproject.toml, so a table here would be silently dead config that
+# disagrees with the file actually in force. Pyright's settings live in
+# pyrightconfig.json, and only there.
+
+[tool.ty.environment]
+# The hand-written stubs for the cluster-side packages (see typings/README.md). ty has no
+# `stubPath`, so they go on the module search path instead — `.pyi` files there resolve
+# the same way. Without this, ty silently treated every `torch.*` / `boto3.*` value as
+# Unknown and checked nothing in exactly the code most worth checking: verified by
+# mutating `torch.isfinite` to `torch.isfinit` and watching ty pass.
+extra-paths = ["typings"]
 
 [tool.ty.rules]
-# cerebras.pytorch only exists in the cluster venv; torch / numpy / boto3 / zstandard
-# aren't installed in CI either. Same stance as pyright's reportMissingImports.
-unresolved-import = "ignore"
+# Every third-party import now resolves — through the stubs above, or through a real
+# numpy — so an unresolved import is a genuine error again: a new dependency that no
+# environment can satisfy. (Previously ignored, because nothing resolved.)
+unresolved-import = "error"
 
 # --- coverage.py -------------------------------------------------------------
 #

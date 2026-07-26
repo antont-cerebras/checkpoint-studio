@@ -177,18 +177,29 @@ jobs:
         with:
           python-version: '3.9'
 
-      # Three complementary tools, all configured in pyproject.toml. They disagree
-      # usefully: ty caught wrong return annotations that pyright's inference accepted,
-      # and ruff enforces that the annotations exist in the first place.
+      # Three complementary tools, all configured in pyproject.toml (except pyright, which
+      # reads pyrightconfig.json). They disagree usefully: ty caught wrong return
+      # annotations that pyright's inference accepted, and ruff enforces that the
+      # annotations exist in the first place.
       - name: Install tools
         # `coverage[toml]` because the config lives in pyproject.toml and 3.9 has no
         # tomllib.
-        run: pip install ruff pyright ty "coverage[toml]"
+        #
+        # numpy is here as a TYPE-CHECKING dependency, not a runtime one: the remote
+        # scripts import it, and unlike torch/cstorch/boto3 (hand-stubbed in `typings/`,
+        # see typings/README.md) numpy is small and ships precise inline types, so it is
+        # installed rather than stubbed. `<2` matches the 1.x line the proxy's cstorch
+        # venv is built on, so we check against the types the scripts actually meet.
+        run: pip install ruff pyright ty "numpy<2" "coverage[toml]"
 
       - name: Lint (ruff)
         run: ruff check .
 
-      - name: Typecheck (pyright)
+      # Both type checkers run in STRICT mode over the remote scripts, which is only
+      # meaningful because `typings/` makes their third-party imports resolve — before
+      # that, every cluster-side value was `Unknown` and neither tool checked the code
+      # that matters most (it runs on a cluster we cannot debug interactively).
+      - name: Typecheck (pyright, strict)
         run: pyright
 
       - name: Typecheck (ty)

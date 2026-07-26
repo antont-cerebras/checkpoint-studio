@@ -101,11 +101,11 @@ def download_raw(loc: Loc, on: Callable[[int], object]) -> bytearray:
         buf += c
         on(len(buf))
     return buf
-def decode_u16(buf: bytearray, compressed: bool) -> Any:
+def decode_u16(buf: bytearray, compressed: bool) -> np.ndarray[Any, Any]:
     if compressed:
         return np.frombuffer(zstandard.decompress(bytes(buf)), dtype=np.uint16)
     return np.frombuffer(buf, dtype=np.uint16)     # raw 16-bit words, zero-copy
-def to_u16(dt: Any) -> Any:   # fallback via cstorch (no byte progress)
+def to_u16(dt: Any) -> np.ndarray[Any, Any]:   # fallback via cstorch (no byte progress)
     return dt.to("cpu").contiguous().view(torch.int16).numpy().view(np.uint16)
 NPF = {"float16": np.float16, "float32": np.float32, "float64": np.float64}
 def aux_meta(loc: Loc) -> Aux | None:
@@ -121,7 +121,7 @@ def aux_meta(loc: Loc) -> Aux | None:
         return None
     return Aux(bool(meta.get("compressed")), NPF[nm["dtype"]],
                [int(x) for x in nm["shape"]], int(h.get("ContentLength", 0)))
-def stream_aux(sd: Any, name: str, on_side: Callable[[int], object]) -> tuple[Any, int]:
+def stream_aux(sd: Any, name: str, on_side: Callable[[int], object]) -> tuple[np.ndarray[Any, Any], int]:
     # Read a sibling float tensor (codebook / scale) over S3 with byte progress → f64.
     # Falls back to cstorch materialise (no progress) if it isn't numpy-float-stored.
     dt = sd[name]
@@ -145,8 +145,8 @@ def cmp_aux(oname_a: str, nname_a: str, osz: int, nsz: int) -> dict[str, Any]:
     # Streams both sides over S3 into this sibling's own bar (keyed by the new name,
     # already sized by the caller), records the NAMES tried, and — like the weight —
     # flags a `comparing` phase before the compare and finishes the bar after it.
-    out = {"old_name": oname_a, "new_name": nname_a,
-           "old_present": oname_a in old_sd, "new_present": nname_a in new_sd}
+    out: dict[str, Any] = {"old_name": oname_a, "new_name": nname_a,
+                           "old_present": oname_a in old_sd, "new_present": nname_a in new_sd}
     if not out["old_present"] or not out["new_present"]:
         return out
     od = [0]; nd = [0]; last = [0]
@@ -175,7 +175,7 @@ compared = [0]
 def work(idx: int) -> None:
     oname = PAIRS[idx][0]; nname = PAIRS[idx][1]
     stat("start\t%d\t%d\t%s" % (idx + 1, total, nname))
-    res = {"name": nname}
+    res: dict[str, Any] = {"name": nname}
     # Size the sibling codebook/qscale UP FRONT — before the weight even streams — so
     # their bars show `0/size` immediately instead of an unsized sweep while the (big)
     # weight downloads. Reused by cmp_aux below (no second HEAD).

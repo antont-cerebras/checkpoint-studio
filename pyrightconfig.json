@@ -1,11 +1,45 @@
+// Pyright's own config. Kept separate from pyproject.toml (which configures ruff and ty)
+// because pyright reads this file first and unambiguously; a project-wide scan that walked
+// target/ took minutes on this NFS-backed tree. Comments are `//` — pyright parses this
+// file as JSONC, unlike pyproject.toml's `[tool.pyright]` table.
 {
-  "//": "Pyright's own config. Kept separate from pyproject.toml (which configures ruff",
-  "// ": "and ty) because pyright reads this file first and unambiguously; a project-wide",
-  "//  ": "scan that walked target/ took minutes on this NFS-backed tree.",
-  "include": ["crates/core/src/python", "gen_demo.py", "record_demo.py"],
+  // `typings` is in `include` as well as being the `stubPath`, so the stubs themselves are
+  // checked rather than merely consulted — a mistake inside a stub would otherwise pass
+  // silently and then be believed.
+  "include": [
+    "typings",
+    "crates/core/src/python",
+    "crates/core/tests/python",
+    "gen_demo.py",
+    "record_demo.py"
+  ],
   "exclude": ["**/target", "**/node_modules", "web"],
   "pythonVersion": "3.9",
-  "typeCheckingMode": "standard",
-  "reportMissingImports": false,
-  "reportMissingModuleSource": false
+
+  // `typings/` hand-declares the cluster-side packages (cerebras.pytorch, torch, boto3,
+  // zstandard) that cannot be installed here — see typings/README.md. With them
+  // resolving, a missing import is a real error again rather than the normal state of the
+  // world, so `reportMissingImports` is back on (it used to be suppressed) and any NEW
+  // third-party import fails the check until it's stubbed. numpy is installed, not
+  // stubbed — the README says why.
+  "stubPath": "typings",
+  "typeCheckingMode": "strict",
+
+  // Stub-without-source is the permanent, intended state for everything in typings/ —
+  // that is the whole point of the directory — so this rule would fire 12 times forever.
+  "reportMissingModuleSource": false,
+
+  // The scripts are stringly-typed by design: each parses one JSON blob of parameters and
+  // emits JSON, so `Any` flows through on purpose. Strict's Any-propagation rules would
+  // flag that on nearly every line and say nothing useful. Every other strict check —
+  // including the ones that actually caught bugs here (unknown attributes, bad argument
+  // types, numpy's elementwise comparisons) — stays on.
+  //
+  // (`reportAny`/`reportExplicitAny` are basedpyright-only and pyright rejects them by
+  // name, so the four `reportUnknown*` rules below are the whole of it.)
+  "reportUnknownArgumentType": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownParameterType": false,
+  "reportUnknownVariableType": false,
+  "reportMissingTypeStubs": false
 }
