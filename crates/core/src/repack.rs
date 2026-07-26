@@ -225,12 +225,36 @@ pub fn verify_local(
     }
 }
 
+/// Element-wise `|Δ|` summary of two equal-length value slices: how many differ, and the
+/// largest and mean absolute difference.
+///
+/// Exact equality on purpose, in both callers: repack verification is a proof that two
+/// packings hold the *same* weights, so an approximate compare would defeat the point.
+// (`clippy::float_cmp` is allowed here for exactly that reason.)
+#[allow(clippy::float_cmp)]
+fn diff_summary(old: &[f64], new: &[f64]) -> (u64, f64, f64) {
+    let (mut differing, mut sum_abs, mut max_abs) = (0u64, 0f64, 0f64);
+    for (a, b) in old.iter().zip(new) {
+        let d = (a - b).abs();
+        if a != b {
+            differing += 1;
+        }
+        sum_abs += d;
+        if d > max_abs {
+            max_abs = d;
+        }
+    }
+    let mean_abs = if old.is_empty() {
+        0.0
+    } else {
+        sum_abs / old.len() as f64
+    };
+    (differing, max_abs, mean_abs)
+}
+
 /// Compare two weight tensors as plain stored-dtype values (decoded to f64) — the
 /// fallback when the sparse format check fails. Returns `elements`/`differing` and
 /// max/mean `|Δ|`, or a zeroed result (dtype only) if either side can't be read.
-// Repack verification demands BIT-exact equality — an approximate compare would
-// defeat the purpose of proving two packings hold the same weights.
-#[allow(clippy::float_cmp)]
 fn fallback_local(old_w: &TensorInfo, new_w: &TensorInfo) -> RepackFallback {
     let mut fb = RepackFallback {
         dtype: new_w.dtype.clone(),
@@ -242,32 +266,16 @@ fn fallback_local(old_w: &TensorInfo, new_w: &TensorInfo) -> RepackFallback {
     ) else {
         return fb;
     };
-    let (mut differing, mut sum_abs, mut max_abs) = (0u64, 0f64, 0f64);
-    for (a, b) in oa.iter().zip(&na) {
-        let d = (a - b).abs();
-        if a != b {
-            differing += 1;
-        }
-        sum_abs += d;
-        if d > max_abs {
-            max_abs = d;
-        }
-    }
+    let (differing, max_abs, mean_abs) = diff_summary(&oa, &na);
     fb.elements = oa.len() as u64;
     fb.differing = differing;
     fb.max_abs = max_abs;
-    fb.mean_abs = if oa.is_empty() {
-        0.0
-    } else {
-        sum_abs / oa.len() as f64
-    };
+    fb.mean_abs = mean_abs;
     fb
 }
 
 /// Value-diff a sibling float tensor (codebook / scale) locally, recording the names
 /// tried + whether each side was found (so a wrong-name inference is visible).
-// Exact equality on purpose: codebook/qscale siblings must match bit for bit.
-#[allow(clippy::float_cmp)]
 fn aux_local(
     old_name: &str,
     new_name: &str,
@@ -302,25 +310,11 @@ fn aux_local(
         ax.shape_mismatch = Some((o.shape.clone(), n.shape.clone()));
         return ax;
     }
-    let (mut differing, mut sum_abs, mut max_abs) = (0u64, 0f64, 0f64);
-    for (a, b) in oa.iter().zip(&na) {
-        let d = (a - b).abs();
-        if a != b {
-            differing += 1;
-        }
-        sum_abs += d;
-        if d > max_abs {
-            max_abs = d;
-        }
-    }
+    let (differing, max_abs, mean_abs) = diff_summary(&oa, &na);
     ax.elements = oa.len() as u64;
     ax.differing = differing;
     ax.max_abs = max_abs;
-    ax.mean_abs = if oa.is_empty() {
-        0.0
-    } else {
-        sum_abs / oa.len() as f64
-    };
+    ax.mean_abs = mean_abs;
     ax
 }
 

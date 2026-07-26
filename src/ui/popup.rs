@@ -63,7 +63,23 @@ pub(super) fn render_popup_box(
     }
 
     let panel = Style::default().bg(palette::PANEL_BG);
-    let block = Block::bordered()
+    let block = popup_block(title, panel);
+    let inner = block.inner(rect);
+    block.render(rect, frame.buffer_mut());
+    Paragraph::new(content)
+        .style(panel)
+        .render(inner, frame.buffer_mut());
+    inner
+}
+
+/// The frame every popup wears: a rounded accent border, its title in the key colour, a
+/// column of horizontal padding, and the panel background.
+///
+/// One definition so the two popup renderers can't drift apart visually — they sit on top
+/// of each other in the same session, and a border or title that differed by a shade
+/// between them would look like a rendering bug.
+fn popup_block(title: &str, panel: Style) -> Block<'static> {
+    Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(palette::ACCENT))
         .title(Span::styled(
@@ -73,13 +89,7 @@ pub(super) fn render_popup_box(
                 .add_modifier(Modifier::BOLD),
         ))
         .padding(Padding::horizontal(1))
-        .style(panel);
-    let inner = block.inner(rect);
-    block.render(rect, frame.buffer_mut());
-    Paragraph::new(content)
         .style(panel)
-        .render(inner, frame.buffer_mut());
-    inner
 }
 
 /// A floating popup with a vertically-scrollable `body` and a pinned `footer`
@@ -145,17 +155,7 @@ pub(super) fn render_scroll_popup(
         height: box_h,
     };
     Clear.render(rect, frame.buffer_mut());
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(palette::ACCENT))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default()
-                .fg(palette::KEY)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .padding(Padding::horizontal(1))
-        .style(panel);
+    let block = popup_block(title, panel);
     let inner = block.inner(rect);
     block.render(rect, frame.buffer_mut());
 

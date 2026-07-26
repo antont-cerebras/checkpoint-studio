@@ -624,7 +624,7 @@ mod local_reads {
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .and_then(std::path::Path::parent)
+            .and_then(Path::parent)
             .expect("the workspace root")
             .join("tests/fixtures")
             .join(name)
@@ -681,9 +681,8 @@ mod local_reads {
     #[test]
     fn a_missing_file_is_an_error_naming_the_path() {
         let missing = fixture("no-such-checkpoint.safetensors");
-        let err = read_local(&[missing.clone()])
-            .err()
-            .expect("a missing file must error");
+        let err =
+            read_local(std::slice::from_ref(&missing)).expect_err("a missing file must error");
         let text = format!("{err:#}");
         assert!(
             text.contains("no-such-checkpoint"),
@@ -700,7 +699,7 @@ mod local_reads {
         let bogus = dir.join("not-a-checkpoint.safetensors");
         std::fs::write(&bogus, b"this is not a safetensors header").expect("write");
         assert!(
-            read_local(&[bogus.clone()]).is_err(),
+            read_local(std::slice::from_ref(&bogus)).is_err(),
             "garbage must not parse as a checkpoint"
         );
         let _ = std::fs::remove_file(&bogus);
@@ -722,9 +721,7 @@ mod local_reads {
         assert!(!tensors.is_empty(), "the hdf5 fixture has datasets");
         // HDF5 tracks chunked storage and compression; the model must carry both.
         assert!(
-            tensors
-                .iter()
-                .any(|t| !matches!(t.layout, crate::tree::Layout::None)),
+            tensors.iter().any(|t| !matches!(t.layout, Layout::None)),
             "an hdf5 tensor should report its layout"
         );
     }
@@ -755,7 +752,7 @@ mod local_reads {
 
     #[test]
     fn reads_a_gguf_file_into_the_model() {
-        use crate::gguf::testing::{Gguf, gguf_str, le_u64};
+        use crate::gguf::testing::{Gguf, gguf_str};
         let dir = scratch("gguf");
         let path = dir.join("model.gguf");
         let mut g = Gguf::default();

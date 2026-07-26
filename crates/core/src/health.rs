@@ -425,9 +425,9 @@ mod tests {
             shape: shape.to_vec(),
             size_bytes: bytes,
             num_elements: shape.iter().product(),
-            storage: crate::tree::Storage::Unknown,
+            storage: Storage::Unknown,
             source_path: "s3://b/k".into(),
-            layout: crate::tree::Layout::None,
+            layout: Layout::None,
         }
     }
 

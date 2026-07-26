@@ -212,14 +212,7 @@ pub(crate) fn layout(s: &WebState, q: &Query) -> Reply {
 // ---- on-demand tensor-data routes (read bytes; local only) ----
 
 pub(crate) fn tensor_stats(s: &WebState, q: &Query) -> Reply {
-    let t = match lookup(s, q) {
-        Ok(t) => t,
-        Err(e) => return e,
-    };
-    if let Some(e) = require_local(t) {
-        return e;
-    }
-    let view = match view_of(q) {
+    let (t, view) = match data_request(s, q) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -230,14 +223,7 @@ pub(crate) fn tensor_stats(s: &WebState, q: &Query) -> Reply {
 }
 
 pub(crate) fn tensor_sample(s: &WebState, q: &Query) -> Reply {
-    let t = match lookup(s, q) {
-        Ok(t) => t,
-        Err(e) => return e,
-    };
-    if let Some(e) = require_local(t) {
-        return e;
-    }
-    let view = match view_of(q) {
+    let (t, view) = match data_request(s, q) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -265,14 +251,7 @@ pub(crate) fn tensor_sample(s: &WebState, q: &Query) -> Reply {
 }
 
 pub(crate) fn tensor_histogram(s: &WebState, q: &Query) -> Reply {
-    let t = match lookup(s, q) {
-        Ok(t) => t,
-        Err(e) => return e,
-    };
-    if let Some(e) = require_local(t) {
-        return e;
-    }
-    let view = match view_of(q) {
+    let (t, view) = match data_request(s, q) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -324,6 +303,21 @@ fn scan_stats(s: &WebState, t: &TensorInfo, view: ViewDtype) -> Result<StatsDto,
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(key, dto.clone());
     Ok(dto)
+}
+
+/// What every on-demand data route needs before it can read bytes: the tensor, a guarantee
+/// it is local, and the dtype view to read it through. `Err` is the error envelope to
+/// return as-is.
+///
+/// `tensor_stats`, `tensor_sample` and `tensor_histogram` each opened with these same three
+/// lookups, and their early returns are exactly what the client sees on a bad request — so
+/// changing any of them meant changing it in three places.
+fn data_request<'a>(s: &'a WebState, q: &Query) -> Result<(&'a TensorInfo, ViewDtype), Reply> {
+    let t = lookup(s, q)?;
+    if let Some(e) = require_local(t) {
+        return Err(e);
+    }
+    Ok((t, view_of(q)?))
 }
 
 fn lookup<'a>(s: &'a WebState, q: &Query) -> Result<&'a TensorInfo, Reply> {

@@ -3761,7 +3761,7 @@ mod tests {
     #[test]
     fn histogram_bins_survive_full_width_64bit_spans() {
         for (dtype, lo, hi) in [
-            ("U64", 0.0, 13_816_973_012_072_644_608.0_f64),
+            ("U64", 0.0, 13_816_973_012_072_645_000_f64),
             ("U64", 0.0, u64::MAX as f64),
             ("I64", i64::MIN as f64, i64::MAX as f64),
         ] {
@@ -4201,7 +4201,7 @@ mod fixture_sampling {
     fn a_whole_tensor_scan_agrees_with_the_values_it_scanned() {
         let tensors = checkpoint();
         let t = pick(&tensors, 2);
-        let go = std::sync::atomic::AtomicBool::new(false);
+        let go = AtomicBool::new(false);
         let stats =
             tensor_stats(t, ViewDtype::Stored, None, &go, &go, None).expect("the scan runs");
         assert_eq!(
@@ -4228,7 +4228,7 @@ mod fixture_sampling {
     fn a_histogram_bins_the_whole_tensor() {
         let tensors = checkpoint();
         let t = pick(&tensors, 2);
-        let go = std::sync::atomic::AtomicBool::new(false);
+        let go = AtomicBool::new(false);
         let stats = tensor_stats(t, ViewDtype::Stored, None, &go, &go, None).expect("scan");
         let (bins, n) = histogram_bins(
             ViewDtype::Stored,
@@ -4240,8 +4240,8 @@ mod fixture_sampling {
         assert_eq!(n, 8, "the requested bucket count is honoured");
 
         let shared = HistShared::new(n);
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        let pause = std::sync::atomic::AtomicBool::new(false);
+        let cancel = AtomicBool::new(false);
+        let pause = AtomicBool::new(false);
         tensor_histogram_into(
             t,
             ViewDtype::Stored,
@@ -4270,8 +4270,8 @@ mod fixture_sampling {
         let (bins, n) =
             histogram_bins(ViewDtype::Stored, &t.dtype, Some((0.0, 1.0)), Some(4)).expect("bins");
         let shared = HistShared::new(n);
-        let cancel = std::sync::atomic::AtomicBool::new(true); // already cancelled
-        let pause = std::sync::atomic::AtomicBool::new(false);
+        let cancel = AtomicBool::new(true); // already cancelled
+        let pause = AtomicBool::new(false);
         let _ = tensor_histogram_into(
             t,
             ViewDtype::Stored,
@@ -4297,7 +4297,7 @@ mod fixture_sampling {
         t.source_path = "/no/such/file.safetensors".into();
         assert!(open_reader(&t).is_err());
         assert!(sample_tensor(&t, 2, 2, 0, ViewDtype::Stored, SampleMode::Grid, None).is_err());
-        let go = std::sync::atomic::AtomicBool::new(false);
+        let go = AtomicBool::new(false);
         assert!(tensor_stats(&t, ViewDtype::Stored, None, &go, &go, None).is_err());
     }
 

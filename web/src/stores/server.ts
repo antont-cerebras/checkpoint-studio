@@ -14,6 +14,23 @@ export const treeError = writable<string | null>(null);
 export const tensorNames = derived(tree, ($t) => collectNames($t, 'tensor'));
 export const shardNames = derived(tree, ($t) => collectNames($t, 'shard'));
 
+/** Every dtype the checkpoint actually contains, sorted — the choices the filter builder
+ * offers and the per-dtype commands the palette lists. Derived here rather than walked in
+ * each component: both had their own copy of the walk, and this way a 31k-tensor tree is
+ * traversed once per load instead of once per component that asks. */
+export const dtypesPresent = derived(tree, ($t) => {
+  const set = new Set<string>();
+  if (!$t) return [] as string[];
+  const walk = (ns: TreeNode[]) => {
+    for (const n of ns) {
+      if (n.kind === 'tensor') set.add(n.info.dtype);
+      else if (n.kind === 'group') walk(n.children);
+    }
+  };
+  walk($t.tree);
+  return [...set].sort();
+});
+
 function collectNames(t: TreeResponse | null, want: 'tensor' | 'shard'): Set<string> {
   const set = new Set<string>();
   if (!t) return set;

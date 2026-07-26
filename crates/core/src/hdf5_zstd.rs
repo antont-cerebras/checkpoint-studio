@@ -11,7 +11,7 @@
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::Once;
 
-use hdf5_metno_sys::h5::{H5allocate_memory, H5free_memory};
+use crate::hdf5_filter::install_output;
 use hdf5_metno_sys::h5z::{
     H5Z_CLASS_T_VERS, H5Z_FLAG_REVERSE, H5Z_class2_t, H5Z_filter_t, H5Zregister,
 };
@@ -98,22 +98,6 @@ unsafe fn run(
             return 0;
         };
         install_output(buf, buf_size, &out)
-    }
-}
-
-/// Replace `*buf` with a fresh, HDF5-owned buffer holding `out`. Returns its
-/// length, or 0 on allocation failure.
-unsafe fn install_output(buf: *mut *mut c_void, buf_size: *mut usize, out: &[u8]) -> usize {
-    unsafe {
-        let p = H5allocate_memory(out.len().max(1), 0) as *mut u8;
-        if p.is_null() {
-            return 0;
-        }
-        std::ptr::copy_nonoverlapping(out.as_ptr(), p, out.len());
-        H5free_memory(*buf);
-        *buf = p as *mut c_void;
-        *buf_size = out.len();
-        out.len()
     }
 }
 

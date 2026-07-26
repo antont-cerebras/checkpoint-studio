@@ -17,6 +17,29 @@ use super::popup::{Backdrop, error_line, render_bottom_band, render_popup_box};
 use super::text::input_box_spans;
 use super::theme::{dim_span, key_span};
 
+/// A horizontal strip of choices with `selected` highlighted and the rest dimmed, each
+/// followed by `gap` — the chooser row both option prompts draw. One definition so the
+/// highlight of a selected option is the same in both.
+fn option_strip(options: &[&str], selected: usize, gap: &'static str) -> Vec<Span<'static>> {
+    let mut strip: Vec<Span<'static>> = Vec::new();
+    for (i, opt) in options.iter().enumerate() {
+        let label = format!(" {opt} ");
+        if i == selected {
+            strip.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(palette::SELECT_FG)
+                    .bg(palette::SELECT_BG)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            strip.push(dim_span(label));
+        }
+        strip.push(Span::raw(gap));
+    }
+    strip
+}
+
 impl UI {
     /// The Ratatui port of [`Self::draw_dtype_menu`]: overlay a dtype-selection
     /// menu on the bottom two rows of the live preview frame — a `view as:` label
@@ -129,22 +152,7 @@ impl UI {
         options: &[&str],
         current: usize,
     ) {
-        let mut strip: Vec<Span> = Vec::new();
-        for (i, opt) in options.iter().enumerate() {
-            let label = format!(" {opt} ");
-            if i == current {
-                strip.push(Span::styled(
-                    label,
-                    Style::default()
-                        .fg(palette::SELECT_FG)
-                        .bg(palette::SELECT_BG)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                strip.push(dim_span(label));
-            }
-            strip.push(Span::raw(" "));
-        }
+        let strip = option_strip(options, current, " ");
         let lines: Vec<Line> = vec![
             Line::from(Span::raw(title.to_string())),
             Line::from(Span::raw("=".repeat(title.len().max(10)))),
@@ -176,22 +184,7 @@ impl UI {
             .map(|l| Line::from(Span::raw(l.clone())))
             .collect();
         content.push(Line::default());
-        let mut strip: Vec<Span> = Vec::new();
-        for (i, opt) in options.iter().enumerate() {
-            let label = format!(" {opt} ");
-            if i == selected {
-                strip.push(Span::styled(
-                    label,
-                    Style::default()
-                        .fg(palette::SELECT_FG)
-                        .bg(palette::SELECT_BG)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                strip.push(dim_span(label));
-            }
-            strip.push(Span::raw("  "));
-        }
+        let strip = option_strip(options, selected, "  ");
         content.push(Line::from(strip));
         content.push(Line::default());
         content.push(Line::from(hint_spans(&[

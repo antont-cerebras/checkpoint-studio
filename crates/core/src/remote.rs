@@ -1860,8 +1860,8 @@ mod tests {
     #[test]
     fn every_param_the_scripts_read_is_supplied() {
         /// Scan a script for the `PARAMS["key"]` lookups it performs.
-        fn keys_read(src: &str) -> std::collections::BTreeSet<String> {
-            let mut found = std::collections::BTreeSet::new();
+        fn keys_read(src: &str) -> BTreeSet<String> {
+            let mut found = BTreeSet::new();
             let mut rest = src;
             while let Some(at) = rest.find("PARAMS[\"") {
                 rest = &rest[at + "PARAMS[\"".len()..];
@@ -2094,12 +2094,11 @@ mod tests {
     #[test]
     fn parse_value_diff_collects_results_and_flags_fatal() {
         let out = format!(
-            "{s}{{\"name\":\"a.w\",\"values\":{{\"elements\":10,\"differing\":3,\"max_abs\":0.5,\"mean_abs\":0.1,\"nonfinite_mismatch\":1}}}}\n\
+            "{SENTINEL}{{\"name\":\"a.w\",\"values\":{{\"elements\":10,\"differing\":3,\"max_abs\":0.5,\"mean_abs\":0.1,\"nonfinite_mismatch\":1}}}}\n\
              motd noise\n\
-             {s}{{\"name\":\"b.w\",\"histogram\":{{\"tvd\":0.25,\"n\":40}}}}\n\
-             {s}{{\"name\":\"c.w\",\"error\":\"shapes differ\"}}\n\
-             {s}{{\"summary\":{{\"tensors\":3,\"compared\":2,\"bytes\":4096,\"elapsed_s\":1.5}}}}\n",
-            s = SENTINEL
+             {SENTINEL}{{\"name\":\"b.w\",\"histogram\":{{\"tvd\":0.25,\"n\":40}}}}\n\
+             {SENTINEL}{{\"name\":\"c.w\",\"error\":\"shapes differ\"}}\n\
+             {SENTINEL}{{\"summary\":{{\"tensors\":3,\"compared\":2,\"bytes\":4096,\"elapsed_s\":1.5}}}}\n"
         );
         let (m, stats) = parse_value_diff(&out, "host").unwrap();
         assert_eq!(m.len(), 3);
@@ -2222,18 +2221,17 @@ mod tests {
     #[test]
     fn parse_repack_reads_results_and_flags_format() {
         let out = format!(
-            "{s}{{\"name\":\"a\",\"elements\":100,\"differing\":0,\"sparse_bad\":0,\"dense_bad\":0,\"fold\":5,\
+            "{SENTINEL}{{\"name\":\"a\",\"elements\":100,\"differing\":0,\"sparse_bad\":0,\"dense_bad\":0,\"fold\":5,\
              \"codebook\":{{\"old_name\":\"a.codebook\",\"new_name\":\"a.codebook\",\"old_present\":true,\"new_present\":true,\
              \"shape_old\":[8,8],\"shape_new\":[8,8],\"elements\":64,\"differing\":0,\"max_abs\":0.0,\"mean_abs\":0.0}}}}\n\
-             {s}{{\"name\":\"b\",\"elements\":100,\"differing\":7,\"sparse_bad\":0,\"dense_bad\":0,\"fold\":5,\"first\":[3,12,5,2],\
+             {SENTINEL}{{\"name\":\"b\",\"elements\":100,\"differing\":7,\"sparse_bad\":0,\"dense_bad\":0,\"fold\":5,\"first\":[3,12,5,2],\
              \"codebook\":{{\"old_name\":\"b.codebook\",\"new_name\":\"b.codebook\",\"old_present\":true,\"new_present\":true,\
              \"shape_old\":[8,8],\"shape_new\":[8,8],\"elements\":64,\"differing\":9,\"max_abs\":0.03,\"mean_abs\":0.001}},\
              \"qscale\":{{\"old_name\":\"b.qscale\",\"new_name\":\"b.qscale\",\"old_present\":true,\"new_present\":true,\
              \"shape_old\":[8,2],\"shape_new\":[8,3]}}}}\n\
-             {s}{{\"name\":\"c\",\"elements\":100,\"differing\":0,\"sparse_bad\":9,\"dense_bad\":0,\"fold\":5,\
+             {SENTINEL}{{\"name\":\"c\",\"elements\":100,\"differing\":0,\"sparse_bad\":9,\"dense_bad\":0,\"fold\":5,\
              \"codebook\":{{\"old_name\":\"c.codebook\",\"new_name\":\"c.codebook\",\"old_present\":true,\"new_present\":false}}}}\n\
-             {s}{{\"summary\":{{\"tensors\":3,\"compared\":3,\"bytes\":2048,\"elapsed_s\":2.0}}}}\n",
-            s = SENTINEL
+             {SENTINEL}{{\"summary\":{{\"tensors\":3,\"compared\":3,\"bytes\":2048,\"elapsed_s\":2.0}}}}\n"
         );
         let (m, stats) = parse_repack(&out, "host").unwrap();
         assert_eq!(m.len(), 3);
@@ -2547,8 +2545,7 @@ mod parse_edges {
     #[test]
     fn an_error_payload_becomes_an_error_with_the_remote_message() {
         let err = dump(r#"{"error": "cstorch.load failed: RuntimeError(...)"}"#)
-            .err()
-            .expect("an error payload must not parse as success");
+            .expect_err("an error payload must not parse as success");
         assert!(
             format!("{err:#}").contains("cstorch.load failed"),
             "{err:#}"
@@ -2562,7 +2559,7 @@ mod parse_edges {
         let json = r#"{"error": "boom", "s3_probe": {"prefix": "ckpt/", "total": 3,
             "empty": 1, "bytes": 12, "metadata_key": "__METADATA__",
             "metadata_empty": true, "sample": [["a", 0]]}}"#;
-        let err = dump(json).err().expect("still an error");
+        let err = dump(json).expect_err("still an error");
         let text = format!("{err:#}");
         assert!(text.contains("boom"), "{text}");
         assert!(
@@ -2584,8 +2581,7 @@ mod parse_edges {
     #[test]
     fn a_payload_with_no_tensors_is_an_error_naming_the_source() {
         let err = dump(r#"{"tensors": [], "metadata": [], "s3_objects": []}"#)
-            .err()
-            .expect("no tensors is an error");
+            .expect_err("no tensors is an error");
         let text = format!("{err:#}");
         assert!(text.contains("no tensors"), "{text}");
         assert!(text.contains(SRC), "the message names the source: {text}");
@@ -2599,8 +2595,7 @@ mod parse_edges {
             {"name": "c", "dtype": "torch.int8", "shape": [2, 2, 2], "itemsize": 1}
         ], "metadata": [], "s3_objects": []}"#;
         let (tensors, _, _) = dump(json).expect("parses");
-        let by: std::collections::HashMap<_, _> =
-            tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+        let by: HashMap<_, _> = tensors.iter().map(|t| (t.name.as_str(), t)).collect();
         assert_eq!(by["a"].dtype, "BF16");
         assert_eq!(by["a"].num_elements, 32);
         assert_eq!(by["a"].size_bytes, 64, "elements × itemsize");
@@ -2659,10 +2654,7 @@ mod parse_edges {
         assert_eq!(a.etag, "abc");
         let c = a.checksum.as_ref().expect("a checksum");
         assert_eq!(c.algorithm.to_lowercase(), "sha256");
-        assert_eq!(
-            a.tags.as_ref().map(std::collections::BTreeMap::len),
-            Some(1)
-        );
+        assert_eq!(a.tags.as_ref().map(BTreeMap::len), Some(1));
         assert_eq!(a.user_meta.len(), 1, "the cross-check reads this");
         // The second object read no tags at all — `None` means "unavailable", which is
         // distinct from `Some(empty)` meaning "read, none set".

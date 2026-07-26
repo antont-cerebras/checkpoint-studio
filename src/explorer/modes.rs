@@ -58,9 +58,9 @@ use super::{
 
 // Per-screen state and small helpers owned by the parent.
 use super::{
-    Bg, BinsChoice, DtypePreview, RenameMode, RenamePair, Representation, ReshapeChoice,
-    STATS_SPINNER, ScanJob, StatsStart, copy_to_clipboard, draw_rename_frame, dtype_overridable,
-    is_ctrl_c, quit_immediately,
+    Bg, BinsChoice, DtypePreview, RenameMode, RenamePair, Representation, ReshapeChoice, ScanJob,
+    StatsStart, copy_to_clipboard, draw_rename_frame, dtype_overridable, is_ctrl_c,
+    poll_stats_scan, quit_immediately, scan_stats_view,
 };
 
 /// The file browser ([`Screen::Files`]) as a [`Mode`]: lists the checkpoint's
@@ -1516,24 +1516,12 @@ impl DetailMode {
 
     /// The current statistics view — cached result, a live scan spinner, or pending.
     /// `stats` is the caller's local so the returned `StatsView` can borrow it.
+    ///
+    /// Only a *pre-warm* scan is shown: without `warm` this screen didn't ask for one, so
+    /// a job left over from elsewhere shouldn't put a spinner on it.
     pub(super) fn stats_view<'a>(&self, stats: &'a Option<Stats>) -> StatsView<'a> {
-        match stats {
-            Some(s) => StatsView::Ready(s),
-            None if self.warm && self.scan.is_some() => {
-                let job = self.scan.as_ref().unwrap();
-                if job.started.elapsed() >= std::time::Duration::from_millis(120) {
-                    self.spin.set(self.spin.get().wrapping_add(1));
-                    StatsView::Computing {
-                        spinner: STATS_SPINNER[self.spin.get() % STATS_SPINNER.len()],
-                        elapsed: job.started.elapsed(),
-                        progress: job.progress(),
-                    }
-                } else {
-                    StatsView::Pending
-                }
-            }
-            None => StatsView::Pending,
-        }
+        let scan = if self.warm { &self.scan } else { &None };
+        scan_stats_view(scan, &self.spin, stats)
     }
 
     pub(super) fn layout_ok(&self) -> bool {
@@ -1626,34 +1614,7 @@ impl Mode for DetailMode {
         }
         let tensor = self.tensor().clone();
         let view = ex.active_view(&tensor.name);
-        if ex.cached_stats(&tensor, view).is_some() {
-            self.scan = None;
-            return Bg::Idle;
-        }
-        // (Re)start the scan for the current view; harvest it when finished.
-        if self.scan.as_ref().is_none_or(|j| j.view != view) {
-            self.scan = Some(ex.spawn_stats_scan(&tensor, view));
-        }
-        let finished = self
-            .scan
-            .as_ref()
-            .and_then(|j| j.handle.as_ref())
-            .is_some_and(|h| h.is_finished());
-        if finished {
-            let mut job = self.scan.take().unwrap();
-            if let Some(h) = job.handle.take()
-                && let Ok(Ok(s)) = h.join()
-            {
-                ex.stats_cache
-                    .borrow_mut()
-                    .insert((tensor.name.clone(), view), s);
-            }
-        }
-        if self.scan.is_some() {
-            Bg::Poll
-        } else {
-            Bg::Idle
-        }
+        poll_stats_scan(ex, &mut self.scan, &tensor, view)
     }
 
     fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
@@ -2187,26 +2148,10 @@ impl DataMode {
         self.tensor.as_ref().expect("on_enter resolves or leaves")
     }
 
-    /// The current statistics view — cached, a live scan spinner (data always
-    /// scans when uncached), or pending. `stats` is the caller's local.
+    /// The current statistics view — cached, a live scan spinner (data always scans when
+    /// uncached, so there is no pre-warm gate here), or pending.
     pub(super) fn stats_view<'a>(&self, stats: &'a Option<Stats>) -> StatsView<'a> {
-        match stats {
-            Some(s) => StatsView::Ready(s),
-            None if self.scan.is_some() => {
-                let job = self.scan.as_ref().unwrap();
-                if job.started.elapsed() >= std::time::Duration::from_millis(120) {
-                    self.spin.set(self.spin.get().wrapping_add(1));
-                    StatsView::Computing {
-                        spinner: STATS_SPINNER[self.spin.get() % STATS_SPINNER.len()],
-                        elapsed: job.started.elapsed(),
-                        progress: job.progress(),
-                    }
-                } else {
-                    StatsView::Pending
-                }
-            }
-            None => StatsView::Pending,
-        }
+        scan_stats_view(&self.scan, &self.spin, stats)
     }
 }
 
@@ -2257,33 +2202,7 @@ impl Mode for DataMode {
     fn tick_background(&mut self, ex: &mut Explorer) -> Bg {
         let tensor = self.tensor().clone();
         let view = ex.active_view(&tensor.name);
-        if ex.cached_stats(&tensor, view).is_some() {
-            self.scan = None;
-            return Bg::Idle;
-        }
-        if self.scan.as_ref().is_none_or(|j| j.view != view) {
-            self.scan = Some(ex.spawn_stats_scan(&tensor, view));
-        }
-        let finished = self
-            .scan
-            .as_ref()
-            .and_then(|j| j.handle.as_ref())
-            .is_some_and(|h| h.is_finished());
-        if finished {
-            let mut job = self.scan.take().unwrap();
-            if let Some(h) = job.handle.take()
-                && let Ok(Ok(s)) = h.join()
-            {
-                ex.stats_cache
-                    .borrow_mut()
-                    .insert((tensor.name.clone(), view), s);
-            }
-        }
-        if self.scan.is_some() {
-            Bg::Poll
-        } else {
-            Bg::Idle
-        }
+        poll_stats_scan(ex, &mut self.scan, &tensor, view)
     }
 
     fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {

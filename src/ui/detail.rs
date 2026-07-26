@@ -18,7 +18,7 @@ use super::data::render_histogram;
 use super::hints::{ChipHit, Seg, chip_regions, close_button, hint_key, wrap_hint_items};
 use super::json::highlight_json_lines;
 use super::palette;
-use super::text::{fmt_duration, fmt_value, with_thousands};
+use super::text::{fmt_duration, fmt_value, view_dtype_spans, view_shape_spans, with_thousands};
 use super::theme::{COMPRESSED_MARK, UNCOMPRESSED_TAG, UNINDEXED_MARK, dim_span, key_span};
 use super::{ChipRegions, Link, LinkRegions, Overlay, ScanProgress, StatsView, UI};
 
@@ -223,38 +223,6 @@ impl UI {
     }
 }
 
-/// Build the detail screen's dtype span(s): the stored dtype plain, or — when a
-/// view reinterpretation is active — a dimmed `stored as` followed by the bold
-/// reinterpretation label. The Ratatui port of [`write_view_dtype`].
-fn detail_dtype_spans(
-    stored: &str,
-    view: ViewDtype,
-    unpacked_label: Option<&str>,
-) -> Vec<Span<'static>> {
-    let label: Option<String> = match (view, unpacked_label) {
-        (ViewDtype::Unpacked, Some(l)) => Some(format!("{l} (unpacked)")),
-        _ => view.label().map(str::to_string),
-    };
-    match label {
-        Some(label) => vec![dim_span(format!("{stored} as ")), key_span(label)],
-        None => vec![Span::raw(stored.to_string())],
-    }
-}
-
-/// Build the detail screen's shape span(s): the (unchanged) shape plain, or a
-/// dimmed `stored as` followed by the bold reinterpreted shape. Port of
-/// [`write_view_shape`].
-fn detail_shape_spans(stored: &[usize], logical: &[usize]) -> Vec<Span<'static>> {
-    if stored == logical {
-        vec![Span::raw(format_shape(logical))]
-    } else {
-        vec![
-            dim_span(format!("{} as ", format_shape(stored))),
-            key_span(format_shape(logical)),
-        ]
-    }
-}
-
 /// The one-line statistics summary (mean, std, sparsity, non-finite count) as
 /// styled spans — the Ratatui port of [`write_stats_line`]. Field labels dimmed;
 /// the non-finite count highlighted (warn) when nonzero.
@@ -393,7 +361,7 @@ fn detail_field_lines(
     // Data type, with the active reinterpretation highlighted.
     let unpacked_label = schema.map(PackingSchema::label);
     let mut dtype_line = vec![dim_span("Data Type: ")];
-    dtype_line.extend(detail_dtype_spans(
+    dtype_line.extend(view_dtype_spans(
         &tensor.dtype,
         view,
         unpacked_label.as_deref(),
@@ -404,7 +372,7 @@ fn detail_field_lines(
     let logical = view.logical_shape_with(shape, &tensor.dtype, schema);
     let num_elements: usize = logical.iter().product();
     let mut shape_line = vec![dim_span("Shape: ")];
-    shape_line.extend(detail_shape_spans(&tensor.shape, &logical));
+    shape_line.extend(view_shape_spans(&tensor.shape, &logical));
     lines.push(Line::from(shape_line));
     lines.push(Line::from(vec![
         dim_span("Parameters: "),

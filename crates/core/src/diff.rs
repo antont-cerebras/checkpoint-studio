@@ -2934,7 +2934,7 @@ mod tests {
                 .iter()
                 .map(|n| (n.to_string(), sig("U8", &[4])))
                 .collect(),
-            metadata: Default::default(),
+            metadata: BTreeMap::default(),
             total_bytes: 0,
             total_params: 0,
         };
@@ -2997,13 +2997,13 @@ mod tests {
         };
         let old = CheckpointSummary {
             tensors: mk("F16").into_iter().collect(),
-            metadata: Default::default(),
+            metadata: BTreeMap::default(),
             total_bytes: 0,
             total_params: 0,
         };
         let new = CheckpointSummary {
             tensors: mk("BF16").into_iter().collect(),
-            metadata: Default::default(),
+            metadata: BTreeMap::default(),
             total_bytes: 0,
             total_params: 0,
         };

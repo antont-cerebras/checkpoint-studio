@@ -38,8 +38,8 @@ export default defineConfig({
       // The global floor is lower because `stores/` deliberately keeps its DOM wiring
       // uncovered (see the note above).
       thresholds: {
-        lines: 64,
-        statements: 64,
+        lines: 65,
+        statements: 65,
         functions: 95,
         branches: 95,
         'src/lib/**/*.ts': {

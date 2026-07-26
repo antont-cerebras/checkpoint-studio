@@ -1813,7 +1813,7 @@ mod tests {
     fn index_mismatch_from_a_health_report_fails() {
         // A remote index/file mismatch arrives as a HealthReport (built by the
         // remote read); Files & sharding folds it in and fails, just as for local.
-        let report = crate::health::HealthReport {
+        let report = HealthReport {
             kind: crate::health::HealthKind::IndexVsFiles,
             index_path: "host:/ckpt/model.safetensors.index.json".into(),
             mismatched_tensors: Vec::new(),

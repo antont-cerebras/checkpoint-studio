@@ -10,7 +10,15 @@
 // hundreds of them into `?` would make the tests harder to read for no gain. So
 // `unwrap_used`/`expect_used` (denied for product code in Cargo.toml) are allowed in test
 // builds only.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+//
+// `float_cmp` likewise: a test that computes a value and asserts it *exactly* is checking
+// the arithmetic, which is the whole point (`assert_eq!(stats.max, 3.5)`). An epsilon there
+// would weaken the test to hide a lint. Product code that needs an exact float comparison
+// still has to say so at the site, with a reason.
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)
+)]
 
 // This tool memory-maps multi-gigabyte checkpoints and converts 64-bit header offsets
 // and element counts to `usize` throughout. That is only sound on a 64-bit target, so
@@ -52,6 +60,8 @@ pub mod viewstate;
 pub mod convert;
 #[cfg(feature = "hdf5")]
 pub mod hdf5;
+#[cfg(feature = "hdf5")]
+pub mod hdf5_filter;
 #[cfg(feature = "hdf5")]
 pub mod hdf5_lz4;
 #[cfg(feature = "hdf5")]

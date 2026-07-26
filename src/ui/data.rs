@@ -7,18 +7,20 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
-use crate::sample::{HistBins, Histogram, Sample, SampleMode, ViewDtype};
+use crate::sample::{HistBins, Histogram, Sample, SampleMode};
 use crate::tree::TensorInfo;
-use crate::utils::format_shape;
 use crate::viewstate::{NumBase, StripeMode};
 
 use super::detail::{
     computing_gauge, detail_computing_spans, detail_stats_summary_spans, render_line_gauge,
 };
-use super::hints::{data_view_footer_wrapped_lines, data_view_regions, hint_spans};
+use super::hints::{ChipHit, data_view_footer_wrapped_lines, data_view_regions, hint_spans};
 use super::palette;
-use super::text::{bar, fmt_duration, fmt_hist_edge, fmt_value, truncate_keep_end, with_thousands};
-use super::theme::{dim_span, heat_color, key_span};
+use super::text::{
+    bar, fmt_duration, fmt_hist_edge, fmt_value, truncate_keep_end, view_dtype_spans,
+    view_shape_spans, with_thousands,
+};
+use super::theme::{dim_span, heat_color};
 use super::{ScanProgress, StatsView, UI};
 
 impl UI {
@@ -60,32 +62,16 @@ impl UI {
             SampleMode::Grid => "sampled",
             SampleMode::GridMax => "abs-max",
         };
-        let mut dtype_line = view_dtype_spans(
-            &tensor.dtype,
-            sample.view,
-            sample.unpacked.as_ref().map(|u| u.label.as_str()),
-        );
-        dtype_line.push(Span::raw(" "));
-        dtype_line.extend(view_shape_spans(&tensor.shape, &sample.display_shape));
-        dtype_line.push(Span::raw(format!(
-            " → {what} {}×{}, value range [{lo}, {hi}]{range_note}",
-            sample.rows.len(),
-            sample.cols.len(),
-        )));
-        lines.push(Line::from(dtype_line));
-
-        // A computing-with-fraction stats row is a native progress bar: reserve a
-        // blank line and render a `LineGauge` over it after the paragraph.
-        let stats_gauge_row = if computing_gauge(stats).is_some() {
-            let row = lines.len();
-            lines.push(Line::default());
-            Some(row)
-        } else {
-            if let Some(stats_line) = data_stats_view_line(stats) {
-                lines.push(stats_line);
-            }
-            None
-        };
+        lines.push(dtype_shape_line(
+            tensor,
+            sample,
+            format!(
+                " → {what} {}×{}, value range [{lo}, {hi}]{range_note}",
+                sample.rows.len(),
+                sample.cols.len(),
+            ),
+        ));
+        let stats_gauge_row = push_stats_row(&mut lines, stats);
         if sample.slices > 1 {
             lines.push(slice_header_line(sample));
         }
@@ -133,48 +119,7 @@ impl UI {
             NumBase::Decimal,
             width,
         );
-        // Bottom-pin the footer; the sampled content fills the region above it
-        // (clipped if it would overflow), like every other view.
-        // Reserve the bottom row for the access badge (drawn by render_data_frame),
-        // so the footer's last chip never runs under it. The footer is *wrapped* to the
-        // terminal width, so on a narrow pane it can be taller than the pane itself —
-        // clamp its height to what's actually there, or the `Paragraph` rect runs past
-        // the buffer and Ratatui panics (a 10×10 terminal did exactly that).
-        let footer_top = area.height.saturating_sub(footer.len() as u16 + 1);
-        let footer_len = (footer.len() as u16).min(area.height.saturating_sub(footer_top));
-        Paragraph::new(lines).render(
-            Rect {
-                x: 0,
-                y: 0,
-                width: area.width,
-                height: footer_top,
-            },
-            frame.buffer_mut(),
-        );
-        Paragraph::new(footer).render(
-            Rect {
-                x: 0,
-                y: footer_top,
-                width: area.width,
-                height: footer_len,
-            },
-            frame.buffer_mut(),
-        );
-        if let (Some(row), Some((ratio, label))) = (stats_gauge_row, computing_gauge(stats)) {
-            render_line_gauge(
-                frame,
-                Rect {
-                    x: 0,
-                    y: row as u16,
-                    width: area.width,
-                    height: 1,
-                },
-                label,
-                ratio,
-                Some(30),
-            );
-        }
-        data_view_regions(frame, &chips, footer_top)
+        render_body_and_footer(frame, lines, footer, &chips, stats_gauge_row, stats)
     }
 
     /// Render a sampled tensor as a grid of numeric values with row/column
@@ -199,58 +144,42 @@ impl UI {
 
         let mut lines: Vec<Line> = data_view_title_lines("Values", tensor, width);
 
-        let mut dtype_line = view_dtype_spans(
-            &tensor.dtype,
-            sample.view,
-            sample.unpacked.as_ref().map(|u| u.label.as_str()),
-        );
-        dtype_line.push(Span::raw(" "));
-        dtype_line.extend(view_shape_spans(&tensor.shape, &sample.display_shape));
         let edges = matches!(sample.mode, SampleMode::Edges { .. });
-        dtype_line.push(Span::raw(match sample.mode {
-            SampleMode::Edges { .. } => format!(
-                " → edges: {} of {} rows × {} of {} cols (indices shown)",
-                edge_desc(&sample.rows, sample.total_rows),
-                sample.total_rows,
-                edge_desc(&sample.cols, sample.total_cols),
-                sample.total_cols
-            ),
-            SampleMode::Window { .. } => format!(
-                " → window: rows {} of {} × cols {} of {} (contiguous)",
-                span_desc(&sample.rows),
-                sample.total_rows,
-                span_desc(&sample.cols),
-                sample.total_cols
-            ),
-            SampleMode::Grid => format!(
-                " → sampled {} of {} rows × {} of {} cols (indices shown)",
-                sample.rows.len(),
-                sample.total_rows,
-                sample.cols.len(),
-                sample.total_cols
-            ),
-            SampleMode::GridMax => format!(
-                " → abs-max: {} × {} blocks over {} × {} (every element scanned)",
-                sample.rows.len(),
-                sample.cols.len(),
-                sample.total_rows,
-                sample.total_cols
-            ),
-        }));
-        lines.push(Line::from(dtype_line));
-
-        // A computing-with-fraction stats row is a native progress bar (see
-        // `render_heatmap`).
-        let stats_gauge_row = if computing_gauge(stats).is_some() {
-            let row = lines.len();
-            lines.push(Line::default());
-            Some(row)
-        } else {
-            if let Some(stats_line) = data_stats_view_line(stats) {
-                lines.push(stats_line);
-            }
-            None
-        };
+        lines.push(dtype_shape_line(
+            tensor,
+            sample,
+            match sample.mode {
+                SampleMode::Edges { .. } => format!(
+                    " → edges: {} of {} rows × {} of {} cols (indices shown)",
+                    edge_desc(&sample.rows, sample.total_rows),
+                    sample.total_rows,
+                    edge_desc(&sample.cols, sample.total_cols),
+                    sample.total_cols
+                ),
+                SampleMode::Window { .. } => format!(
+                    " → window: rows {} of {} × cols {} of {} (contiguous)",
+                    span_desc(&sample.rows),
+                    sample.total_rows,
+                    span_desc(&sample.cols),
+                    sample.total_cols
+                ),
+                SampleMode::Grid => format!(
+                    " → sampled {} of {} rows × {} of {} cols (indices shown)",
+                    sample.rows.len(),
+                    sample.total_rows,
+                    sample.cols.len(),
+                    sample.total_cols
+                ),
+                SampleMode::GridMax => format!(
+                    " → abs-max: {} × {} blocks over {} × {} (every element scanned)",
+                    sample.rows.len(),
+                    sample.cols.len(),
+                    sample.total_rows,
+                    sample.total_cols
+                ),
+            },
+        ));
+        let stats_gauge_row = push_stats_row(&mut lines, stats);
         if sample.slices > 1 {
             lines.push(slice_header_line(sample));
         }
@@ -421,49 +350,97 @@ impl UI {
             base,
             width,
         );
-        // Bottom-pin the footer; the value grid fills the region above it (clipped
-        // if it would overflow), like every other view.
-        // Reserve the bottom row for the access badge (drawn by render_data_frame),
-        // so the footer's last chip never runs under it. The footer is *wrapped* to the
-        // terminal width, so on a narrow pane it can be taller than the pane itself —
-        // clamp its height to what's actually there, or the `Paragraph` rect runs past
-        // the buffer and Ratatui panics (a 10×10 terminal did exactly that).
-        let footer_top = area.height.saturating_sub(footer.len() as u16 + 1);
-        let footer_len = (footer.len() as u16).min(area.height.saturating_sub(footer_top));
-        Paragraph::new(lines).render(
-            Rect {
-                x: 0,
-                y: 0,
-                width: area.width,
-                height: footer_top,
-            },
-            frame.buffer_mut(),
-        );
-        Paragraph::new(footer).render(
-            Rect {
-                x: 0,
-                y: footer_top,
-                width: area.width,
-                height: footer_len,
-            },
-            frame.buffer_mut(),
-        );
-        if let (Some(row), Some((ratio, label))) = (stats_gauge_row, computing_gauge(stats)) {
-            render_line_gauge(
-                frame,
-                Rect {
-                    x: 0,
-                    y: row as u16,
-                    width: area.width,
-                    height: 1,
-                },
-                label,
-                ratio,
-                Some(30),
-            );
-        }
-        data_view_regions(frame, &chips, footer_top)
+        render_body_and_footer(frame, lines, footer, &chips, stats_gauge_row, stats)
     }
+}
+
+/// The `stored as …  (shape) as …` prelude both grid views open with, followed by
+/// whatever that view wants to say about its sampling (`what`).
+fn dtype_shape_line(tensor: &TensorInfo, sample: &Sample, what: String) -> Line<'static> {
+    let mut spans = view_dtype_spans(
+        &tensor.dtype,
+        sample.view,
+        sample.unpacked.as_ref().map(|u| u.label.as_str()),
+    );
+    spans.push(Span::raw(" "));
+    spans.extend(view_shape_spans(&tensor.shape, &sample.display_shape));
+    spans.push(Span::raw(what));
+    Line::from(spans)
+}
+
+/// Push the stats row, returning the line it reserved when that row is a live progress
+/// bar instead of text.
+///
+/// A computing-with-fraction stats row is drawn as a native `LineGauge`, which is a
+/// widget rather than a `Line`, so the row has to be left blank here and painted over
+/// afterwards — see [`render_body_and_footer`], which is where the painting happens.
+fn push_stats_row(lines: &mut Vec<Line<'static>>, stats: StatsView) -> Option<usize> {
+    if computing_gauge(stats).is_some() {
+        let row = lines.len();
+        lines.push(Line::default());
+        return Some(row);
+    }
+    if let Some(stats_line) = data_stats_view_line(stats) {
+        lines.push(stats_line);
+    }
+    None
+}
+
+/// Draw a data view: its `lines` in the region above a bottom-pinned `footer`, the
+/// stats gauge over the row [`push_stats_row`] reserved, and the footer's hit regions.
+///
+/// Shared by the heatmap and the value grid, which had this identical 40 lines each —
+/// including the rect clamping that keeps Ratatui from panicking, which is not something
+/// to maintain in two places.
+fn render_body_and_footer(
+    frame: &mut Frame,
+    lines: Vec<Line<'static>>,
+    footer: Vec<Line<'static>>,
+    chips: &[ChipHit],
+    stats_gauge_row: Option<usize>,
+    stats: StatsView,
+) -> Vec<(Rect, KeyEvent)> {
+    let area = frame.area();
+    // Reserve the bottom row for the access badge (drawn by render_data_frame), so the
+    // footer's last chip never runs under it. The footer is *wrapped* to the terminal
+    // width, so on a narrow pane it can be taller than the pane itself — clamp its height
+    // to what's actually there, or the `Paragraph` rect runs past the buffer and Ratatui
+    // panics (a 10×10 terminal did exactly that).
+    let footer_top = area.height.saturating_sub(footer.len() as u16 + 1);
+    let footer_len = (footer.len() as u16).min(area.height.saturating_sub(footer_top));
+    Paragraph::new(lines).render(
+        Rect {
+            x: 0,
+            y: 0,
+            width: area.width,
+            height: footer_top,
+        },
+        frame.buffer_mut(),
+    );
+    Paragraph::new(footer).render(
+        Rect {
+            x: 0,
+            y: footer_top,
+            width: area.width,
+            height: footer_len,
+        },
+        frame.buffer_mut(),
+    );
+    if let (Some(row), Some((ratio, label))) = (stats_gauge_row, computing_gauge(stats)) {
+        render_line_gauge(
+            frame,
+            Rect {
+                x: 0,
+                y: row as u16,
+                width: area.width,
+                height: 1,
+            },
+            label,
+            ratio,
+            Some(30),
+        );
+    }
+    data_view_regions(frame, chips, footer_top)
 }
 
 /// The data-view title block as styled [`Line`]s — the Ratatui port of
@@ -487,35 +464,6 @@ fn data_view_title_lines(kind: &str, tensor: &TensorInfo, width: usize) -> Vec<L
             )),
         ]),
     ]
-}
-
-/// The data-view dtype span(s) — Ratatui port of [`write_view_dtype`]: just the
-/// stored dtype, or a dimmed `stored as` + the bold reinterpretation label.
-fn view_dtype_spans(
-    stored: &str,
-    view: ViewDtype,
-    unpacked_label: Option<&str>,
-) -> Vec<Span<'static>> {
-    let label: Option<String> = match (view, unpacked_label) {
-        (ViewDtype::Unpacked, Some(l)) => Some(format!("{l} (unpacked)")),
-        _ => view.label().map(str::to_string),
-    };
-    match label {
-        Some(label) => vec![dim_span(format!("{stored} as ")), key_span(label)],
-        None => vec![Span::raw(stored.to_string())],
-    }
-}
-
-/// The data-view shape span(s) — Ratatui port of [`write_view_shape`].
-fn view_shape_spans(stored: &[usize], logical: &[usize]) -> Vec<Span<'static>> {
-    if stored == logical {
-        vec![Span::raw(format_shape(logical))]
-    } else {
-        vec![
-            dim_span(format!("{} as ", format_shape(stored))),
-            key_span(format_shape(logical)),
-        ]
-    }
 }
 
 /// The one-line statistics view for a data screen as a styled [`Line`] — Ratatui
@@ -737,6 +685,9 @@ pub(super) fn render_histogram(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Used only by the fixtures below — the production code reaches `ViewDtype` through
+    // the shared span builders in `text.rs`.
+    use crate::sample::ViewDtype;
     use crate::ui::tests_support::strip_ansi_codes;
 
     fn tensor(name: &str, shape: &[usize]) -> TensorInfo {

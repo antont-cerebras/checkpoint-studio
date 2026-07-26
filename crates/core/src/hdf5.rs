@@ -449,7 +449,7 @@ mod tests {
             other => panic!("expected compressed storage, got {other:?}"),
         }
         // The compressed dataset is chunked, so its layout is reported.
-        assert!(matches!(comp.layout, crate::tree::Layout::Chunked { .. }));
+        assert!(matches!(comp.layout, Layout::Chunked { .. }));
 
         let _ = std::fs::remove_file(&path);
     }

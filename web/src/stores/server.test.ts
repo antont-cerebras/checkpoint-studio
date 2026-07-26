@@ -13,12 +13,12 @@ import { get } from 'svelte/store';
 import type { TreeNode, TreeResponse } from '../lib/types';
 
 /** A tensor leaf, with the shard path the `<Ref>` resolver reads. */
-const leaf = (name: string, shard: string): TreeNode => ({
+const leaf = (name: string, shard: string, dtype = 'F16'): TreeNode => ({
   kind: 'tensor',
   label: null,
   info: {
     name,
-    dtype: 'F16',
+    dtype,
     shape: [2],
     size_bytes: 4,
     num_elements: 2,
@@ -134,6 +134,32 @@ describe('name indexes', () => {
     const s = await load();
     expect(get(s.tensorNames).size).toBe(0);
     expect(get(s.shardNames).size).toBe(0);
+  });
+
+  // The filter builder's dtype chips and the palette's per-dtype commands both read this.
+  // It lives here rather than in each component because they had a copy of the walk each,
+  // and a 31k-tensor tree should be traversed once per load, not once per asker.
+  it('lists each dtype present once, sorted, at any depth', async () => {
+    const s = await load();
+    s.tree.set({
+      tree: [
+        group('model', [
+          leaf('a', '/s.safetensors', 'F32'),
+          group('layers', [
+            leaf('b', '/s.safetensors', 'BF16'),
+            // A repeat of an outer dtype: listed once, not twice.
+            leaf('c', '/s.safetensors'),
+          ]),
+        ]),
+        leaf('d', '/s.safetensors'),
+      ],
+    } as TreeResponse);
+    expect(get(s.dtypesPresent)).toEqual(['BF16', 'F16', 'F32']);
+  });
+
+  it('has no dtypes before the tree arrives', async () => {
+    const s = await load();
+    expect(get(s.dtypesPresent)).toEqual([]);
   });
 });
 

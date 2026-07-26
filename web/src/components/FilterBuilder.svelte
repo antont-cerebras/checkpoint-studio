@@ -3,23 +3,11 @@
   // input: it parses the current query into facet controls, and every control edits
   // the query live (rebuilding it), so raw ⇄ builder are two views of one query.
   // Terms the builder doesn't model (bare words, unusual facets) are preserved.
-  import { tree } from '../stores/server';
+  import { dtypesPresent } from '../stores/server';
   import { filterQuery } from '../stores/view';
-  import type { TreeNode } from '../lib/types';
   import { dtypeInfo } from '../lib/dtype';
 
-  function distinctDtypes(nodes: TreeNode[]): string[] {
-    const set = new Set<string>();
-    const walk = (ns: TreeNode[]) => {
-      for (const n of ns) {
-        if (n.kind === 'tensor') set.add(n.info.dtype);
-        else if (n.kind === 'group') walk(n.children);
-      }
-    };
-    walk(nodes);
-    return [...set].sort();
-  }
-  $: present = $tree ? distinctDtypes($tree.tree) : [];
+  $: present = $dtypesPresent;
 
   interface Neg {
     dtype: boolean;

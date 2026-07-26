@@ -51,6 +51,7 @@ mod load;
 mod render;
 use cache::{
     CachedReader, CachedSample, HistKey, Representation, STATS_SPINNER, SampleKey, ScanJob,
+    poll_stats_scan, scan_stats_view,
 };
 
 /// The program name used when building the copyable CLI commands (`y`).
@@ -171,6 +172,67 @@ enum BinsChoice {
     Clear,
     /// Leave the count unchanged (`Esc`).
     Cancel,
+}
+
+/// What a text prompt's `Enter` decided: accept a value, or reject the input with a
+/// message the prompt then shows above the field.
+enum Submit<T> {
+    Accept(T),
+    Reject(String),
+}
+
+/// Run a single-line text prompt until it is submitted or cancelled (`None`).
+///
+/// The prompts for histogram bins, the streaming buffer size, the tensor filter and the
+/// repack output path differ only in their title, their initial text, and what `Enter`
+/// makes of the input. Everything else — the redraw, Ctrl-C, `Esc`, `Backspace`, character
+/// entry, clearing the error message as soon as the text changes, and bailing out when the
+/// terminal write fails — was written out four times, so a fix to any of it (the last one
+/// was clearing the stale error on edit) had to be made in four places or in none.
+///
+/// `background` paints behind the prompt for the prompts that overlay a live screen; the
+/// standalone ones pass an empty closure.
+fn run_text_prompt<T>(
+    term: &mut crate::tui::LiveTerminal,
+    title: &str,
+    initial: String,
+    background: impl Fn(&mut ratatui::Frame),
+    mut submit: impl FnMut(&str) -> Submit<T>,
+) -> Option<T> {
+    let mut input = initial;
+    let mut error: Option<String> = None;
+    loop {
+        if term
+            .draw(|f| {
+                background(f);
+                UI::render_text_prompt(f, title, &input, error.as_deref());
+            })
+            .is_err()
+        {
+            return None;
+        }
+        match event::read() {
+            Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+            Ok(Event::Key(KeyEvent { code, .. })) => match code {
+                KeyCode::Enter => match submit(input.trim()) {
+                    Submit::Accept(value) => return Some(value),
+                    Submit::Reject(message) => error = Some(message),
+                },
+                KeyCode::Esc => return None,
+                KeyCode::Backspace => {
+                    input.pop();
+                    error = None;
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    error = None;
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Whether a screen waits for keys or renders once and returns (`--exit`).
@@ -5198,97 +5260,40 @@ impl Explorer {
         background: impl Fn(&mut ratatui::Frame),
         current: Option<usize>,
     ) -> BinsChoice {
-        let mut input = current.map(|n| n.to_string()).unwrap_or_default();
-        let mut error: Option<String> = None;
-        loop {
-            if term
-                .draw(|f| {
-                    background(f);
-                    UI::render_text_prompt(
-                        f,
-                        "Histogram bin count (1–512, empty for automatic)",
-                        &input,
-                        error.as_deref(),
-                    );
-                })
-                .is_err()
-            {
-                return BinsChoice::Cancel;
-            }
-            match event::read() {
-                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
-                Ok(Event::Key(KeyEvent { code, .. })) => match code {
-                    KeyCode::Enter => {
-                        let t = input.trim();
-                        if t.is_empty() {
-                            return BinsChoice::Clear;
-                        }
-                        match t.parse::<usize>() {
-                            Ok(n) if (1..=512).contains(&n) => return BinsChoice::Set(n),
-                            Ok(_) => error = Some("Enter a count between 1 and 512.".to_string()),
-                            Err(_) => {
-                                error =
-                                    Some("Enter a whole number (empty = automatic).".to_string())
-                            }
-                        }
+        let initial = current.map(|n| n.to_string()).unwrap_or_default();
+        run_text_prompt(
+            term,
+            "Histogram bin count (1–512, empty for automatic)",
+            initial,
+            background,
+            |input| {
+                if input.is_empty() {
+                    return Submit::Accept(BinsChoice::Clear);
+                }
+                match input.parse::<usize>() {
+                    Ok(n) if (1..=512).contains(&n) => Submit::Accept(BinsChoice::Set(n)),
+                    Ok(_) => Submit::Reject("Bin count must be between 1 and 512.".to_string()),
+                    Err(_) => {
+                        Submit::Reject("Enter a whole number (empty = automatic).".to_string())
                     }
-                    KeyCode::Esc => return BinsChoice::Cancel,
-                    KeyCode::Backspace => {
-                        input.pop();
-                        error = None;
-                    }
-                    KeyCode::Char(c) => {
-                        input.push(c);
-                        error = None;
-                    }
-                    _ => {}
-                },
-                Ok(_) => {}
-                Err(_) => return BinsChoice::Cancel,
-            }
-        }
+                }
+            },
+        )
+        .unwrap_or(BinsChoice::Cancel)
     }
 
     fn prompt_buffer(&self, term: &mut crate::tui::LiveTerminal) -> Option<usize> {
-        let mut input = "256M".to_string();
-        let mut error: Option<String> = None;
-        loop {
-            if term
-                .draw(|f| {
-                    UI::render_text_prompt(
-                        f,
-                        "Streaming buffer size (e.g. 64M, 256M, 1G)",
-                        &input,
-                        error.as_deref(),
-                    )
-                })
-                .is_err()
-            {
-                return None;
-            }
-            match event::read() {
-                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
-                Ok(Event::Key(KeyEvent { code, .. })) => match code {
-                    KeyCode::Enter => match crate::utils::parse_size(input.trim()) {
-                        Ok(n) if n > 0 => return Some(n),
-                        Ok(_) => error = Some("Buffer must be greater than zero.".to_string()),
-                        Err(e) => error = Some(e),
-                    },
-                    KeyCode::Esc => return None,
-                    KeyCode::Backspace => {
-                        input.pop();
-                        error = None;
-                    }
-                    KeyCode::Char(c) => {
-                        input.push(c);
-                        error = None;
-                    }
-                    _ => {}
-                },
-                Ok(_) => {}
-                Err(_) => return None,
-            }
-        }
+        run_text_prompt(
+            term,
+            "Streaming buffer size (e.g. 64M, 256M, 1G)",
+            "256M".to_string(),
+            |_| {},
+            |input| match crate::utils::parse_size(input) {
+                Ok(n) if n > 0 => Submit::Accept(n),
+                Ok(_) => Submit::Reject("Buffer must be greater than zero.".to_string()),
+                Err(e) => Submit::Reject(e),
+            },
+        )
     }
 
     /// Prompt for the repack output path, pre-filled with `default`, rejecting an
@@ -5312,50 +5317,21 @@ impl Explorer {
     /// each Enter with [`crate::tensorfilter::TensorFilter::parse`] and showing any
     /// error inline. Empty is allowed (clears). `None` on Esc (cancel).
     fn prompt_filter(&self, term: &mut crate::tui::LiveTerminal) -> Option<String> {
-        let mut input = self.tree_state.filter_query().to_string();
-        let mut error: Option<String> = None;
-        loop {
-            if term
-                .draw(|f| {
-                    UI::render_text_prompt(
-                        f,
-                        "Filter tensors (e.g. dtype:F16 shape:(_,4096) size:>1MiB — empty clears)",
-                        &input,
-                        error.as_deref(),
-                    )
-                })
-                .is_err()
-            {
-                return None;
-            }
-            match event::read() {
-                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
-                Ok(Event::Key(KeyEvent { code, .. })) => match code {
-                    KeyCode::Enter => {
-                        let trimmed = input.trim();
-                        if trimmed.is_empty() {
-                            return Some(String::new()); // clear
-                        }
-                        match crate::tensorfilter::TensorFilter::parse(trimmed) {
-                            Ok(_) => return Some(trimmed.to_string()),
-                            Err(e) => error = Some(e.to_string()),
-                        }
-                    }
-                    KeyCode::Esc => return None,
-                    KeyCode::Backspace => {
-                        input.pop();
-                        error = None;
-                    }
-                    KeyCode::Char(c) => {
-                        input.push(c);
-                        error = None;
-                    }
-                    _ => {}
-                },
-                Ok(_) => {}
-                Err(_) => return None,
-            }
-        }
+        run_text_prompt(
+            term,
+            "Filter tensors (e.g. dtype:F16 shape:(_,4096) size:>1MiB — empty clears)",
+            self.tree_state.filter_query().to_string(),
+            |_| {},
+            |input| {
+                if input.is_empty() {
+                    return Submit::Accept(String::new()); // clear
+                }
+                match crate::tensorfilter::TensorFilter::parse(input) {
+                    Ok(_) => Submit::Accept(input.to_string()),
+                    Err(e) => Submit::Reject(e.to_string()),
+                }
+            },
+        )
     }
 
     fn prompt_output_path(
@@ -5363,51 +5339,21 @@ impl Explorer {
         term: &mut crate::tui::LiveTerminal,
         default: &Path,
     ) -> Option<PathBuf> {
-        let mut input = default.to_string_lossy().into_owned();
-        let mut error: Option<String> = None;
-        loop {
-            if term
-                .draw(|f| {
-                    UI::render_text_prompt(
-                        f,
-                        "Save repacked checkpoint as",
-                        &input,
-                        error.as_deref(),
-                    )
-                })
-                .is_err()
-            {
-                return None;
-            }
-            match event::read() {
-                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
-                Ok(Event::Key(KeyEvent { code, .. })) => match code {
-                    KeyCode::Enter => {
-                        let trimmed = input.trim();
-                        if trimmed.is_empty() {
-                            error = Some("Enter a file name.".to_string());
-                        } else if Path::new(trimmed).exists() {
-                            error =
-                                Some("That file already exists — choose another name.".to_string());
-                        } else {
-                            return Some(PathBuf::from(trimmed));
-                        }
-                    }
-                    KeyCode::Esc => return None,
-                    KeyCode::Backspace => {
-                        input.pop();
-                        error = None;
-                    }
-                    KeyCode::Char(c) => {
-                        input.push(c);
-                        error = None;
-                    }
-                    _ => {}
-                },
-                Ok(_) => {}
-                Err(_) => return None,
-            }
-        }
+        run_text_prompt(
+            term,
+            "Save repacked checkpoint as",
+            default.to_string_lossy().into_owned(),
+            |_| {},
+            |input| {
+                if input.is_empty() {
+                    Submit::Reject("Enter a file name.".to_string())
+                } else if Path::new(input).exists() {
+                    Submit::Reject("That file already exists — choose another name.".to_string())
+                } else {
+                    Submit::Accept(PathBuf::from(input))
+                }
+            },
+        )
     }
 
     #[cfg(feature = "hdf5")]

@@ -48,6 +48,78 @@ impl Seg {
     }
 }
 
+/// A chip for a plain single-character key, where the glyph *is* the key —
+/// `letter("y")` rather than `Seg::Key("y", hint_key('y'))`.
+///
+/// Writing the character once removes the only interesting way one of these can be wrong:
+/// a label that doesn't match the key it synthesizes, which nothing but a click would
+/// reveal. Use `Seg::Key` directly where the label is a word (`Tab`, `Enter`) or a glyph
+/// standing for a non-character key (`⌫`, `↵`).
+fn letter(text: &'static str) -> Vec<Seg> {
+    let c = text.chars().next().unwrap_or(' ');
+    vec![Seg::Key(text, hint_key(c))]
+}
+
+/// A dual chip: two independently clickable keys joined by a non-clickable `/`.
+fn pair(a: &'static str, ka: KeyEvent, b: &'static str, kb: KeyEvent) -> Vec<Seg> {
+    vec![Seg::Key(a, ka), Seg::Sep("/"), Seg::Key(b, kb)]
+}
+
+// The chips that appear on more than one screen, each built once. These are the same
+// bindings in the same order everywhere they show up, and spelling them out per screen
+// meant the glyph and the key it synthesizes were re-paired by hand five or six times —
+// a `↓` chip wired to `Up` is a bug you can only find by clicking it. They also have to
+// match the web UI's footers (see the TUI/web parity note in the README), which is easier
+// to check against one definition than against six copies.
+
+/// `↑`/`↓` — move the selection by a row.
+fn nav_updown() -> Vec<Seg> {
+    let plain = KeyModifiers::NONE;
+    pair(
+        "↑",
+        KeyEvent::new(KeyCode::Up, plain),
+        "↓",
+        KeyEvent::new(KeyCode::Down, plain),
+    )
+}
+
+/// `←`/`→` — collapse/expand, or step by column.
+fn nav_leftright() -> Vec<Seg> {
+    let plain = KeyModifiers::NONE;
+    pair(
+        "←",
+        KeyEvent::new(KeyCode::Left, plain),
+        "→",
+        KeyEvent::new(KeyCode::Right, plain),
+    )
+}
+
+/// `PgUp`/`PgDn` — move by a screenful.
+fn nav_pages() -> Vec<Seg> {
+    let plain = KeyModifiers::NONE;
+    pair(
+        "PgUp",
+        KeyEvent::new(KeyCode::PageUp, plain),
+        "PgDn",
+        KeyEvent::new(KeyCode::PageDown, plain),
+    )
+}
+
+/// `Space`/`:` — open the command palette.
+fn palette_keys() -> Vec<Seg> {
+    pair("Space", hint_key(' '), ":", hint_key(':'))
+}
+
+/// `⌫`/`\` — step back and forward through the view history.
+fn history_keys() -> Vec<Seg> {
+    pair(
+        "⌫",
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        "\\",
+        hint_key('\\'),
+    )
+}
+
 /// Draw a `[×]` close control in the top-right corner and return its clickable
 /// region paired with the key a click should synthesize (`q` to quit the tree,
 /// `⌫` to step back from a sub-screen). No-op (empty region list) if too narrow.
@@ -251,29 +323,12 @@ pub(crate) fn stats_hint_lines(
     shards_expanded: bool,
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<ChipHit>) {
-    use KeyCode::{Backspace, Down, PageDown, PageUp, Up};
+    use KeyCode::Backspace;
     let plain = KeyModifiers::NONE;
-    let mut items: Vec<(Vec<Seg>, &str)> = vec![
-        (
-            vec![
-                Seg::Key("↑", KeyEvent::new(Up, plain)),
-                Seg::Sep("/"),
-                Seg::Key("↓", KeyEvent::new(Down, plain)),
-            ],
-            "scroll",
-        ),
-        (
-            vec![
-                Seg::Key("PgUp", KeyEvent::new(PageUp, plain)),
-                Seg::Sep("/"),
-                Seg::Key("PgDn", KeyEvent::new(PageDown, plain)),
-            ],
-            "page",
-        ),
-    ];
+    let mut items: Vec<(Vec<Seg>, &str)> = vec![(nav_updown(), "scroll"), (nav_pages(), "page")];
     if can_fold {
         items.push((
-            vec![Seg::Key("f", hint_key('f'))],
+            letter("f"),
             if shards_expanded {
                 "fold shards"
             } else {
@@ -281,12 +336,12 @@ pub(crate) fn stats_hint_lines(
             },
         ));
     }
-    items.push((vec![Seg::Key("r", hint_key('r'))], "copy report"));
-    items.push((vec![Seg::Key("c", hint_key('c'))], "copy screen"));
-    items.push((vec![Seg::Key("y", hint_key('y'))], "copy command"));
-    items.push((vec![Seg::Key("l", hint_key('l'))], "legend"));
+    items.push((letter("r"), "copy report"));
+    items.push((letter("c"), "copy screen"));
+    items.push((letter("y"), "copy command"));
+    items.push((letter("l"), "legend"));
     items.push((vec![Seg::Key("⌫", KeyEvent::new(Backspace, plain))], "back"));
-    items.push((vec![Seg::Key("q", hint_key('q'))], "quit"));
+    items.push((letter("q"), "quit"));
     wrap_hint_items(items, width)
 }
 
@@ -305,14 +360,14 @@ fn view_footer_items(
     stripe: StripeMode,
     base: NumBase,
 ) -> Vec<(Vec<Seg>, &'static str)> {
-    use KeyCode::{Backspace, Down, End, Home, Left, PageDown, PageUp, Right, Up};
+    use KeyCode::{Down, End, Home, Left, Right, Up};
     let plain = KeyModifiers::NONE;
     let shift = KeyModifiers::SHIFT;
     // The other representation to switch to (heatmap ⇆ numeric values).
     let switch = if heatmap {
-        (vec![Seg::Key("v", hint_key('v'))], "numeric values")
+        (letter("v"), "numeric values")
     } else {
-        (vec![Seg::Key("m", hint_key('m'))], "heatmap")
+        (letter("m"), "heatmap")
     };
     let mut items: Vec<(Vec<Seg>, &str)> = vec![switch];
     let edges = matches!(mode, SampleMode::Edges { .. });
@@ -350,14 +405,7 @@ fn view_footer_items(
             ],
             "col edge",
         ));
-        items.push((
-            vec![
-                Seg::Key("PgUp", KeyEvent::new(PageUp, plain)),
-                Seg::Sep("/"),
-                Seg::Key("PgDn", KeyEvent::new(PageDown, plain)),
-            ],
-            "row edge",
-        ));
+        items.push((nav_pages(), "row edge"));
     }
     if slices > 1 {
         if edges || window {
@@ -388,16 +436,16 @@ fn view_footer_items(
                 "jump 5%",
             ));
         }
-        items.push((vec![Seg::Key("/", hint_key('/'))], "index or %"));
+        items.push((letter("/"), "index or %"));
     }
     if overridable {
-        items.push((vec![Seg::Key("d", hint_key('d'))], "dtype"));
-        items.push((vec![Seg::Key("r", hint_key('r'))], "reshape"));
+        items.push((letter("d"), "dtype"));
+        items.push((letter("r"), "reshape"));
     }
     // Cycle the layout overview → abs-max → edges → window → overview; the label
     // names the layout `e` switches to next.
     items.push((
-        vec![Seg::Key("e", hint_key('e'))],
+        letter("e"),
         match mode {
             SampleMode::Grid => "abs-max",
             SampleMode::GridMax => "edges",
@@ -408,7 +456,7 @@ fn view_footer_items(
     // Cycle the zebra striping / numeral base (numeric grid only).
     if !heatmap {
         items.push((
-            vec![Seg::Key("z", hint_key('z'))],
+            letter("z"),
             match stripe {
                 StripeMode::Rows => "zebra: rows",
                 StripeMode::Cols => "zebra: cols",
@@ -416,7 +464,7 @@ fn view_footer_items(
             },
         ));
         items.push((
-            vec![Seg::Key("b", hint_key('b'))],
+            letter("b"),
             match base {
                 NumBase::Decimal => "base: dec",
                 NumBase::Hex => "base: hex",
@@ -425,25 +473,11 @@ fn view_footer_items(
             },
         ));
     }
-    items.push((vec![Seg::Key("c", hint_key('c'))], "copy screen"));
-    items.push((vec![Seg::Key("y", hint_key('y'))], "copy cmd"));
-    items.push((vec![Seg::Key("l", hint_key('l'))], "legend"));
-    items.push((
-        vec![
-            Seg::Key("Space", hint_key(' ')),
-            Seg::Sep("/"),
-            Seg::Key(":", hint_key(':')),
-        ],
-        "commands",
-    ));
-    items.push((
-        vec![
-            Seg::Key("⌫", KeyEvent::new(Backspace, plain)),
-            Seg::Sep("/"),
-            Seg::Key("\\", hint_key('\\')),
-        ],
-        "back/fwd",
-    ));
+    items.push((letter("c"), "copy screen"));
+    items.push((letter("y"), "copy cmd"));
+    items.push((letter("l"), "legend"));
+    items.push((palette_keys(), "commands"));
+    items.push((history_keys(), "back/fwd"));
     items
 }
 
@@ -512,29 +546,15 @@ pub(crate) fn tree_hint_lines(
     can_rename: bool,
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<ChipHit>) {
-    use KeyCode::{Backspace, Down, Enter, Left, PageDown, PageUp, Right, Tab, Up};
+    use KeyCode::{Down, Enter, Tab, Up};
     let plain = KeyModifiers::NONE;
     let shift = KeyModifiers::SHIFT;
     // Each chip's key text is a list of segments; a `Seg::Key` glyph is clickable
     // (and synthesizes its key), a `Seg::Sep` (`/`, `Shift+`) is not. Both halves
     // of a dual chip are thus independently clickable.
     let mut items: Vec<(Vec<Seg>, &str)> = vec![
-        (
-            vec![
-                Seg::Key("↑", KeyEvent::new(Up, plain)),
-                Seg::Sep("/"),
-                Seg::Key("↓", KeyEvent::new(Down, plain)),
-            ],
-            "navigate",
-        ),
-        (
-            vec![
-                Seg::Key("←", KeyEvent::new(Left, plain)),
-                Seg::Sep("/"),
-                Seg::Key("→", KeyEvent::new(Right, plain)),
-            ],
-            "parent/child",
-        ),
+        (nav_updown(), "navigate"),
+        (nav_leftright(), "parent/child"),
         (
             vec![
                 Seg::Sep("Shift+"),
@@ -544,24 +564,10 @@ pub(crate) fn tree_hint_lines(
             ],
             "sibling",
         ),
-        (
-            vec![
-                Seg::Key("PgUp", KeyEvent::new(PageUp, plain)),
-                Seg::Sep("/"),
-                Seg::Key("PgDn", KeyEvent::new(PageDown, plain)),
-            ],
-            "page",
-        ),
+        (nav_pages(), "page"),
         (vec![Seg::Key("Enter", KeyEvent::new(Enter, plain))], "open"),
         (vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))], "files"),
-        (
-            vec![
-                Seg::Key("Space", hint_key(' ')),
-                Seg::Sep("/"),
-                Seg::Key(":", hint_key(':')),
-            ],
-            "commands",
-        ),
+        (palette_keys(), "commands"),
         (
             vec![
                 Seg::Key("e", hint_key('e')),
@@ -570,30 +576,23 @@ pub(crate) fn tree_hint_lines(
             ],
             "expand/collapse all",
         ),
-        (vec![Seg::Key("/", hint_key('/'))], "search"),
-        (vec![Seg::Key("l", hint_key('l'))], "legend"),
-        (vec![Seg::Key("h", hint_key('h'))], "health"),
-        (vec![Seg::Key("s", hint_key('s'))], "stats"),
-        (vec![Seg::Key("t", hint_key('t'))], "copy tree"),
-        (vec![Seg::Key("f", hint_key('f'))], "copy file"),
-        (vec![Seg::Key("n", hint_key('n'))], "copy name"),
-        (vec![Seg::Key("y", hint_key('y'))], "copy command"),
-        (
-            vec![
-                Seg::Key("⌫", KeyEvent::new(Backspace, plain)),
-                Seg::Sep("/"),
-                Seg::Key("\\", hint_key('\\')),
-            ],
-            "back/fwd",
-        ),
+        (letter("/"), "search"),
+        (letter("l"), "legend"),
+        (letter("h"), "health"),
+        (letter("s"), "stats"),
+        (letter("t"), "copy tree"),
+        (letter("f"), "copy file"),
+        (letter("n"), "copy name"),
+        (letter("y"), "copy command"),
+        (history_keys(), "back/fwd"),
     ];
     if can_repack {
-        items.push((vec![Seg::Key("r", hint_key('r'))], "repack"));
+        items.push((letter("r"), "repack"));
     }
     if can_rename {
-        items.push((vec![Seg::Key("R", hint_key('R'))], "rename"));
+        items.push((letter("R"), "rename"));
     }
-    items.push((vec![Seg::Key("q", hint_key('q'))], "quit"));
+    items.push((letter("q"), "quit"));
     wrap_hint_items(items, width)
 }
 
@@ -605,7 +604,7 @@ pub(crate) fn rename_hint_lines(
     width: u16,
     applicable: bool,
 ) -> (Vec<Line<'static>>, Vec<ChipHit>) {
-    use KeyCode::{Char, Down, Enter, Esc, Left, PageDown, PageUp, Right, Tab, Up};
+    use KeyCode::{Char, Enter, Esc, Tab};
     let plain = KeyModifiers::NONE;
     let ctrl = KeyModifiers::CONTROL;
     // The apply chip's label reflects readiness (`^R` is blocked until clean).
@@ -615,35 +614,14 @@ pub(crate) fn rename_hint_lines(
         "apply (fix issues)"
     };
     let items: Vec<(Vec<Seg>, &str)> = vec![
-        (
-            vec![
-                Seg::Key("Space", hint_key(' ')),
-                Seg::Sep("/"),
-                Seg::Key(":", hint_key(':')),
-            ],
-            "commands",
-        ),
+        (palette_keys(), "commands"),
         (vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))], "complete"),
-        (
-            vec![
-                Seg::Key("↑", KeyEvent::new(Up, plain)),
-                Seg::Sep("/"),
-                Seg::Key("↓", KeyEvent::new(Down, plain)),
-            ],
-            "fields",
-        ),
+        (nav_updown(), "fields"),
         (
             vec![Seg::Key("↵", KeyEvent::new(Enter, plain))],
             "next field",
         ),
-        (
-            vec![
-                Seg::Key("←", KeyEvent::new(Left, plain)),
-                Seg::Sep("/"),
-                Seg::Key("→", KeyEvent::new(Right, plain)),
-            ],
-            "caret",
-        ),
+        (nav_leftright(), "caret"),
         (
             vec![Seg::Key("^N", KeyEvent::new(Char('n'), ctrl))],
             "add rule",
@@ -652,14 +630,7 @@ pub(crate) fn rename_hint_lines(
             vec![Seg::Key("^D", KeyEvent::new(Char('d'), ctrl))],
             "remove",
         ),
-        (
-            vec![
-                Seg::Key("PgUp", KeyEvent::new(PageUp, plain)),
-                Seg::Sep("/"),
-                Seg::Key("PgDn", KeyEvent::new(PageDown, plain)),
-            ],
-            "scroll",
-        ),
+        (nav_pages(), "scroll"),
         (
             vec![Seg::Key("^R", KeyEvent::new(Char('r'), ctrl))],
             apply_label,
@@ -766,33 +737,12 @@ pub(super) fn wrap_hint_items(
 /// [`tree_hint_lines`] — the same `key label · …` chips and clickable
 /// [`ChipHit`]s, for the file-view footer.
 pub(crate) fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
-    use KeyCode::{Backspace, Down, Enter, Left, PageDown, PageUp, Right, Tab, Up};
+    use KeyCode::{Enter, Tab};
     let plain = KeyModifiers::NONE;
     let items: Vec<(Vec<Seg>, &str)> = vec![
-        (
-            vec![
-                Seg::Key("↑", KeyEvent::new(Up, plain)),
-                Seg::Sep("/"),
-                Seg::Key("↓", KeyEvent::new(Down, plain)),
-            ],
-            "navigate",
-        ),
-        (
-            vec![
-                Seg::Key("←", KeyEvent::new(Left, plain)),
-                Seg::Sep("/"),
-                Seg::Key("→", KeyEvent::new(Right, plain)),
-            ],
-            "collapse/expand",
-        ),
-        (
-            vec![
-                Seg::Key("PgUp", KeyEvent::new(PageUp, plain)),
-                Seg::Sep("/"),
-                Seg::Key("PgDn", KeyEvent::new(PageDown, plain)),
-            ],
-            "page",
-        ),
+        (nav_updown(), "navigate"),
+        (nav_leftright(), "collapse/expand"),
+        (nav_pages(), "page"),
         (
             vec![Seg::Key("Enter", KeyEvent::new(Enter, plain))],
             "open/preview",
@@ -801,27 +751,13 @@ pub(crate) fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>)
             vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))],
             "tensor tree",
         ),
-        (
-            vec![
-                Seg::Key("Space", hint_key(' ')),
-                Seg::Sep("/"),
-                Seg::Key(":", hint_key(':')),
-            ],
-            "commands",
-        ),
-        (vec![Seg::Key("l", hint_key('l'))], "legend"),
-        (vec![Seg::Key("f", hint_key('f'))], "copy path"),
-        (vec![Seg::Key("c", hint_key('c'))], "copy screen"),
-        (vec![Seg::Key("y", hint_key('y'))], "copy command"),
-        (
-            vec![
-                Seg::Key("⌫", KeyEvent::new(Backspace, plain)),
-                Seg::Sep("/"),
-                Seg::Key("\\", hint_key('\\')),
-            ],
-            "back/fwd",
-        ),
-        (vec![Seg::Key("q", hint_key('q'))], "quit"),
+        (palette_keys(), "commands"),
+        (letter("l"), "legend"),
+        (letter("f"), "copy path"),
+        (letter("c"), "copy screen"),
+        (letter("y"), "copy command"),
+        (history_keys(), "back/fwd"),
+        (letter("q"), "quit"),
     ];
     wrap_hint_items(items, width)
 }
@@ -829,50 +765,22 @@ pub(crate) fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>)
 /// The layout map's footer hints (`↑↓ select · ↵ in tree · …`), wrapped to
 /// `width` like the tree's, with clickable [`ChipHit`]s.
 pub(crate) fn layout_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
-    use KeyCode::{Backspace, Down, Enter, PageDown, PageUp, Tab, Up};
+    use KeyCode::{Enter, Tab};
     let plain = KeyModifiers::NONE;
     let items: Vec<(Vec<Seg>, &str)> = vec![
-        (
-            vec![
-                Seg::Key("↑", KeyEvent::new(Up, plain)),
-                Seg::Sep("/"),
-                Seg::Key("↓", KeyEvent::new(Down, plain)),
-            ],
-            "select",
-        ),
-        (
-            vec![
-                Seg::Key("PgUp", KeyEvent::new(PageUp, plain)),
-                Seg::Sep("/"),
-                Seg::Key("PgDn", KeyEvent::new(PageDown, plain)),
-            ],
-            "page",
-        ),
+        (nav_updown(), "select"),
+        (nav_pages(), "page"),
         (vec![Seg::Key("↵", KeyEvent::new(Enter, plain))], "in tree"),
         (
             vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))],
             "tensor tree",
         ),
-        (
-            vec![
-                Seg::Key("Space", hint_key(' ')),
-                Seg::Sep("/"),
-                Seg::Key(":", hint_key(':')),
-            ],
-            "commands",
-        ),
-        (vec![Seg::Key("l", hint_key('l'))], "legend"),
-        (vec![Seg::Key("c", hint_key('c'))], "copy screen"),
-        (vec![Seg::Key("y", hint_key('y'))], "copy command"),
-        (
-            vec![
-                Seg::Key("⌫", KeyEvent::new(Backspace, plain)),
-                Seg::Sep("/"),
-                Seg::Key("\\", hint_key('\\')),
-            ],
-            "back/fwd",
-        ),
-        (vec![Seg::Key("q", hint_key('q'))], "quit"),
+        (palette_keys(), "commands"),
+        (letter("l"), "legend"),
+        (letter("c"), "copy screen"),
+        (letter("y"), "copy command"),
+        (history_keys(), "back/fwd"),
+        (letter("q"), "quit"),
     ];
     wrap_hint_items(items, width)
 }

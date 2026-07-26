@@ -103,32 +103,24 @@ impl Explorer {
             return ScanOutcome::Completed;
         }
 
-        // `cancel` lets a key press abort the scan cooperatively; we set it and
-        // return without joining, so the UI is responsive and the worker winds
-        // down on its own at the next block boundary.
-        let cancel = Arc::new(AtomicBool::new(false));
-        // The detail-screen scan has nothing to interleave with, so it never pauses.
-        let pause = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicUsize::new(0));
-        let total = tensor.size_bytes;
-        let owned = tensor.clone();
-        let schema = self.schema_for(&tensor.name).cloned();
-        let worker_cancel = Arc::clone(&cancel);
-        let worker_pause = Arc::clone(&pause);
-        let worker_done = Arc::clone(&done);
-        let handle = std::thread::spawn(move || {
-            crate::sample::tensor_stats(
-                &owned,
-                view,
-                schema.as_ref(),
-                &worker_cancel,
-                &worker_pause,
-                Some(&*worker_done),
-            )
-        });
+        // The same worker the data view spawns; the difference here is that this screen
+        // animates it in place and waits for it, rather than polling it between frames.
+        // `job.cancel` lets a key press abort cooperatively: we set it and return without
+        // joining, so the UI stays responsive and the worker winds down at its next block
+        // boundary. (`ScanJob`'s own `Drop` sets it too, which is what stops the worker if
+        // this returns early.)
+        let mut job = self.spawn_stats_scan(tensor, view);
+        let (cancel, done, total, started) = (
+            Arc::clone(&job.cancel),
+            Arc::clone(&job.done),
+            job.total,
+            job.started,
+        );
+        let Some(handle) = job.handle.take() else {
+            return ScanOutcome::Completed;
+        };
 
         const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        let started = std::time::Instant::now();
         let mut frame = 0usize;
         while !handle.is_finished() {
             // Only animate once it's clearly not instant, to avoid a flash for

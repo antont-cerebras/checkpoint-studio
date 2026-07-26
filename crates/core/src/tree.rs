@@ -737,7 +737,7 @@ mod tests {
         // leaves (still keyed by their full names for lookup).
         let children = group(&tree, base);
         let mut variants = leaf_names(children);
-        variants.sort();
+        variants.sort_unstable();
         assert_eq!(
             variants,
             vec![
@@ -758,7 +758,7 @@ mod tests {
         // both leaves.
         let zero = group(&tree, "model.layers.0");
         let mut names = leaf_names(zero);
-        names.sort();
+        names.sort_unstable();
         assert_eq!(names, vec!["model.layers.0.bias", "model.layers.0.weight"]);
     }
 
@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(aw_label, Some(Some("a.w".to_string())));
         let b = group(enc, "b");
         let mut names = leaf_names(b);
-        names.sort();
+        names.sort_unstable();
         assert_eq!(names, vec!["enc.b.x", "enc.b.y"]);
     }
 
@@ -830,7 +830,7 @@ mod tests {
         // compacts to one `a.b` group holding both tensors and the metadata).
         let ab = group(&tree, "a.b");
         let mut names: Vec<&str> = ab.iter().map(|n| n.name()).collect();
-        names.sort();
+        names.sort_unstable();
         assert_eq!(
             names,
             vec!["a.b.qscale", "a.b.qscale.__metadata__", "a.b.weight"]
@@ -840,7 +840,7 @@ mod tests {
         // Standalone metadata (no matching tensor) stays in the top-level group.
         let md = group(&tree, "🔧 Metadata");
         let mut standalone = meta_names(md);
-        standalone.sort();
+        standalone.sort_unstable();
         assert_eq!(
             standalone,
             vec!["__version__", "inference_version.__metadata__"]
@@ -908,7 +908,7 @@ mod tests {
         );
         let md = group(&tree, "🔧 Metadata");
         let mut names = meta_names(md);
-        names.sort();
+        names.sort_unstable();
         assert_eq!(names, vec!["__version__", "inference_version.__metadata__"]);
     }
 

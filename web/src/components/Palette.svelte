@@ -7,10 +7,9 @@
     filterByDtype,
     clearFilter,
   } from '../stores/view';
-  import { tree } from '../stores/server';
+  import { dtypesPresent } from '../stores/server';
   import { theme } from '../stores/theme';
   import { fuzzyScore } from '../lib/search';
-  import type { TreeNode } from '../lib/types';
 
   interface Cmd {
     group: string;
@@ -33,20 +32,9 @@
     { group: 'Theme', label: 'Theme: Fallout', run: () => theme.set('fallout') },
   ];
 
-  function distinctDtypes(nodes: TreeNode[]): string[] {
-    const set = new Set<string>();
-    const walk = (ns: TreeNode[]) => {
-      for (const n of ns) {
-        if (n.kind === 'tensor') set.add(n.info.dtype);
-        else if (n.kind === 'group') walk(n.children);
-      }
-    };
-    walk(nodes);
-    return [...set].sort();
-  }
 
   // Filter commands are data-driven: one per dtype present, plus a clear.
-  $: dtypes = $tree ? distinctDtypes($tree.tree) : [];
+  $: dtypes = $dtypesPresent;
   $: commands = [
     ...base,
     ...dtypes.map((d) => ({ group: 'Filter', label: `Filter dtype: ${d}`, run: () => filterByDtype(d) })),

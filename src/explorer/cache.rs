@@ -65,6 +65,70 @@ impl Drop for ScanJob {
     }
 }
 
+/// Keep at most one scan alive in `slot` for `tensor`'s current `view`, harvesting a
+/// finished one into the stats cache. Returns whether the caller must keep polling.
+///
+/// Shared by the detail and data screens: they show a tensor's statistics with different
+/// chrome, but their relationship to the scan is the same — one job per `(tensor, view)`,
+/// restarted when the dtype view changes, joined into the cache when it lands. Each screen
+/// keeps its own decision about *whether* to scan (detail only pre-warms when asked to);
+/// this is only the mechanics, which had drifted into two copies.
+pub(super) fn poll_stats_scan(
+    ex: &mut Explorer,
+    slot: &mut Option<ScanJob>,
+    tensor: &TensorInfo,
+    view: ViewDtype,
+) -> Bg {
+    if ex.cached_stats(tensor, view).is_some() {
+        *slot = None;
+        return Bg::Idle;
+    }
+    if slot.as_ref().is_none_or(|j| j.view != view) {
+        *slot = Some(ex.spawn_stats_scan(tensor, view));
+    }
+    let finished = slot
+        .as_ref()
+        .and_then(|j| j.handle.as_ref())
+        .is_some_and(|h| h.is_finished());
+    if finished
+        && let Some(mut job) = slot.take()
+        && let Some(h) = job.handle.take()
+        && let Ok(Ok(s)) = h.join()
+    {
+        ex.stats_cache
+            .borrow_mut()
+            .insert((tensor.name.clone(), view), s);
+    }
+    if slot.is_some() { Bg::Poll } else { Bg::Idle }
+}
+
+/// How a scan in `slot` should be described to the renderer: the cached result, a live
+/// spinner with its elapsed time and progress, or nothing yet.
+///
+/// The spinner only appears after 120 ms, so a scan that finishes quickly never flashes
+/// one. `spin` is a `Cell` because this is called from `render_frame`, which has only `&self`.
+pub(super) fn scan_stats_view<'a>(
+    slot: &Option<ScanJob>,
+    spin: &Cell<usize>,
+    stats: &'a Option<Stats>,
+) -> StatsView<'a> {
+    if let Some(s) = stats {
+        return StatsView::Ready(s);
+    }
+    let Some(job) = slot else {
+        return StatsView::Pending;
+    };
+    if job.started.elapsed() < std::time::Duration::from_millis(120) {
+        return StatsView::Pending;
+    }
+    spin.set(spin.get().wrapping_add(1));
+    StatsView::Computing {
+        spinner: STATS_SPINNER[spin.get() % STATS_SPINNER.len()],
+        elapsed: job.started.elapsed(),
+        progress: job.progress(),
+    }
+}
+
 /// The last sample a data view rendered, reused when nothing that affects it
 /// changed. This keeps the spinner-frame redraws during a stats scan from
 /// re-reading (and, for HDF5, re-decompressing) the tensor every frame — those

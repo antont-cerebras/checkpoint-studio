@@ -6,7 +6,11 @@ use std::time::Duration;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use crate::sample::ViewDtype;
+use crate::utils::format_shape;
+
 use super::palette;
+use super::theme::{dim_span, key_span};
 
 /// Greedy word-wrap of a short help string into lines no wider than `width`.
 pub(super) fn wrap_help(text: &str, width: usize) -> Vec<Line<'static>> {
@@ -152,5 +156,39 @@ pub(super) fn fmt_hist_edge(x: f64) -> String {
         format!("{x:.2e}")
     } else {
         format!("{x:.4}")
+    }
+}
+
+/// The `stored as VIEW` dtype span(s): the stored dtype plain, or — when a view
+/// reinterpretation is active — a dimmed `stored as` followed by the bold view label.
+///
+/// One definition for the detail screen and both data views: they show the same fact in the
+/// same place on screens the user steps between with one key, so any difference between them
+/// would read as a bug.
+pub(super) fn view_dtype_spans(
+    stored: &str,
+    view: ViewDtype,
+    unpacked_label: Option<&str>,
+) -> Vec<Span<'static>> {
+    let label: Option<String> = match (view, unpacked_label) {
+        (ViewDtype::Unpacked, Some(l)) => Some(format!("{l} (unpacked)")),
+        _ => view.label().map(str::to_string),
+    };
+    match label {
+        Some(label) => vec![dim_span(format!("{stored} as ")), key_span(label)],
+        None => vec![Span::raw(stored.to_string())],
+    }
+}
+
+/// The shape span(s) beside the dtype: the shape plain, or a dimmed `stored as` followed by
+/// the bold reinterpreted shape. Shared for the same reason as [`view_dtype_spans`].
+pub(super) fn view_shape_spans(stored: &[usize], logical: &[usize]) -> Vec<Span<'static>> {
+    if stored == logical {
+        vec![Span::raw(format_shape(logical))]
+    } else {
+        vec![
+            dim_span(format!("{} as ", format_shape(stored))),
+            key_span(format_shape(logical)),
+        ]
     }
 }

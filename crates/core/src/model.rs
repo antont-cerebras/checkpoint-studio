@@ -321,11 +321,10 @@ mod tests {
             }),
             index: vec![IndexEntry {
                 path: "model.safetensors.index.json".into(),
-                weight_map: [(
+                weight_map: std::iter::once((
                     "model.embed_tokens.weight".to_string(),
                     "model-00001-of-00002.safetensors".to_string(),
-                )]
-                .into_iter()
+                ))
                 .collect(),
             }],
             s3: None,
