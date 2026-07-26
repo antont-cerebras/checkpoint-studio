@@ -307,3 +307,126 @@ impl UI {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::ui::tests_support::strip_ansi_codes;
+
+    /// Render one transient overlay into a fixed buffer and return its plain text.
+    fn render(w: u16, h: u16, f: impl FnOnce(&mut Frame)) -> String {
+        strip_ansi_codes(&crate::tui::headless_render(w, h, f).expect("headless render"))
+    }
+
+    #[test]
+    fn the_command_band_shows_the_command_and_how_to_dismiss_it() {
+        let out = render(80, 12, |f| {
+            UI::render_command_band(f, "checkpoint-studio --tensor model.norm.weight");
+        });
+        assert!(out.contains("--tensor model.norm.weight"), "{out}");
+        assert!(
+            out.to_lowercase().contains("key") || out.contains("dismiss"),
+            "the band must say how to get rid of it:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_long_command_is_wrapped_rather_than_clipped() {
+        // The `y` command for a wide rename is far longer than any terminal; losing its
+        // tail would hand the user a command that doesn't run.
+        let long = format!(
+            "checkpoint-studio {}",
+            "--rename a.very.long.tensor.name=b ".repeat(6)
+        );
+        let out = render(60, 24, |f| UI::render_command_band(f, &long));
+        assert!(out.contains("--rename"), "{out}");
+        let tail = long.split_whitespace().last().unwrap();
+        assert!(
+            out.contains(tail),
+            "the end of the command must survive:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_loading_screen_names_the_file_and_counts_the_rest() {
+        let out = render(80, 10, |f| {
+            UI::render_loading(
+                f,
+                "model-00001-of-00016.safetensors",
+                16,
+                '⠋',
+                Duration::from_millis(2500),
+            );
+        });
+        assert!(out.contains("model-00001-of-00016.safetensors"), "{out}");
+        assert!(
+            out.contains("+15 more"),
+            "a multi-file load says how many:\n{out}"
+        );
+        assert!(out.contains("2.5s"), "the elapsed time shows:\n{out}");
+        assert!(out.contains("cancel"), "and how to abort:\n{out}");
+    }
+
+    #[test]
+    fn a_single_file_load_says_nothing_about_more_files() {
+        let out = render(80, 10, |f| {
+            UI::render_loading(f, "model.safetensors", 1, '⠋', Duration::from_millis(100));
+        });
+        assert!(!out.contains("more"), "{out}");
+    }
+
+    #[test]
+    fn the_message_box_carries_its_title_body_and_dismissal() {
+        let out = render(70, 14, |f| {
+            UI::render_message(f, "Export failed", "permission denied writing report.txt");
+        });
+        assert!(out.contains("Export failed"), "{out}");
+        assert!(
+            out.contains("permission denied writing report.txt"),
+            "{out}"
+        );
+        assert!(out.contains("any key"), "{out}");
+    }
+
+    #[test]
+    fn the_notice_box_floats_over_the_screen_behind_it() {
+        // Unlike `render_message`, the notice must not fill the frame — the live screen
+        // stays visible around it (that's the difference between the two).
+        let out = render(80, 20, |f| {
+            UI::render_notice_box(f, "metadata-only — data views need the file locally");
+        });
+        assert!(out.contains("metadata-only"), "{out}");
+        let blank_rows = out.lines().filter(|l| l.trim().is_empty()).count();
+        assert!(
+            blank_rows > 5,
+            "the notice occupies a few rows, not the frame:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_copied_flash_names_what_it_copied() {
+        let out = render(60, 6, |f| UI::render_copied_flash(f, "tensor name"));
+        assert!(out.contains("tensor name"), "{out}");
+        assert!(out.contains('✓'), "the flash confirms with a tick:\n{out}");
+    }
+
+    #[test]
+    fn the_export_band_shows_the_written_path() {
+        let out = render(80, 8, |f| {
+            UI::render_export_band(f, "wrote /tmp/report.txt")
+        });
+        assert!(out.contains("/tmp/report.txt"), "{out}");
+    }
+
+    #[test]
+    fn a_notice_line_fits_a_narrow_terminal_without_panicking() {
+        // Ratatui panics on out-of-bounds writes, so a too-narrow frame is a real risk
+        // for every one of these overlays.
+        for w in [4u16, 8, 20] {
+            let out = render(w, 6, |f| UI::render_notice(f, "read-only"));
+            assert!(!out.is_empty(), "width {w} rendered nothing");
+        }
+    }
+}
