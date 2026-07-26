@@ -237,9 +237,10 @@ impl TreeState {
         if depth == 0 {
             return;
         }
+        let visible = self.visible();
         let parent = (0..self.selected)
             .rev()
-            .find(|&i| self.visible()[i].1 < depth);
+            .find(|&i| visible.get(i).is_some_and(|row| row.1 < depth));
         if let Some(p) = parent {
             self.selected = p;
         }
@@ -257,7 +258,9 @@ impl TreeState {
             (0..self.selected).rev().collect()
         };
         for i in indices {
-            let d = self.visible()[i].1;
+            let Some(d) = self.visible().get(i).map(|row| row.1) else {
+                break;
+            };
             if d < depth {
                 break; // left the parent: no sibling in this direction
             }
@@ -384,7 +387,7 @@ impl FileState {
         }
         if let Some(parent) = (0..self.selected)
             .rev()
-            .find(|&i| self.rows[i].depth < depth)
+            .find(|&i| self.rows.get(i).is_some_and(|r| r.depth < depth))
         {
             self.selected = parent;
         }

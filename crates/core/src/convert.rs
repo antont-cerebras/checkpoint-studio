@@ -291,8 +291,12 @@ fn stream_copy<T: hdf5_metno::H5Type + Clone + Default>(
 ) -> Result<()> {
     use hdf5_metno::{Hyperslab, SliceOrIndex};
 
-    let outer = shape[0];
-    let inner: usize = shape[1..].iter().product::<usize>().max(1);
+    // An outer dimension to stride over and the rest read whole; an empty shape has
+    // nothing to copy.
+    let Some((&outer, rest)) = shape.split_first() else {
+        return Ok(());
+    };
+    let inner: usize = rest.iter().product::<usize>().max(1);
     let chunk0 = chunk.first().copied().unwrap_or(outer).max(1);
     // Aim for ~buffer_bytes per block, rounded to whole chunks along axis 0.
     let target_elems = (buffer_bytes / size_of::<T>().max(1)).max(1);
@@ -302,7 +306,7 @@ fn stream_copy<T: hdf5_metno::H5Type + Clone + Default>(
     while i < outer {
         let hi = (i + rows).min(outer);
         let sel: Vec<SliceOrIndex> = std::iter::once(SliceOrIndex::from(i..hi))
-            .chain(shape[1..].iter().map(|&d| SliceOrIndex::from(0..d)))
+            .chain(rest.iter().map(|&d| SliceOrIndex::from(0..d)))
             .collect();
         let block = src.read_slice::<T, _, ndarray::IxDyn>(Hyperslab::from(sel.clone()))?;
         dst.write_slice(block.view(), Hyperslab::from(sel))?;

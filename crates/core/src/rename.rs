@@ -411,16 +411,21 @@ impl Loaded {
     pub fn shard_fits(&self, map: &NameMap) -> Vec<ShardFit> {
         self.rebuild(map)
             .into_iter()
-            .map(|(i, new_json, changed)| ShardFit {
-                file: self.headers[i]
-                    .path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                path: self.headers[i].path.to_string_lossy().into_owned(),
-                current: self.headers[i].n,
-                needed: new_json.len() as u64,
-                tensors: changed.len(),
+            // `rebuild` yields the index of a header it just read, so the lookup holds; a
+            // miss would be that pairing broken, and reporting no shard beats a panic.
+            .filter_map(|(i, new_json, changed)| {
+                let h = self.headers.get(i)?;
+                Some(ShardFit {
+                    file: h
+                        .path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    path: h.path.to_string_lossy().into_owned(),
+                    current: h.n,
+                    needed: new_json.len() as u64,
+                    tensors: changed.len(),
+                })
             })
             .collect()
     }
@@ -435,7 +440,8 @@ impl Loaded {
 
         let mut rows: Vec<PreviewRow> = Vec::new();
         for (i, new_json, changed) in &rebuilt {
-            let over = new_json.len() as u64 > self.headers[*i].n;
+            let fits = self.headers.get(*i).map_or(0, |h| h.n);
+            let over = new_json.len() as u64 > fits;
             for (old, new) in changed {
                 let status = if new.is_empty() || new == "__metadata__" {
                     RenameStatus::Invalid
@@ -527,7 +533,9 @@ impl Loaded {
         let mut index: Option<(PathBuf, String)> = None;
         if map_sound {
             for (i, new_json, mut changed) in self.rebuild(map) {
-                let h = &self.headers[i];
+                let Some(h) = self.headers.get(i) else {
+                    continue;
+                };
                 if new_json.len() as u64 > h.n {
                     problems.push(format!(
                         "{}: the renamed header is {} B but only {} B fit in place ({} B too big) — \
@@ -743,13 +751,13 @@ pub fn generalize(name: &str) -> (String, Vec<String>) {
     let mut tokens: Vec<String> = Vec::new();
     let mut generic = 0usize;
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i].is_ascii_digit() {
+    while let Some(&c) = chars.get(i) {
+        if c.is_ascii_digit() {
             let start = i;
-            while i < chars.len() && chars[i].is_ascii_digit() {
+            while chars.get(i).is_some_and(char::is_ascii_digit) {
                 i += 1;
             }
-            let prefix: String = chars[..start].iter().collect();
+            let prefix: String = chars.get(..start).unwrap_or_default().iter().collect();
             let base = classify_number_segment(&prefix, &mut generic);
             let token = unique_token(&base, &tokens);
             schema.push('{');
@@ -757,7 +765,7 @@ pub fn generalize(name: &str) -> (String, Vec<String>) {
             schema.push('}');
             tokens.push(token);
         } else {
-            schema.push(chars[i]);
+            schema.push(c);
             i += 1;
         }
     }
@@ -828,13 +836,14 @@ pub fn rule_from_fields(
     let mut lit = String::new();
     let chars: Vec<char> = source.chars().collect();
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '{' {
-            let rel = chars[i + 1..]
+    while let Some(&c) = chars.get(i) {
+        if c == '{' {
+            let after = chars.get(i + 1..).unwrap_or_default();
+            let rel = after
                 .iter()
                 .position(|&c| c == '}')
                 .ok_or_else(|| "unclosed `{` in the source".to_string())?;
-            let tok: String = chars[i + 1..i + 1 + rel].iter().collect();
+            let tok: String = after.get(..rel).unwrap_or_default().iter().collect();
             if tok.trim().is_empty() {
                 return Err("empty `{}` placeholder in the source".to_string());
             }
@@ -846,7 +855,7 @@ pub fn rule_from_fields(
             tokens.push(tok);
             i += 1 + rel + 1;
         } else {
-            lit.push(chars[i]);
+            lit.push(c);
             i += 1;
         }
     }
@@ -864,14 +873,15 @@ pub fn rule_from_fields(
     let tchars: Vec<char> = target.chars().collect();
     let mut replacement = String::new();
     let mut i = 0;
-    while i < tchars.len() {
-        match tchars[i] {
+    while let Some(&tc) = tchars.get(i) {
+        match tc {
             '{' => {
-                let rel = tchars[i + 1..]
+                let after = tchars.get(i + 1..).unwrap_or_default();
+                let rel = after
                     .iter()
                     .position(|&c| c == '}')
                     .ok_or_else(|| "unclosed `{` in the new name".to_string())?;
-                let tok: String = tchars[i + 1..i + 1 + rel].iter().collect();
+                let tok: String = after.get(..rel).unwrap_or_default().iter().collect();
                 let g = group_of.get(tok.as_str()).ok_or_else(|| {
                     let avail = tokens
                         .iter()
@@ -911,7 +921,7 @@ fn preview_names(names: &[String]) -> String {
     } else {
         format!(
             "{}, … (+{} more)",
-            names[..MAX].join(", "),
+            names.get(..MAX).unwrap_or(names).join(", "),
             names.len() - MAX
         )
     }

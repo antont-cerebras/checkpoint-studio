@@ -67,7 +67,8 @@ pub fn parse_header(r: &mut impl Read) -> Result<NpyHeader, String> {
 /// (the decoders assume little-endian) and non-numeric kinds.
 pub fn map_descr(descr: &str) -> Result<String, String> {
     let (order, rest) = match descr.as_bytes().first() {
-        Some(b'<' | b'=' | b'>' | b'|') => (descr.as_bytes()[0], &descr[1..]),
+        // A byte-order prefix; `get(1..)` is the rest of the descriptor after it.
+        Some(&o @ (b'<' | b'=' | b'>' | b'|')) => (o, descr.get(1..).unwrap_or("")),
         _ => (b'=', descr),
     };
     let kind = rest.chars().next().ok_or("empty dtype descriptor")?;

@@ -2770,15 +2770,16 @@ impl TensorReader for Hdf5Reader {
             loop {
                 // All three vectors have rank `ndim`, so this binds; `else return` makes
                 // that structural instead of three indexes that assume it.
-                let (Some(o), Some(&t), Some(&s)) = (origin.get_mut(d), tile.get(d), shape.get(d))
+                let (Some(start), Some(&step), Some(&extent)) =
+                    (origin.get_mut(d), tile.get(d), shape.get(d))
                 else {
                     return Ok(());
                 };
-                *o += t;
-                if *o < s {
+                *start += step;
+                if *start < extent {
                     break;
                 }
-                *o = 0;
+                *start = 0;
                 if d == 0 {
                     return Ok(());
                 }

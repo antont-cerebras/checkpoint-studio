@@ -866,8 +866,13 @@ pub(crate) fn split_layer_index(name: &str) -> Option<(String, usize, String)> {
     let pos = parts
         .iter()
         .position(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))?;
-    let idx: usize = parts[pos].parse().ok()?;
-    Some((parts[..pos].join("."), idx, parts[pos + 1..].join(".")))
+    // `pos` came from `position`, so all three slices exist.
+    let idx: usize = parts.get(pos)?.parse().ok()?;
+    Some((
+        parts.get(..pos).unwrap_or_default().join("."),
+        idx,
+        parts.get(pos + 1..).unwrap_or_default().join("."),
+    ))
 }
 
 /// Layer completeness: for each repeated `<prefix>.<i>.<suffix>` stack, the
@@ -1598,13 +1603,16 @@ fn sort_key(a: &Finding, b: &Finding) -> std::cmp::Ordering {
 /// Format a sorted index list compactly: `[3, 4, 5, 9]` -> `3–5, 9`.
 fn fmt_indices(idx: &[usize]) -> String {
     let mut out = String::new();
-    let mut i = 0;
-    while i < idx.len() {
-        let start = idx[i];
+    // Runs of consecutive indices, walked over slices so the two cursors can't disagree.
+    let mut rest = idx;
+    while let Some((&start, mut tail)) = rest.split_first() {
         let mut end = start;
-        while i + 1 < idx.len() && idx[i + 1] == end + 1 {
-            i += 1;
-            end = idx[i];
+        while let Some((&next, more)) = tail.split_first() {
+            if next != end + 1 {
+                break;
+            }
+            end = next;
+            tail = more;
         }
         if !out.is_empty() {
             out.push_str(", ");
@@ -1615,7 +1623,7 @@ fn fmt_indices(idx: &[usize]) -> String {
             use std::fmt::Write as _;
             let _ = write!(out, "{start}–{end}");
         }
-        i += 1;
+        rest = tail;
     }
     out
 }

@@ -206,7 +206,8 @@ impl RemoteSession {
             if n == 0 {
                 break;
             }
-            pending.extend_from_slice(&buf[..n]);
+            // `read` returns how many bytes it wrote, so `n <= buf.len()`.
+            pending.extend_from_slice(buf.get(..n).unwrap_or(&buf));
             while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = pending.drain(..=pos).collect();
                 let text = String::from_utf8_lossy(&line);
@@ -416,8 +417,13 @@ impl RemoteSession {
             if idx >= files.len() {
                 break;
             }
-            let header = read_header(&sftp, &files[idx])?;
-            let (ts, ms) = crate::stheader::parse_header(&header, &displays[idx])?;
+            // `idx` came from the shared counter and was bounds-checked above; `files` and
+            // `displays` are parallel, so both lookups hold.
+            let (Some(file), Some(display)) = (files.get(idx), displays.get(idx)) else {
+                break;
+            };
+            let header = read_header(&sftp, file)?;
+            let (ts, ms) = crate::stheader::parse_header(&header, display)?;
             out.push((idx, ts, ms));
             if let Some(p) = progress {
                 p.advance();

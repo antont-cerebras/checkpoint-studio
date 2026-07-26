@@ -324,16 +324,20 @@ pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+    while let Some(&b) = bytes.get(i) {
+        // `%XX` decodes to one byte; anything else (including a truncated escape) is copied
+        // through as written.
+        if b == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).copied().and_then(hex_val),
+                bytes.get(i + 2).copied().and_then(hex_val),
+            )
         {
             out.push((hi << 4) | lo);
             i += 3;
             continue;
         }
-        out.push(bytes[i]);
+        out.push(b);
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()

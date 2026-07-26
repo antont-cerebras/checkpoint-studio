@@ -84,7 +84,12 @@ fn match_dims(pats: &[DimPat], shape: &[usize]) -> bool {
         None => shape.is_empty(),
         Some((DimPat::Rest, tail)) => {
             // `tail` has no further Rest, so it must match the trailing dims.
-            tail.len() <= shape.len() && match_dims(tail, &shape[shape.len() - tail.len()..])
+            // `Rest` matches the trailing dims: take exactly `tail.len()` from the end.
+            shape
+                .len()
+                .checked_sub(tail.len())
+                .and_then(|from| shape.get(from..))
+                .is_some_and(|trailing| match_dims(tail, trailing))
         }
         Some((p, tail)) => match shape.split_first() {
             Some((d, rest)) => {

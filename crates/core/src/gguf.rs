@@ -287,9 +287,10 @@ impl std::fmt::Display for GGUFValue {
                     write!(
                         f,
                         "[{}, {}, ..., {} ({})]",
-                        arr[0],
-                        arr[1],
-                        arr[arr.len() - 1],
+                        // `len() > 5` on this branch, so all three are present.
+                        arr.first().map_or_else(String::new, ToString::to_string),
+                        arr.get(1).map_or_else(String::new, ToString::to_string),
+                        arr.last().map_or_else(String::new, ToString::to_string),
                         arr.len()
                     )
                 }

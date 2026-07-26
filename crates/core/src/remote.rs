@@ -1133,9 +1133,10 @@ fn parse_list(json: &str) -> Result<Vec<(String, u64)>> {
         .ok_or_else(|| anyhow!("object listing had no `objects` array"))?;
     let mut out = Vec::with_capacity(arr.len());
     for it in arr {
-        if let Some(pair) = it.as_array()
-            && pair.len() == 2
-            && let (Some(k), Some(sz)) = (pair[0].as_str(), pair[1].as_u64())
+        // Each entry is a `[key, size]` pair; matching the slice states that instead of
+        // checking the length and then indexing it.
+        if let Some([key, size]) = it.as_array().map(Vec::as_slice)
+            && let (Some(k), Some(sz)) = (key.as_str(), size.as_u64())
         {
             out.push((k.to_string(), sz));
         }

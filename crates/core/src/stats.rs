@@ -56,7 +56,14 @@ pub(crate) fn bucket_means(values: &[usize], width: usize) -> Vec<f64> {
     (0..cells)
         .map(|c| {
             let (s, e) = bucket_bounds(n, cells, c);
-            values[s..e].iter().sum::<usize>() as f64 / (e - s) as f64
+            // `bucket_bounds` returns a sub-range of `0..n`; an empty bucket averages 0
+            // rather than dividing by zero.
+            let bucket = values.get(s..e).unwrap_or_default();
+            if bucket.is_empty() {
+                0.0
+            } else {
+                bucket.iter().sum::<usize>() as f64 / bucket.len() as f64
+            }
         })
         .collect()
 }
@@ -87,7 +94,9 @@ pub fn spark_string(values: &[usize], width: usize) -> String {
     spark_levels(values, width)
         .0
         .iter()
-        .map(|&l| SPARK_BLOCKS[l])
+        // `spark_levels` returns levels in `0..SPARK_BLOCKS.len()`; a blank is the honest
+        // glyph for one that somehow wasn't.
+        .map(|&l| SPARK_BLOCKS.get(l).copied().unwrap_or(' '))
         .collect()
 }
 
@@ -102,18 +111,24 @@ pub(crate) fn alloc_rows(parts: [usize; 3], height: usize) -> [usize; 3] {
     let mut out = raw.map(|r| r.floor() as usize);
     let mut leftover = height - out.iter().sum::<usize>();
     // Hand the leftover rows to the largest fractional parts (ties → lowest index).
-    let mut order = [0usize, 1, 2];
-    order.sort_by(|&i, &j| {
-        let (fi, fj) = (raw[i] - raw[i].floor(), raw[j] - raw[j].floor());
+    // Sort the (index, fraction) pairs themselves, so the comparator reads its inputs
+    // directly instead of indexing `raw` twice per comparison.
+    let mut order: [(usize, f64); 3] = [0, 1, 2].map(|i| {
+        let r = raw.get(i).copied().unwrap_or(0.0);
+        (i, r - r.floor())
+    });
+    order.sort_by(|&(i, fi), &(j, fj)| {
         fj.partial_cmp(&fi)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(i.cmp(&j))
     });
-    for &i in &order {
+    for (i, _) in order {
         if leftover == 0 {
             break;
         }
-        out[i] += 1;
+        if let Some(slot) = out.get_mut(i) {
+            *slot += 1;
+        }
         leftover -= 1;
     }
     out
@@ -126,13 +141,26 @@ pub(crate) fn alloc_rows(parts: [usize; 3], height: usize) -> [usize; 3] {
 #[must_use]
 pub fn composition_cells(totals: [usize; 3], width: usize) -> [usize; 3] {
     let mut cells = alloc_rows(totals, width);
+    // Give each non-zero component that rounded to nothing one cell, borrowed from the
+    // widest that can spare it. `totals` and `cells` are both `[_; 3]`, so the lookups
+    // below cannot miss — `get` states that rather than three indexes assuming it.
     for i in 0..3 {
-        if totals[i] > 0
-            && cells[i] == 0
-            && let Some(j) = (0..3).filter(|&j| cells[j] > 1).max_by_key(|&j| cells[j])
-        {
-            cells[j] -= 1;
-            cells[i] += 1;
+        let (Some(&total), Some(&cell)) = (totals.get(i), cells.get(i)) else {
+            continue;
+        };
+        if total == 0 || cell > 0 {
+            continue;
+        }
+        let widest = (0..3)
+            .filter(|&j| cells.get(j).is_some_and(|&c| c > 1))
+            .max_by_key(|&j| cells.get(j).copied().unwrap_or(0));
+        if let Some(j) = widest {
+            if let Some(slot) = cells.get_mut(j) {
+                *slot -= 1;
+            }
+            if let Some(slot) = cells.get_mut(i) {
+                *slot += 1;
+            }
         }
     }
     cells
@@ -235,7 +263,11 @@ impl PerLayerStats {
                 && p == prefix
                 && idx < count
             {
-                let r = &mut rows[idx];
+                // `idx < count` was checked in the guard above, and `rows` has `count`
+                // entries.
+                let Some(r) = rows.get_mut(idx) else {
+                    continue;
+                };
                 r.tensors += 1;
                 r.params += t.num_elements;
                 r.bytes += t.size_bytes;
@@ -1145,10 +1177,11 @@ fn expert_stats(
                 .and_then(|c| c.num_experts)
                 .map(|n| n as usize)
                 .or_else(|| {
-                    tensors
-                        .iter()
-                        .find(|t| is_expert(&t.name) && !t.shape.is_empty())
-                        .map(|t| t.shape[0])
+                    tensors.iter().find_map(|t| {
+                        (is_expert(&t.name))
+                            .then(|| t.shape.first().copied())
+                            .flatten()
+                    })
                 }),
         },
         |m| ExpertLayout::Unfused { per_layer: m + 1 },

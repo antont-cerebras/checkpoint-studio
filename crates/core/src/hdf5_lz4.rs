@@ -92,10 +92,16 @@ unsafe extern "C" fn lz4_filter(
     .unwrap_or(0)
 }
 
-/// Read a big-endian `u32` at `off`. The caller guarantees `off + 4 <= b.len()`.
+/// Read a big-endian `u32` at `off`, or 0 if four bytes aren't there.
+///
+/// Every caller checks the length first; returning 0 rather than panicking means a
+/// truncated LZ4 block fails the filter (which the callers already handle) instead of
+/// aborting the process from inside an FFI callback, where a panic cannot unwind safely.
 #[inline]
 fn be_u32(b: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    b.get(off..off + 4)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .map_or(0, u32::from_be_bytes)
 }
 
 /// The frame's declared total decompressed size (its `u64` big-endian header),
@@ -134,8 +140,14 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> bool {
         if clen == 0 || rpos + clen > input.len() {
             return false;
         }
-        let src = &input[rpos..rpos + clen];
-        let dst = &mut out[wpos..wpos + this_block];
+        // Both ranges were bounds-checked above; `else return false` fails the filter the
+        // same way a corrupt block does, rather than unwinding through the FFI boundary.
+        let (Some(src), Some(dst)) = (
+            input.get(rpos..rpos + clen),
+            out.get_mut(wpos..wpos + this_block),
+        ) else {
+            return false;
+        };
         let ok = if clen == this_block {
             // Stored uncompressed (LZ4 wouldn't have shrunk it).
             dst.copy_from_slice(src);

@@ -242,7 +242,9 @@ pub fn check_s3_correspondence(
         if shapes.len() != 1 || dtypes.len() != 1 {
             return None; // a packed object: several tensors behind one key
         }
-        let shape: Vec<usize> = shapes[0]
+        // Exactly one entry each, checked just above.
+        let shape: Vec<usize> = shapes
+            .first()?
             .as_array()?
             .iter()
             .map(|d| d.as_u64().map(|n| n as usize))
@@ -261,7 +263,7 @@ pub fn check_s3_correspondence(
         Some(ObjectClaim {
             // The object states the raw torch name (`torch.float16`); a tensor's dtype
             // is the display form (`F16`). Compare like with like.
-            dtype: crate::remote::map_dtype(dtypes[0].as_str()?),
+            dtype: crate::remote::map_dtype(dtypes.first()?.as_str()?),
             shape,
             data_bytes,
         })

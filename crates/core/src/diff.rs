@@ -247,10 +247,14 @@ fn group_entries<K: Clone + Eq + std::hash::Hash>(items: &[(String, K)]) -> Vec<
             });
             groups.len() - 1
         };
-        let g = &mut groups[gi];
+        // `gi` indexes the entry just found or pushed, and `indices` has one bucket per
+        // placeholder — the same count `idx` was built from.
+        let Some(g) = groups.get_mut(gi) else {
+            continue;
+        };
         g.count += 1;
-        for (p, v) in idx.into_iter().enumerate() {
-            g.indices[p].push(v);
+        for (bucket, v) in g.indices.iter_mut().zip(idx) {
+            bucket.push(v);
         }
     }
     groups
@@ -324,7 +328,10 @@ pub fn tensor_families(tensors: &[TensorInfo]) -> Vec<TensorFamily> {
             });
             aggs.len() - 1
         });
-        let a = &mut aggs[gi];
+        // `gi` indexes the entry just found or pushed.
+        let Some(a) = aggs.get_mut(gi) else {
+            continue;
+        };
         a.count += 1;
         a.params += t.num_elements;
         a.size += t.size_bytes;
@@ -387,8 +394,9 @@ fn display_name(template: &str, indices: &[Vec<String>]) -> String {
 fn summarize_indices(values: &[String]) -> String {
     use std::collections::BTreeSet;
     let distinct: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+    // One distinct value means at least one value.
     if distinct.len() == 1 {
-        return values[0].clone();
+        return values.first().cloned().unwrap_or_default();
     }
     distinct
         .iter()
@@ -406,21 +414,26 @@ fn summarize_indices(values: &[String]) -> String {
 /// Collapse a sorted integer list into comma-separated runs: `[0,1,2,5]` → `0-2,5`.
 fn compact_int_ranges(sorted: &[i64]) -> String {
     let mut out = String::new();
-    let mut i = 0;
-    while i < sorted.len() {
-        let mut j = i;
-        while j + 1 < sorted.len() && sorted[j + 1] == sorted[j] + 1 {
-            j += 1;
+    let mut rest = sorted;
+    while let Some((&start, mut tail)) = rest.split_first() {
+        // Extend the run while each next value is one more than the last.
+        let mut end = start;
+        while let Some((&next, more)) = tail.split_first() {
+            if next != end + 1 {
+                break;
+            }
+            end = next;
+            tail = more;
         }
         if !out.is_empty() {
             out.push(',');
         }
-        if j == i {
-            let _ = write!(out, "{}", sorted[i]);
+        if end == start {
+            let _ = write!(out, "{start}");
         } else {
-            let _ = write!(out, "{}-{}", sorted[i], sorted[j]);
+            let _ = write!(out, "{start}-{end}");
         }
-        i = j + 1;
+        rest = tail;
     }
     out
 }
@@ -504,10 +517,14 @@ fn group_changed(items: &[TensorChange], group: bool) -> Vec<ChangedGroup> {
             });
             groups.len() - 1
         };
-        let g = &mut groups[gi];
+        // `gi` indexes the entry just found or pushed, and `indices` has one bucket per
+        // placeholder — the same count `idx` was built from.
+        let Some(g) = groups.get_mut(gi) else {
+            continue;
+        };
         g.count += 1;
-        for (p, v) in idx.into_iter().enumerate() {
-            g.indices[p].push(v);
+        for (bucket, v) in g.indices.iter_mut().zip(idx) {
+            bucket.push(v);
         }
         g.values = merge_values(g.values, c.values);
         if let Some(h) = c.histogram {
@@ -747,15 +764,19 @@ impl NameMap {
         let mut matched = vec![false; self.rules.len()];
         for name in names {
             let mut cur = Cow::Borrowed(name);
-            for (i, (re, rep)) in self.rules.iter().enumerate() {
+            for ((re, rep), hit) in self.rules.iter().zip(matched.iter_mut()) {
                 // `replace_all` returns `Owned` iff it matched at least once.
                 if let Cow::Owned(s) = re.replace_all(&cur, rep.as_str()) {
-                    matched[i] = true;
+                    *hit = true;
                     cur = Cow::Owned(s);
                 }
             }
         }
-        (0..self.rules.len()).filter(|&i| !matched[i]).collect()
+        matched
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &hit)| (!hit).then_some(i))
+            .collect()
     }
 
     /// How many of `names` at least one rule matches — counting a name even when
@@ -1513,17 +1534,20 @@ pub fn is_timestamp_like(key: &str, value: &str) -> bool {
     }
     let b = value.as_bytes();
     // ISO-8601 / RFC3339: `YYYY-MM-DD` then `T`/space then `HH:MM`.
-    let iso = b.len() >= 16
-        && b[..10].iter().enumerate().all(|(i, &c)| {
+    // `YYYY-MM-DD` then `T`/space, an hour digit, and the `:` before the minutes. Taken as
+    // one 14-byte prefix so the offsets are read from a slice that is known to be there.
+    let iso = b.get(..14).is_some_and(|head| {
+        let date_ok = head.iter().take(10).enumerate().all(|(i, &c)| {
             if i == 4 || i == 7 {
                 c == b'-'
             } else {
                 c.is_ascii_digit()
             }
-        })
-        && (b[10] == b'T' || b[10] == b' ')
-        && b[11].is_ascii_digit()
-        && b[13] == b':';
+        });
+        let sep_ok = matches!(head.get(10), Some(b'T' | b' '));
+        let time_ok = head.get(11).is_some_and(u8::is_ascii_digit) && head.get(13) == Some(&b':');
+        b.len() >= 16 && date_ok && sep_ok && time_ok
+    });
     // Unix epoch seconds (10) or milliseconds (13).
     let epoch = (value.len() == 10 || value.len() == 13) && b.iter().all(u8::is_ascii_digit);
     iso || epoch
@@ -1984,7 +2008,7 @@ fn quote_diff(old: &str, new: &str) -> (String, String) {
         if start > 0 {
             s.push('…');
         }
-        s.extend(&chars[start..end]);
+        s.extend(chars.get(start..end).unwrap_or_default());
         if end < chars.len() {
             s.push('…');
         }
@@ -2020,7 +2044,7 @@ fn window_pair(o: &str, n: &str, max: usize) -> (String, String) {
         if start > 0 {
             s.push('…');
         }
-        s.extend(&chars[start..end]);
+        s.extend(chars.get(start..end).unwrap_or_default());
         if end < chars.len() {
             s.push('…');
         }
@@ -2156,7 +2180,7 @@ fn write_meta_line_diff(s: &mut String, old: &str, new: &str, color: bool) {
         for op in group {
             match *op {
                 DiffOp::Equal { old_index, len, .. } => {
-                    for l in &ol[old_index..old_index + len] {
+                    for l in ol.get(old_index..old_index + len).unwrap_or_default() {
                         push(&mut lines, ' ', DIM, &strip(l));
                     }
                 }
@@ -2164,7 +2188,7 @@ fn write_meta_line_diff(s: &mut String, old: &str, new: &str, color: bool) {
                     old_index, old_len, ..
                 } => {
                     removed += old_len;
-                    for l in &ol[old_index..old_index + old_len] {
+                    for l in ol.get(old_index..old_index + old_len).unwrap_or_default() {
                         push(&mut lines, '-', RED, &strip(l));
                     }
                 }
@@ -2172,7 +2196,7 @@ fn write_meta_line_diff(s: &mut String, old: &str, new: &str, color: bool) {
                     new_index, new_len, ..
                 } => {
                     added += new_len;
-                    for l in &nl[new_index..new_index + new_len] {
+                    for l in nl.get(new_index..new_index + new_len).unwrap_or_default() {
                         push(&mut lines, '+', GREEN, &strip(l));
                     }
                 }
@@ -2188,8 +2212,11 @@ fn write_meta_line_diff(s: &mut String, old: &str, new: &str, color: bool) {
                     // show whole, window each around where they diverge (… diff …)
                     // rather than clipping both to the same shared prefix.
                     let pairs = old_len.min(new_len);
-                    for k in 0..pairs {
-                        let (o, n) = (strip(ol[old_index + k]), strip(nl[new_index + k]));
+                    // Zip the two runs so each pair comes from the slices themselves.
+                    let old_run = ol.get(old_index..old_index + pairs).unwrap_or_default();
+                    let new_run = nl.get(new_index..new_index + pairs).unwrap_or_default();
+                    for (ol_line, nl_line) in old_run.iter().zip(new_run) {
+                        let (o, n) = (strip(ol_line), strip(nl_line));
                         if o.chars().count() > width || n.chars().count() > width {
                             let (ow, nw) = window_pair(&o, &n, width.saturating_sub(2));
                             lines.push(paint(&format!("- {ow}"), color, RED));
@@ -2199,10 +2226,16 @@ fn write_meta_line_diff(s: &mut String, old: &str, new: &str, color: bool) {
                             lines.push(paint(&format!("+ {n}"), color, GREEN));
                         }
                     }
-                    for l in &ol[old_index + pairs..old_index + old_len] {
+                    for l in ol
+                        .get(old_index + pairs..old_index + old_len)
+                        .unwrap_or_default()
+                    {
                         push(&mut lines, '-', RED, &strip(l));
                     }
-                    for l in &nl[new_index + pairs..new_index + new_len] {
+                    for l in nl
+                        .get(new_index + pairs..new_index + new_len)
+                        .unwrap_or_default()
+                    {
                         push(&mut lines, '+', GREEN, &strip(l));
                     }
                 }

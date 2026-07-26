@@ -62,11 +62,13 @@ fn common_root(files: &[PathBuf]) -> PathBuf {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
-        many => {
+        [first, others @ ..] => {
             // Longest shared directory prefix by component.
-            let first = many[0].parent().unwrap_or_else(|| Path::new("."));
-            let mut common = first.to_path_buf();
-            for f in &many[1..] {
+            let mut common = first
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            for f in others {
                 let p = f.parent().unwrap_or_else(|| Path::new("."));
                 while !p.starts_with(&common) {
                     if !common.pop() {

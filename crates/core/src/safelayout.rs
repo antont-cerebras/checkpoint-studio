@@ -165,8 +165,8 @@ pub fn parse_from(name: &str, total_len: u64, header_json: &[u8]) -> Result<Layo
             })
             .unwrap_or_default();
         let offsets = e.get("data_offsets").and_then(serde_json::Value::as_array);
-        let (begin, end) = match offsets {
-            Some(a) if a.len() == 2 => (a[0].as_u64().unwrap_or(0), a[1].as_u64().unwrap_or(0)),
+        let (begin, end) = match offsets.map(Vec::as_slice) {
+            Some([start, end]) => (start.as_u64().unwrap_or(0), end.as_u64().unwrap_or(0)),
             _ => continue,
         };
         tensors.push(Segment {

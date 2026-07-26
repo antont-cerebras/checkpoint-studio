@@ -293,7 +293,9 @@ impl TreeBuilder {
                 // Parent path = the stem minus its own leaf segment (empty for a
                 // top-level stem, which inserts at the tree root).
                 let parts: Vec<&str> = stem.split('.').collect();
-                let parent = &parts[..parts.len() - 1];
+                // The stem minus its own leaf; `split` always yields at least one part, so
+                // this is empty for a top-level stem rather than absent.
+                let parent = parts.split_last().map_or(&[][..], |(_, rest)| rest);
                 insert_metadata(&mut raw, parent, meta.clone());
             }
         }

@@ -71,8 +71,12 @@ pub fn parse_header(
         let data_offsets = value
             .get("data_offsets")
             .and_then(|v| v.as_array())
-            .filter(|offsets| offsets.len() == 2)
-            .and_then(|offsets| Some((offsets[0].as_u64()?, offsets[1].as_u64()?)));
+            // Exactly the `[start, end]` pair safetensors defines — matched as a slice so
+            // the length check and the reads are one operation.
+            .and_then(|offsets| match offsets.as_slice() {
+                [start, end] => Some((start.as_u64()?, end.as_u64()?)),
+                _ => None,
+            });
         let size_bytes = data_offsets.map_or(0, |(start, end)| end.saturating_sub(start) as usize);
         let layout = match data_offsets {
             Some((start, end)) => Layout::ByteRange { start, end },
