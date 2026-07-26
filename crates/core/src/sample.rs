@@ -59,13 +59,21 @@ impl PackingSchema {
     /// Bit offset of field `k` (sum of the preceding widths).
     #[must_use]
     pub fn offset(&self, k: usize) -> u32 {
-        self.bit_widths[..k].iter().sum()
+        // A `k` past the end sums every width, which is the offset just past the last
+        // field — the same answer indexing would give for `k == len`, without the panic.
+        self.bit_widths
+            .get(..k)
+            .unwrap_or(&self.bit_widths)
+            .iter()
+            .sum()
     }
 
     /// Bit width of field `k`.
     #[must_use]
     pub fn width(&self, k: usize) -> u32 {
-        self.bit_widths[k]
+        // 0 for a field this schema doesn't have: a zero-width field contributes nothing,
+        // which is what the decoders do with an absent one anyway.
+        self.bit_widths.get(k).copied().unwrap_or(0)
     }
 
     /// Unmerge field `k` from a stored word: shift right past the lower fields,
@@ -916,11 +924,15 @@ fn grid_absmax(
         )?;
         for (bi, vrow) in chunk.iter().enumerate() {
             let gi = ((r0 + bi) * grid_rows / total_rows).min(grid_rows - 1);
-            let out = &mut values[gi];
+            let Some(out) = values.get_mut(gi) else {
+                continue; // `gi` is clamped to the grid above, so this cannot be taken
+            };
             for (c, &v) in vrow.iter().enumerate() {
                 if v.is_finite() {
                     let a = v.abs();
-                    let cell = &mut out[col_gj[c]];
+                    let Some(cell) = col_gj.get(c).and_then(|&j| out.get_mut(j)) else {
+                        continue;
+                    };
                     if a > *cell {
                         *cell = a;
                     }
@@ -1067,7 +1079,9 @@ fn decode_prim(p: Prim, b: &[u8]) -> f64 {
     if b.len() < p.size() {
         return f64::NAN;
     }
-    let b = &b[..p.size()];
+    let Some(b) = b.get(..p.size()) else {
+        return f64::NAN; // unreachable: the length was just checked
+    };
     match p {
         Prim::F64 => f64::from_le_bytes(b.try_into().unwrap()),
         Prim::F32 => f32::from_le_bytes(b.try_into().unwrap()) as f64,
@@ -1076,11 +1090,11 @@ fn decode_prim(p: Prim, b: &[u8]) -> f64 {
         Prim::I64 => i64::from_le_bytes(b.try_into().unwrap()) as f64,
         Prim::I32 => i32::from_le_bytes(b.try_into().unwrap()) as f64,
         Prim::I16 => i16::from_le_bytes(b.try_into().unwrap()) as f64,
-        Prim::I8 => (b[0] as i8) as f64,
+        Prim::I8 => f64::from(b.first().map_or(0, |&x| x as i8)),
         Prim::U64 => u64::from_le_bytes(b.try_into().unwrap()) as f64,
         Prim::U32 => u32::from_le_bytes(b.try_into().unwrap()) as f64,
         Prim::U16 => u16::from_le_bytes(b.try_into().unwrap()) as f64,
-        Prim::U8 => b[0] as f64,
+        Prim::U8 => f64::from(b.first().copied().unwrap_or(0)),
     }
 }
 
@@ -1387,14 +1401,22 @@ const STATS_TILE_ELEMS: usize = 2 << 20; // ≈2M elements
 /// than a single chunk (the smallest aligned read), even if that exceeds budget.
 #[cfg(feature = "hdf5")]
 fn stats_tile_shape(shape: &[usize], chunk: &[usize], budget: usize) -> Vec<usize> {
-    let n = shape.len();
+    // `shape` and `chunk` are parallel per-dimension vectors; zipping says so, and a
+    // `chunk` shorter than `shape` (which libhdf5 shouldn't produce) then reads as 1 rather
+    // than panicking.
+    let chunk_at = |d: usize| chunk.get(d).copied().unwrap_or(1).max(1);
     // Start at one chunk per dimension (clamped to the shape).
-    let mut tile: Vec<usize> = (0..n)
-        .map(|d| chunk[d].max(1).min(shape[d].max(1)))
+    let mut tile: Vec<usize> = shape
+        .iter()
+        .enumerate()
+        .map(|(d, &s)| chunk_at(d).min(s.max(1)))
         .collect();
     // Grow inner dimensions first while staying within the element budget.
-    for d in (0..n).rev() {
-        if tile[d] >= shape[d] {
+    for d in (0..shape.len()).rev() {
+        let (Some(&extent), Some(&cur)) = (shape.get(d), tile.get(d)) else {
+            continue;
+        };
+        if cur >= extent {
             continue; // already spans the whole dimension
         }
         let others: usize = tile
@@ -1404,11 +1426,13 @@ fn stats_tile_shape(shape: &[usize], chunk: &[usize], budget: usize) -> Vec<usiz
             .map(|(_, &t)| t)
             .product::<usize>()
             .max(1);
-        let c = chunk[d].max(1);
+        let c = chunk_at(d);
         // Largest chunk-multiple for this dimension that keeps `tile` ≤ budget.
-        let grown = ((budget / others / c).max(1) * c).min(shape[d]);
-        tile[d] = grown;
-        if grown < shape[d] {
+        let grown = ((budget / others / c).max(1) * c).min(extent);
+        if let Some(slot) = tile.get_mut(d) {
+            *slot = grown;
+        }
+        if grown < extent {
             break; // this dimension is the frontier; leave outer dims at one chunk
         }
     }
@@ -1448,15 +1472,19 @@ pub trait TensorReader {
             let _ = f(&bytes);
             return Ok(());
         }
-        let outer = shape[0];
-        let inner: usize = shape[1..].iter().product::<usize>().max(1);
+        // Non-empty (checked just above), so split rather than index: `outer` is the
+        // dimension we stride over, `rest` is everything read whole.
+        let Some((&outer, rest)) = shape.split_first() else {
+            return Ok(());
+        };
+        let inner: usize = rest.iter().product::<usize>().max(1);
         let block = (STATS_BLOCK_ELEMS / inner).max(1);
         let mut i = 0;
         while i < outer {
             let hi = (i + block).min(outer);
             let mut ranges: Vec<Range<usize>> = Vec::with_capacity(shape.len());
             ranges.push(i..hi);
-            ranges.extend(shape[1..].iter().map(|&d| 0..d));
+            ranges.extend(rest.iter().map(|&d| 0..d));
             let bytes = self.read_region(&ranges)?;
             if f(&bytes).is_break() {
                 break;
@@ -1511,7 +1539,11 @@ pub fn read_all_u16(t: &TensorInfo) -> Result<Vec<u16>, String> {
     let bytes = r.read_region(&ranges)?;
     Ok(bytes
         .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        // `chunks_exact(2)` yields exactly two bytes; matching the pair says so.
+        .filter_map(|b| match *b {
+            [lo, hi] => Some(u16::from_le_bytes([lo, hi])),
+            _ => None,
+        })
         .collect())
 }
 
@@ -1531,10 +1563,13 @@ pub fn read_all_f64(t: &TensorInfo) -> Result<Vec<f64>, String> {
 
 /// Decompose a flat row-major container index into per-dimension indices.
 fn unravel(mut flat: usize, shape: &[usize]) -> Vec<usize> {
+    // Innermost dimension first, writing each slot as it is consumed — no index into
+    // either vector, and a zero extent can't divide by zero.
     let mut idx = vec![0usize; shape.len()];
-    for d in (0..shape.len()).rev() {
-        idx[d] = flat % shape[d];
-        flat /= shape[d];
+    for (slot, &extent) in idx.iter_mut().zip(shape).rev() {
+        let extent = extent.max(1);
+        *slot = flat % extent;
+        flat /= extent;
     }
     idx
 }
@@ -1548,14 +1583,11 @@ fn region_for_span(shape: &[usize], first: usize, last: usize) -> Vec<Range<usiz
     }
     let lo = unravel(first, shape);
     let hi = unravel(last, shape);
-    (0..shape.len())
-        .map(|d| {
-            if d + 1 == shape.len() {
-                lo[d]..hi[d] + 1
-            } else {
-                lo[d]..lo[d] + 1
-            }
-        })
+    let last_dim = shape.len() - 1; // `shape` is non-empty (checked above)
+    lo.iter()
+        .zip(&hi)
+        .enumerate()
+        .map(|(d, (&l, &h))| if d == last_dim { l..h + 1 } else { l..l + 1 })
         .collect()
 }
 
@@ -1579,37 +1611,69 @@ fn gather_region(
         return Vec::new();
     }
     if n == 0 {
-        return src[..total * item].to_vec();
+        return src.get(..total * item).unwrap_or_default().to_vec();
     }
-    // Row-major container strides of the source layout.
+    // Row-major container strides of the source layout, innermost first: each is the one
+    // to its right times that dimension's extent. Built by folding rather than by indexing
+    // `stride[d + 1]`, so the recurrence is visible and there is no off-by-one to get wrong.
     let mut stride = vec![1usize; n];
-    for d in (0..n - 1).rev() {
-        stride[d] = stride[d + 1] * src_ranges[d + 1].len();
+    for d in (0..n.saturating_sub(1)).rev() {
+        let right = stride.get(d + 1).copied().unwrap_or(1);
+        let extent = src_ranges.get(d + 1).map_or(1, ExactSizeIterator::len);
+        if let Some(slot) = stride.get_mut(d) {
+            *slot = right * extent;
+        }
     }
     let last = n - 1;
-    let span = want[last].len();
+    // The innermost span, and the byte offset of its start within a row. `want ⊆ src_ranges`
+    // and both have rank `n`, so these are present; `else return` says that structurally.
+    let (Some(want_last), Some(src_last), Some(stride_last)) =
+        (want.get(last), src_ranges.get(last), stride.get(last))
+    else {
+        return Vec::new();
+    };
+    let span = want_last.len();
+    let base = (want_last.start - src_last.start) * stride_last;
     let mut out = Vec::with_capacity(total * item);
     // Odometer over `want`'s leading dimensions; copy the contiguous last-dim
     // span for each combination.
-    let mut idx: Vec<usize> = want[..last].iter().map(|r| r.start).collect();
+    let mut idx: Vec<usize> = want
+        .get(..last)
+        .unwrap_or_default()
+        .iter()
+        .map(|r| r.start)
+        .collect();
     loop {
-        let mut off = (want[last].start - src_ranges[last].start) * stride[last];
-        for d in 0..last {
-            off += (idx[d] - src_ranges[d].start) * stride[d];
-        }
+        // Offset of this combination: the innermost base plus each leading dimension's
+        // distance from the source origin, weighted by its stride.
+        let off = base
+            + idx
+                .iter()
+                .zip(src_ranges)
+                .zip(&stride)
+                .map(|((&i, src), &s)| (i - src.start) * s)
+                .sum::<usize>();
         let bo = off * item;
-        out.extend_from_slice(&src[bo..bo + span * item]);
+        let Some(chunk) = src.get(bo..bo + span * item) else {
+            // A source shorter than the ranges describe: stop with what was gathered
+            // rather than panicking mid-read.
+            return out;
+        };
+        out.extend_from_slice(chunk);
         if last == 0 {
             break;
         }
         let mut d = last;
         loop {
             d -= 1;
-            idx[d] += 1;
-            if idx[d] < want[d].end {
+            let (Some(slot), Some(range)) = (idx.get_mut(d), want.get(d)) else {
+                return out;
+            };
+            *slot += 1;
+            if *slot < range.end {
                 break;
             }
-            idx[d] = want[d].start;
+            *slot = range.start;
             if d == 0 {
                 return out;
             }
@@ -1744,7 +1808,11 @@ impl<'a> Decoder<'a> {
 
     /// Decode logical value `sub` of container `c` from this side's block bytes.
     fn at(&self, bytes: &[u8], c: usize, sub: usize) -> f64 {
-        let container = &bytes[c * self.item..c * self.item + self.item];
+        // The block is sized from the same container count `c` walks, so a short read here
+        // would mean the two disagreed — NaN is what every other "no value" path returns.
+        let Some(container) = bytes.get(c * self.item..c * self.item + self.item) else {
+            return f64::NAN;
+        };
         if let Some(prim) = self.prim {
             return decode_prim(prim, container);
         }
@@ -1821,16 +1889,18 @@ pub fn compare_values(
         let ba = ra.read_region(&[])?;
         let bb = rb.read_region(&[])?;
         acc.add_block(&ba, &bb, &da, &db, 1);
-    } else {
-        let inner: usize = shape[1..].iter().product::<usize>().max(1);
-        let outer = shape[0];
+    } else if let Some((&outer, rest)) = shape.split_first() {
+        // Non-empty by the branch above, so this always binds; as an `else if` the
+        // impossible case simply contributes nothing to `acc`, and the shared return
+        // below reports an empty diff rather than needing a second exit.
+        let inner: usize = rest.iter().product::<usize>().max(1);
         let block = (STATS_BLOCK_ELEMS / inner).max(1);
         let mut i = 0;
         while i < outer {
             let hi = (i + block).min(outer);
             let mut ranges: Vec<Range<usize>> = Vec::with_capacity(shape.len());
             ranges.push(i..hi);
-            ranges.extend(shape[1..].iter().map(|&d| 0..d));
+            ranges.extend(rest.iter().map(|&d| 0..d));
             let ba = ra.read_region(&ranges)?;
             let bb = rb.read_region(&ranges)?;
             acc.add_block(&ba, &bb, &da, &db, (hi - i) * inner);
@@ -2148,7 +2218,10 @@ fn reduce_view_hist(
                         |s| s.extract(container_word(container), sub) as f64,
                     );
                     if v.is_finite() {
-                        counts[bin_index(bins, n, v)] += 1;
+                        // `bin_index` clamps to `0..n`, which is `counts.len()`.
+                        if let Some(slot) = counts.get_mut(bin_index(bins, n, v)) {
+                            *slot += 1;
+                        }
                         total += 1;
                     } else {
                         nonfinite += 1;
@@ -2238,11 +2311,9 @@ fn read_sampled(
     let packing = view.packing(item);
     // Elements per stored innermost row — used to detect when a sampled row's
     // span crosses stored rows (only possible under a shape override).
-    let inner: usize = if shape.len() > 1 {
-        shape[1..].iter().product::<usize>().max(1)
-    } else {
-        1
-    };
+    let inner: usize = shape
+        .split_first()
+        .map_or(1, |(_, rest)| rest.iter().product::<usize>().max(1));
     let (Some(&first_col), Some(&last_col)) = (cols.first(), cols.last()) else {
         // No columns sampled (a zero-width view): an empty grid, not an error.
         return Ok((Vec::new(), Vec::new()));
@@ -2268,7 +2339,14 @@ fn read_sampled(
             let (r0, r1) = (first / inner, last / inner);
             let mut region = Vec::with_capacity(shape.len());
             region.push(r0..r1 + 1);
-            region.extend(shape[1..].iter().map(|&d| 0..d));
+            region.extend(
+                shape
+                    .split_first()
+                    .map(|(_, rest)| rest)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|&d| 0..d),
+            );
             regions.push(region);
             starts.push(r0 * inner);
         }
@@ -2412,7 +2490,12 @@ impl BlobReader {
     }
 
     fn blob(&self) -> &[u8] {
-        &self.backing.bytes()[self.data_start..self.data_end]
+        // `mmapped`/`open_npz` validated `data_start <= data_end <= len` before building
+        // this, so the range is an invariant of the type rather than of the caller.
+        self.backing
+            .bytes()
+            .get(self.data_start..self.data_end)
+            .unwrap_or_default()
     }
 }
 
@@ -2470,7 +2553,10 @@ impl TensorReader for BlobReader {
         let mut off = 0;
         while off < blob.len() {
             let hi = (off + chunk).min(blob.len());
-            if f(&blob[off..hi]).is_break() {
+            let Some(block) = blob.get(off..hi) else {
+                break; // `hi` is clamped to `blob.len()` on the line above
+            };
+            if f(block).is_break() {
                 break;
             }
             off = hi;
@@ -2611,11 +2697,24 @@ impl TensorReader for Hdf5Reader {
         if regions.len() < 2 {
             return regions.iter().map(|r| self.read_region(r)).collect();
         }
-        let ndim = regions[0].len();
+        // Every region has the tensor's rank, so the first one gives `ndim` and each
+        // dimension's extremes come from `get(d)` — a region of the wrong rank contributes
+        // nothing instead of panicking.
+        let ndim = regions.first().map_or(0, Vec::len);
         let bbox: Vec<Range<usize>> = (0..ndim)
             .map(|d| {
-                let lo = regions.iter().map(|r| r[d].start).min().unwrap_or(0);
-                let hi = regions.iter().map(|r| r[d].end).max().unwrap_or(0);
+                let lo = regions
+                    .iter()
+                    .filter_map(|r| r.get(d))
+                    .map(|r| r.start)
+                    .min()
+                    .unwrap_or(0);
+                let hi = regions
+                    .iter()
+                    .filter_map(|r| r.get(d))
+                    .map(|r| r.end)
+                    .max()
+                    .unwrap_or(0);
                 lo..hi
             })
             .collect();
@@ -2651,8 +2750,13 @@ impl TensorReader for Hdf5Reader {
         let tile = stats_tile_shape(shape, &chunk, STATS_TILE_ELEMS);
         let mut origin = vec![0usize; ndim];
         loop {
-            let ranges: Vec<Range<usize>> = (0..ndim)
-                .map(|d| origin[d]..(origin[d] + tile[d]).min(shape[d]))
+            // `origin`, `tile` and `shape` are parallel per-dimension vectors — zip them
+            // rather than indexing all three by the same `d`.
+            let ranges: Vec<Range<usize>> = origin
+                .iter()
+                .zip(&tile)
+                .zip(shape)
+                .map(|((&o, &t), &s)| o..(o + t).min(s))
                 .collect();
             let flow =
                 with_hdf5_block_bytes(&self.dataset, Self::hyperslab(&ranges), &self.dtype, |b| {
@@ -2664,11 +2768,17 @@ impl TensorReader for Hdf5Reader {
             // Advance the tile odometer, innermost dimension first.
             let mut d = ndim - 1;
             loop {
-                origin[d] += tile[d];
-                if origin[d] < shape[d] {
+                // All three vectors have rank `ndim`, so this binds; `else return` makes
+                // that structural instead of three indexes that assume it.
+                let (Some(o), Some(&t), Some(&s)) = (origin.get_mut(d), tile.get(d), shape.get(d))
+                else {
+                    return Ok(());
+                };
+                *o += t;
+                if *o < s {
                     break;
                 }
-                origin[d] = 0;
+                *o = 0;
                 if d == 0 {
                     return Ok(());
                 }
