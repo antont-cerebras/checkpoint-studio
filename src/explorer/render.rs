@@ -150,10 +150,14 @@ impl Explorer {
             area.width,
             area.height,
         )?;
+        // Filled by the call on the line above (the cache is what it just built), so a
+        // `None` here would mean it was emptied in between — nothing does that, and drawing
+        // nothing beats panicking mid-frame if it ever changes.
         let cache = self.sample_cache.borrow();
-        // Filled by the caller on the line before this one (the cache is what it just built).
-        #[allow(clippy::unwrap_used)]
-        let sample = &cache.as_ref().unwrap().sample;
+        let Some(cached) = cache.as_ref() else {
+            return Ok(info);
+        };
+        let sample = &cached.sample;
         *self.clickable.borrow_mut() = match repr {
             Representation::Heatmap => UI::render_heatmap(frame, tensor, sample, stats),
             Representation::Values => UI::render_values(frame, tensor, sample, stats, stripe, base),

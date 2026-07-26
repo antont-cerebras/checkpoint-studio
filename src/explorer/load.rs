@@ -6,12 +6,6 @@
 //! inherent impls across modules of one crate, and a child module can still reach its
 //! parent's private fields, so this needs no widening of `Explorer`'s internals.
 
-// The `self.remote.as_ref().unwrap()` sites here are inside `if self.remote_read().is_some()`
-// branches (a remote read is what the whole function is for), and the cache unwraps follow
-// the line that fills the cache. Same follow-up as `modes.rs`: thread the remote through as
-// a parameter instead of re-reading an option that is known to be `Some`.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 #[allow(clippy::wildcard_imports)] // a submodule of the module it was split from
 use super::*;
 
@@ -40,7 +34,13 @@ impl Explorer {
             }
         }
         let cache = self.reader_cache.borrow();
-        f(cache.as_ref().unwrap().reader.as_ref())
+        let Some(cached) = cache.as_ref() else {
+            // The block above either found a live reader or replaced it, so this can only
+            // be `None` if something cleared the cache in between — nothing does, and an
+            // error beats a panic if that ever changes.
+            return Err("the tensor reader vanished from the cache".to_string());
+        };
+        f(cached.reader.as_ref())
     }
 
     /// Cached exact statistics for `(tensor, view)`, or `None` if not yet
@@ -341,14 +341,19 @@ impl Explorer {
     pub(super) fn gather_remote_keeping_session(
         &mut self,
     ) -> Result<(CheckpointParts, Option<crate::model::Checkpoint>)> {
-        let r = self
-            .remote_read()
-            .cloned()
-            .expect("gather_remote_keeping_session requires --ssh-proxy");
+        // Bind the remote context once. Re-reading `self.remote` at each use meant three
+        // separate assertions that it is `Some` in a function whose whole purpose is the
+        // remote read; the caller's contract is now stated once, as an error.
+        let Some(remote) = self.remote.as_ref() else {
+            return Err(anyhow::anyhow!(
+                "reading over ssh needs --ssh-proxy (no remote is configured)"
+            ));
+        };
+        let r = remote.read.clone();
         // One authenticated session for the whole run; the password entered here is
         // cached (any later reopen after an idle timeout reuses it silently).
         let session = {
-            let mut pw = self.remote.as_ref().unwrap().password.borrow_mut();
+            let mut pw = remote.password.borrow_mut();
             r.open_with(&mut pw)?
         };
         eprintln!("checkpoint-studio: reading tensor metadata over ssh …");
@@ -366,7 +371,7 @@ impl Explorer {
             // Fetch the S3 object metadata up front for an `s3://` source (checksums
             // /ETags/tags — a HEAD per object), so the stats report's S3 section is
             // ready; `want_s3` is a no-op for an SFTP source.
-            let pw = self.remote.as_ref().unwrap().password.borrow().clone();
+            let pw = remote.password.borrow().clone();
             let out = r.read(
                 &session,
                 &as_str,
@@ -394,7 +399,7 @@ impl Explorer {
                 config = r.read_config(&session, &as_str);
             }
         }
-        *self.remote.as_ref().unwrap().session.borrow_mut() = Some(session);
+        *remote.session.borrow_mut() = Some(session);
 
         // Build the central model from what was just read — no extra network I/O:
         // group tensors by their source file into shard headers, roll the on-disk

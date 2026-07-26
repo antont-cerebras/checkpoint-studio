@@ -6,14 +6,14 @@
 //! and the `residual` screen it restores to). The persistent selection/scroll state
 //! stays on [`Explorer`]; these hold only what the old per-screen loops kept as locals.
 
-// `unwrap`/`expect` in this module are all *mode-lifecycle* invariants: `on_enter` either
-// resolves the tensor / loads the map / starts the scan or leaves the mode, so by the time
-// `render_frame`, `pre_draw` or a key handler runs, the option is `Some` — and the
-// `*_command_for_key` calls are inside `if …is_some()` guards. Each site says which
-// invariant it relies on. Allowed at module scope rather than 12 times over; making the
-// invariant structural (a `Loaded` state type that can't be constructed empty) is the
-// follow-up that would let this be removed.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// The tensor-data screens no longer need a lifecycle invariant at all: `DetailMode` and
+// `DataMode` take a resolved `TensorInfo`, so "a screen for a tensor that isn't here" is
+// not a state they can be in, and the caller decides where to go instead (see
+// `Explorer::tensor_named`). The three screens whose payload needs I/O and `&mut Explorer`
+// — the layout map, the rename editor, the statistics report — still load it in `on_enter`,
+// and each states that invariant at its own accessor rather than under a file-wide allow.
+// With the allow gone from this file, a NEW unwrap anywhere in these 3,300 lines is an
+// error again.
 
 // Imports are explicit, and external types are taken from their real source instead of
 // being laundered through the parent. What remains below is an honest measure of what
@@ -162,20 +162,21 @@ impl Mode for FilesMode {
         key: KeyEvent,
     ) -> Result<Outcome> {
         let total = ex.file_state.rows.len();
-        match key.code {
-            // Every lettered command dispatches through the registry (like the tree),
-            // so key and palette entry can't drift.
-            KeyCode::Char(c)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && file_command_for_key(c).is_some() =>
-            {
-                let cmd = file_command_for_key(c).expect("guarded by is_some");
-                if let Some(nav) = ex.run_file_command(cmd, term) {
-                    return Ok(Outcome::Leave(nav));
-                }
+        // Every lettered command dispatches through the registry (like the tree), so key
+        // and palette entry can't drift. Handled before the match rather than in a guard
+        // that then has to look the command up a second time to use it.
+        if !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && let KeyCode::Char(c) = key.code
+            && let Some(cmd) = file_command_for_key(c)
+        {
+            if let Some(nav) = ex.run_file_command(cmd, term) {
+                return Ok(Outcome::Leave(nav));
             }
+            return Ok(Outcome::Stay);
+        }
+        match key.code {
             KeyCode::Tab | KeyCode::Backspace => return Ok(Outcome::Leave(Nav::Back)),
             KeyCode::Char('\\') => return Ok(Outcome::Leave(Nav::Forward)),
             KeyCode::Up => {
@@ -306,7 +307,11 @@ impl LayoutMode {
         }
     }
 
-    /// The parsed map — only reached after `on_enter` has bailed on a parse error.
+    /// The parsed map. `on_enter` either fills this or returns `Outcome::Leave`, so every
+    /// later call — `render_frame`, `pre_draw`, a key handler — happens only after it was
+    /// filled. Building it needs the file read and `&mut Explorer`, which is why it can't be
+    /// a constructor argument the way the tensor screens' `TensorInfo` is.
+    #[allow(clippy::expect_used)]
     pub(super) fn map(&self) -> &crate::safelayout::LayoutMap {
         self.map.as_ref().expect("on_enter leaves on a parse error")
     }
@@ -420,27 +425,28 @@ impl Mode for LayoutMode {
                 (sel + delta as usize).min(n.saturating_sub(1))
             }
         };
-        match key.code {
-            // Every lettered command dispatches through the registry (`q`/`l`/`c`/`y`)
-            // so key and palette entry can't drift.
-            KeyCode::Char(ch)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && layout_command_for_key(ch).is_some() =>
-            {
-                let cmd = layout_command_for_key(ch).expect("guarded by is_some");
-                if let Some(nav) = ex.run_layout_command(
-                    cmd,
-                    &self.path,
-                    self.map(),
-                    self.selected,
-                    self.scroll,
-                    term,
-                ) {
-                    return Ok(Outcome::Leave(nav));
-                }
+        // Every lettered command dispatches through the registry (`q`/`l`/`c`/`y`) so key
+        // and palette entry can't drift. See `FilesMode::handle_key` for why this sits
+        // ahead of the match rather than in a guard.
+        if !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && let KeyCode::Char(ch) = key.code
+            && let Some(cmd) = layout_command_for_key(ch)
+        {
+            if let Some(nav) = ex.run_layout_command(
+                cmd,
+                &self.path,
+                self.map(),
+                self.selected,
+                self.scroll,
+                term,
+            ) {
+                return Ok(Outcome::Leave(nav));
             }
+            return Ok(Outcome::Stay);
+        }
+        match key.code {
             KeyCode::Backspace | KeyCode::Tab | KeyCode::Esc => {
                 return Ok(Outcome::Leave(Nav::Back));
             }
@@ -632,22 +638,22 @@ impl Mode for TreeMode {
         term: &mut crate::tui::LiveTerminal,
         key: KeyEvent,
     ) -> Result<Outcome> {
-        match key {
-            // Every tree command dispatches through the registry (the same path the
-            // palette uses). In search mode the letters fall through to the query.
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                ..
-            } if !ex.tree_state.search_mode()
-                && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && tree_command_for_key(c).is_some() =>
-            {
-                let cmd = tree_command_for_key(c).expect("guarded by is_some");
-                if let Some(nav) = ex.run_command(cmd, term) {
-                    return Ok(Outcome::Leave(nav));
-                }
+        // Every tree command dispatches through the registry (the same path the palette
+        // uses). In search mode the letters fall through to the query instead. Handled
+        // before the match so the command is looked up once — see `FilesMode::handle_key`.
+        if !ex.tree_state.search_mode()
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && let KeyCode::Char(c) = key.code
+            && let Some(cmd) = tree_command_for_key(c)
+        {
+            if let Some(nav) = ex.run_command(cmd, term) {
+                return Ok(Outcome::Leave(nav));
             }
+            return Ok(Outcome::Stay);
+        }
+        match key {
             // '/' is ignored rather than typed into the query.
             KeyEvent {
                 code: KeyCode::Char('/'),
@@ -917,6 +923,10 @@ impl RenameMode2 {
         }
     }
 
+    /// The loaded rename set. As with `LayoutMode::map`, `on_enter` loads it or leaves the
+    /// screen, and loading reads the checkpoint's headers — not something a constructor
+    /// can do.
+    #[allow(clippy::expect_used)]
     pub(super) fn loaded(&self) -> &crate::rename::Loaded {
         self.loaded.as_ref().expect("on_enter loads or leaves")
     }
@@ -1463,11 +1473,13 @@ impl Mode for RenameMode2 {
 /// scan on a worker thread (via `tick_background` + `Bg::Poll`) and floats the legend
 /// / copied-command as an in-frame `overlay` so a running scan animates behind it.
 pub(super) struct DetailMode {
-    pub(super) tensor_name: String,
     pub(super) slice: usize,
     pub(super) stats_start: StatsStart,
     pub(super) interaction: Interaction,
-    pub(super) tensor: Option<TensorInfo>,
+    /// The tensor this screen is about. Resolved by the caller — a screen for a tensor
+    /// that isn't in the checkpoint is not a state this can be in, so there is nothing
+    /// for the renderer or a key handler to unwrap.
+    pub(super) tensor: TensorInfo,
     pub(super) overridable: bool,
     pub(super) unindexed: bool,
     pub(super) remote: bool,
@@ -1479,17 +1491,16 @@ pub(super) struct DetailMode {
 
 impl DetailMode {
     pub(super) fn new(
-        tensor_name: String,
+        tensor: TensorInfo,
         slice: usize,
         stats_start: StatsStart,
         interaction: Interaction,
     ) -> Self {
         Self {
-            tensor_name,
             slice,
             stats_start,
             interaction,
-            tensor: None,
+            tensor,
             overridable: false,
             unindexed: false,
             remote: false,
@@ -1501,7 +1512,7 @@ impl DetailMode {
     }
 
     pub(super) fn tensor(&self) -> &TensorInfo {
-        self.tensor.as_ref().expect("on_enter resolves or leaves")
+        &self.tensor
     }
 
     pub(super) fn shape(&self, ex: &Explorer) -> Vec<usize> {
@@ -1559,14 +1570,7 @@ impl Mode for DetailMode {
         ex: &mut Explorer,
         term: &mut crate::tui::LiveTerminal,
     ) -> Result<Outcome> {
-        let Some(tensor) = ex
-            .tensors()
-            .iter()
-            .find(|t| t.name == self.tensor_name)
-            .cloned()
-        else {
-            return Ok(Outcome::Leave(Nav::Open(Screen::Tree)));
-        };
+        let tensor = self.tensor.clone();
         self.overridable = dtype_overridable(&tensor);
         self.unindexed = ex.unindexed.contains(&tensor.source_path);
         self.remote = crate::remote::is_remote_source(&tensor.source_path);
@@ -1604,7 +1608,6 @@ impl Mode for DetailMode {
                 );
             });
         }
-        self.tensor = Some(tensor);
         Ok(Outcome::Stay)
     }
 
@@ -1904,7 +1907,7 @@ impl Mode for DetailMode {
 
     fn residual(&self) -> Screen {
         Screen::Detail {
-            tensor: self.tensor_name.clone(),
+            tensor: self.tensor.name.clone(),
             slice: self.slice,
         }
     }
@@ -1934,7 +1937,9 @@ impl StatsMode {
         }
     }
 
-    /// The cached stats (computed in `on_enter`).
+    /// The whole-checkpoint statistics, computed and cached by `on_enter` (it scans every
+    /// shard, so it cannot happen at construction).
+    #[allow(clippy::expect_used)]
     pub(super) fn stats(&self, ex: &Explorer) -> crate::stats::CheckpointStats {
         ex.checkpoint_stats_cache
             .borrow()
@@ -2111,11 +2116,12 @@ impl Mode for StatsMode {
 /// (`tick_background`/`Bg::Poll`, paused while input flows). `slice`/`slices`/
 /// `overridable` are `Cell`s because they're learned during the (`&self`) sample.
 pub(super) struct DataMode {
-    pub(super) tensor_name: String,
+    /// The tensor being viewed, resolved by the caller. As in [`DetailMode`], a data view
+    /// of a tensor the checkpoint doesn't have isn't a representable state.
+    pub(super) tensor: TensorInfo,
     pub(super) repr: Representation,
     pub(super) slice: Cell<usize>,
     pub(super) interaction: Interaction,
-    pub(super) tensor: Option<TensorInfo>,
     pub(super) scan: Option<ScanJob>,
     pub(super) spin: Cell<usize>,
     pub(super) overlay: Option<Overlay>,
@@ -2125,17 +2131,16 @@ pub(super) struct DataMode {
 
 impl DataMode {
     pub(super) fn new(
-        tensor_name: String,
+        tensor: TensorInfo,
         repr: Representation,
         slice: usize,
         interaction: Interaction,
     ) -> Self {
         Self {
-            tensor_name,
+            tensor,
             repr,
             slice: Cell::new(slice),
             interaction,
-            tensor: None,
             scan: None,
             spin: Cell::new(0),
             overlay: None,
@@ -2145,7 +2150,7 @@ impl DataMode {
     }
 
     pub(super) fn tensor(&self) -> &TensorInfo {
-        self.tensor.as_ref().expect("on_enter resolves or leaves")
+        &self.tensor
     }
 
     /// The current statistics view — cached, a live scan spinner (data always scans when
@@ -2181,21 +2186,13 @@ impl Mode for DataMode {
         ex: &mut Explorer,
         _term: &mut crate::tui::LiveTerminal,
     ) -> Result<Outcome> {
-        let Some(tensor) = ex
-            .tensors()
-            .iter()
-            .find(|t| t.name == self.tensor_name)
-            .cloned()
-        else {
-            return Ok(Outcome::Leave(Nav::Back));
-        };
         // One-shot (`--exit`): compute the stats synchronously so the single frame
         // shows them (interactively the scan runs in the background via tick).
         if self.interaction == Interaction::OneShot {
+            let tensor = self.tensor.clone();
             let view = ex.active_view(&tensor.name);
             ex.compute_stats_sync(&tensor, view);
         }
-        self.tensor = Some(tensor);
         Ok(Outcome::Stay)
     }
 
@@ -2507,7 +2504,7 @@ impl Mode for DataMode {
 
     fn residual(&self) -> Screen {
         Screen::Data {
-            tensor: self.tensor_name.clone(),
+            tensor: self.tensor.name.clone(),
             repr: self.repr,
             slice: self.slice.get(),
         }
@@ -2772,20 +2769,19 @@ mod tests {
     }
 
     /// The name of the first tensor in the fixture, for the detail / data modes.
-    fn first_tensor(ex: &Explorer) -> String {
+    fn first_tensor(ex: &Explorer) -> TensorInfo {
         ex.tensors()
             .first()
             .expect("the fixture has tensors")
-            .name
             .clone()
     }
 
     #[test]
     fn the_detail_screen_steps_slices_and_opens_the_data_views() {
         let (mut ex, mut term) = loaded();
-        let name = first_tensor(&ex);
+        let tensor = first_tensor(&ex);
         let mut mode = DetailMode::new(
-            name.clone(),
+            tensor.clone(),
             0,
             StatsStart::OnDemand, // don't kick off a byte scan in a test
             Interaction::Interactive,
@@ -2796,11 +2792,11 @@ mod tests {
         // `m` / `v` open the heatmap and the numeric grid for the same tensor.
         assert_eq!(
             outcome(&mode.handle_key(&mut ex, &mut term, key('m')).unwrap()),
-            format!("data:{name}")
+            format!("data:{}", tensor.name)
         );
         assert_eq!(
             outcome(&mode.handle_key(&mut ex, &mut term, key('v')).unwrap()),
-            format!("data:{name}")
+            format!("data:{}", tensor.name)
         );
         // Backspace leaves; `q` quits from anywhere.
         assert_eq!(
@@ -2823,9 +2819,9 @@ mod tests {
     #[test]
     fn the_data_view_pans_its_window_and_keeps_the_tensor() {
         let (mut ex, mut term) = loaded();
-        let name = first_tensor(&ex);
+        let tensor = first_tensor(&ex);
         let mut mode = DataMode::new(
-            name.clone(),
+            tensor.clone(),
             Representation::Values,
             0,
             Interaction::Interactive,
@@ -2842,7 +2838,7 @@ mod tests {
         // Switching representation stays on the same tensor.
         let o = outcome(&mode.handle_key(&mut ex, &mut term, key('m')).unwrap());
         assert!(
-            o == "stay" || o == format!("data:{name}"),
+            o == "stay" || o == format!("data:{}", tensor.name),
             "`m` shows the heatmap for the same tensor, got {o:?}"
         );
         assert_eq!(
@@ -3064,8 +3060,8 @@ mod tests {
     #[test]
     fn the_data_view_steps_through_slices_and_cycles_its_display() {
         let (mut ex, mut term) = loaded();
-        let name = first_tensor(&ex);
-        let mut mode = DataMode::new(name, Representation::Values, 0, Interaction::Interactive);
+        let tensor = first_tensor(&ex);
+        let mut mode = DataMode::new(tensor, Representation::Values, 0, Interaction::Interactive);
         mode.on_enter(&mut ex, &mut term).expect("resolves");
         // `b` cycles the numeric base, `z` the zebra striping — both view state, so the
         // screen stays put.
@@ -3161,7 +3157,7 @@ mod tests {
     #[test]
     fn the_other_modes_draw_themselves() {
         let (mut ex, mut term) = loaded();
-        let name = first_tensor(&ex);
+        let tensor = first_tensor(&ex);
 
         let mut files = FilesMode::new();
         files.on_enter(&mut ex, &mut term).unwrap();
@@ -3188,7 +3184,7 @@ mod tests {
         );
 
         let mut detail = DetailMode::new(
-            name.clone(),
+            tensor.clone(),
             0,
             StatsStart::OnDemand,
             Interaction::Interactive,
@@ -3197,7 +3193,12 @@ mod tests {
         detail.pre_draw(&mut ex, &mut term);
         draw_mode("the detail screen", &detail, &ex);
 
-        let mut data = DataMode::new(name, Representation::Heatmap, 0, Interaction::Interactive);
+        let mut data = DataMode::new(
+            tensor.clone(),
+            Representation::Heatmap,
+            0,
+            Interaction::Interactive,
+        );
         data.on_enter(&mut ex, &mut term).unwrap();
         data.pre_draw(&mut ex, &mut term);
         draw_mode("the heatmap", &data, &ex);
@@ -3268,10 +3269,10 @@ mod tests {
     #[test]
     fn a_background_scan_ticks_without_a_terminal() {
         let (mut ex, mut term) = loaded();
-        let name = first_tensor(&ex);
+        let tensor = first_tensor(&ex);
         // `StatsStart::Auto` kicks off the whole-tensor scan on entry; ticking it is what
         // the driver does between polls.
-        let mut detail = DetailMode::new(name, 0, StatsStart::Auto, Interaction::Interactive);
+        let mut detail = DetailMode::new(tensor, 0, StatsStart::Auto, Interaction::Interactive);
         detail.on_enter(&mut ex, &mut term).unwrap();
         for _ in 0..50 {
             if matches!(detail.tick_background(&mut ex), Bg::Idle) {

@@ -1,4 +1,6 @@
-#![allow(unused, non_camel_case_types)]
+// The GGML type names are the format's own (`Q4_K`, `IQ2_XXS`), so they keep their spelling
+// rather than being re-cased into something a reader can't match against the spec.
+#![allow(non_camel_case_types)]
 
 use anyhow::Result;
 use std::collections::HashMap;

@@ -1,10 +1,3 @@
-// As in `modes.rs`: these are driver invariants, each stated at its site. The terminal is
-// taken and put back by `run_mode` (so it is `Some` whenever a mode runs), the filter is
-// read only when active, and the report is unwrapped on the line after it is computed or
-// read from the cache. Making them structural — a `Driver` that owns the terminal by value
-// — is the follow-up.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use anyhow::Result;
 use crossterm::{
     cursor,
@@ -1555,8 +1548,7 @@ impl Explorer {
         // The in-place rename editor (`--rename`), with any `--rename-rule` seeds
         // applied. Rendered with an empty preview (headless can't run the live
         // per-keystroke recompute), which is the editor's initial state anyway.
-        if want_rename && self.rename_target().is_some() {
-            let target = self.rename_target().expect("checked above");
+        if let Some(target) = self.rename_target().filter(|_| want_rename) {
             let loaded = crate::rename::load(&target).map_err(|e| anyhow::anyhow!("{e:#}"))?;
             let mut counts: HashMap<String, usize> = HashMap::new();
             for n in loaded.names() {
@@ -2026,9 +2018,7 @@ impl Explorer {
         // the navigator (dismissing it drops into the normal tree).
         if want_health {
             self.ensure_full_load()?;
-            let mut term = self.terminal.take().expect("interactive loop owns it");
-            self.show_check_report(&mut term, want_health_findings);
-            self.terminal = Some(term);
+            self.with_terminal(|ex, term| ex.show_check_report(term, want_health_findings));
         }
         // `--stats` / `--stats-shards`: open straight into the full-screen stats
         // mode (Esc / `⌫` drops back to the tree).
@@ -2129,24 +2119,32 @@ impl Explorer {
                     history[cursor] = mode.residual();
                     nav
                 }
-                Screen::Detail { tensor, slice } => self.run_mode(&mut DetailMode::new(
-                    tensor,
-                    slice,
-                    StatsStart::OnDemand,
-                    Interaction::Interactive,
-                ))?,
+                Screen::Detail { tensor, slice } => match self.tensor_named(&tensor) {
+                    Some(t) => self.run_mode(&mut DetailMode::new(
+                        t,
+                        slice,
+                        StatsStart::OnDemand,
+                        Interaction::Interactive,
+                    ))?,
+                    // A history entry for a tensor this checkpoint doesn't have (it was
+                    // filtered out, or the checkpoint was reloaded): show the tree.
+                    None => Nav::Open(Screen::Tree),
+                },
                 Screen::Data {
                     tensor,
                     repr,
                     slice,
-                } => {
-                    // Re-record the screen with where the user left it (slice /
-                    // representation), so back/forward returns there faithfully.
-                    let mut mode = DataMode::new(tensor, repr, slice, Interaction::Interactive);
-                    let nav = self.run_mode(&mut mode)?;
-                    history[cursor] = mode.residual();
-                    nav
-                }
+                } => match self.tensor_named(&tensor) {
+                    Some(t) => {
+                        // Re-record the screen with where the user left it (slice /
+                        // representation), so back/forward returns there faithfully.
+                        let mut mode = DataMode::new(t, repr, slice, Interaction::Interactive);
+                        let nav = self.run_mode(&mut mode)?;
+                        history[cursor] = mode.residual();
+                        nav
+                    }
+                    None => Nav::Back,
+                },
                 Screen::Stats {
                     shards_expanded,
                     scroll,
@@ -2343,12 +2341,10 @@ impl Explorer {
     /// tensors from the full session (so the filter can be edited/cleared live) and
     /// hands it to the kernel, or clears the filter when none is active.
     fn refresh_filter(&mut self) {
-        let active = self.tensor_filter.as_ref().is_some_and(|f| f.is_active());
-        if !active {
+        let Some(filter) = self.tensor_filter.clone().filter(|f| f.is_active()) else {
             self.tree_state.clear_filter();
             return;
-        }
-        let filter = self.tensor_filter.clone().expect("active implies Some");
+        };
         let rows: Vec<(TreeNode, usize)> = self
             .tensors()
             .iter()
@@ -2445,22 +2441,48 @@ impl Explorer {
         });
     }
 
+    /// Run `f` with the terminal borrowed out of `self`, putting it back afterwards.
+    /// `None` when there is no live terminal (headless), so `f` never ran.
+    ///
+    /// The terminal cannot be borrowed *from* `self` while `self` is also borrowed mutably,
+    /// and every mode call needs both — so it is moved out for the duration and moved back.
+    /// Doing that in one place means the five callers no longer each restate the invariant
+    /// that it is present, and a caller that returns early part-way through can't leave the
+    /// terminal stranded, which would silently blank every later draw.
+    /// The tensor called `name`, cloned — the resolution the tensor-data screens need
+    /// before they can be built. `None` when the checkpoint has no such tensor, which is
+    /// the caller's cue to go somewhere else rather than open an empty screen.
+    fn tensor_named(&self, name: &str) -> Option<TensorInfo> {
+        self.tensors().iter().find(|t| t.name == name).cloned()
+    }
+
+    fn with_terminal<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &mut crate::tui::LiveTerminal) -> T,
+    ) -> Option<T> {
+        let mut term = self.terminal.take()?;
+        let out = f(self, &mut term);
+        self.terminal = Some(term);
+        Some(out)
+    }
+
     fn run_mode(&mut self, mode: &mut dyn Mode) -> Result<Nav> {
+        self.with_terminal(|ex, term| ex.drive_mode(mode, term))
+            .unwrap_or_else(|| Err(anyhow::anyhow!("no live terminal to run a screen on")))
+    }
+
+    /// The mode event loop proper, with the terminal already borrowed out of `self` by
+    /// [`Self::with_terminal`] — so an early return here cannot strand it.
+    fn drive_mode(
+        &mut self,
+        mode: &mut dyn Mode,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> Result<Nav> {
         let spec = mode.spec();
-        let mut term = self
-            .terminal
-            .take()
-            .expect("interactive loop owns the terminal");
-        match mode.on_enter(self, &mut term) {
-            Ok(Outcome::Leave(nav)) => {
-                self.terminal = Some(term);
-                return Ok(nav);
-            }
+        match mode.on_enter(self, term) {
+            Ok(Outcome::Leave(nav)) => return Ok(nav),
             Ok(Outcome::Stay) => {}
-            Err(e) => {
-                self.terminal = Some(term);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
         // No `term.clear()` on entry: clearing blanks the screen, and the new frame
         // only lands on the first draw — a visible black flash between screens.
@@ -2477,7 +2499,7 @@ impl Explorer {
             let bg = mode.tick_background(self);
 
             if !input_pending {
-                mode.pre_draw(self, &mut term);
+                mode.pre_draw(self, term);
                 let hint = layout_hint;
                 // Start each frame with no scroll bar; the mode's render records one
                 // (via `self.vscrollbar`) when its body overflows, and the engine
@@ -2575,7 +2597,7 @@ impl Explorer {
             // mouse action.
             let key = match ev {
                 Event::Key(k) => k,
-                Event::Mouse(m) => match self.route_mouse(&mut term, mode, &spec, m)? {
+                Event::Mouse(m) => match self.route_mouse(term, mode, &spec, m)? {
                     MouseOutcome::Leave(nav) => break nav,
                     MouseOutcome::SynthKey(k) => k,
                     MouseOutcome::Redraw | MouseOutcome::Ignored => continue,
@@ -2606,7 +2628,7 @@ impl Explorer {
                 },
             );
             if key == copy_cmd {
-                self.do_copy_command(mode, &mut term);
+                self.do_copy_command(mode, term);
                 continue;
             }
 
@@ -2615,11 +2637,11 @@ impl Explorer {
             if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char(':'))
                 && mode.palette_on_space(self)
             {
-                match mode.open_palette(self, &mut term) {
+                match mode.open_palette(self, term) {
                     PaletteResult::Nav(n) => break n,
-                    PaletteResult::CopyCommand => self.do_copy_command(mode, &mut term),
+                    PaletteResult::CopyCommand => self.do_copy_command(mode, term),
                     PaletteResult::SynthKey(k) => {
-                        if let Outcome::Leave(n) = mode.handle_key(self, &mut term, k)? {
+                        if let Outcome::Leave(n) = mode.handle_key(self, term, k)? {
                             break n;
                         }
                     }
@@ -2637,12 +2659,10 @@ impl Explorer {
                 continue;
             }
 
-            if let Outcome::Leave(nav) = mode.handle_key(self, &mut term, key)? {
+            if let Outcome::Leave(nav) = mode.handle_key(self, term, key)? {
                 break nav;
             }
         };
-
-        self.terminal = Some(term);
         Ok(nav)
     }
 
@@ -2650,15 +2670,12 @@ impl Explorer {
     /// `on_enter` (which handles a `--compute-stats` synchronous scan) then draws a
     /// single frame, leaving it on screen. No event loop.
     fn run_mode_once(&mut self, mode: &mut dyn Mode) -> Result<()> {
-        let mut term = self
-            .terminal
-            .take()
-            .expect("interactive loop owns the terminal");
-        let leave = matches!(mode.on_enter(self, &mut term), Ok(Outcome::Leave(_)));
-        if !leave {
-            let _ = term.draw(|f| mode.render_frame(self, f));
-        }
-        self.terminal = Some(term);
+        self.with_terminal(|ex, term| {
+            let leave = matches!(mode.on_enter(ex, term), Ok(Outcome::Leave(_)));
+            if !leave {
+                let _ = term.draw(|f| mode.render_frame(ex, f));
+            }
+        });
         Ok(())
     }
 
@@ -3906,9 +3923,11 @@ impl Explorer {
                             copy_path: Some(dir),
                         },
                         None => {
+                            // Both ends of the set, or (for an empty one) empty names —
+                            // the count in the message is what carries the information.
                             let first = files.iter().next().cloned().unwrap_or_default();
-                            let first_name = file_name(&first);
-                            let last_name = file_name(files.iter().next_back().unwrap());
+                            let last = files.iter().next_back().cloned().unwrap_or_default();
+                            let (first_name, last_name) = (file_name(&first), file_name(&last));
                             SelectionView {
                                 status: (
                                     "▸",
@@ -4370,19 +4389,16 @@ impl Explorer {
             // The pre-warm animates through the live terminal (set in interactive
             // / one-shot modes; this block never runs headless, where the request
             // strips `--histogram`/`--bins`).
-            let mut term = self
-                .terminal
-                .take()
-                .expect("interactive loop owns the terminal");
-            self.ensure_detail_histogram(
-                &mut term,
-                &tensor,
-                view,
-                &shape,
-                dtype_overridable(&tensor),
-                self.unindexed.contains(&tensor.source_path),
-            );
-            self.terminal = Some(term);
+            self.with_terminal(|ex, term| {
+                ex.ensure_detail_histogram(
+                    term,
+                    &tensor,
+                    view,
+                    &shape,
+                    dtype_overridable(&tensor),
+                    ex.unindexed.contains(&tensor.source_path),
+                );
+            });
         }
 
         // One-shot (`--exit`): render the requested screen once and return (the
@@ -4390,24 +4406,28 @@ impl Explorer {
         if mode == OpenMode::OneShot {
             match &screen {
                 Screen::Detail { tensor, slice } => {
-                    self.run_mode_once(&mut DetailMode::new(
-                        tensor.clone(),
-                        *slice,
-                        stats_start,
-                        Interaction::OneShot,
-                    ))?;
+                    if let Some(t) = self.tensor_named(tensor) {
+                        self.run_mode_once(&mut DetailMode::new(
+                            t,
+                            *slice,
+                            stats_start,
+                            Interaction::OneShot,
+                        ))?;
+                    }
                 }
                 Screen::Data {
                     tensor,
                     repr,
                     slice,
                 } => {
-                    self.run_mode_once(&mut DataMode::new(
-                        tensor.clone(),
-                        *repr,
-                        *slice,
-                        Interaction::OneShot,
-                    ))?;
+                    if let Some(t) = self.tensor_named(tensor) {
+                        self.run_mode_once(&mut DataMode::new(
+                            t,
+                            *repr,
+                            *slice,
+                            Interaction::OneShot,
+                        ))?;
+                    }
                 }
                 // The tree renders itself; the file browser, layout map, rename
                 // editor and stats view are interactive-only (a `--files` / `--layout`
@@ -4442,25 +4462,22 @@ impl Explorer {
                 .get(&tensor.name)
                 .cloned()
                 .unwrap_or_else(|| tensor.shape.clone());
-            let mut term = self
-                .terminal
-                .take()
-                .expect("interactive loop owns the terminal");
-            self.compute_stats_animated(&mut term, &tensor, view, |f, sv| {
-                self.render_detail_frame(
-                    f,
-                    &tensor,
-                    &shape,
-                    view,
-                    overridable,
-                    unindexed,
-                    sv,
-                    None,
-                    None,
-                    None,
-                );
+            self.with_terminal(|ex, term| {
+                ex.compute_stats_animated(term, &tensor, view, |f, sv| {
+                    ex.render_detail_frame(
+                        f,
+                        &tensor,
+                        &shape,
+                        view,
+                        overridable,
+                        unindexed,
+                        sv,
+                        None,
+                        None,
+                        None,
+                    );
+                });
             });
-            self.terminal = Some(term);
         }
         Ok(Some(screen))
     }
@@ -4799,8 +4816,13 @@ impl Explorer {
             }
             *self.sample_cache.borrow_mut() = Some(CachedSample { key, sample });
         }
+        // Read back through the same option that was just filled; `None` here would mean
+        // the cache was emptied between the write above and this read, which nothing does.
         let cache = self.sample_cache.borrow();
-        let sample = &cache.as_ref().unwrap().sample;
+        let Some(cached) = cache.as_ref() else {
+            return Err("the sampled grid vanished from the cache".to_string());
+        };
+        let sample = &cached.sample;
         Ok((sample.slices, sample.overridable, sample.slice))
     }
 
@@ -5457,8 +5479,12 @@ impl Explorer {
         // The first open computes them; on a big checkpoint that's a beat, so draw
         // an immediate "running checks" notice for feedback rather than freezing on
         // the tree.
-        let mut report = self.cached_check.borrow().clone();
-        if report.is_none() {
+        // Compute it now if it isn't cached, so `report` is a value from here on rather
+        // than an option that every later line knows is `Some`.
+        let cached = self.cached_check.borrow().clone();
+        let mut report = if let Some(report) = cached {
+            report
+        } else {
             let _ = term.draw(|f| {
                 self.render_tree_frame(f, true);
                 UI::render_notice(f, "Running health checks…");
@@ -5481,9 +5507,8 @@ impl Explorer {
                 1,
             );
             *self.cached_check.borrow_mut() = Some(computed.clone());
-            report = Some(computed);
-        }
-        let mut report = report.expect("just computed or cached");
+            computed
+        };
 
         // What was just copied (and when), so the footer can flash it briefly.
         let mut copied_at: Option<(std::time::Instant, &'static str)> = None;
