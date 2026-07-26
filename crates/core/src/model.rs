@@ -71,46 +71,53 @@ pub enum FsNode {
 
 impl FsNode {
     /// Whether this is a real, descendable directory.
+    #[must_use]
     pub fn is_dir(&self) -> bool {
-        matches!(self, FsNode::Directory)
+        matches!(self, Self::Directory)
     }
     /// Apparent size in bytes (0 for a directory).
+    #[must_use]
     pub fn apparent(&self) -> u64 {
         match self {
-            FsNode::File { apparent, .. } | FsNode::Symlink { apparent, .. } => *apparent,
-            FsNode::Directory => 0,
+            Self::File { apparent, .. } | Self::Symlink { apparent, .. } => *apparent,
+            Self::Directory => 0,
         }
     }
     /// On-disk allocation in bytes (0 for a directory / when unknown).
+    #[must_use]
     pub fn allocated(&self) -> u64 {
         match self {
-            FsNode::File { allocated, .. } | FsNode::Symlink { allocated, .. } => *allocated,
-            FsNode::Directory => 0,
+            Self::File { allocated, .. } | Self::Symlink { allocated, .. } => *allocated,
+            Self::Directory => 0,
         }
     }
     /// The content classification, for a file or a symlink's target.
+    #[must_use]
     pub fn file_kind(&self) -> Option<FileKind> {
         match self {
-            FsNode::File { kind, .. } | FsNode::Symlink { kind, .. } => Some(*kind),
-            FsNode::Directory => None,
+            Self::File { kind, .. } | Self::Symlink { kind, .. } => Some(*kind),
+            Self::Directory => None,
         }
     }
     /// The raw link text when this is a symlink, else `None`.
+    #[must_use]
     pub fn symlink_target(&self) -> Option<&str> {
         match self {
-            FsNode::Symlink { target, .. } => Some(target),
+            Self::Symlink { target, .. } => Some(target),
             _ => None,
         }
     }
     /// Hard-link count (`st_nlink`) of the underlying inode; `>1` means the file
     /// is hardlinked. 0 for a directory.
+    #[must_use]
     pub fn links(&self) -> u64 {
         match self {
-            FsNode::File { links, .. } | FsNode::Symlink { links, .. } => *links,
-            FsNode::Directory => 0,
+            Self::File { links, .. } | Self::Symlink { links, .. } => *links,
+            Self::Directory => 0,
         }
     }
     /// Whether this entry is a hardlinked file (its inode has more than one name).
+    #[must_use]
     pub fn is_hardlinked(&self) -> bool {
         self.links() > 1
     }
@@ -148,22 +155,27 @@ pub struct FileEntry {
 
 impl FileEntry {
     /// Whether this entry is a real, descendable directory.
+    #[must_use]
     pub fn is_dir(&self) -> bool {
         self.node.is_dir()
     }
     /// Apparent (symlink-followed) size in bytes.
+    #[must_use]
     pub fn apparent(&self) -> u64 {
         self.node.apparent()
     }
     /// On-disk allocation in bytes.
+    #[must_use]
     pub fn allocated(&self) -> u64 {
         self.node.allocated()
     }
     /// The content classification (file / symlink target), else `None` for a dir.
+    #[must_use]
     pub fn file_kind(&self) -> Option<FileKind> {
         self.node.file_kind()
     }
     /// The raw symlink target text, when this entry is a symlink.
+    #[must_use]
     pub fn symlink_target(&self) -> Option<&str> {
         self.node.symlink_target()
     }
@@ -228,11 +240,13 @@ impl Checkpoint {
 
     /// Owned copies of the flattened tensors — a bridge for the (still
     /// `Vec<TensorInfo>`-based) views/reports until they take `&Checkpoint`.
+    #[must_use]
     pub fn tensors_vec(&self) -> Vec<TensorInfo> {
         self.tensors().cloned().collect()
     }
 
     /// Owned copies of the flattened metadata (same bridging role).
+    #[must_use]
     pub fn metadata_vec(&self) -> Vec<MetadataInfo> {
         self.metadata().cloned().collect()
     }
@@ -241,6 +255,7 @@ impl Checkpoint {
     /// found (all `.safetensors`/`.gguf`/… in the directory, not just the loaded
     /// shards) — the `DiskUsage` the stats "on disk" section shows, now derived
     /// from the cached model (symlink-followed sizes) instead of a live `stat`.
+    #[must_use]
     pub fn disk_usage(&self) -> Option<DiskUsage> {
         use crate::stats::ShardDisk;
         // Count each physical inode once: a hardlink, or a symlink to a blob that

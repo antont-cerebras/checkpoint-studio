@@ -29,10 +29,10 @@ impl std::str::FromStr for Codec {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "gzip" => Ok(Codec::Gzip),
-            "zstd" => Ok(Codec::Zstd),
-            "lz4" => Ok(Codec::Lz4),
-            "none" | "store" | "uncompressed" => Ok(Codec::Uncompressed),
+            "gzip" => Ok(Self::Gzip),
+            "zstd" => Ok(Self::Zstd),
+            "lz4" => Ok(Self::Lz4),
+            "none" | "store" | "uncompressed" => Ok(Self::Uncompressed),
             other => Err(format!(
                 "unknown codec '{other}' (expected gzip, zstd, lz4, or none)"
             )),
@@ -45,34 +45,38 @@ impl std::str::FromStr for Codec {
 #[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
 impl Codec {
     /// Short display label.
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Codec::Gzip => "gzip",
-            Codec::Zstd => "zstd",
-            Codec::Lz4 => "lz4",
-            Codec::Uncompressed => "none",
+            Self::Gzip => "gzip",
+            Self::Zstd => "zstd",
+            Self::Lz4 => "lz4",
+            Self::Uncompressed => "none",
         }
     }
 
     /// Whether a compression level applies (gzip/zstd) or is ignored (lz4/none).
+    #[must_use]
     pub fn uses_level(self) -> bool {
-        matches!(self, Codec::Gzip | Codec::Zstd)
+        matches!(self, Self::Gzip | Self::Zstd)
     }
 
     /// The default level when the user doesn't specify one.
+    #[must_use]
     pub fn default_level(self) -> u8 {
         match self {
-            Codec::Gzip => 6, // 0–9
-            Codec::Zstd => 3, // 1–22; 3 is fast, raise for more compression
+            Self::Gzip => 6, // 0–9
+            Self::Zstd => 3, // 1–22; 3 is fast, raise for more compression
             _ => 0,
         }
     }
 
     /// Clamp a level into the codec's valid range.
+    #[must_use]
     pub fn clamp_level(self, level: u8) -> u8 {
         match self {
-            Codec::Gzip => level.min(9),
-            Codec::Zstd => level.clamp(1, 22),
+            Self::Gzip => level.min(9),
+            Self::Zstd => level.clamp(1, 22),
             _ => 0,
         }
     }

@@ -284,6 +284,7 @@ fn read_hdf5_shard(file_path: &Path, source_path: String) -> Result<Option<Shard
 /// Whether `path`'s first bytes are the HDF5 signature (`\x89HDF\r\n\x1a\n`) — so an
 /// extensionless HDF5 checkpoint is recognized. Cheap (reads 8 bytes); false on any
 /// read error.
+#[must_use]
 pub fn looks_like_hdf5(path: &Path) -> bool {
     use std::io::Read;
     let mut buf = [0u8; 8];

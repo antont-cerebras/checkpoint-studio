@@ -21,7 +21,7 @@ pub(crate) enum WebFileNode {
         path: String,
         size: u64,
         files: usize,
-        children: Vec<WebFileNode>,
+        children: Vec<Self>,
     },
     File {
         name: String,
@@ -43,7 +43,7 @@ impl WebFileNode {
                 size,
                 files,
                 ..
-            } => WebFileNode::Dir {
+            } => Self::Dir {
                 name: name.clone(),
                 path: rel(path, root),
                 size: *size,
@@ -55,7 +55,7 @@ impl WebFileNode {
                 path,
                 size,
                 kind,
-            } => WebFileNode::File {
+            } => Self::File {
                 name: name.clone(),
                 path: rel(path, root),
                 size: *size,
@@ -88,7 +88,7 @@ pub(crate) struct StatsDto {
 
 impl From<&Stats> for StatsDto {
     fn from(s: &Stats) -> Self {
-        StatsDto {
+        Self {
             count: s.count,
             min: s.min,
             max: s.max,
@@ -155,7 +155,7 @@ impl SampleDto {
                 })
                 .collect()
         });
-        SampleDto {
+        Self {
             rows: s.rows.clone(),
             cols: s.cols.clone(),
             values: s.values.clone(),
@@ -198,7 +198,7 @@ pub(crate) enum HistBinsDto {
 
 impl From<&Histogram> for HistogramDto {
     fn from(h: &Histogram) -> Self {
-        HistogramDto {
+        Self {
             bins: match h.bins {
                 HistBins::IntBins { start, step } => HistBinsDto::Int { start, step },
                 HistBins::Range { lo, hi } => HistBinsDto::Range { lo, hi },
@@ -259,7 +259,7 @@ impl S3SummaryDto {
     /// Build from the stats module's S3 view, or `None` for a checkpoint without one.
     pub(crate) fn from_stats(stats: &crate::stats::CheckpointStats) -> Option<Self> {
         let s3 = stats.s3()?;
-        Some(S3SummaryDto {
+        Some(Self {
             count: s3.count(),
             total_bytes: s3.total_bytes(),
             checksums: crate::stats::s3_checksums_phrase(s3),

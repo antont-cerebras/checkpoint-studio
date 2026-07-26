@@ -23,23 +23,24 @@ pub enum FileKind {
 impl FileKind {
     /// Classify by extension / name. `Text` is a best-effort guess refined when
     /// the file is actually read (a non-UTF-8 "text" file falls back to info).
-    pub fn of(name: &str) -> FileKind {
+    #[must_use]
+    pub fn of(name: &str) -> Self {
         let lower = name.to_ascii_lowercase();
         let ext = lower.rsplit('.').next().unwrap_or("");
         match ext {
-            "safetensors" | "gguf" | "npy" | "npz" | "h5" | "hdf5" => FileKind::Checkpoint,
-            "json" => FileKind::Json,
+            "safetensors" | "gguf" | "npy" | "npz" | "h5" | "hdf5" => Self::Checkpoint,
+            "json" => Self::Json,
             "txt" | "md" | "py" | "yaml" | "yml" | "toml" | "cfg" | "ini" | "csv" | "tsv"
-            | "jsonl" | "text" | "log" | "sh" | "rs" => FileKind::Text,
+            | "jsonl" | "text" | "log" | "sh" | "rs" => Self::Text,
             // Extensionless docs that are conventionally text.
             _ if matches!(
                 lower.as_str(),
                 "readme" | "license" | "licence" | "notice" | "authors" | "copying" | "changelog"
             ) =>
             {
-                FileKind::Text
+                Self::Text
             }
-            _ => FileKind::Other,
+            _ => Self::Other,
         }
     }
 }
@@ -50,7 +51,7 @@ pub enum FileNode {
     Dir {
         name: String,
         path: PathBuf,
-        children: Vec<FileNode>,
+        children: Vec<Self>,
         expanded: bool,
         /// Aggregate size (bytes) and file count of everything under here.
         size: u64,
@@ -65,15 +66,17 @@ pub enum FileNode {
 }
 
 impl FileNode {
+    #[must_use]
     pub fn size(&self) -> u64 {
         match self {
-            FileNode::Dir { size, .. } | FileNode::File { size, .. } => *size,
+            Self::Dir { size, .. } | Self::File { size, .. } => *size,
         }
     }
 
+    #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            FileNode::Dir { name, .. } | FileNode::File { name, .. } => name,
+            Self::Dir { name, .. } | Self::File { name, .. } => name,
         }
     }
 }
@@ -93,9 +96,10 @@ pub enum DirEntry {
 }
 
 impl DirEntry {
+    #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            DirEntry::File { name, .. } | DirEntry::Directory { name } => name,
+            Self::File { name, .. } | Self::Directory { name } => name,
         }
     }
 }
@@ -106,6 +110,7 @@ impl DirEntry {
 /// directory itself, expanded. Symlinks are followed for a file's size (so a linked
 /// shard shows its target's size) but a symlinked directory is a leaf, not
 /// descended, to avoid cycles — see [`DirEntry`].
+#[must_use]
 pub fn build(root: &Path, max_depth: usize) -> FileNode {
     build_from(&local_list, root, max_depth)
 }
@@ -137,6 +142,7 @@ pub fn build_from(
 /// node's display name; every other node's `path` is its **exact prefix-relative
 /// key** (`a/b/c` for the object `a/b/c`), so the browser rebuilds the full
 /// `s3://…` URI as `{uri}/{path}`. Browse-only — no per-object layout or preview.
+#[must_use]
 pub fn build_from_keys(root_label: &str, objects: &[(String, u64)]) -> FileNode {
     use std::collections::{HashMap, HashSet};
     // Directory (a relative path; "" is the root) → its immediate entries.
@@ -302,14 +308,17 @@ pub enum FileRowKind {
 
 impl FileRow {
     /// Whether this row is a directory.
+    #[must_use]
     pub fn is_dir(&self) -> bool {
         matches!(self.kind, FileRowKind::Dir { .. })
     }
     /// Whether this (directory) row is expanded — `false` for a file row.
+    #[must_use]
     pub fn expanded(&self) -> bool {
         matches!(self.kind, FileRowKind::Dir { expanded: true, .. })
     }
     /// Child-file count for a directory row (0 for a file row).
+    #[must_use]
     pub fn files(&self) -> usize {
         match self.kind {
             FileRowKind::Dir { files, .. } => files,
@@ -317,6 +326,7 @@ impl FileRow {
         }
     }
     /// The content classification for a file row, else `None` for a directory.
+    #[must_use]
     pub fn file_kind(&self) -> Option<FileKind> {
         match self.kind {
             FileRowKind::File { kind } => Some(kind),
@@ -327,6 +337,7 @@ impl FileRow {
 
 /// Flatten the tree into the visible rows (a collapsed directory hides its
 /// subtree), root first, mirroring the tensor tree's flattening.
+#[must_use]
 pub fn flatten(root: &FileNode) -> Vec<FileRow> {
     let mut out = Vec::new();
     flatten_node(root, 0, &mut out);

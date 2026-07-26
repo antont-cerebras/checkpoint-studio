@@ -55,6 +55,7 @@ pub struct HealthReport {
 }
 
 impl HealthReport {
+    #[must_use]
     pub fn has_issues(&self) -> bool {
         !self.missing_files.is_empty()
             || !self.extra_files.is_empty()
@@ -68,6 +69,7 @@ impl HealthReport {
     /// absent) rather than a benign *warning* (something on disk the index doesn't
     /// mention). Matches the `check` report's severities: missing files/tensors are
     /// errors; extra files/tensors are warnings. Drives the health badge's colour.
+    #[must_use]
     pub fn has_errors(&self) -> bool {
         !self.missing_files.is_empty()
             || !self.missing_tensors.is_empty()
@@ -102,6 +104,7 @@ pub fn parse_index_spec(dir: &Path, index_path: &Path) -> Result<IndexSpec> {
 /// loader already parsed from each shard's header. `tensors` is the whole loaded
 /// set; only those whose `source_path` is a file directly in `spec.dir` count, so
 /// this is safe when several checkpoints are loaded together.
+#[must_use]
 pub fn check_loaded(spec: &IndexSpec, tensors: &[TensorInfo]) -> HealthReport {
     let actual = list_safetensors(&spec.dir);
 

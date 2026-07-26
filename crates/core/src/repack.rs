@@ -37,6 +37,7 @@ pub struct IdxCompare {
 /// Decode + compare the two sides' 16-bit words. `old` is `e × inner` words (one
 /// index each); `new` is `w × inner` words (`fold` indices each, `w = ceil(e/fold)`).
 /// Pure — unit-tested with synthetic slices.
+#[must_use]
 pub fn compare_indices(
     old: &[u16],
     new: &[u16],
@@ -152,6 +153,7 @@ fn build_sample(
 /// sibling codebook / scale tensors. Reads the raw words locally via
 /// [`crate::sample`]. `fold`/`bits` come from the shape detection.
 #[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn verify_local(
     old_w: &TensorInfo,
     new_w: &TensorInfo,

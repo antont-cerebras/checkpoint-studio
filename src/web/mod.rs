@@ -138,7 +138,7 @@ impl WebState {
             })
             .collect();
 
-        WebState {
+        Self {
             root,
             checkpoint,
             tree,
@@ -309,8 +309,8 @@ enum Body {
 impl Body {
     fn as_slice(&self) -> &[u8] {
         match self {
-            Body::Owned(v) => v,
-            Body::Shared(a) => a,
+            Self::Owned(v) => v,
+            Self::Shared(a) => a,
         }
     }
 }

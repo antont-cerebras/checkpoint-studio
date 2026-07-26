@@ -89,6 +89,7 @@ impl S3Meta {
     /// Project into the stats module's own view for the stats screen's S3 section.
     /// Lives here so `stats` needn't know about remote reads — and so the TUI and the
     /// web server share one conversion instead of each writing their own.
+    #[must_use]
     pub fn to_stats(&self) -> crate::stats::S3Stats {
         crate::stats::S3Stats {
             objects: self
@@ -125,7 +126,7 @@ pub enum ObjectMeta {
 
 impl ObjectMeta {
     fn wanted(self) -> bool {
-        self == ObjectMeta::Fetch
+        self == Self::Fetch
     }
 }
 
@@ -258,6 +259,7 @@ pub struct RepackAux {
 
 impl RepackAux {
     /// Found on both sides.
+    #[must_use]
     pub fn present(&self) -> bool {
         self.old_present && self.new_present
     }
@@ -289,6 +291,7 @@ pub struct RepackFallback {
 impl RepackResult {
     /// Whether this tensor verified as equivalent: same indices and both format
     /// checks clean.
+    #[must_use]
     pub fn equivalent(&self) -> bool {
         self.error.is_none() && self.differing == 0 && self.sparse_bad == 0 && self.dense_bad == 0
     }
@@ -368,6 +371,7 @@ type ShardParse = (usize, Vec<TensorInfo>, Vec<MetadataInfo>);
 /// available locally. The scp test (a `:` before any `/`, with a non-empty host to
 /// its left) matches how `scp` itself distinguishes a remote target from a local
 /// path, so local absolute/relative paths are never misread as remote.
+#[must_use]
 pub fn is_remote_source(source_path: &str) -> bool {
     if source_path.starts_with("s3://") {
         return true;
@@ -387,8 +391,9 @@ pub struct RemoteRead {
 }
 
 impl RemoteRead {
+    #[must_use]
     pub fn new(host: String, venv: String) -> Self {
-        RemoteRead { host, venv }
+        Self { host, venv }
     }
 
     /// Read a remote checkpoint's structure over a fresh SSH session (one auth),

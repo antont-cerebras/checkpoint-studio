@@ -58,12 +58,6 @@ cast_possible_wrap = "allow"
 cast_lossless = "allow"
 cast_sign_loss = "allow"
 
-# `#[must_use]` on 426 functions, most of them small accessors whose result is obviously
-# the point. The lint cannot tell "ignoring this is a bug" from "this is a getter", and the
-# annotation is noise at that density. The cases where ignoring a result IS a bug are
-# covered by returning `Result`, which `unused_must_use` already enforces.
-must_use_candidate = "allow"
-
 # Documentation prose, not correctness: a first paragraph over one line, an undocumented
 # `Err` variant on a function whose error type is a `String` message, an identifier that
 # reads like code but isn't in backticks. Worth doing as writing; not worth gating a build.
@@ -71,11 +65,9 @@ too_long_first_doc_paragraph = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
-# `Self` vs the concrete name inside an impl, and 200+ functions that *could* be `const`.
-# Both are near-mechanical, but `use_self` fights the places where the concrete name is
-# clearer (a `Foo::new` returning `Foo`), and `missing_const_for_fn` would freeze the
-# implementation of functions we still change.
-use_self = "allow"
+# 200+ functions that *could* be `const`. Left off because it would freeze the
+# implementation of functions we still change — a `const fn` cannot later call a
+# non-const one without breaking every caller that relied on it in a const context.
 missing_const_for_fn = "allow"
 
 # Directly contradicts rustc's `unreachable_pub`, which is on below: inside a `pub(crate)`

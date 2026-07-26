@@ -37,12 +37,14 @@ pub struct Report {
 
 impl Report {
     /// On-disk size ratio of source / repacked (>1 means we got smaller).
+    #[must_use]
     pub fn ratio(&self) -> f64 {
         self.in_bytes as f64 / self.out_bytes.max(1) as f64
     }
 
     /// A human summary of how the repack changed the on-disk size, including the
     /// new codec's overall ratio against the uncompressed data.
+    #[must_use]
     pub fn summary(&self, new: Codec) -> String {
         let pct = if self.in_bytes > 0 {
             (self.out_bytes as f64 / self.in_bytes as f64 - 1.0) * 100.0
@@ -183,6 +185,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 
 /// Detect the codec a source file uses (for a same-codec warning), if every
 /// compressed dataset shares one; `None` if uncompressed, mixed, or unreadable.
+#[must_use]
 pub fn source_codec(input: &Path) -> Option<Codec> {
     let src = hdf5_metno::File::open(input).ok()?;
     crate::hdf5_lz4::register();

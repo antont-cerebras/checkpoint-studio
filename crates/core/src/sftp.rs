@@ -71,21 +71,24 @@ pub enum RemoteStat {
 }
 
 impl RemoteStat {
+    #[must_use]
     pub fn is_dir(&self) -> bool {
-        matches!(self, RemoteStat::Directory)
+        matches!(self, Self::Directory)
     }
     /// Apparent size in bytes (0 for a directory).
+    #[must_use]
     pub fn apparent(&self) -> u64 {
         match self {
-            RemoteStat::File { apparent, .. } => *apparent,
-            RemoteStat::Directory => 0,
+            Self::File { apparent, .. } => *apparent,
+            Self::Directory => 0,
         }
     }
     /// On-disk allocation in bytes (0 for a directory).
+    #[must_use]
     pub fn allocated(&self) -> u64 {
         match self {
-            RemoteStat::File { allocated, .. } => *allocated,
-            RemoteStat::Directory => 0,
+            Self::File { allocated, .. } => *allocated,
+            Self::Directory => 0,
         }
     }
 }
@@ -118,7 +121,7 @@ impl RemoteSession {
         for attempt in 1..=max_attempts {
             let session = handshake(&host, port)?;
             match authenticate(&session, &user, &host, password) {
-                Ok(()) => return Ok(RemoteSession { session }),
+                Ok(()) => return Ok(Self { session }),
                 Err(e) => {
                     if attempt < max_attempts {
                         let msg = format!("checkpoint-studio: {e} — try again");
@@ -341,6 +344,7 @@ impl RemoteSession {
     /// `path → RemoteStat`. Best-effort: a path that can't be resolved (broken
     /// link, no GNU `stat`) is simply absent, and the exit status is ignored so one
     /// bad path doesn't drop the rest.
+    #[must_use]
     pub fn stat_paths(&self, paths: &[String]) -> HashMap<String, RemoteStat> {
         let mut out = HashMap::new();
         if paths.is_empty() {

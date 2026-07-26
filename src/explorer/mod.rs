@@ -103,7 +103,7 @@ struct SelectionView {
 impl SelectionView {
     /// The empty selection (nothing highlighted / an empty group).
     fn empty() -> Self {
-        SelectionView {
+        Self {
             status: ("", String::new(), String::new()),
             copy_path: None,
         }

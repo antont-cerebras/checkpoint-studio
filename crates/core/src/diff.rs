@@ -262,6 +262,7 @@ fn group_entries<K: Clone + Eq + std::hash::Hash>(items: &[(String, K)]) -> Vec<
 /// `model.layers.{0-47}.…experts.{0-3}.down_proj.weight` → count 192. Ordered by
 /// first appearance (alphabetical when `names` is sorted). Used to summarize which
 /// tensors a `diff` filter matched.
+#[must_use]
 pub fn name_schema(names: &[&str]) -> Vec<(String, usize)> {
     let items: Vec<(String, ())> = names.iter().map(|n| ((*n).to_string(), ())).collect();
     group_entries(&items)
@@ -294,6 +295,7 @@ pub struct TensorFamily {
 /// params / bytes, and the dtype + shape when uniform. First-appearance order
 /// (alphabetical when the input is sorted). A compact "what's in here, per layer /
 /// per expert" summary, mirroring how `diff` collapses its entries.
+#[must_use]
 pub fn tensor_families(tensors: &[TensorInfo]) -> Vec<TensorFamily> {
     use std::collections::HashMap;
     struct Agg {
@@ -526,6 +528,7 @@ pub struct TensorSig {
 
 impl TensorSig {
     /// The signature of a loaded tensor.
+    #[must_use]
     pub fn of(t: &TensorInfo) -> Self {
         Self {
             dtype: t.dtype.clone(),
@@ -575,6 +578,7 @@ impl CheckpointSummary {
     /// checkpoint can list a name in more than one file; the last one wins (the
     /// same name+shape is expected across shards, so this only matters if they
     /// genuinely disagree, which a diff can't meaningfully represent anyway).
+    #[must_use]
     pub fn from_loaded(tensors: &[TensorInfo], metadata: &[MetadataInfo]) -> Self {
         let mut t = BTreeMap::new();
         // Track size/params per name (last-wins, matching `t`) so totals are over
@@ -622,11 +626,13 @@ impl NameMap {
     /// is a no-op.
     ///
     /// [`remap_summary`]: NameMap::remap_summary
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
 
     /// The number of rewrite rules (for a "applied N rule(s)" note).
+    #[must_use]
     pub fn len(&self) -> usize {
         self.rules.len()
     }
@@ -668,6 +674,7 @@ impl NameMap {
 
     /// Rewrite `name` through every rule in order. `replace_all` only allocates on
     /// a match, so a name no rule touches passes through cheaply.
+    #[must_use]
     pub fn map<'n>(&self, name: &'n str) -> Cow<'n, str> {
         let mut cur = Cow::Borrowed(name);
         for (re, rep) in &self.rules {
@@ -826,6 +833,7 @@ pub struct TensorFilter {
 
 impl TensorFilter {
     /// Whether any constraint is set (so the diff is scoped to a subset).
+    #[must_use]
     pub fn is_active(&self) -> bool {
         self.names.is_active()
             || self.names_exact.is_some()
@@ -982,6 +990,7 @@ impl DiffReport {
 
     /// [`Self::has_differences_with`] counting S3 material changes — the default
     /// whole-checkpoint comparison (no `--name` filter).
+    #[must_use]
     pub fn has_differences(&self) -> bool {
         self.has_differences_with(true)
     }
@@ -1454,6 +1463,7 @@ pub struct S3Scope {
 /// rather than a single-part object's plain MD5. A multipart `ETag` isn't a content
 /// hash — it depends on the part size — so a matching one implies identical content
 /// only when the part layout also matches.
+#[must_use]
 pub fn is_multipart_etag(etag: &str) -> bool {
     etag.rsplit_once('-')
         .is_some_and(|(_, parts)| !parts.is_empty() && parts.bytes().all(|b| b.is_ascii_digit()))
@@ -1477,6 +1487,7 @@ pub struct S3Diff {
 impl S3Diff {
     /// Material changes only — timestamp-only deltas never count (never affect the
     /// exit code).
+    #[must_use]
     pub fn has_material_changes(&self) -> bool {
         !self.added.is_empty() || !self.removed.is_empty() || !self.changed.is_empty()
     }
@@ -1549,6 +1560,7 @@ fn map_differs(
 /// Compare two `s3://` checkpoints' object metadata, matching objects by their
 /// prefix-relative key. Timestamps (last-modified, timestamp-like tags/metadata) are
 /// bucketed as info and never counted as a difference.
+#[must_use]
 pub fn compare_s3(old: &S3Meta, new: &S3Meta) -> S3Diff {
     let index = |m: &S3Meta| -> BTreeMap<String, S3Object> {
         m.objects
@@ -1661,6 +1673,7 @@ pub fn compare_s3(old: &S3Meta, new: &S3Meta) -> S3Diff {
 
 /// Structural comparison of two checkpoint summaries (old → new). Tensor values
 /// are not read; see [`compare_with`].
+#[must_use]
 pub fn compare(old: &CheckpointSummary, new: &CheckpointSummary) -> DiffReport {
     compare_with(old, new, |_| TensorExtras::default())
 }
@@ -1746,6 +1759,7 @@ pub fn compare_with(
 /// Whether the focused (`--tensor`) diff counts as a difference — drives exit `1`
 /// vs `0`. The tensor differs if it's present on only one side, its signature
 /// changed, or (same signature) its values changed.
+#[must_use]
 pub fn tensor_focus_differs(
     old: Option<&TensorSig>,
     new: Option<&TensorSig>,
@@ -1762,6 +1776,7 @@ pub fn tensor_focus_differs(
 /// Render the focused single-tensor diff: the `[old] → [new]` signature line (or
 /// added/removed/identical), then an indented `values:` line from the element
 /// comparison when both sides exist.
+#[must_use]
 pub fn render_tensor_focus(
     old_label: &str,
     new_label: &str,
@@ -1844,6 +1859,7 @@ fn histogram_line(tvds: &[f64], bins: usize) -> String {
 /// The full per-tensor histogram comparison table for `diff --tensor --histogram`:
 /// one row per shared bin with its label and the old / new counts and delta. Only
 /// bins where at least one side is non-empty are shown.
+#[must_use]
 pub fn render_histogram_table(name: &str, hd: &HistogramDiff, color: bool) -> String {
     let mut s = String::new();
     let _ = writeln!(

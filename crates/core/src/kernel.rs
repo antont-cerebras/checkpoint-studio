@@ -113,14 +113,17 @@ pub struct SearchState {
 
 impl TreeState {
     /// Whether search input is active.
+    #[must_use]
     pub fn search_mode(&self) -> bool {
         self.search.is_some()
     }
     /// The live search query, or `""` when not searching.
+    #[must_use]
     pub fn search_query(&self) -> &str {
         self.search.as_ref().map_or("", |s| s.query.as_str())
     }
     /// The caret position, or 0 when not searching.
+    #[must_use]
     pub fn search_cursor(&self) -> usize {
         self.search.as_ref().map_or(0, |s| s.cursor)
     }
@@ -150,6 +153,7 @@ impl TreeState {
     /// The currently visible rows: an in-progress search wins, then a persistent
     /// structured filter, else the fold-aware flattened tree. The one selector
     /// every navigation op reads.
+    #[must_use]
     pub fn visible(&self) -> &[(TreeNode, usize)] {
         if let Some(s) = &self.search {
             return &s.filtered;
@@ -161,11 +165,13 @@ impl TreeState {
     }
 
     /// Whether a persistent structured filter is active.
+    #[must_use]
     pub fn filter_active(&self) -> bool {
         self.filter.is_some()
     }
 
     /// The active filter query, or `""` when none.
+    #[must_use]
     pub fn filter_query(&self) -> &str {
         self.filter.as_ref().map_or("", |f| f.query.as_str())
     }
@@ -451,7 +457,7 @@ pub struct DataViewState {
 
 impl Default for DataViewState {
     fn default() -> Self {
-        DataViewState {
+        Self {
             dtype_overrides: RefCell::new(HashMap::new()),
             shape_overrides: RefCell::new(HashMap::new()),
             histogram_bins: Cell::new(None),
@@ -500,6 +506,7 @@ pub struct Session {
 
 impl Session {
     /// Open a session over an already-read checkpoint model (local reads).
+    #[must_use]
     pub fn from_model(model: Checkpoint) -> Self {
         let tensors = model.tensors_vec();
         let metadata = model.metadata_vec();
@@ -509,6 +516,7 @@ impl Session {
 
     /// Open a session from raw parts — a remote read whose serializable model
     /// isn't assembled yet. Canonicalises the tensors exactly as [`from_model`].
+    #[must_use]
     pub fn from_parts(
         tensors: Vec<TensorInfo>,
         metadata: Vec<MetadataInfo>,
@@ -527,7 +535,7 @@ impl Session {
     ) -> Self {
         let tensors = Self::canonical_tensors(tensors);
         let total_parameters = tensors.iter().map(|t| t.num_elements).sum();
-        Session {
+        Self {
             model,
             tensors,
             metadata,
@@ -539,6 +547,7 @@ impl Session {
 
     /// Build the initial tensor tree (fold-aware) from the canonical data — the
     /// starting point a frontend loads into its [`TreeState`]. No disk.
+    #[must_use]
     pub fn build_tree(&self) -> Vec<TreeNode> {
         if self.metadata.is_empty() {
             TreeBuilder::build_tree(&self.tensors)
@@ -581,26 +590,31 @@ impl Session {
     }
 
     /// The serializable model (local reads only), for serialization / reports.
+    #[must_use]
     pub fn model(&self) -> Option<&Checkpoint> {
         self.model.as_ref()
     }
 
     /// The canonical tensor list (deduped + natural-sorted).
+    #[must_use]
     pub fn tensors(&self) -> &[TensorInfo] {
         &self.tensors
     }
 
     /// The metadata entries (model / shard order).
+    #[must_use]
     pub fn metadata(&self) -> &[MetadataInfo] {
         &self.metadata
     }
 
     /// The checkpoint's config, when present.
+    #[must_use]
     pub fn config(&self) -> Option<&ModelConfig> {
         self.config.as_ref()
     }
 
     /// Total element count across the canonical tensors.
+    #[must_use]
     pub fn total_parameters(&self) -> usize {
         self.total_parameters
     }
@@ -635,6 +649,7 @@ impl ViewModel {
     /// straight from the frontend's live [`TreeState`]. Pure — the kernel's output
     /// contract that a TUI renders, a web server sends as JSON, or an MCP tool
     /// returns.
+    #[must_use]
     pub fn from_tree(root: &str, tree: &TreeState) -> Self {
         let rows: Vec<Row> = tree
             .visible()
@@ -650,7 +665,7 @@ impl ViewModel {
             .get(selected)
             .map(|r| r.label.clone())
             .unwrap_or_default();
-        ViewModel {
+        Self {
             screen: Screen::Tree,
             root: root.to_string(),
             rows,
@@ -666,6 +681,7 @@ impl ViewModel {
 
     /// Project the file-browser screen into a serializable snapshot from the
     /// frontend's live [`FileState`].
+    #[must_use]
     pub fn from_files(root: &str, files: &FileState) -> Self {
         let rows: Vec<Row> = files
             .rows
@@ -681,7 +697,7 @@ impl ViewModel {
             .get(selected)
             .map(|r| r.label.clone())
             .unwrap_or_default();
-        ViewModel {
+        Self {
             screen: Screen::Files,
             root: root.to_string(),
             rows,

@@ -19,7 +19,7 @@ pub(crate) struct CliConfig {
 impl CliConfig {
     /// Load from [`Self::path`], or return the defaults (all `None`) when the file
     /// is absent or unreadable — a missing/typo'd config is never fatal.
-    pub(crate) fn load() -> CliConfig {
+    pub(crate) fn load() -> Self {
         Self::path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|s| Self::parse(&s))
@@ -39,8 +39,8 @@ impl CliConfig {
     /// Parse `key = "value"` lines (a TOML subset): blank lines and `#` comments are
     /// ignored, values may be quoted or bare, and unknown keys are ignored (so a
     /// newer config doesn't break an older binary). Accepts `ssh_proxy`/`ssh-proxy`.
-    pub(crate) fn parse(text: &str) -> CliConfig {
-        let mut cfg = CliConfig::default();
+    pub(crate) fn parse(text: &str) -> Self {
+        let mut cfg = Self::default();
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {

@@ -38,8 +38,8 @@ impl AccessBadge {
     /// The chip text, symmetrically padded with one space on each side.
     const fn label(self) -> &'static str {
         match self {
-            AccessBadge::ReadOnly => " read-only ",
-            AccessBadge::Editable => " editable ",
+            Self::ReadOnly => " read-only ",
+            Self::Editable => " editable ",
         }
     }
 
@@ -47,20 +47,20 @@ impl AccessBadge {
     /// amber when the checkpoint can be rewritten in place.
     fn color(self) -> Color {
         match self {
-            AccessBadge::ReadOnly => palette::SUCCESS,
-            AccessBadge::Editable => palette::WARN,
+            Self::ReadOnly => palette::SUCCESS,
+            Self::Editable => palette::WARN,
         }
     }
 
     /// The hover-bubble text explaining what the badge means.
     fn hover(self) -> &'static str {
         match self {
-            AccessBadge::ReadOnly => {
+            Self::ReadOnly => {
                 "The checkpoint you open is never modified — browsing and exports only \
                  ever read it. (Repack / convert write a new file, leaving the original \
                  untouched.)"
             }
-            AccessBadge::Editable => {
+            Self::Editable => {
                 "Browsing and exports never modify this checkpoint. The one exception is \
                  the in-place rename (R / convert --map), which rewrites the headers \
                  after you confirm."

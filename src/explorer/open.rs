@@ -33,8 +33,8 @@ impl TreeState {
     /// The `--tree-state` value that names this state.
     pub(crate) fn label(self) -> &'static str {
         match self {
-            TreeState::Expanded => "expanded",
-            TreeState::Collapsed => "collapsed",
+            Self::Expanded => "expanded",
+            Self::Collapsed => "collapsed",
         }
     }
 }
@@ -77,9 +77,9 @@ impl TreeDetail {
     /// Map a repeated-`-v` count to a detail level (0 → compact, ≥1 → full).
     pub(crate) fn from_verbosity(count: u8) -> Self {
         if count == 0 {
-            TreeDetail::Compact
+            Self::Compact
         } else {
-            TreeDetail::Full
+            Self::Full
         }
     }
 }
@@ -181,14 +181,14 @@ impl OpenTarget {
     /// The explicit tensor name, if `--tensor` named one.
     pub(crate) fn tensor(&self) -> Option<&str> {
         match self {
-            OpenTarget::Tensor(n) => Some(n),
+            Self::Tensor(n) => Some(n),
             _ => None,
         }
     }
     /// The metadata entry name, if `--metadata` named one.
     pub(crate) fn metadata(&self) -> Option<&str> {
         match self {
-            OpenTarget::Metadata(n) => Some(n),
+            Self::Metadata(n) => Some(n),
             _ => None,
         }
     }
@@ -207,11 +207,11 @@ pub(crate) enum HistogramReq {
 
 impl HistogramReq {
     pub(crate) fn on(&self) -> bool {
-        !matches!(self, HistogramReq::Off)
+        !matches!(self, Self::Off)
     }
     pub(crate) fn bins(&self) -> Option<usize> {
         match self {
-            HistogramReq::Bins(n) => Some(*n),
+            Self::Bins(n) => Some(*n),
             _ => None,
         }
     }
@@ -228,10 +228,10 @@ pub(crate) enum HealthReq {
 
 impl HealthReq {
     pub(crate) fn wants(&self) -> bool {
-        !matches!(self, HealthReq::Off)
+        !matches!(self, Self::Off)
     }
     pub(crate) fn findings(&self) -> bool {
-        matches!(self, HealthReq::Findings)
+        matches!(self, Self::Findings)
     }
 }
 
@@ -245,10 +245,10 @@ pub(crate) enum StatsReq {
 
 impl StatsReq {
     pub(crate) fn wants(&self) -> bool {
-        !matches!(self, StatsReq::Off)
+        !matches!(self, Self::Off)
     }
     pub(crate) fn shards(&self) -> bool {
-        matches!(self, StatsReq::Shards)
+        matches!(self, Self::Shards)
     }
 }
 

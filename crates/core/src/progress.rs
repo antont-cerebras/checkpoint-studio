@@ -84,11 +84,11 @@ impl Stage {
     /// The dimmed text shown after the timer.
     const fn label(self) -> &'static str {
         match self {
-            Stage::Index => "loading the checkpoint index",
-            Stage::Listing => "listing the checkpoint files",
-            Stage::Shards => "reading shard headers",
-            Stage::Tensors => "reading tensor metadata",
-            Stage::S3Objects => "reading S3 storage metadata",
+            Self::Index => "loading the checkpoint index",
+            Self::Listing => "listing the checkpoint files",
+            Self::Shards => "reading shard headers",
+            Self::Tensors => "reading tensor metadata",
+            Self::S3Objects => "reading S3 storage metadata",
         }
     }
 
@@ -100,20 +100,20 @@ impl Stage {
     /// ones where a bar otherwise looks stuck.
     const fn short(self) -> &'static str {
         match self {
-            Stage::Index => "index",
-            Stage::Listing => "listing files",
-            Stage::Shards | Stage::Tensors | Stage::S3Objects => "",
+            Self::Index => "index",
+            Self::Listing => "listing files",
+            Self::Shards | Self::Tensors | Self::S3Objects => "",
         }
     }
 
     /// Every stage, so the tests can check the labels are distinct and complete.
     #[cfg(test)]
-    const ALL: [Stage; 5] = [
-        Stage::Index,
-        Stage::Listing,
-        Stage::Shards,
-        Stage::Tensors,
-        Stage::S3Objects,
+    const ALL: [Self; 5] = [
+        Self::Index,
+        Self::Listing,
+        Self::Shards,
+        Self::Tensors,
+        Self::S3Objects,
     ];
 }
 
@@ -132,6 +132,7 @@ fn fit_stage(room: usize, long: &'static str, short: &'static str) -> &'static s
 }
 
 impl LoadProgress {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -248,7 +249,8 @@ pub struct Bars {
 
 impl Bars {
     /// Reserve one bar per label and (on a terminal) start animating them.
-    pub fn start(labels: &[String]) -> Bars {
+    #[must_use]
+    pub fn start(labels: &[String]) -> Self {
         let n = labels.len();
         let states: Vec<_> = (0..n).map(|_| Arc::new(AtomicU8::new(RUNNING))).collect();
         let durations: Vec<_> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
@@ -263,7 +265,7 @@ impl Bars {
                 start,
             )
         });
-        Bars {
+        Self {
             states,
             durations,
             progress,
@@ -274,6 +276,7 @@ impl Bars {
 
     /// The shared progress handle for read `i` — hand it to the reader so it can
     /// report shard/file completion, and the bar fills in as they land.
+    #[must_use]
     pub fn progress(&self, i: usize) -> Option<Arc<LoadProgress>> {
         self.progress.get(i).cloned()
     }

@@ -52,6 +52,7 @@ pub struct TensorInfo {
 impl TensorInfo {
     /// The size actually occupied on disk: the compressed size when stored
     /// compressed, otherwise the logical size.
+    #[must_use]
     pub fn on_disk_size(&self) -> usize {
         match &self.storage {
             Storage::Compressed { stored_bytes, .. } => *stored_bytes,
@@ -75,7 +76,7 @@ pub struct MetadataInfo {
 pub enum TreeNode {
     Group {
         name: String,
-        children: Vec<TreeNode>,
+        children: Vec<Self>,
         expanded: bool,
         tensor_count: usize,
         /// Total number of parameters (elements) across descendant tensors.
@@ -98,11 +99,12 @@ pub enum TreeNode {
 }
 
 impl TreeNode {
+    #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            TreeNode::Group { name, .. } => name,
-            TreeNode::Tensor { info, .. } => &info.name,
-            TreeNode::Metadata { info } => &info.name,
+            Self::Group { name, .. } => name,
+            Self::Tensor { info, .. } => &info.name,
+            Self::Metadata { info } => &info.name,
         }
     }
 
@@ -113,9 +115,9 @@ impl TreeNode {
     /// list, so deep-cloning a whole subtree once per visible ancestor (the `Group`
     /// clone recurses through all children) was the bulk of the build cost on big
     /// checkpoints. Leaves clone whole (they hold no subtree).
-    fn flatten_row_clone(&self) -> TreeNode {
+    fn flatten_row_clone(&self) -> Self {
         match self {
-            TreeNode::Group {
+            Self::Group {
                 name,
                 children,
                 expanded,
@@ -123,9 +125,9 @@ impl TreeNode {
                 params,
                 total_size,
                 stored_size,
-            } => TreeNode::Group {
+            } => Self::Group {
                 name: name.clone(),
-                children: children.iter().map(TreeNode::child_stub).collect(),
+                children: children.iter().map(Self::child_stub).collect(),
                 expanded: *expanded,
                 tensor_count: *tensor_count,
                 params: *params,
@@ -139,9 +141,9 @@ impl TreeNode {
     /// A direct-child stub for [`flatten_row_clone`]: a `Group` keeps its name and
     /// kind (so `layer_count` still recognises a numbered stack) but drops its own
     /// children; leaves clone whole.
-    fn child_stub(&self) -> TreeNode {
+    fn child_stub(&self) -> Self {
         match self {
-            TreeNode::Group {
+            Self::Group {
                 name,
                 expanded,
                 tensor_count,
@@ -149,7 +151,7 @@ impl TreeNode {
                 total_size,
                 stored_size,
                 ..
-            } => TreeNode::Group {
+            } => Self::Group {
                 name: name.clone(),
                 children: Vec::new(),
                 expanded: *expanded,
@@ -165,6 +167,7 @@ impl TreeNode {
 
 /// The last path segment of a tensor name, treating `.` and `__` as separators
 /// (so `…_down_proj_weight__variant` yields `variant`). Used for the leaf label.
+#[must_use]
 pub fn last_segment(name: &str) -> &str {
     let after = name.rsplit("__").next().unwrap_or(name);
     after.rsplit('.').next().unwrap_or(after)
@@ -175,6 +178,7 @@ pub fn last_segment(name: &str) -> &str {
 /// `qscale.__metadata__`, beside its `qscale` tensor). Names without that suffix
 /// (`__version__`, `inference_version.__metadata__` at the root) are returned as
 /// their final dotted segment.
+#[must_use]
 pub fn metadata_short(name: &str) -> String {
     match name.strip_suffix(".__metadata__") {
         Some(stem) => format!("{}.__metadata__", stem.rsplit('.').next().unwrap_or(stem)),
@@ -182,6 +186,7 @@ pub fn metadata_short(name: &str) -> String {
     }
 }
 
+#[must_use]
 pub fn natural_sort_key(name: &str) -> Vec<NaturalSortItem> {
     let mut result = Vec::new();
     let mut current_number = String::new();
@@ -250,6 +255,7 @@ impl TreeBuilder {
     /// one (`<tensor>.quantization_schema.__metadata__`). The remaining
     /// standalone/config metadata (e.g. `inference_version`, `__version__`) stays
     /// in a top-level group.
+    #[must_use]
     pub fn build_tree_mixed(tensors: &[TensorInfo], metadata: &[MetadataInfo]) -> Vec<TreeNode> {
         let tensor_names: HashSet<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
         // Whether `path` (dotted) names a group in the tensor tree — i.e. it is a
@@ -319,6 +325,7 @@ impl TreeBuilder {
         tree
     }
 
+    #[must_use]
     pub fn build_tree(tensors: &[TensorInfo]) -> Vec<TreeNode> {
         compact_nodes(Self::build_tree_raw(tensors))
     }
@@ -482,6 +489,7 @@ impl TreeBuilder {
     /// — i.e. matches a `set_all_expanded(want)`. Lets the reopen command detect
     /// the `--expand-all` / `--collapse-all` bulk states so `y` round-trips them.
     /// A tree with no groups vacuously matches either.
+    #[must_use]
     pub fn all_groups(nodes: &[TreeNode], want: bool) -> bool {
         nodes.iter().all(|node| match node {
             TreeNode::Group {
@@ -491,6 +499,7 @@ impl TreeBuilder {
         })
     }
 
+    #[must_use]
     pub fn flatten_tree(tree: &[TreeNode]) -> Vec<(TreeNode, usize)> {
         let mut flattened = Vec::new();
         for node in tree {

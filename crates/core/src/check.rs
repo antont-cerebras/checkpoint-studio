@@ -37,15 +37,16 @@ pub struct Finding {
 }
 
 impl Finding {
+    #[must_use]
     pub fn error(subject: Option<String>, message: String) -> Self {
-        Finding {
+        Self {
             severity: Severity::Error,
             subject,
             message,
         }
     }
     fn warning(subject: Option<String>, message: String) -> Self {
-        Finding {
+        Self {
             severity: Severity::Warning,
             subject,
             message,
@@ -93,20 +94,21 @@ pub struct CheckResult {
 
 impl CheckResult {
     fn na(id: &'static str, title: &'static str, note: &'static str) -> Self {
-        CheckResult {
+        Self {
             id,
             title,
             note,
             outcome: CheckOutcome::NotApplicable,
         }
     }
+    #[must_use]
     pub fn done(
         id: &'static str,
         title: &'static str,
         note: &'static str,
         findings: Vec<Finding>,
     ) -> Self {
-        CheckResult {
+        Self {
             id,
             title,
             note,
@@ -119,10 +121,12 @@ impl CheckResult {
     }
 
     /// Whether the check applied (i.e. actually ran).
+    #[must_use]
     pub fn applicable(&self) -> bool {
         matches!(self.outcome, CheckOutcome::Ran { .. })
     }
     /// The findings produced (empty when the check didn't apply).
+    #[must_use]
     pub fn findings(&self) -> &[Finding] {
         match &self.outcome {
             CheckOutcome::Ran { findings, .. } => findings,
@@ -130,6 +134,7 @@ impl CheckResult {
         }
     }
     /// The check's wall-clock time, when timed.
+    #[must_use]
     pub fn elapsed(&self) -> Option<std::time::Duration> {
         match &self.outcome {
             CheckOutcome::Ran { elapsed, .. } => *elapsed,
@@ -137,6 +142,7 @@ impl CheckResult {
         }
     }
     /// The dynamic pass summary, when the check set one.
+    #[must_use]
     pub fn summary(&self) -> Option<&str> {
         match &self.outcome {
             CheckOutcome::Ran { summary, .. } => summary.as_deref(),
@@ -155,12 +161,14 @@ impl CheckResult {
             *elapsed = Some(d);
         }
     }
+    #[must_use]
     pub fn errors(&self) -> usize {
         self.findings()
             .iter()
             .filter(|f| f.severity == Severity::Error)
             .count()
     }
+    #[must_use]
     pub fn warnings(&self) -> usize {
         self.findings()
             .iter()
@@ -191,6 +199,7 @@ impl CheckReport {
     /// Every check in display order: the format's storage-integrity check first (when
     /// it has one), then the universal checks — so renderers iterate uniformly
     /// without matching on the storage variant.
+    #[must_use]
     pub fn checks(&self) -> Vec<&CheckResult> {
         self.storage
             .check()
@@ -198,14 +207,17 @@ impl CheckReport {
             .chain(self.results.iter())
             .collect()
     }
+    #[must_use]
     pub fn errors(&self) -> usize {
         self.checks().iter().map(|r| r.errors()).sum()
     }
+    #[must_use]
     pub fn warnings(&self) -> usize {
         self.checks().iter().map(|r| r.warnings()).sum()
     }
     /// `diff`-style: `1` when the checkpoint is unhealthy, else `0`. Errors
     /// always count; warnings only when `strict`.
+    #[must_use]
     pub fn exit_code(&self, strict: bool) -> i32 {
         i32::from(self.errors() > 0 || (strict && self.warnings() > 0))
     }
@@ -223,15 +235,16 @@ pub enum Status {
 impl Status {
     fn as_str(self) -> &'static str {
         match self {
-            Status::Pass => "pass",
-            Status::Warn => "warn",
-            Status::Fail => "fail",
-            Status::Na => "na",
+            Self::Pass => "pass",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+            Self::Na => "na",
         }
     }
 }
 
 impl CheckResult {
+    #[must_use]
     pub fn status(&self) -> Status {
         if !self.applicable() {
             Status::Na
@@ -261,7 +274,7 @@ pub enum CheckpointFormat {
 }
 
 impl CheckpointFormat {
-    fn detect(tensors: &[TensorInfo]) -> CheckpointFormat {
+    fn detect(tensors: &[TensorInfo]) -> Self {
         let has = |exts: &[&str]| {
             tensors.iter().any(|t| {
                 let p = t.source_path.to_ascii_lowercase();
@@ -269,22 +282,23 @@ impl CheckpointFormat {
             })
         };
         if has(&[".hdf5", ".h5"]) {
-            CheckpointFormat::Hdf5
+            Self::Hdf5
         } else if has(&[".gguf"]) {
-            CheckpointFormat::Gguf
+            Self::Gguf
         } else if has(&[".npy", ".npz"]) {
-            CheckpointFormat::Numpy
+            Self::Numpy
         } else if has(&[".safetensors"]) {
-            CheckpointFormat::Safetensors
+            Self::Safetensors
         } else {
-            CheckpointFormat::Other
+            Self::Other
         }
     }
 
     /// Whether this format uses `model.safetensors.index.json` (so index
     /// reconciliation is meaningful) — safetensors only.
+    #[must_use]
     pub fn has_index(self) -> bool {
-        matches!(self, CheckpointFormat::Safetensors)
+        matches!(self, Self::Safetensors)
     }
 }
 
@@ -306,27 +320,28 @@ pub enum StorageCheck {
 }
 
 impl StorageCheck {
-    fn detect(tensors: &[TensorInfo]) -> StorageCheck {
+    fn detect(tensors: &[TensorInfo]) -> Self {
         if tensors
             .iter()
             .any(|t| matches!(t.layout, Layout::Chunked { .. }))
         {
-            StorageCheck::Hdf5(check_hdf5(tensors))
+            Self::Hdf5(check_hdf5(tensors))
         } else if tensors
             .iter()
             .any(|t| matches!(t.layout, Layout::ByteRange { .. }))
         {
-            StorageCheck::ByteRanges(check_byte_ranges(tensors))
+            Self::ByteRanges(check_byte_ranges(tensors))
         } else {
-            StorageCheck::Opaque
+            Self::Opaque
         }
     }
 
     /// The integrity check to render, when the format has one.
+    #[must_use]
     pub fn check(&self) -> Option<&CheckResult> {
         match self {
-            StorageCheck::ByteRanges(c) | StorageCheck::Hdf5(c) => Some(c),
-            StorageCheck::Opaque => None,
+            Self::ByteRanges(c) | Self::Hdf5(c) => Some(c),
+            Self::Opaque => None,
         }
     }
 }
@@ -350,6 +365,7 @@ fn paint(s: &str, color: bool, code: &str) -> String {
 
 impl CheckReport {
     /// Render the human-readable report. `color` gates ANSI styling.
+    #[must_use]
     pub fn render(&self, color: bool) -> String {
         use std::fmt::Write;
         let mut s = String::new();
@@ -468,6 +484,7 @@ impl CheckReport {
 impl CheckReport {
     /// Structured report for `--format json`. `strict` decides the top-level
     /// `healthy` / `exit_code` (whether warnings count).
+    #[must_use]
     pub fn to_json(&self, strict: bool) -> serde_json::Value {
         use serde_json::json;
         let checks: Vec<serde_json::Value> = self
@@ -513,6 +530,7 @@ impl CheckReport {
     /// checks as `rules` and whose `results` are the findings (errors/warnings),
     /// each located at its file (safetensors/HDF5 path) or, for a tensor, a
     /// logical location. Consumable by GitHub code scanning and other SARIF tools.
+    #[must_use]
     pub fn to_sarif(&self) -> serde_json::Value {
         use serde_json::{Value, json};
 
@@ -579,11 +597,13 @@ fn sarif_location(subject: &str) -> serde_json::Value {
 }
 
 /// A scan duration for the report, in the progress bar's `12.3s` style.
+#[must_use]
 pub fn fmt_elapsed(d: std::time::Duration) -> String {
     format!("{:.1}s", d.as_secs_f64())
 }
 
 /// "1 error, 2 warnings" (omitting a zero side, keeping at least one).
+#[must_use]
 pub fn count_phrase(errors: usize, warnings: usize) -> String {
     let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
     match (errors, warnings) {
@@ -598,6 +618,7 @@ pub fn count_phrase(errors: usize, warnings: usize) -> String {
 /// Run every applicable check against an already-loaded checkpoint. Structural
 /// checks always run; the value tier runs only when `values`.
 #[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn run(
     label: String,
     tensors: &[TensorInfo],

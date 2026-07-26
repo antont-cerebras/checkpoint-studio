@@ -71,17 +71,20 @@ pub struct Plan {
 
 impl Plan {
     /// The number of tensors this rename will change.
+    #[must_use]
     pub fn rename_count(&self) -> usize {
         self.renames.len()
     }
 
     /// The number of shard files whose header will be rewritten.
+    #[must_use]
     pub fn shard_count(&self) -> usize {
         self.shards.len()
     }
 
     /// Human-readable summary lines for the CLI prompt and the TUI confirmation,
     /// capped at `cap` rename rows so a huge rename doesn't scroll off the screen.
+    #[must_use]
     pub fn summary_lines(&self, cap: usize) -> Vec<String> {
         let mut out = Vec::new();
         out.push(format!(
@@ -256,14 +259,17 @@ pub struct ShardFit {
 }
 
 impl ShardFit {
+    #[must_use]
     pub fn fits(&self) -> bool {
         self.needed <= self.current
     }
     /// Bytes the new header is over the region (0 when it fits).
+    #[must_use]
     pub fn over(&self) -> u64 {
         self.needed.saturating_sub(self.current)
     }
     /// Bytes to spare (0 when it doesn't fit).
+    #[must_use]
     pub fn spare(&self) -> u64 {
         self.current.saturating_sub(self.needed)
     }
@@ -283,6 +289,7 @@ pub struct RenamePreview {
 
 impl RenamePreview {
     /// Whether every affected row applies cleanly, so the rename can go ahead.
+    #[must_use]
     pub fn applicable(&self) -> bool {
         !self.rows.is_empty() && self.rows.iter().all(|r| r.status == RenameStatus::Ok)
     }
@@ -358,11 +365,13 @@ pub fn load(path: &Path) -> Result<Loaded> {
 
 impl Loaded {
     /// The checkpoint's tensor names (for the source-field autocomplete).
+    #[must_use]
     pub fn names(&self) -> &[String] {
         &self.all_names
     }
 
     /// The checkpoint root (for the mode's title).
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.target.root
     }
@@ -398,6 +407,7 @@ impl Loaded {
     /// How each *changed* shard's rewritten header sizes up against its fixed region
     /// — the detail behind a `won't fit` verdict, so the user can see exactly which
     /// file overflows and by how much.
+    #[must_use]
     pub fn shard_fits(&self, map: &NameMap) -> Vec<ShardFit> {
         self.rebuild(map)
             .into_iter()
@@ -597,6 +607,7 @@ pub fn plan(path: &Path, map: &NameMap) -> Result<Plan> {
 /// the immutable flag). Non-destructive: opens `O_WRONLY` without truncating, so it
 /// changes neither the contents nor the timestamps. Shared by the in-place-rename
 /// pre-flight below and the `editable` badge's `checkpoint_writable` probe.
+#[must_use]
 pub fn is_writable(path: &Path) -> bool {
     fs::OpenOptions::new().write(true).open(path).is_ok()
 }
@@ -725,6 +736,7 @@ fn index_shard_files(index_path: &Path) -> Result<BTreeSet<String>> {
 ///
 /// e.g. `model.layers.3.mlp.experts.5.down_proj.weight`
 ///   →  `model.layers.{layer}.mlp.experts.{expert}.down_proj.weight`, `[layer, expert]`
+#[must_use]
 pub fn generalize(name: &str) -> (String, Vec<String>) {
     let chars: Vec<char> = name.chars().collect();
     let mut schema = String::new();

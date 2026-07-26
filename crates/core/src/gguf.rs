@@ -44,7 +44,7 @@ pub enum GGUFValue {
     F64(f64),
     Bool(bool),
     String(String),
-    Array(Vec<GGUFValue>),
+    Array(Vec<Self>),
 }
 
 /// GGML tensor types from llama.cpp
@@ -85,38 +85,39 @@ pub enum GGMLType {
 }
 
 impl GGMLType {
+    #[must_use]
     pub fn from_u32(value: u32) -> Option<Self> {
         match value {
-            0 => Some(GGMLType::F32),
-            1 => Some(GGMLType::F16),
-            2 => Some(GGMLType::Q4_0),
-            3 => Some(GGMLType::Q4_1),
-            6 => Some(GGMLType::Q5_0),
-            7 => Some(GGMLType::Q5_1),
-            8 => Some(GGMLType::Q8_0),
-            9 => Some(GGMLType::Q8_1),
-            10 => Some(GGMLType::Q2_K),
-            11 => Some(GGMLType::Q3_K),
-            12 => Some(GGMLType::Q4_K),
-            13 => Some(GGMLType::Q5_K),
-            14 => Some(GGMLType::Q6_K),
-            15 => Some(GGMLType::Q8_K),
-            16 => Some(GGMLType::IQ2_XXS),
-            17 => Some(GGMLType::IQ2_XS),
-            18 => Some(GGMLType::IQ3_XXS),
-            19 => Some(GGMLType::IQ1_S),
-            20 => Some(GGMLType::IQ4_NL),
-            21 => Some(GGMLType::IQ3_S),
-            22 => Some(GGMLType::IQ2_S),
-            23 => Some(GGMLType::IQ4_XS),
-            24 => Some(GGMLType::I8),
-            25 => Some(GGMLType::I16),
-            26 => Some(GGMLType::I32),
-            27 => Some(GGMLType::I64),
-            28 => Some(GGMLType::F64),
-            29 => Some(GGMLType::IQ1_M),
-            30 => Some(GGMLType::BF16),
-            36 => Some(GGMLType::GGML_TYPE_Q1_58),
+            0 => Some(Self::F32),
+            1 => Some(Self::F16),
+            2 => Some(Self::Q4_0),
+            3 => Some(Self::Q4_1),
+            6 => Some(Self::Q5_0),
+            7 => Some(Self::Q5_1),
+            8 => Some(Self::Q8_0),
+            9 => Some(Self::Q8_1),
+            10 => Some(Self::Q2_K),
+            11 => Some(Self::Q3_K),
+            12 => Some(Self::Q4_K),
+            13 => Some(Self::Q5_K),
+            14 => Some(Self::Q6_K),
+            15 => Some(Self::Q8_K),
+            16 => Some(Self::IQ2_XXS),
+            17 => Some(Self::IQ2_XS),
+            18 => Some(Self::IQ3_XXS),
+            19 => Some(Self::IQ1_S),
+            20 => Some(Self::IQ4_NL),
+            21 => Some(Self::IQ3_S),
+            22 => Some(Self::IQ2_S),
+            23 => Some(Self::IQ4_XS),
+            24 => Some(Self::I8),
+            25 => Some(Self::I16),
+            26 => Some(Self::I32),
+            27 => Some(Self::I64),
+            28 => Some(Self::F64),
+            29 => Some(Self::IQ1_M),
+            30 => Some(Self::BF16),
+            36 => Some(Self::GGML_TYPE_Q1_58),
             _ => None,
         }
     }
@@ -129,47 +130,49 @@ impl GGMLType {
     /// bits, so large tensors came out wrong (an F32 tensor of 20,000,001 elements
     /// measured 80,000,000 instead of 80,000,004), and truncating the product also
     /// dropped the final partial block.
+    #[must_use]
     pub fn block_layout(&self) -> (usize, usize) {
         match self {
-            GGMLType::F32 | GGMLType::I32 => (4, 1),
-            GGMLType::F16 | GGMLType::BF16 | GGMLType::I16 => (2, 1),
-            GGMLType::F64 | GGMLType::I64 => (8, 1),
-            GGMLType::I8 => (1, 1),
+            Self::F32 | Self::I32 => (4, 1),
+            Self::F16 | Self::BF16 | Self::I16 => (2, 1),
+            Self::F64 | Self::I64 => (8, 1),
+            Self::I8 => (1, 1),
 
             // Legacy Q‑quants (block of 32 weights)
-            GGMLType::Q4_0 => (18, 32),
-            GGMLType::Q4_1 => (20, 32),
-            GGMLType::Q5_0 => (22, 32),
-            GGMLType::Q5_1 => (24, 32),
-            GGMLType::Q8_0 => (34, 32),
-            GGMLType::Q8_1 => (36, 32),
+            Self::Q4_0 => (18, 32),
+            Self::Q4_1 => (20, 32),
+            Self::Q5_0 => (22, 32),
+            Self::Q5_1 => (24, 32),
+            Self::Q8_0 => (34, 32),
+            Self::Q8_1 => (36, 32),
 
             // K‑quants (super‑block of 256 weights); bytes = bpw * 256 / 8
-            GGMLType::Q2_K => (84, 256), // 2.625  bpw
+            Self::Q2_K => (84, 256), // 2.625  bpw
             // Q3_K and IQ3_S share a block layout (3.4375 bpw), hence one arm.
-            GGMLType::Q3_K | GGMLType::IQ3_S => (110, 256),
-            GGMLType::Q4_K => (144, 256), // 4.5    bpw
-            GGMLType::Q5_K => (176, 256), // 5.5    bpw
-            GGMLType::Q6_K => (210, 256), // 6.5625 bpw
-            GGMLType::Q8_K => (292, 256), // 9.125  bpw
+            Self::Q3_K | Self::IQ3_S => (110, 256),
+            Self::Q4_K => (144, 256), // 4.5    bpw
+            Self::Q5_K => (176, 256), // 5.5    bpw
+            Self::Q6_K => (210, 256), // 6.5625 bpw
+            Self::Q8_K => (292, 256), // 9.125  bpw
 
             // Importance‑quants (IQ‑family, super‑block 256 except IQ4_NL's 32)
-            GGMLType::IQ1_S => (50, 256),   // 1.5625 bpw
-            GGMLType::IQ1_M => (56, 256),   // 1.75   bpw
-            GGMLType::IQ2_XXS => (66, 256), // 2.0625 bpw
-            GGMLType::IQ2_XS => (74, 256),  // 2.3125 bpw
-            GGMLType::IQ2_S => (80, 256),   // 2.5    bpw
-            GGMLType::IQ3_XXS => (98, 256), // 3.0625 bpw
-            GGMLType::IQ4_NL => (17, 32),   // 4.25   bpw
-            GGMLType::IQ4_XS => (136, 256), // 4.25   bpw
+            Self::IQ1_S => (50, 256),   // 1.5625 bpw
+            Self::IQ1_M => (56, 256),   // 1.75   bpw
+            Self::IQ2_XXS => (66, 256), // 2.0625 bpw
+            Self::IQ2_XS => (74, 256),  // 2.3125 bpw
+            Self::IQ2_S => (80, 256),   // 2.5    bpw
+            Self::IQ3_XXS => (98, 256), // 3.0625 bpw
+            Self::IQ4_NL => (17, 32),   // 4.25   bpw
+            Self::IQ4_XS => (136, 256), // 4.25   bpw
             // 1.58 bpw doesn't land on a whole byte per 256, so keep the exact ratio
             // this type has always been measured with (0.1975 B/elem = 79/400).
-            GGMLType::GGML_TYPE_Q1_58 => (79, 400),
+            Self::GGML_TYPE_Q1_58 => (79, 400),
         }
     }
 
     /// Exact stored size of `elements` values of this type, rounded up to whole
     /// blocks (see [`GGMLType::block_layout`]).
+    #[must_use]
     pub fn stored_size(&self, elements: usize) -> usize {
         let (bytes, per_block) = self.block_layout();
         elements.div_ceil(per_block.max(1)).saturating_mul(bytes)
@@ -181,73 +184,73 @@ impl GGMLType {
     /// likelier mistake — a wrong discriminant or a copy-pasted name among the 30 that
     /// are already here.)
     #[cfg(test)]
-    pub(crate) const ALL: [GGMLType; 30] = [
-        GGMLType::F32,
-        GGMLType::F16,
-        GGMLType::F64,
-        GGMLType::BF16,
-        GGMLType::I8,
-        GGMLType::I16,
-        GGMLType::I32,
-        GGMLType::I64,
-        GGMLType::Q4_0,
-        GGMLType::Q4_1,
-        GGMLType::Q5_0,
-        GGMLType::Q5_1,
-        GGMLType::Q8_0,
-        GGMLType::Q8_1,
-        GGMLType::Q2_K,
-        GGMLType::Q3_K,
-        GGMLType::Q4_K,
-        GGMLType::Q5_K,
-        GGMLType::Q6_K,
-        GGMLType::Q8_K,
-        GGMLType::IQ1_S,
-        GGMLType::IQ1_M,
-        GGMLType::IQ2_XXS,
-        GGMLType::IQ2_XS,
-        GGMLType::IQ2_S,
-        GGMLType::IQ3_XXS,
-        GGMLType::IQ3_S,
-        GGMLType::IQ4_NL,
-        GGMLType::IQ4_XS,
-        GGMLType::GGML_TYPE_Q1_58,
+    pub(crate) const ALL: [Self; 30] = [
+        Self::F32,
+        Self::F16,
+        Self::F64,
+        Self::BF16,
+        Self::I8,
+        Self::I16,
+        Self::I32,
+        Self::I64,
+        Self::Q4_0,
+        Self::Q4_1,
+        Self::Q5_0,
+        Self::Q5_1,
+        Self::Q8_0,
+        Self::Q8_1,
+        Self::Q2_K,
+        Self::Q3_K,
+        Self::Q4_K,
+        Self::Q5_K,
+        Self::Q6_K,
+        Self::Q8_K,
+        Self::IQ1_S,
+        Self::IQ1_M,
+        Self::IQ2_XXS,
+        Self::IQ2_XS,
+        Self::IQ2_S,
+        Self::IQ3_XXS,
+        Self::IQ3_S,
+        Self::IQ4_NL,
+        Self::IQ4_XS,
+        Self::GGML_TYPE_Q1_58,
     ];
 }
 
 impl std::fmt::Display for GGMLType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            GGMLType::F32 => "F32",
-            GGMLType::F16 => "F16",
-            GGMLType::F64 => "F64",
-            GGMLType::BF16 => "BF16",
-            GGMLType::I8 => "I8",
-            GGMLType::I16 => "I16",
-            GGMLType::I32 => "I32",
-            GGMLType::I64 => "I64",
-            GGMLType::Q4_0 => "Q4_0",
-            GGMLType::Q4_1 => "Q4_1",
-            GGMLType::Q5_0 => "Q5_0",
-            GGMLType::Q5_1 => "Q5_1",
-            GGMLType::Q8_0 => "Q8_0",
-            GGMLType::Q8_1 => "Q8_1",
-            GGMLType::Q2_K => "Q2_K",
-            GGMLType::Q3_K => "Q3_K",
-            GGMLType::Q4_K => "Q4_K",
-            GGMLType::Q5_K => "Q5_K",
-            GGMLType::Q6_K => "Q6_K",
-            GGMLType::Q8_K => "Q8_K",
-            GGMLType::IQ2_XXS => "IQ2_XXS",
-            GGMLType::IQ2_XS => "IQ2_XS",
-            GGMLType::IQ3_XXS => "IQ3_XXS",
-            GGMLType::IQ1_S => "IQ1_S",
-            GGMLType::IQ4_NL => "IQ4_NL",
-            GGMLType::IQ3_S => "IQ3_S",
-            GGMLType::IQ2_S => "IQ2_S",
-            GGMLType::IQ4_XS => "IQ4_XS",
-            GGMLType::IQ1_M => "IQ1_M",
-            GGMLType::GGML_TYPE_Q1_58 => "Q1_58",
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::F64 => "F64",
+            Self::BF16 => "BF16",
+            Self::I8 => "I8",
+            Self::I16 => "I16",
+            Self::I32 => "I32",
+            Self::I64 => "I64",
+            Self::Q4_0 => "Q4_0",
+            Self::Q4_1 => "Q4_1",
+            Self::Q5_0 => "Q5_0",
+            Self::Q5_1 => "Q5_1",
+            Self::Q8_0 => "Q8_0",
+            Self::Q8_1 => "Q8_1",
+            Self::Q2_K => "Q2_K",
+            Self::Q3_K => "Q3_K",
+            Self::Q4_K => "Q4_K",
+            Self::Q5_K => "Q5_K",
+            Self::Q6_K => "Q6_K",
+            Self::Q8_K => "Q8_K",
+            Self::IQ2_XXS => "IQ2_XXS",
+            Self::IQ2_XS => "IQ2_XS",
+            Self::IQ3_XXS => "IQ3_XXS",
+            Self::IQ1_S => "IQ1_S",
+            Self::IQ4_NL => "IQ4_NL",
+            Self::IQ3_S => "IQ3_S",
+            Self::IQ2_S => "IQ2_S",
+            Self::IQ4_XS => "IQ4_XS",
+            Self::IQ1_M => "IQ1_M",
+            Self::GGML_TYPE_Q1_58 => "Q1_58",
         };
         write!(f, "{s}")
     }
@@ -256,19 +259,19 @@ impl std::fmt::Display for GGMLType {
 impl std::fmt::Display for GGUFValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GGUFValue::U8(v) => write!(f, "{v}"),
-            GGUFValue::I8(v) => write!(f, "{v}"),
-            GGUFValue::U16(v) => write!(f, "{v}"),
-            GGUFValue::I16(v) => write!(f, "{v}"),
-            GGUFValue::U32(v) => write!(f, "{v}"),
-            GGUFValue::I32(v) => write!(f, "{v}"),
-            GGUFValue::F32(v) => write!(f, "{v}"),
-            GGUFValue::U64(v) => write!(f, "{v}"),
-            GGUFValue::I64(v) => write!(f, "{v}"),
-            GGUFValue::F64(v) => write!(f, "{v}"),
-            GGUFValue::Bool(v) => write!(f, "{v}"),
-            GGUFValue::String(v) => write!(f, "\"{v}\""),
-            GGUFValue::Array(arr) => {
+            Self::U8(v) => write!(f, "{v}"),
+            Self::I8(v) => write!(f, "{v}"),
+            Self::U16(v) => write!(f, "{v}"),
+            Self::I16(v) => write!(f, "{v}"),
+            Self::U32(v) => write!(f, "{v}"),
+            Self::I32(v) => write!(f, "{v}"),
+            Self::F32(v) => write!(f, "{v}"),
+            Self::U64(v) => write!(f, "{v}"),
+            Self::I64(v) => write!(f, "{v}"),
+            Self::F64(v) => write!(f, "{v}"),
+            Self::Bool(v) => write!(f, "{v}"),
+            Self::String(v) => write!(f, "\"{v}\""),
+            Self::Array(arr) => {
                 if arr.len() <= 5 {
                     // Show small arrays in full
                     write!(f, "[")?;
@@ -313,7 +316,7 @@ impl GGUFFile {
         // Read tensor info
         let tensors = Self::read_tensor_info(&mut cursor, header.tensor_count)?;
 
-        Ok(GGUFFile {
+        Ok(Self {
             header,
             metadata,
             tensors,

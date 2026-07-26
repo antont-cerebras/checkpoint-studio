@@ -82,6 +82,7 @@ pub(crate) fn spark_levels(values: &[usize], width: usize) -> (Vec<usize>, usize
 }
 
 /// The sparkline string for `values` at `width`.
+#[must_use]
 pub fn spark_string(values: &[usize], width: usize) -> String {
     spark_levels(values, width)
         .0
@@ -122,6 +123,7 @@ pub(crate) fn alloc_rows(parts: [usize; 3], height: usize) -> [usize; 3] {
 /// non-zero component at least one cell — a thin sliver — so a tiny attention or
 /// "other" share stays visible instead of rounding away. The sliver is borrowed
 /// from the widest segment (so the cells still sum to `width`).
+#[must_use]
 pub fn composition_cells(totals: [usize; 3], width: usize) -> [usize; 3] {
     let mut cells = alloc_rows(totals, width);
     for i in 0..3 {
@@ -166,10 +168,12 @@ pub struct LayerStats {
 
 impl LayerStats {
     /// Average parameters in a single layer.
+    #[must_use]
     pub fn params_each(&self) -> usize {
         self.params / self.count.max(1)
     }
     /// Average bytes in a single layer.
+    #[must_use]
     pub fn bytes_each(&self) -> usize {
         self.bytes / self.count.max(1)
     }
@@ -200,17 +204,21 @@ pub struct PerLayerStats {
 }
 
 impl PerLayerStats {
+    #[must_use]
     pub fn bytes_series(&self) -> Vec<usize> {
         self.rows.iter().map(|r| r.bytes).collect()
     }
+    #[must_use]
     pub fn params_series(&self) -> Vec<usize> {
         self.rows.iter().map(|r| r.params).collect()
     }
+    #[must_use]
     pub fn tensor_series(&self) -> Vec<usize> {
         self.rows.iter().map(|r| r.tensors).collect()
     }
 
     /// Total `[attention, ffn/experts, other]` bytes across every layer.
+    #[must_use]
     pub fn composition_totals(&self) -> [usize; 3] {
         self.rows.iter().fold([0; 3], |[a, f, o], r| {
             [a + r.attn_bytes, f + r.ffn_bytes, o + r.other_bytes]
@@ -219,7 +227,7 @@ impl PerLayerStats {
 
     /// Aggregate the per-layer series over the canonical layer family — the same
     /// family [`LayerStats`] uses, so the graphs line up with `Layers ×N`.
-    fn compute(tensors: &[TensorInfo]) -> Option<PerLayerStats> {
+    fn compute(tensors: &[TensorInfo]) -> Option<Self> {
         let (prefix, count) = canonical_family(tensors)?;
         let mut rows: Vec<LayerRow> = vec![LayerRow::default(); count];
         for t in tensors {
@@ -238,7 +246,7 @@ impl PerLayerStats {
                 }
             }
         }
-        Some(PerLayerStats { rows })
+        Some(Self { rows })
     }
 }
 
@@ -256,16 +264,18 @@ pub enum ExpertLayout {
 
 impl ExpertLayout {
     /// Experts per layer, when known (unfused always; fused only when derivable).
+    #[must_use]
     pub fn per_layer(self) -> Option<usize> {
         match self {
-            ExpertLayout::Unfused { per_layer } => Some(per_layer),
-            ExpertLayout::Fused { per_layer } => per_layer,
+            Self::Unfused { per_layer } => Some(per_layer),
+            Self::Fused { per_layer } => per_layer,
         }
     }
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            ExpertLayout::Unfused { .. } => "unfused (per-expert tensors)",
-            ExpertLayout::Fused { .. } => "fused (stacked tensors)",
+            Self::Unfused { .. } => "unfused (per-expert tensors)",
+            Self::Fused { .. } => "fused (stacked tensors)",
         }
     }
 }
@@ -303,10 +313,12 @@ impl ExpertStats {
         (self.layers.max(1) * self.layout.per_layer().unwrap_or(1).max(1)).max(1)
     }
     /// Average parameters in a single expert.
+    #[must_use]
     pub fn params_each(&self) -> usize {
         self.params / self.divisor()
     }
     /// Average bytes in a single expert.
+    #[must_use]
     pub fn bytes_each(&self) -> usize {
         self.bytes / self.divisor()
     }
@@ -363,13 +375,14 @@ pub struct DiskUsage {
 
 impl DiskUsage {
     /// Build from per-shard rows, summing the totals. `None` if empty.
-    pub fn from_shards(shards: Vec<ShardDisk>) -> Option<DiskUsage> {
+    #[must_use]
+    pub fn from_shards(shards: Vec<ShardDisk>) -> Option<Self> {
         if shards.is_empty() {
             return None;
         }
         let total_apparent = shards.iter().map(|s| s.apparent).sum();
         let total_allocated = shards.iter().map(|s| s.allocated).sum();
-        Some(DiskUsage {
+        Some(Self {
             shards,
             total_apparent,
             total_allocated,
@@ -379,7 +392,8 @@ impl DiskUsage {
     /// Stat local files through the OS (`st_blocks × 512`). Paths that don't stat
     /// (e.g. a remote scp-form path, or one that's since vanished) are skipped.
     #[cfg(unix)]
-    pub fn from_local(paths: &[&str]) -> Option<DiskUsage> {
+    #[must_use]
+    pub fn from_local(paths: &[&str]) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
         let shards = paths
             .iter()
@@ -392,7 +406,7 @@ impl DiskUsage {
                 })
             })
             .collect();
-        DiskUsage::from_shards(shards)
+        Self::from_shards(shards)
     }
 
     #[cfg(not(unix))]
@@ -403,6 +417,7 @@ impl DiskUsage {
 
 /// A path's final component — the shard's filename. Splits on `/` and `:` so an
 /// scp-form remote path (`host:/dir/shard.safetensors`) also reduces to the name.
+#[must_use]
 pub fn shard_name(path: &str) -> String {
     path.rsplit(['/', ':']).next().unwrap_or(path).to_string()
 }
@@ -437,21 +452,25 @@ pub struct S3Stats {
 }
 
 impl S3Stats {
+    #[must_use]
     pub fn count(&self) -> usize {
         self.objects.len()
     }
 
+    #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.objects.iter().map(|o| o.size).sum()
     }
 
     /// Objects that reported an `ETag`.
+    #[must_use]
     pub fn etags(&self) -> usize {
         self.objects.iter().filter(|o| !o.etag.is_empty()).count()
     }
 
     /// Stored-checksum coverage as `(algorithm, count)`, most common first — e.g.
     /// `[("SHA256", 126)]`. Empty when no object stored an extra checksum.
+    #[must_use]
     pub fn checksums(&self) -> Vec<(String, usize)> {
         let mut by_algo: BTreeMap<String, usize> = BTreeMap::new();
         for o in &self.objects {
@@ -467,21 +486,25 @@ impl S3Stats {
     /// Objects whose tags were readable (`Some`), and whether *any* object's tags
     /// were denied (`s3:GetObjectTagging` refused) — so the report can say
     /// "N read" vs "unavailable (permission)".
+    #[must_use]
     pub fn tags_read(&self) -> usize {
         self.objects.iter().filter(|o| o.tags.is_some()).count()
     }
 
+    #[must_use]
     pub fn any_tags_denied(&self) -> bool {
         self.objects.iter().any(|o| o.tags.is_none())
     }
 
     /// Objects carrying any user (`x-amz-meta-*`) metadata.
+    #[must_use]
     pub fn with_user_meta(&self) -> usize {
         self.objects.iter().filter(|o| o.user_meta > 0).count()
     }
 
     /// The span of object last-modified dates (ISO-8601, so lexicographic min/max
     /// is chronological) as `(earliest, latest)` date parts — `None` if unknown.
+    #[must_use]
     pub fn modified_range(&self) -> Option<(String, String)> {
         let date = |s: &str| s.split('T').next().unwrap_or(s).to_string();
         let dates: Vec<String> = self
@@ -545,7 +568,7 @@ impl CheckpointStats {
         tensors: &[TensorInfo],
         config: Option<&crate::config::ModelConfig>,
         disk: Option<DiskUsage>,
-    ) -> CheckpointStats {
+    ) -> Self {
         let n_tensors = tensors.len();
         let params: usize = tensors.iter().map(|t| t.num_elements).sum();
         let logical_bytes: usize = tensors.iter().map(|t| t.size_bytes).sum();
@@ -624,7 +647,7 @@ impl CheckpointStats {
             .collect();
         dtypes.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.dtype.cmp(&b.dtype)));
 
-        CheckpointStats {
+        Self {
             files,
             n_tensors,
             params,
@@ -656,6 +679,7 @@ impl CheckpointStats {
     }
 
     /// The on-disk (local/SFTP) footprint, if this checkpoint has one.
+    #[must_use]
     pub fn disk(&self) -> Option<&DiskUsage> {
         match &self.footprint {
             Some(StorageFootprint::Disk(d)) => Some(d),
@@ -664,6 +688,7 @@ impl CheckpointStats {
     }
 
     /// The S3 object footprint, if this is an `s3://` source.
+    #[must_use]
     pub fn s3(&self) -> Option<&S3Stats> {
         match &self.footprint {
             Some(StorageFootprint::S3(s)) => Some(s),
@@ -969,12 +994,14 @@ impl CheckpointStats {
 /// ~1%, so files the filesystem left untouched (and trivial block-rounding
 /// differences) don't clutter the per-shard list; only real savings are worth a
 /// row.
+#[must_use]
 pub fn has_saving(apparent: u64, allocated: u64) -> bool {
     allocated < apparent && (apparent - allocated).saturating_mul(100) >= apparent
 }
 
 /// "N.N× smaller" when the filesystem shrank the file, else "no filesystem
 /// saving" — describing `allocated` relative to `apparent`.
+#[must_use]
 pub fn ratio_phrase(apparent: u64, allocated: u64) -> String {
     if allocated == 0 || allocated >= apparent {
         "no filesystem saving".to_string()
@@ -986,6 +1013,7 @@ pub fn ratio_phrase(apparent: u64, allocated: u64) -> String {
 /// The S3 section's "Checksums" value: stored-checksum coverage by algorithm
 /// (e.g. "126 with SHA256"), or a note that none were stored (so object equality
 /// would rest on the `ETag` alone). Shared by the plain + styled reports.
+#[must_use]
 pub fn s3_checksums_phrase(s3: &S3Stats) -> String {
     let by_algo = s3.checksums();
     if by_algo.is_empty() {
@@ -1001,6 +1029,7 @@ pub fn s3_checksums_phrase(s3: &S3Stats) -> String {
 
 /// The S3 section's "Tags" value: how many objects carried tags, whether any were
 /// denied by permission (`s3:GetObjectTagging`), or that none were tagged.
+#[must_use]
 pub fn s3_tags_phrase(s3: &S3Stats) -> String {
     let tagged = s3
         .objects
@@ -1023,6 +1052,7 @@ pub fn s3_tags_phrase(s3: &S3Stats) -> String {
 
 /// The S3 section's "Modified" value: a single date when all objects share one,
 /// else the "earliest – latest" span; `None` when no object reported a date.
+#[must_use]
 pub fn s3_modified_phrase(s3: &S3Stats) -> Option<String> {
     s3.modified_range().map(|(lo, hi)| {
         if lo == hi {
@@ -1037,6 +1067,7 @@ pub fn s3_modified_phrase(s3: &S3Stats) -> Option<String> {
 /// per-object breakdown, shared by the plain + styled reports. Hashes are shown in
 /// full (not abbreviated) — they're the whole point of the row, and the report
 /// scrolls / the `r` copy carries them verbatim.
+#[must_use]
 pub fn s3_object_detail(o: &S3ObjectStat) -> String {
     use crate::utils::format_size;
     let mut parts = vec![format!("{:>9}", format_size(o.size as usize))];

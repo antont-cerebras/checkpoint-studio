@@ -44,41 +44,47 @@ impl PackingSchema {
                 "bit widths sum to {total} (> 16, exceeds the U16 word)"
             ));
         }
-        Ok(PackingSchema {
+        Ok(Self {
             bit_widths,
             quant_mode,
         })
     }
 
     /// Experts packed per stored word (`lenP`).
+    #[must_use]
     pub fn len_p(&self) -> usize {
         self.bit_widths.len()
     }
 
     /// Bit offset of field `k` (sum of the preceding widths).
+    #[must_use]
     pub fn offset(&self, k: usize) -> u32 {
         self.bit_widths[..k].iter().sum()
     }
 
     /// Bit width of field `k`.
+    #[must_use]
     pub fn width(&self, k: usize) -> u32 {
         self.bit_widths[k]
     }
 
     /// Unmerge field `k` from a stored word: shift right past the lower fields,
     /// then mask to the field's width (unsigned codebook index).
+    #[must_use]
     pub fn extract(&self, word: u64, k: usize) -> u64 {
         let mask = (1u64 << self.width(k)) - 1;
         (word >> self.offset(k)) & mask
     }
 
     /// The single width when all fields share it (e.g. `[3,3,3,3,3]` → 3).
+    #[must_use]
     pub fn uniform_width(&self) -> Option<u32> {
         let first = *self.bit_widths.first()?;
         self.bit_widths.iter().all(|&w| w == first).then_some(first)
     }
 
     /// The widest field — the intrinsic value range is `0..=2^max_width-1`.
+    #[must_use]
     pub fn max_width(&self) -> u32 {
         self.bit_widths.iter().copied().max().unwrap_or(0)
     }
@@ -98,10 +104,12 @@ impl PackingSchema {
         }
     }
 
+    #[must_use]
     pub fn bit_widths(&self) -> &[u32] {
         &self.bit_widths
     }
 
+    #[must_use]
     pub fn quant_mode(&self) -> Option<&str> {
         self.quant_mode.as_deref()
     }
@@ -145,41 +153,44 @@ pub enum ViewDtype {
 
 impl ViewDtype {
     /// Short label for the active override, or `None` when using the stored dtype.
+    #[must_use]
     pub fn label(self) -> Option<&'static str> {
         match self {
-            ViewDtype::Stored => None,
-            ViewDtype::As(dt) => Some(dt),
-            ViewDtype::U4 => Some("u4"),
-            ViewDtype::I4 => Some("i4"),
-            ViewDtype::Unpacked => Some("unpacked"),
+            Self::Stored => None,
+            Self::As(dt) => Some(dt),
+            Self::U4 => Some("u4"),
+            Self::I4 => Some("i4"),
+            Self::Unpacked => Some("unpacked"),
         }
     }
 
     /// The `--dtype` CLI value that re-selects this view (e.g. `f16`, `u4`), or
     /// `None` for the stored dtype (no flag needed). Inverse of
     /// [`parse_view_dtype`].
+    #[must_use]
     pub fn cli_value(self) -> Option<String> {
         Some(match self {
             // For a schema tensor `stored` is a real override (raw U16 vs the
             // unpacked default), so it must round-trip via `--dtype stored`. For a
             // plain tensor `stored` is the default and is never recorded as an
             // override, so the flag is simply never emitted there.
-            ViewDtype::Stored => "stored".to_string(),
-            ViewDtype::As(dt) => dt.to_ascii_lowercase(),
-            ViewDtype::U4 => "u4".to_string(),
-            ViewDtype::I4 => "i4".to_string(),
-            ViewDtype::Unpacked => "unpacked".to_string(),
+            Self::Stored => "stored".to_string(),
+            Self::As(dt) => dt.to_ascii_lowercase(),
+            Self::U4 => "u4".to_string(),
+            Self::I4 => "i4".to_string(),
+            Self::Unpacked => "unpacked".to_string(),
         })
     }
 
     /// A compact label for the selection menu (e.g. `stored`, `F16`, `u4`).
+    #[must_use]
     pub fn menu_label(self) -> &'static str {
         match self {
-            ViewDtype::Stored => "stored",
-            ViewDtype::As(dt) => dt,
-            ViewDtype::U4 => "u4",
-            ViewDtype::I4 => "i4",
-            ViewDtype::Unpacked => "unpacked",
+            Self::Stored => "stored",
+            Self::As(dt) => dt,
+            Self::U4 => "u4",
+            Self::I4 => "i4",
+            Self::Unpacked => "unpacked",
         }
     }
 
@@ -188,22 +199,23 @@ impl ViewDtype {
     /// unpack `item_bytes * 2` nibbles per container.
     fn packing(self, item_bytes: usize) -> usize {
         match self {
-            ViewDtype::U4 | ViewDtype::I4 => item_bytes * 2,
+            Self::U4 | Self::I4 => item_bytes * 2,
             _ => 1,
         }
     }
 
     fn is_signed(self) -> bool {
-        matches!(self, ViewDtype::I4)
+        matches!(self, Self::I4)
     }
 
     /// Whether the decoded values are integers (so they should be shown without
     /// a fractional part). True for the 4-bit views and for integer stored / `As`
     /// dtypes; false for floats.
+    #[must_use]
     pub fn is_integer(self, stored: &str) -> bool {
         match self {
-            ViewDtype::Stored => dtype_is_integer(stored),
-            ViewDtype::As(dt) => dtype_is_integer(dt),
+            Self::Stored => dtype_is_integer(stored),
+            Self::As(dt) => dtype_is_integer(dt),
             _ => true, // all 4-bit views are integer-valued
         }
     }
@@ -211,10 +223,11 @@ impl ViewDtype {
     /// Whether those integers are **signed** — needed to print a value exactly from
     /// its raw bits (see [`format_int_bits`]), which is the only way to show a wide
     /// I64/U64 element correctly.
+    #[must_use]
     pub fn is_signed_integer(self, stored: &str) -> bool {
         match self {
-            ViewDtype::Stored => dtype_is_signed_integer(stored),
-            ViewDtype::As(dt) => dtype_is_signed_integer(dt),
+            Self::Stored => dtype_is_signed_integer(stored),
+            Self::As(dt) => dtype_is_signed_integer(dt),
             other => other.is_signed(),
         }
     }
@@ -222,15 +235,16 @@ impl ViewDtype {
     /// Bit width of one element under this view — 4 for the packed/nibble views,
     /// otherwise the byte width of the (possibly reinterpreted) dtype. Used to
     /// size and zero-pad hex/octal/binary cells, and matches [`RawBits::width`].
+    #[must_use]
     pub fn bit_width(self, stored: &str) -> u32 {
         match self {
-            ViewDtype::Stored => item_size(stored).unwrap_or(4) as u32 * 8,
-            ViewDtype::As(dt) => item_size(dt).unwrap_or(4) as u32 * 8,
+            Self::Stored => item_size(stored).unwrap_or(4) as u32 * 8,
+            Self::As(dt) => item_size(dt).unwrap_or(4) as u32 * 8,
             // The unmerged value is a sub-field of the U16 word; the exact field
             // width is known only with the schema (see `raw_bits_field`), so this
             // fallback is the container width.
-            ViewDtype::Unpacked => 16,
-            ViewDtype::U4 | ViewDtype::I4 => 4,
+            Self::Unpacked => 16,
+            Self::U4 | Self::I4 => 4,
         }
     }
 
@@ -241,6 +255,7 @@ impl ViewDtype {
     /// columns as a 4-bit view, instead of always reserving room for `-32768`.
     /// Without a range (stats not computed yet) it falls back to the dtype's
     /// theoretical maximum width.
+    #[must_use]
     pub fn cell_width(self, stored: &str, range: Option<(f64, f64)>) -> usize {
         // Floats render in scientific notation — a fixed width regardless of
         // magnitude (e.g. `-1.234e-05`).
@@ -260,10 +275,10 @@ impl ViewDtype {
     fn int_max_digits(self, stored: &str) -> usize {
         let dt = match self {
             // Both 4-bit views are two digits wide: 0..=15 and -8..=7.
-            ViewDtype::U4 | ViewDtype::I4 => return 2,
-            ViewDtype::Unpacked => return 5, // up to a 16-bit field (65535); range shrinks it
-            ViewDtype::As(dt) => dt,
-            ViewDtype::Stored => stored,
+            Self::U4 | Self::I4 => return 2,
+            Self::Unpacked => return 5, // up to a 16-bit field (65535); range shrinks it
+            Self::As(dt) => dt,
+            Self::Stored => stored,
         };
         match dt {
             "I8" | "U8" | "BOOL" => 4, // -128
@@ -288,6 +303,7 @@ impl ViewDtype {
     /// The logical shape under this view: the stored `shape` with its last
     /// dimension scaled by the packing factor. Unchanged unless this is a
     /// packed 4-bit view (which unpacks several values per stored container).
+    #[must_use]
     pub fn logical_shape(self, shape: &[usize], stored_dtype: &str) -> Vec<usize> {
         let packing = item_size(stored_dtype).map_or(1, |b| self.packing(b));
         let mut shape = shape.to_vec();
@@ -302,13 +318,14 @@ impl ViewDtype {
     /// Logical shape including the codebook unmerge: for [`ViewDtype::Unpacked`]
     /// with a schema the *first* dimension grows by `lenP` (each stored expert
     /// unpacks into `lenP` logical experts); otherwise defers to [`logical_shape`].
+    #[must_use]
     pub fn logical_shape_with(
         self,
         shape: &[usize],
         stored_dtype: &str,
         schema: Option<&PackingSchema>,
     ) -> Vec<usize> {
-        if let (ViewDtype::Unpacked, Some(s)) = (self, schema) {
+        if let (Self::Unpacked, Some(s)) = (self, schema) {
             let mut shape = shape.to_vec();
             match shape.first_mut() {
                 Some(first) => *first *= s.len_p(),
@@ -340,6 +357,7 @@ fn dtype_is_signed_integer(dtype: &str) -> bool {
 /// 13816973012072644608 rendered as 9223372036854775807. The raw bits are exact, so
 /// the decimal display is derived from those instead. `width` is the element's bit
 /// width; a signed value is sign-extended from it.
+#[must_use]
 pub fn format_int_bits(raw: RawBits, signed: bool) -> String {
     let w = u32::from(raw.width).clamp(1, 64);
     let masked = if w >= 64 {
@@ -382,6 +400,7 @@ pub fn view_options(stored: &str) -> Vec<ViewDtype> {
 
 /// [`view_options`] plus the codebook [`ViewDtype::Unpacked`] view, offered only
 /// when the tensor actually carries a packing schema.
+#[must_use]
 pub fn view_options_for(stored: &str, has_schema: bool) -> Vec<ViewDtype> {
     let mut opts = view_options(stored);
     if has_schema {
@@ -458,6 +477,7 @@ fn parse_schema_json(v: &serde_json::Value) -> Option<PackingSchema> {
 ///    (`down_proj` / `gate_up_proj`).
 ///
 /// Only `U16` tensors (the fused-codebook storage) are matched.
+#[must_use]
 pub fn parse_packing_schemas(
     tensors: &[TensorInfo],
     metadata: &[MetadataInfo],
@@ -617,6 +637,7 @@ pub enum SampleMode {
 /// it. Dropping such dimensions lets an `(N, M, 1, K)` tensor preview as the 3D
 /// `(N, M, K)` it effectively is. An all-ones (or already empty) shape squeezes
 /// to a single element, returned as the empty slice.
+#[must_use]
 pub fn squeezed_shape(shape: &[usize]) -> Vec<usize> {
     shape.iter().copied().filter(|&d| d != 1).collect()
 }
@@ -944,6 +965,7 @@ fn sample_indices(n: usize, k: usize) -> Vec<usize> {
 /// The total number of indices the edges view shows for one axis with `max`
 /// cells available (leaving one slot for the "⋯" / "⋮" gap). Exposed so the UI
 /// can size an arrow-key step to exactly one index (`1 / edge_total`).
+#[must_use]
 pub fn edge_total(max: usize) -> usize {
     2 * (max.saturating_sub(1) / 2).max(1)
 }
@@ -1020,10 +1042,10 @@ impl Prim {
     /// Width in bytes of one element.
     const fn size(self) -> usize {
         match self {
-            Prim::F64 | Prim::I64 | Prim::U64 => 8,
-            Prim::F32 | Prim::I32 | Prim::U32 => 4,
-            Prim::F16 | Prim::BF16 | Prim::I16 | Prim::U16 => 2,
-            Prim::I8 | Prim::U8 => 1,
+            Self::F64 | Self::I64 | Self::U64 => 8,
+            Self::F32 | Self::I32 | Self::U32 => 4,
+            Self::F16 | Self::BF16 | Self::I16 | Self::U16 => 2,
+            Self::I8 | Self::U8 => 1,
         }
     }
 }
@@ -1155,6 +1177,7 @@ pub struct Stats {
 
 impl Stats {
     /// Fraction of elements that are exactly zero, in `0.0..=1.0`.
+    #[must_use]
     pub fn zero_fraction(&self) -> f64 {
         if self.count == 0 {
             0.0
@@ -1183,7 +1206,7 @@ struct Acc {
 }
 
 impl Acc {
-    const ID: Acc = Acc {
+    const ID: Self = Self {
         count: 0,
         finite: 0,
         zeros: 0,
@@ -1217,7 +1240,7 @@ impl Acc {
         self.m2 = delta.mul_add(v - self.mean, self.m2);
     }
 
-    fn merge(a: Acc, b: Acc) -> Acc {
+    fn merge(a: Self, b: Self) -> Self {
         let finite = a.finite + b.finite;
         let (mean, m2) = if finite == 0 {
             (0.0, 0.0)
@@ -1232,7 +1255,7 @@ impl Acc {
                 a.m2 + b.m2 + delta * delta * na * nb / n,
             )
         };
-        Acc {
+        Self {
             count: a.count + b.count,
             finite,
             zeros: a.zeros + b.zeros,
@@ -1846,6 +1869,7 @@ impl HistogramDiff {
     /// Total variation distance of the two normalized distributions, in `[0, 1]`:
     /// half the summed absolute difference of the per-bin fractions. `0` = same
     /// shape; `1` = disjoint. A compact "how much did the distribution move".
+    #[must_use]
     pub fn tvd(&self) -> f64 {
         match (self.old_total, self.new_total) {
             (0, 0) => 0.0,
@@ -1863,6 +1887,7 @@ impl HistogramDiff {
     }
 
     /// Whether the two histograms differ at all (any bin count, or the totals).
+    #[must_use]
     pub fn differs(&self) -> bool {
         self.old != self.new || self.old_total != self.new_total
     }
@@ -1949,8 +1974,9 @@ pub struct HistShared {
 }
 
 impl HistShared {
+    #[must_use]
     pub fn new(n: usize) -> Self {
-        HistShared {
+        Self {
             counts: (0..n).map(|_| AtomicU64::new(0)).collect(),
             total: AtomicU64::new(0),
             nonfinite: AtomicU64::new(0),
@@ -1979,8 +2005,8 @@ impl ViewDtype {
     /// including ones absent from the data. `None` otherwise (use the data range).
     fn small_int_span(self) -> Option<(i64, i64)> {
         match self {
-            ViewDtype::U4 => Some((0, 15)),
-            ViewDtype::I4 => Some((-8, 7)),
+            Self::U4 => Some((0, 15)),
+            Self::I4 => Some((-8, 7)),
             _ => None,
         }
     }
@@ -1998,6 +2024,7 @@ const RANGE_BINS: usize = 40;
 /// a specific bucket count (the `b` key / `--bins`); `None` uses the defaults.
 /// Returns the layout and bin count, or `None` when a range is required but not
 /// yet known.
+#[must_use]
 pub fn histogram_bins(
     view: ViewDtype,
     dtype: &str,
@@ -2292,8 +2319,8 @@ enum Backing {
 impl Backing {
     fn bytes(&self) -> &[u8] {
         match self {
-            Backing::Mmap(m) => &m[..],
-            Backing::Owned(v) => v,
+            Self::Mmap(m) => &m[..],
+            Self::Owned(v) => v,
         }
     }
 }

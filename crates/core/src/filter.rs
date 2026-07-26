@@ -47,8 +47,8 @@ impl NameFilter {
     /// exclude ("everything except …"), any other value is an include. Globs use
     /// the standard `*` / `?` / `[…]` plus brace alternation `{a,b,c}` (e.g.
     /// `layers.{1,31,60}.*`); a bad glob is an error.
-    pub fn parse(patterns: &[String]) -> Result<NameFilter> {
-        let mut filter = NameFilter::default();
+    pub fn parse(patterns: &[String]) -> Result<Self> {
+        let mut filter = Self::default();
         for pattern in patterns {
             let (bucket, glob) = match pattern.strip_prefix('!') {
                 Some(rest) => (&mut filter.exclude, rest),
@@ -68,12 +68,14 @@ impl NameFilter {
 
     /// Whether the filter constrains anything (so callers can skip work / drop
     /// metadata when it doesn't).
+    #[must_use]
     pub fn is_active(&self) -> bool {
         !self.include.is_empty() || !self.exclude.is_empty()
     }
 
     /// Whether `name` passes: it matches at least one include (or there are no
     /// includes) and matches none of the excludes.
+    #[must_use]
     pub fn matches(&self, name: &str) -> bool {
         if !self.include.is_empty() && !self.include.iter().any(|p| p.matches(name)) {
             return false;

@@ -20,12 +20,12 @@ pub struct ModelConfig {
 impl ModelConfig {
     /// Parse the fields we care about from a `config.json` string. `None` only
     /// when the text isn't a JSON object at all; missing keys stay `None`.
-    pub fn parse(json: &str) -> Option<ModelConfig> {
+    pub fn parse(json: &str) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_str(json).ok()?;
         let obj = value.as_object()?;
         let uint = |k: &str| obj.get(k).and_then(serde_json::Value::as_u64);
         let boolean = |k: &str| obj.get(k).and_then(serde_json::Value::as_bool);
-        Some(ModelConfig {
+        Some(Self {
             model_type: obj
                 .get("model_type")
                 .and_then(|v| v.as_str())
@@ -41,6 +41,7 @@ impl ModelConfig {
 
     /// Whether at least one checkable field is present — so an unrelated JSON
     /// object sitting next to the weights isn't mistaken for a model config.
+    #[must_use]
     pub fn is_meaningful(&self) -> bool {
         self.num_hidden_layers.is_some()
             || self.num_experts.is_some()
@@ -53,6 +54,7 @@ impl ModelConfig {
 /// The `config.json` beside a local checkpoint — in the parent dir of its files
 /// (shards share one dir), or in the dir itself when a directory was given.
 /// `None` when there's no such file.
+#[must_use]
 pub fn local_path(files: &[PathBuf]) -> Option<PathBuf> {
     let first = files.first()?;
     let dir = if first.is_dir() {
@@ -75,6 +77,7 @@ pub fn load_local(files: &[PathBuf]) -> Option<ModelConfig> {
 /// directory (a remote safetensors dir, or the parent of a single `.safetensors`
 /// file) plus `config.json`. `None` for an `s3://` cstorch checkpoint, which has
 /// no Hugging Face `config.json`.
+#[must_use]
 pub fn remote_path(src: &str) -> Option<String> {
     if src.starts_with("s3://") {
         return None;

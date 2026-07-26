@@ -31,13 +31,13 @@ impl VScrollbar {
     /// The bar for a scrollable `body` region showing `total` rows starting at
     /// `offset`, or `None` when it all fits (or there's no room for a bar +
     /// content). The bar rides `body`'s rightmost column.
-    pub(crate) fn for_body(body: Rect, total: usize, offset: usize) -> Option<VScrollbar> {
+    pub(crate) fn for_body(body: Rect, total: usize, offset: usize) -> Option<Self> {
         let rows = body.height as usize;
         if body.width < 2 || rows == 0 || total <= rows {
             return None;
         }
         let max_offset = total - rows;
-        Some(VScrollbar {
+        Some(Self {
             col: body.x + body.width - 1,
             top: body.y,
             rows: body.height,

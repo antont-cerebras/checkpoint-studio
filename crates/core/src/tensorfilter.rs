@@ -114,9 +114,9 @@ enum NameMatch {
 impl NameMatch {
     fn matches(&self, name: &str) -> bool {
         match self {
-            NameMatch::Substr(s) => name.to_lowercase().contains(&s.to_lowercase()),
-            NameMatch::Glob(ps) => ps.iter().any(|p| p.matches(name)),
-            NameMatch::Regex(r) => r.is_match(name),
+            Self::Substr(s) => name.to_lowercase().contains(&s.to_lowercase()),
+            Self::Glob(ps) => ps.iter().any(|p| p.matches(name)),
+            Self::Regex(r) => r.is_match(name),
         }
     }
 }
@@ -138,14 +138,14 @@ enum Predicate {
 impl Predicate {
     fn matches(&self, t: &TensorInfo) -> bool {
         match self {
-            Predicate::Dtype(vs) => vs.iter().any(|v| v.eq_ignore_ascii_case(&t.dtype)),
-            Predicate::Shape(ps) => ps.iter().any(|p| p.matches(&t.shape)),
-            Predicate::Dim(r) => t.shape.iter().any(|&d| r.contains(d as f64)),
-            Predicate::Rank(r) => r.contains(t.shape.len() as f64),
-            Predicate::Size(r) => r.contains(t.size_bytes as f64),
-            Predicate::Params(r) => r.contains(t.num_elements as f64),
-            Predicate::Name(m) => m.matches(&t.name),
-            Predicate::Shard(vs) => {
+            Self::Dtype(vs) => vs.iter().any(|v| v.eq_ignore_ascii_case(&t.dtype)),
+            Self::Shape(ps) => ps.iter().any(|p| p.matches(&t.shape)),
+            Self::Dim(r) => t.shape.iter().any(|&d| r.contains(d as f64)),
+            Self::Rank(r) => r.contains(t.shape.len() as f64),
+            Self::Size(r) => r.contains(t.size_bytes as f64),
+            Self::Params(r) => r.contains(t.num_elements as f64),
+            Self::Name(m) => m.matches(&t.name),
+            Self::Shard(vs) => {
                 let base = t
                     .source_path
                     .rsplit(['/', '\\'])
@@ -177,28 +177,31 @@ impl TensorFilter {
     /// Parse the text query. An empty / whitespace-only query is the inactive
     /// filter (matches everything). A malformed term is an error (the UI surfaces
     /// it so the user can fix the query).
-    pub fn parse(query: &str) -> Result<TensorFilter> {
+    pub fn parse(query: &str) -> Result<Self> {
         let mut terms = Vec::new();
         for tok in tokenize(query) {
             terms.push(parse_term(&tok)?);
         }
-        Ok(TensorFilter {
+        Ok(Self {
             query: query.to_string(),
             terms,
         })
     }
 
     /// The canonical text (for round-tripping through the URL / `y` / `--filter`).
+    #[must_use]
     pub fn query(&self) -> &str {
         &self.query
     }
 
+    #[must_use]
     pub fn is_active(&self) -> bool {
         !self.terms.is_empty()
     }
 
     /// Whether `t` passes every term (a negated term passes when its predicate
     /// does *not* match).
+    #[must_use]
     pub fn matches(&self, t: &TensorInfo) -> bool {
         self.terms
             .iter()

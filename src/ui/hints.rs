@@ -43,7 +43,7 @@ pub(super) enum Seg {
 impl Seg {
     fn text(&self) -> &'static str {
         match self {
-            Seg::Key(t, _) | Seg::Sep(t) => t,
+            Self::Key(t, _) | Self::Sep(t) => t,
         }
     }
 }

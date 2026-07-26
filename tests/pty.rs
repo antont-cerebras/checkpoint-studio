@@ -40,7 +40,7 @@ struct Tui {
 
 impl Tui {
     /// Launch the binary with `args` on an 80×24 pseudo-terminal.
-    fn launch(args: &[&str]) -> Tui {
+    fn launch(args: &[&str]) -> Self {
         let (master, slave) = openpty(24, 80);
         // The child gets the slave as all three streams, so crossterm sees a tty and
         // takes the interactive path.
@@ -53,7 +53,7 @@ impl Tui {
             .env("NO_COLOR", "1")
             .spawn()
             .expect("spawn the TUI");
-        Tui {
+        Self {
             child,
             master,
             seen: String::new(),

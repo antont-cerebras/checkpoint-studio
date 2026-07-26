@@ -24,10 +24,10 @@ impl DataLayout {
     #[must_use]
     pub fn next(self) -> Self {
         match self {
-            DataLayout::Overview => DataLayout::OverviewMax,
-            DataLayout::OverviewMax => DataLayout::Edges,
-            DataLayout::Edges => DataLayout::Window,
-            DataLayout::Window => DataLayout::Overview,
+            Self::Overview => Self::OverviewMax,
+            Self::OverviewMax => Self::Edges,
+            Self::Edges => Self::Window,
+            Self::Window => Self::Overview,
         }
     }
 }
@@ -47,9 +47,9 @@ impl StripeMode {
     #[must_use]
     pub fn next(self) -> Self {
         match self {
-            StripeMode::Rows => StripeMode::Cols,
-            StripeMode::Cols => StripeMode::Off,
-            StripeMode::Off => StripeMode::Rows,
+            Self::Rows => Self::Cols,
+            Self::Cols => Self::Off,
+            Self::Off => Self::Rows,
         }
     }
 }
@@ -84,31 +84,33 @@ impl NumBase {
     #[must_use]
     pub fn next(self) -> Self {
         match self {
-            NumBase::Decimal => NumBase::Hex,
-            NumBase::Hex => NumBase::Octal,
-            NumBase::Octal => NumBase::Binary,
-            NumBase::Binary => NumBase::Decimal,
+            Self::Decimal => Self::Hex,
+            Self::Hex => Self::Octal,
+            Self::Octal => Self::Binary,
+            Self::Binary => Self::Decimal,
         }
     }
 
     /// Short label for the footer/command (`dec`, `hex`, `oct`, `bin`).
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            NumBase::Decimal => "dec",
-            NumBase::Hex => "hex",
-            NumBase::Octal => "oct",
-            NumBase::Binary => "bin",
+            Self::Decimal => "dec",
+            Self::Hex => "hex",
+            Self::Octal => "oct",
+            Self::Binary => "bin",
         }
     }
 
     /// Number of digits needed to print `width` bits in this base (raw-bit
     /// bases only; `Decimal` returns 0 since it sizes cells differently).
+    #[must_use]
     pub fn digits(self, width: u32) -> usize {
         match self {
-            NumBase::Decimal => 0,
-            NumBase::Hex => width.div_ceil(4) as usize,
-            NumBase::Octal => width.div_ceil(3) as usize,
-            NumBase::Binary => width as usize,
+            Self::Decimal => 0,
+            Self::Hex => width.div_ceil(4) as usize,
+            Self::Octal => width.div_ceil(3) as usize,
+            Self::Binary => width as usize,
         }
     }
 
@@ -117,9 +119,10 @@ impl NumBase {
     /// value `range` (small ints pack tighter); the raw-bit bases use the
     /// dtype's fixed digit count. Both the sampler (how many columns to fetch)
     /// and the renderer call this, so they can't disagree on the width.
+    #[must_use]
     pub fn cell_width(self, view: ViewDtype, dtype: &str, range: Option<(f64, f64)>) -> usize {
         match self {
-            NumBase::Decimal => view.cell_width(dtype, range),
+            Self::Decimal => view.cell_width(dtype, range),
             _ => self.digits(view.bit_width(dtype)) + 1,
         }
     }

@@ -38,10 +38,12 @@ pub enum SegmentKind {
 }
 
 impl Segment {
+    #[must_use]
     pub fn len(&self) -> u64 {
         self.end.saturating_sub(self.start)
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.end <= self.start
     }
@@ -66,6 +68,7 @@ pub struct LayoutMap {
 
 impl LayoutMap {
     /// Number of `__metadata__` entries (for the header summary line).
+    #[must_use]
     pub fn metadata_entries(&self) -> usize {
         self.metadata.len()
     }
@@ -181,6 +184,7 @@ pub fn parse_from(name: &str, total_len: u64, header_json: &[u8]) -> Result<Layo
 /// `data_offsets` in each [`TensorInfo`] (`Layout::ByteRange`) are shifted by
 /// `header_len` to absolute file positions; `metadata` becomes the header band's
 /// `__metadata__` list. Infallible: the header was already parsed at load.
+#[must_use]
 pub fn from_tensors(
     name: &str,
     total_len: u64,

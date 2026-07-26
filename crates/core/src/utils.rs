@@ -1,5 +1,6 @@
 /// Standard (RFC 4648) base64 encoding. Used to wrap clipboard text in the
 /// OSC 52 terminal escape; avoids pulling in a dependency for ~20 lines.
+#[must_use]
 pub fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -44,6 +45,7 @@ pub fn parse_size(s: &str) -> Result<usize, String> {
 /// core's frontend-free replacement for `crossterm::terminal::size()`, so output
 /// formatters (diff, progress bars) can fit the terminal without depending on the
 /// full crossterm terminal layer.
+#[must_use]
 pub fn term_width(fallback: usize) -> usize {
     terminal_size::terminal_size().map_or(fallback, |(w, _)| w.0 as usize)
 }
@@ -66,6 +68,7 @@ pub fn format_shape(shape: &[usize]) -> String {
     )
 }
 
+#[must_use]
 pub fn format_size(bytes: usize) -> String {
     // Sizes are scaled by 1024, so use the binary (IEC) unit labels. Up to PiB: a
     // fleet-sized total shouldn't read as "5120.0 GiB".
@@ -85,6 +88,7 @@ pub fn format_size(bytes: usize) -> String {
     }
 }
 
+#[must_use]
 pub fn format_parameters(params: usize) -> String {
     if params < 1_000 {
         format!("{params}")
@@ -106,6 +110,7 @@ pub fn format_parameters(params: usize) -> String {
 ///
 /// `is_zero` comes from the true count rather than the fraction, so floating-point
 /// dust can't masquerade as an exact zero.
+#[must_use]
 pub fn format_percent(fraction: f64, is_zero: bool) -> String {
     if is_zero {
         return "0%".to_string();

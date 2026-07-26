@@ -6,6 +6,7 @@
 const SCHEME: &str = "s3://";
 
 /// Is this CLI argument an `s3://…` URI?
+#[must_use]
 pub fn is_uri(s: &str) -> bool {
     s.starts_with(SCHEME)
 }
