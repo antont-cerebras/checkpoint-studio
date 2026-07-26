@@ -172,6 +172,45 @@ impl GGMLType {
         let (bytes, per_block) = self.block_layout();
         elements.div_ceil(per_block.max(1)).saturating_mul(bytes)
     }
+
+    /// Every type, so the tests can sweep all of them instead of whichever ones someone
+    /// remembered to list. (It's still hand-maintained: a *new* variant has to be added
+    /// here as well as to `from_u32` and `Display`. What the sweep does catch is the
+    /// likelier mistake — a wrong discriminant or a copy-pasted name among the 30 that
+    /// are already here.)
+    #[cfg(test)]
+    pub(crate) const ALL: [GGMLType; 30] = [
+        GGMLType::F32,
+        GGMLType::F16,
+        GGMLType::F64,
+        GGMLType::BF16,
+        GGMLType::I8,
+        GGMLType::I16,
+        GGMLType::I32,
+        GGMLType::I64,
+        GGMLType::Q4_0,
+        GGMLType::Q4_1,
+        GGMLType::Q5_0,
+        GGMLType::Q5_1,
+        GGMLType::Q8_0,
+        GGMLType::Q8_1,
+        GGMLType::Q2_K,
+        GGMLType::Q3_K,
+        GGMLType::Q4_K,
+        GGMLType::Q5_K,
+        GGMLType::Q6_K,
+        GGMLType::Q8_K,
+        GGMLType::IQ1_S,
+        GGMLType::IQ1_M,
+        GGMLType::IQ2_XXS,
+        GGMLType::IQ2_XS,
+        GGMLType::IQ2_S,
+        GGMLType::IQ3_XXS,
+        GGMLType::IQ3_S,
+        GGMLType::IQ4_NL,
+        GGMLType::IQ4_XS,
+        GGMLType::GGML_TYPE_Q1_58,
+    ];
 }
 
 impl std::fmt::Display for GGMLType {
@@ -444,46 +483,49 @@ impl GGUFFile {
     }
 }
 
+/// A GGUF writer, so the reader can be tested against bytes rather than only against
+/// whatever real file happens to be at hand. Little-endian throughout, as the format
+/// specifies.
+///
+/// `pub(crate)` because `readers.rs` needs it too: its `read_gguf` is the layer above
+/// this one, and testing it means putting a real GGUF file on disk.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Sizes were computed as `elements as f32 * bytes_per_element`, which has only 24
-    /// mantissa bits and truncated the trailing partial block. Both errors are visible
-    /// on realistic tensor sizes, and the result feeds the displayed size, the
-    /// checkpoint totals, and the exact `size>N` filter.
-    /// A GGUF writer, so the reader can be tested against bytes rather than only
-    /// against whatever real file happens to be at hand. Little-endian throughout, as
-    /// the format specifies.
+pub(crate) mod testing {
     #[derive(Default)]
-    struct Gguf {
+    pub(crate) struct Gguf {
         body: Vec<u8>,
         tensors: u64,
         kvs: u64,
     }
 
     impl Gguf {
-        fn str(&mut self, s: &str) -> &mut Self {
+        pub(crate) fn str(&mut self, s: &str) -> &mut Self {
             self.body.extend((s.len() as u64).to_le_bytes());
             self.body.extend(s.as_bytes());
             self
         }
-        fn u32(&mut self, v: u32) -> &mut Self {
+        pub(crate) fn u32(&mut self, v: u32) -> &mut Self {
             self.body.extend(v.to_le_bytes());
             self
         }
-        fn u64(&mut self, v: u64) -> &mut Self {
+        pub(crate) fn u64(&mut self, v: u64) -> &mut Self {
             self.body.extend(v.to_le_bytes());
             self
         }
         /// One metadata entry: key, value-type tag, then the value's bytes.
-        fn kv(&mut self, key: &str, ty: u32, value: &[u8]) -> &mut Self {
+        pub(crate) fn kv(&mut self, key: &str, ty: u32, value: &[u8]) -> &mut Self {
             self.kvs += 1;
             self.str(key).u32(ty);
             self.body.extend(value);
             self
         }
-        fn tensor(&mut self, name: &str, dims: &[u64], ty: u32, offset: u64) -> &mut Self {
+        pub(crate) fn tensor(
+            &mut self,
+            name: &str,
+            dims: &[u64],
+            ty: u32,
+            offset: u64,
+        ) -> &mut Self {
             self.tensors += 1;
             self.str(name).u32(dims.len() as u32);
             for d in dims {
@@ -493,7 +535,7 @@ mod tests {
             self
         }
         /// Header (magic `GGUF`, version, counts) followed by the body.
-        fn finish(&self) -> Vec<u8> {
+        pub(crate) fn finish(&self) -> Vec<u8> {
             let mut out = Vec::new();
             out.extend(0x4655_4747u32.to_le_bytes());
             out.extend(3u32.to_le_bytes());
@@ -504,9 +546,27 @@ mod tests {
         }
     }
 
-    fn le_u64(v: u64) -> Vec<u8> {
+    /// A GGUF string value's payload (length-prefixed, as `kv` expects for type 8).
+    pub(crate) fn gguf_str(s: &str) -> Vec<u8> {
+        let mut v = (s.len() as u64).to_le_bytes().to_vec();
+        v.extend(s.as_bytes());
+        v
+    }
+
+    pub(crate) fn le_u64(v: u64) -> Vec<u8> {
         v.to_le_bytes().to_vec()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::{Gguf, le_u64};
+    use super::*;
+
+    /// Sizes were computed as `elements as f32 * bytes_per_element`, which has only 24
+    /// mantissa bits and truncated the trailing partial block. Both errors are visible on
+    /// realistic tensor sizes, and the result feeds the displayed size, the checkpoint
+    /// totals, and the exact `size>N` filter.
 
     #[test]
     fn reads_a_whole_file_header_metadata_and_tensors() {
@@ -655,18 +715,6 @@ mod tests {
     }
 
     #[test]
-    fn ggml_types_round_trip_their_tags_and_reject_unknown_ones() {
-        for tag in [0u32, 1, 8, 10, 12] {
-            let ty = GGMLType::from_u32(tag).unwrap_or_else(|| panic!("tag {tag} should be known"));
-            // Every known type must describe itself and report a usable block layout.
-            let (elems, bytes) = ty.block_layout();
-            assert!(elems > 0 && bytes > 0, "{ty:?} has an empty block layout");
-            assert!(!format!("{ty}").is_empty());
-        }
-        assert!(GGMLType::from_u32(9999).is_none());
-    }
-
-    #[test]
     fn stored_size_is_exact_and_rounds_up_to_whole_blocks() {
         // f32 rounding: 20_000_001 * 4.0 lost the last increment.
         assert_eq!(GGMLType::F32.stored_size(20_000_001), 80_000_004);
@@ -683,41 +731,114 @@ mod tests {
         assert_eq!(GGMLType::F32.stored_size(0), 0);
         assert_eq!(GGMLType::Q6_K.stored_size(0), 0);
         // Every type reports a usable block (no zero divisor, no zero-byte block).
-        for t in [
-            GGMLType::F32,
-            GGMLType::F16,
-            GGMLType::F64,
-            GGMLType::BF16,
-            GGMLType::I8,
-            GGMLType::I16,
-            GGMLType::I32,
-            GGMLType::I64,
-            GGMLType::Q4_0,
-            GGMLType::Q4_1,
-            GGMLType::Q5_0,
-            GGMLType::Q5_1,
-            GGMLType::Q8_0,
-            GGMLType::Q8_1,
-            GGMLType::Q2_K,
-            GGMLType::Q3_K,
-            GGMLType::Q4_K,
-            GGMLType::Q5_K,
-            GGMLType::Q6_K,
-            GGMLType::Q8_K,
-            GGMLType::IQ1_S,
-            GGMLType::IQ1_M,
-            GGMLType::IQ2_XXS,
-            GGMLType::IQ2_XS,
-            GGMLType::IQ2_S,
-            GGMLType::IQ3_XXS,
-            GGMLType::IQ3_S,
-            GGMLType::IQ4_NL,
-            GGMLType::IQ4_XS,
-            GGMLType::GGML_TYPE_Q1_58,
-        ] {
+        for t in GGMLType::ALL {
             let (bytes, per_block) = t.block_layout();
             assert!(bytes > 0 && per_block > 0, "{t} has an empty block layout");
             assert!(t.stored_size(1) > 0, "{t} sized one element as 0 bytes");
+            // The documented formula, checked against the implementation across a range
+            // that crosses block boundaries in both directions.
+            for n in [1usize, per_block - 1, per_block, per_block + 1, 10_000_003] {
+                assert_eq!(
+                    t.stored_size(n),
+                    n.div_ceil(per_block) * bytes,
+                    "{t} sized {n} elements wrong"
+                );
+            }
         }
+    }
+
+    /// The type table is three parallel matches — the discriminant, `from_u32`, and the
+    /// displayed name — and nothing tied them together. A wrong number in `from_u32`
+    /// silently reads every tensor of that type as some other type.
+    #[test]
+    fn every_ggml_type_round_trips_through_its_tag_and_has_its_own_name() {
+        let mut names: Vec<&'static str> = Vec::new();
+        for t in GGMLType::ALL {
+            let tag = t as u32;
+            assert_eq!(
+                GGMLType::from_u32(tag),
+                Some(t),
+                "{t} (tag {tag}) does not come back from its own tag"
+            );
+            let name = t.to_string();
+            assert!(!name.is_empty(), "{t:?} has no display name");
+            assert!(
+                !names.contains(&name.as_str()),
+                "two types both display as {name:?}"
+            );
+            names.push(Box::leak(name.into_boxed_str()));
+        }
+        // Tags nobody has defined stay unknown rather than mapping to a neighbour — the
+        // reader refuses the file instead of misreading its tensors.
+        for tag in [4u32, 5, 31, 35, 37, 100, u32::MAX] {
+            assert!(
+                GGMLType::from_u32(tag).is_none(),
+                "tag {tag} should be unknown"
+            );
+        }
+    }
+
+    /// Bits per weight, derived from the block layout, must land near the name — the
+    /// quant tables are dense columns of numbers where a transposed digit is invisible
+    /// by eye but silently misreports every size in the checkpoint.
+    #[test]
+    fn quantized_block_layouts_match_the_width_in_their_name() {
+        for t in GGMLType::ALL {
+            let (bytes, per_block) = t.block_layout();
+            let bpw = bytes as f64 * 8.0 / per_block as f64;
+            let name = t.to_string();
+            // `Q4_K` / `IQ2_XS` / `Q1_58`: the digit after the leading Q or IQ is the
+            // nominal bit width, and the real one is that plus block overhead — never
+            // less, and never more than ~1.5 bits of it. (Matching only `Q`/`IQ` and not
+            // a bare leading `I`, or `I16` would read as a 1-bit quant.)
+            let Some(nominal) = name
+                .strip_prefix("IQ")
+                .or_else(|| name.strip_prefix('Q'))
+                .and_then(|rest| rest.chars().next())
+                .and_then(|c| c.to_digit(10))
+            else {
+                // F32/F16/BF16/I8… — exact widths, no blocking.
+                assert_eq!(per_block, 1, "{name} should not be blocked");
+                assert_eq!(bpw, bytes as f64 * 8.0);
+                continue;
+            };
+            let nominal = f64::from(nominal);
+            assert!(
+                bpw >= nominal && bpw <= nominal + 1.6,
+                "{name} stores {bpw:.4} bits per weight, which is not ~{nominal}"
+            );
+        }
+    }
+
+    /// Metadata values are shown as text on the detail screen; long arrays are elided so
+    /// one 32k-token vocabulary doesn't push everything else off the panel.
+    #[test]
+    fn values_render_as_text_with_long_arrays_elided() {
+        use GGUFValue::{Array, Bool, F32, I32, String as Str, U32};
+        assert_eq!(U32(7).to_string(), "7");
+        assert_eq!(I32(-7).to_string(), "-7");
+        assert_eq!(F32(0.5).to_string(), "0.5");
+        assert_eq!(Bool(true).to_string(), "true");
+        // Strings are quoted, so `"32"` can't be mistaken for the number.
+        assert_eq!(Str("llama".into()).to_string(), "\"llama\"");
+        // Up to five elements show in full.
+        let small = Array(vec![U32(1), U32(2), U32(3)]);
+        assert_eq!(small.to_string(), "[1, 2, 3]");
+        let five = Array((1..=5).map(U32).collect());
+        assert_eq!(five.to_string(), "[1, 2, 3, 4, 5]");
+        // Six or more elide the middle, keeping the ends and the count — enough to tell
+        // what the array is without printing a vocabulary.
+        let six = Array((1..=6).map(U32).collect());
+        assert_eq!(six.to_string(), "[1, 2, ..., 6 (6)]");
+        let tokens = Array((0..32_000).map(|i| Str(format!("tok{i}"))).collect());
+        assert_eq!(
+            tokens.to_string(),
+            "[\"tok0\", \"tok1\", ..., \"tok31999\" (32000)]"
+        );
+        // Nested arrays render through the same rule.
+        assert_eq!(
+            Array(vec![small.clone(), six]).to_string(),
+            "[[1, 2, 3], [1, 2, ..., 6 (6)]]"
+        );
     }
 }

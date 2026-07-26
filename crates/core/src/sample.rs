@@ -1548,6 +1548,13 @@ fn gather_region(
 ) -> Vec<u8> {
     let total: usize = want.iter().map(|r| r.len()).product();
     let n = src_ranges.len();
+    // Nothing to gather if any dimension is empty. The odometer below always copies at
+    // least one last-dim span before it can notice, so a tensor with a zero dimension —
+    // legal in safetensors, and what a truncated or hostile header can claim — would read
+    // past the end of `src` and panic.
+    if want.iter().any(|r| r.is_empty()) {
+        return Vec::new();
+    }
     if n == 0 {
         return src[..total * item].to_vec();
     }
@@ -2354,6 +2361,7 @@ impl BlobReader {
         entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
         let header = crate::npy::parse_header(&mut std::io::Cursor::new(&bytes))?;
         let data_end = bytes.len();
+        shape_fits(t, item, data_end.saturating_sub(header.data_offset))?;
         Ok(Self {
             backing: Backing::Owned(bytes),
             data_start: header.data_offset,
@@ -2373,6 +2381,7 @@ impl BlobReader {
         if data_end > mmap.len() || data_start > data_end {
             return Err("tensor data range is out of bounds".to_string());
         }
+        shape_fits(t, item, data_end - data_start)?;
         Ok(Self {
             backing: Backing::Mmap(mmap),
             data_start,
@@ -2385,6 +2394,25 @@ impl BlobReader {
     fn blob(&self) -> &[u8] {
         &self.backing.bytes()[self.data_start..self.data_end]
     }
+}
+
+/// Reject a header whose declared shape needs more bytes than the segment it points at
+/// actually holds.
+///
+/// A `data_offsets` span shorter than `shape × itemsize` means the file is corrupt,
+/// truncated, or hostile. Without this the read goes ahead: `gather_region` copies the
+/// declared last-dimension span for each row, runs off the end of the segment, and the
+/// process aborts on a slice bounds check — a crash rather than the error message the
+/// user should get. Checked at open, so every read of that tensor fails the same way.
+fn shape_fits(t: &TensorInfo, item: usize, span: usize) -> Result<(), String> {
+    let need = t.shape.iter().product::<usize>().saturating_mul(item);
+    if need > span {
+        return Err(format!(
+            "{}: header declares shape {:?} ({need} bytes) but only {span} bytes are stored",
+            t.name, t.shape
+        ));
+    }
+    Ok(())
 }
 
 /// Memory-map a file read-only. SAFETY: read-only inspection; we accept that a
@@ -4271,5 +4299,44 @@ mod fixture_sampling {
         assert!(sample_tensor(&t, 2, 2, 0, ViewDtype::Stored, SampleMode::Grid, None).is_err());
         let go = std::sync::atomic::AtomicBool::new(false);
         assert!(tensor_stats(&t, ViewDtype::Stored, None, &go, &go, None).is_err());
+    }
+
+    /// A header that claims a bigger shape than its `data_offsets` span — corrupt,
+    /// truncated, or hostile — must be refused at open. Reading it went ahead and ran off
+    /// the end of the segment, aborting the process on a slice bounds check instead of
+    /// printing an error.
+    #[test]
+    fn a_header_claiming_more_than_it_stores_is_refused_at_open() {
+        let mut t = checkpoint()[0].clone();
+        let real = t.shape.clone();
+        t.shape = vec![real.iter().product::<usize>() * 4]; // 4× the stored bytes
+        let Err(e) = open_reader(&t) else {
+            panic!("a segment shorter than the declared shape must not open");
+        };
+        assert!(
+            e.contains("but only") && e.contains("bytes are stored"),
+            "{e}"
+        );
+        // Every read of that tensor fails the same way, rather than one path crashing.
+        assert!(sample_tensor(&t, 2, 2, 0, ViewDtype::Stored, SampleMode::Grid, None).is_err());
+        assert!(read_all_f64(&t).is_err());
+        // A shape that fits is still fine — the check is a bound, not an equality.
+        t.shape = vec![1];
+        assert!(open_reader(&t).is_ok());
+    }
+
+    /// A zero-length dimension is legal on disk; reading it yields nothing. The region
+    /// gather always copied one last-dimension span before it could notice, so it read
+    /// past the end of an empty segment and panicked.
+    #[test]
+    fn a_zero_dimension_reads_as_empty_rather_than_panicking() {
+        let mut t = checkpoint()[0].clone();
+        t.shape = vec![0, 4];
+        t.num_elements = 0;
+        let Ok(r) = open_reader(&t) else {
+            panic!("a zero-element tensor still opens");
+        };
+        assert!(r.read_region(&[0..0, 0..4]).unwrap().is_empty());
+        assert!(read_all_f64(&t).is_ok_and(|v| v.is_empty()));
     }
 }

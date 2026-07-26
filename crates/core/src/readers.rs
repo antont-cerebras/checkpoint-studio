@@ -728,4 +728,187 @@ mod local_reads {
             "an hdf5 tensor should report its layout"
         );
     }
+
+    // --- the non-safetensors formats -----------------------------------------------
+    //
+    // GGUF, `.npy` and `.npz` are advertised as supported but had no fixture and no test:
+    // the dispatch, the per-format header read and the `TensorInfo` each produces were
+    // only ever exercised by opening a real file by hand. These build one of each on disk
+    // and go in through `read_local`, the same way the CLI does.
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cs_readers_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        dir
+    }
+
+    /// A `.npy` file: the v1.0 header for `shape`/`descr`, then `data` bytes.
+    fn write_npy(path: &Path, descr: &str, shape: &str, data: &[u8]) {
+        let dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape}, }}");
+        let mut bytes = b"\x93NUMPY\x01\x00".to_vec();
+        bytes.extend((dict.len() as u16).to_le_bytes());
+        bytes.extend(dict.as_bytes());
+        bytes.extend(data);
+        std::fs::write(path, bytes).expect("write the .npy");
+    }
+
+    #[test]
+    fn reads_a_gguf_file_into_the_model() {
+        use crate::gguf::testing::{Gguf, gguf_str, le_u64};
+        let dir = scratch("gguf");
+        let path = dir.join("model.gguf");
+        let mut g = Gguf::default();
+        // Types 8 (string), 4 (u32) and 7 (bool) — three of the value kinds the reader
+        // labels, so the `value_type` mapping is exercised, not just the happy path.
+        g.kv("general.architecture", 8, &gguf_str("llama"))
+            .kv("block_count", 4, &32u32.to_le_bytes())
+            .kv("general.quantized", 7, &[1u8])
+            // Q4_0 is block-quantized, so `stored_size` is block arithmetic rather than
+            // elements × itemsize — the case an f32 product used to get wrong.
+            .tensor("blk.0.attn_q.weight", &[64, 32], 2, 0)
+            .tensor("output_norm.weight", &[64], 0, 4096)
+            .u64(0); // padding byte the reader skips past
+        std::fs::write(&path, g.finish()).expect("write the gguf");
+
+        let ck = read_local(&[path]).expect("the gguf reads");
+        let tensors: Vec<_> = ck.shards.iter().flat_map(|s| &s.tensors).collect();
+        assert_eq!(tensors.len(), 2);
+        let q = tensors
+            .iter()
+            .find(|t| t.name == "blk.0.attn_q.weight")
+            .expect("the quantized tensor");
+        assert_eq!(q.shape, vec![64, 32]);
+        assert_eq!(q.num_elements, 2048);
+        assert_eq!(q.dtype, "Q4_0");
+        // 2048 elements at 32 per block, 18 bytes a block — exact, not a float product.
+        assert_eq!(q.size_bytes, 2048 / 32 * 18);
+        assert!(matches!(q.layout, Layout::Offset(0)));
+        let norm = tensors
+            .iter()
+            .find(|t| t.name == "output_norm.weight")
+            .expect("the f32 tensor");
+        assert_eq!((norm.dtype.as_str(), norm.size_bytes), ("F32", 256));
+        assert!(matches!(norm.layout, Layout::Offset(4096)));
+
+        // The metadata comes through with each value's type named.
+        let meta: Vec<_> = ck.shards.iter().flat_map(|s| &s.metadata).collect();
+        let by = |k: &str| meta.iter().find(|m| m.name == k).expect(k);
+        assert_eq!(by("general.architecture").value_type, "string");
+        // Strings render quoted, so a value that merely *looks* numeric stays readable.
+        assert_eq!(by("general.architecture").value, "\"llama\"");
+        assert_eq!(by("block_count").value_type, "u32");
+        assert_eq!(by("general.quantized").value_type, "bool");
+    }
+
+    #[test]
+    fn reads_a_npy_file_into_a_single_tensor() {
+        let dir = scratch("npy");
+        let path = dir.join("weights.npy");
+        write_npy(&path, "<f4", "(4, 5)", &[0u8; 80]);
+        let ck = read_local(&[path]).expect("the .npy reads");
+        let tensors: Vec<_> = ck.shards.iter().flat_map(|s| &s.tensors).collect();
+        assert_eq!(tensors.len(), 1, "a .npy holds exactly one array");
+        let t = tensors[0];
+        // The tensor is named after the file, since a .npy carries no name of its own.
+        assert_eq!(t.name, "weights");
+        assert_eq!((t.dtype.as_str(), t.shape.clone()), ("F32", vec![4, 5]));
+        assert_eq!((t.num_elements, t.size_bytes), (20, 80));
+        // The byte range must start after the header, or the first values read as header.
+        let Layout::ByteRange { start, end } = t.layout else {
+            panic!("a .npy tensor is a byte range, got {:?}", t.layout);
+        };
+        assert_eq!(end - start, 80);
+        assert!(start > 10, "data must start past the magic + header");
+    }
+
+    #[test]
+    fn reads_a_npz_archive_reporting_compression_per_entry() {
+        let dir = scratch("npz");
+        let path = dir.join("bundle.npz");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).expect("create the npz"));
+        let mut member = |file: &str, body: &[u8], deflate: bool| {
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(if deflate {
+                    zip::CompressionMethod::Deflated
+                } else {
+                    zip::CompressionMethod::Stored
+                });
+            zip.start_file(file.to_string(), opts).expect("entry");
+            std::io::Write::write_all(&mut zip, body).expect("write the entry");
+        };
+        let npy = |descr: &str, shape: &str, data: &[u8]| {
+            let dict =
+                format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape}, }}");
+            let mut bytes = b"\x93NUMPY\x01\x00".to_vec();
+            bytes.extend((dict.len() as u16).to_le_bytes());
+            bytes.extend(dict.as_bytes());
+            bytes.extend(data);
+            bytes
+        };
+        member("stored.npy", &npy("<f4", "(2, 2)", &[0u8; 16]), false);
+        member("squashed.npy", &npy("<f8", "(3,)", &[0u8; 24]), true);
+        // A member that is not an array at all — numpy writes none, but archives get
+        // edited, and a stray file must be skipped rather than parsed as a header.
+        member("README.txt", b"not an array", false);
+        zip.finish().expect("finish the npz");
+
+        let ck = read_local(&[path]).expect("the .npz reads");
+        let tensors: Vec<_> = ck.shards.iter().flat_map(|s| &s.tensors).collect();
+        assert_eq!(
+            tensors.len(),
+            2,
+            "one tensor per .npy member, and only those"
+        );
+        let stored = tensors.iter().find(|t| t.name == "stored").expect("stored");
+        assert_eq!(
+            (stored.dtype.as_str(), stored.shape.clone()),
+            ("F32", vec![2, 2])
+        );
+        assert!(
+            matches!(stored.storage, Storage::Raw),
+            "an uncompressed member is Raw, got {:?}",
+            stored.storage
+        );
+        let squashed = tensors
+            .iter()
+            .find(|t| t.name == "squashed")
+            .expect("squashed");
+        assert_eq!(squashed.dtype, "F64");
+        // The compressed size is what the file actually costs, and it drives the
+        // `A → B` display; it must be recorded, not inferred from the shape.
+        let Storage::Compressed {
+            codec,
+            stored_bytes,
+        } = &squashed.storage
+        else {
+            panic!(
+                "a deflated member must report its codec, got {:?}",
+                squashed.storage
+            );
+        };
+        assert_eq!(codec, "deflate");
+        assert!(*stored_bytes > 0 && *stored_bytes <= 24 + 64);
+        // Data inside a zip isn't addressable by byte range, so reads go through the
+        // archive instead — the layout says so rather than pointing somewhere wrong.
+        assert!(matches!(squashed.layout, Layout::None));
+    }
+
+    /// The HDF5 sniff is what lets an extensionless checkpoint be recognized, and it must
+    /// not claim anything else — including a file it can't read at all.
+    #[test]
+    fn the_hdf5_signature_sniff_only_matches_hdf5() {
+        let dir = scratch("sniff");
+        let h5 = dir.join("nameless");
+        std::fs::write(&h5, b"\x89HDF\r\n\x1a\n and then whatever").expect("write");
+        assert!(looks_like_hdf5(&h5));
+        let st = dir.join("plain.safetensors");
+        std::fs::write(&st, b"\x08\x00\x00\x00\x00\x00\x00\x00{}").expect("write");
+        assert!(!looks_like_hdf5(&st));
+        // Shorter than the signature, and absent entirely — both false, not a panic.
+        let tiny = dir.join("tiny");
+        std::fs::write(&tiny, b"\x89HDF").expect("write");
+        assert!(!looks_like_hdf5(&tiny));
+        assert!(!looks_like_hdf5(&dir.join("nope")));
+    }
 }

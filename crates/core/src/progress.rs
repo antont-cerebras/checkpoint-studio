@@ -5,6 +5,7 @@
 //! (escape codes never pollute a pipe/log). Callers must do any password prompt
 //! *before* starting the bars.
 
+use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -345,6 +346,172 @@ fn sweep_pos(frame: usize, width: usize, win: usize) -> usize {
     if t <= span { t } else { span * 2 - t }
 }
 
+/// Spinner frames for a running bar.
+const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+// Bold cyan spinner, bold green ✓, bold red ✗; dimmed labels so the coloured mark and
+// the timer stand out.
+const RUN: &str = "\x1b[1;36m";
+const DONE: &str = "\x1b[1;32m";
+const FAIL: &str = "\x1b[1;31m";
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
+
+/// One bar at one instant: what [`render_line`] needs, read out of the atomics by the
+/// animation thread — or built directly by a test.
+struct BarView<'a> {
+    label: &'a str,
+    state: u8,
+    ms: u64,
+    done: usize,
+    total: usize,
+    unit: &'static str,
+    is_bytes: bool,
+    note: &'static str,
+    stage: Option<Stage>,
+}
+
+/// Draw one bar line — escape codes, bar, count, timer and stage — to fit `cols`
+/// columns, ready to `\r`-overwrite the line it's on.
+///
+/// Split out of the animation thread so it's a pure function of a snapshot: the column
+/// arithmetic here is what keeps a line from wrapping (a wrapped line breaks the
+/// fixed-height in-place redraw), and inside the thread there was no way to check it
+/// without a terminal and an eyeball.
+fn render_line(v: &BarView, frame: usize, cols: usize) -> String {
+    let (color, mark) = match v.state {
+        OK => (DONE, '✓'),
+        ERR => (FAIL, '✗'),
+        ABORTED => (DIM, '⊘'), // cut short, not a failure — dim, not red
+        _ => (RUN, FRAMES[frame % FRAMES.len()]),
+    };
+    let secs = v.ms as f64 / 1000.0;
+    // Each piece below carries the columns it actually occupies alongside its text, since
+    // the escape codes are zero-width and the fitting further down counts columns.
+    //
+    // The ━ gauge and the `done/total` count are separate pieces on purpose: the gauge is
+    // the first thing given up on a narrow terminal, and the count is far more use than
+    // the picture of it.
+    let (gauge, gauge_cols) = if v.state == ABORTED || (v.total == 0 && v.state != RUNNING) {
+        (String::new(), 0) // aborted, or finished with no total: mark + text only
+    } else if v.total > 0 {
+        // Determinate: a thin bar in the TUI `LineGauge` style (`symbols::line::THICK`) —
+        // done part in the mark's colour, the rest dim.
+        let filled = filled_cols(v.done, v.total, BAR_COLS);
+        (
+            format!(
+                "  {color}{}{RESET}{DIM}{}{RESET}",
+                "━".repeat(filled),
+                "━".repeat(BAR_COLS - filled),
+            ),
+            2 + BAR_COLS,
+        )
+    } else {
+        // Total not known yet (still connecting / listing the dir) or an `s3://` read
+        // with no per-shard count: an indeterminate bar with a bright window sweeping
+        // across, so a live bar shows from the start instead of a bare spinner.
+        let win = 3.min(BAR_COLS);
+        let pos = sweep_pos(frame, BAR_COLS, win);
+        (
+            format!(
+                "  {DIM}{}{RESET}{color}{}{RESET}{DIM}{}{RESET}",
+                "━".repeat(pos),
+                "━".repeat(win),
+                "━".repeat(BAR_COLS - pos - win),
+            ),
+            2 + BAR_COLS,
+        )
+    };
+    let (count, count_cols) = if v.state == ABORTED {
+        // Aborted: a partial count and a partial time both read as "died partway", so
+        // they're replaced by the reason (and the timer is dropped below). The reason
+        // always shows in some form — losing it would leave a bare `⊘` — so it has a
+        // terse fallback for a narrow pane rather than a fit that can come back empty.
+        const LONG: &str = "aborted — the other checkpoint failed to load";
+        const SHORT: &str = "aborted";
+        let room = cols.saturating_sub(4 + v.label.chars().count());
+        let text = if room >= LONG.chars().count() + 2 {
+            LONG
+        } else {
+            SHORT
+        };
+        (format!("  {DIM}{text}{RESET}"), 2 + text.chars().count())
+    } else if v.total > 0 {
+        // `done/total` and its unit — human sizes for a byte count — plus a trailing note
+        // (e.g. `· comparing…`) when work continues past a full bar, but only while
+        // running, so a finished `✓` bar doesn't keep claiming to compare.
+        let text = if v.is_bytes {
+            format!(
+                "{}/{}",
+                crate::utils::format_size(v.done),
+                crate::utils::format_size(v.total)
+            )
+        } else {
+            format!("{}/{}{}", v.done, v.total, v.unit)
+        };
+        let note = if v.state == RUNNING { v.note } else { "" };
+        (
+            format!(" {text}{DIM}{note}{RESET}"),
+            1 + text.chars().count() + note.chars().count(),
+        )
+    } else {
+        (String::new(), 0)
+    };
+    // No timer on an aborted line — see the count above.
+    let (timer, timer_cols) = if v.state == ABORTED {
+        (String::new(), 0)
+    } else {
+        let text = format!("{secs:.1}s");
+        let width = 1 + text.chars().count();
+        (format!(" {color}{text}{RESET}"), width)
+    };
+    // In a terminal too narrow for all of it, give up the gauge first and then trim the
+    // path — never the line's width. `spawn` already fits the label to a budget, but that
+    // budget has a floor (a three-column path tells you nothing), so in a ~40-column pane
+    // the line would otherwise run past the edge, wrap, and send the bars marching down
+    // the screen as each frame redrew below the last.
+    let mut label = Cow::Borrowed(v.label);
+    let (mut gauge, mut gauge_cols) = (gauge, gauge_cols);
+    let (mut count, mut count_cols) = (count, count_cols);
+    let width = |label: &str, gauge_cols: usize, count_cols: usize| {
+        4 + label.chars().count() + gauge_cols + count_cols + timer_cols
+    };
+    if width(&label, gauge_cols, count_cols) > cols {
+        (gauge, gauge_cols) = (String::new(), 0);
+    }
+    if width(&label, gauge_cols, count_cols) > cols {
+        let room = cols.saturating_sub(4 + count_cols + timer_cols);
+        label = Cow::Owned(truncate_middle(&label, room));
+    }
+    if width(&label, gauge_cols, count_cols) > cols {
+        // Last resort: a pane narrower than `999.9 MiB/999.9 MiB · comparing…` isn't one
+        // this display can serve — but it still must not wrap, so the count goes and the
+        // path takes back the room.
+        (count, count_cols) = (String::new(), 0);
+        label = Cow::Owned(truncate_middle(
+            v.label,
+            cols.saturating_sub(4 + timer_cols),
+        ));
+    }
+    // Which step is running, dimmed, after the timer — so a bar that sits at a steady
+    // count still says what it's doing. Only while running: a finished `✓` line
+    // shouldn't claim to still be reading. Sized to the columns left over, so it never
+    // pushes the line into wrapping.
+    let stage = match v.stage.filter(|_| v.state == RUNNING) {
+        None => String::new(),
+        Some(s) => match fit_stage(
+            cols.saturating_sub(width(&label, gauge_cols, count_cols)),
+            s.label(),
+            s.short(),
+        ) {
+            "" => String::new(),
+            text => format!("  {DIM}{text}{RESET}"),
+        },
+    };
+    // `\r` + text + clear-to-EOL (`\x1b[K` *after* the text, so there's no
+    // blank-then-fill flash) — overwrites the line in place.
+    format!("\r  {color}{mark}{RESET} {DIM}{label}{RESET}{gauge}{count}{timer}{stage}\x1b[K\n")
+}
+
 fn spawn(
     labels: Vec<String>,
     states: Vec<Arc<AtomicU8>>,
@@ -364,14 +531,6 @@ fn spawn(
     let budget = cols.saturating_sub(BAR_COLS + 48).max(20);
     let labels: Vec<String> = labels.iter().map(|l| truncate_middle(l, budget)).collect();
     std::thread::spawn(move || {
-        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        // Bold cyan spinner, bold green ✓, bold red ✗; dimmed labels so the
-        // coloured mark and the timer stand out.
-        const RUN: &str = "\x1b[1;36m";
-        const DONE: &str = "\x1b[1;32m";
-        const FAIL: &str = "\x1b[1;31m";
-        const DIM: &str = "\x1b[2m";
-        const RESET: &str = "\x1b[0m";
         let n = labels.len();
         let mut err = std::io::stderr();
         for _ in 0..n {
@@ -386,108 +545,25 @@ fn spawn(
             let mut frame = String::with_capacity(n * 96);
             frame.push_str(&format!("\x1b[{n}A")); // back up to the first reserved line
             for (k, &st) in now.iter().enumerate() {
-                let (color, mark) = match st {
-                    OK => (DONE, '✓'),
-                    ERR => (FAIL, '✗'),
-                    ABORTED => (DIM, '⊘'), // cut short, not a failure — dim, not red
-                    _ => (RUN, FRAMES[i % FRAMES.len()]),
-                };
-                let ms = if st == RUNNING {
-                    start.elapsed().as_millis() as u64
-                } else {
-                    durations[k].load(Ordering::Relaxed)
-                };
-                let secs = ms as f64 / 1000.0;
                 // A `[███░░░] done/total` bar once the total is known (e.g. after a
                 // remote dir is listed); until then just the spinner + timer.
                 let (done, total) = progress[k].snapshot();
-                let unit = progress[k].unit_label();
-                // Each branch returns the drawn segment plus how many columns it
-                // actually occupies (escape codes are zero-width), so the stage text
-                // below knows how much room is left on the line.
-                let (bar, bar_cols) = if st == ABORTED {
-                    // Aborted: the partial count/timer would read as "failed partway",
-                    // so replace them with a clear note (see the trailing timer too).
-                    const NOTE: &str = "aborted — the other checkpoint failed to load";
-                    (format!("  {DIM}{NOTE}{RESET}"), 2 + NOTE.chars().count())
-                } else if total > 0 {
-                    // Determinate: a thin bar in the TUI `LineGauge` style
-                    // (`symbols::line::THICK`) — done part in the mark's colour, the
-                    // rest dim — plus the `done/total` count (human sizes for a byte
-                    // count) and its unit.
-                    let filled = filled_cols(done, total, BAR_COLS);
-                    let count = if progress[k].is_bytes() {
-                        format!(
-                            "{}/{}",
-                            crate::utils::format_size(done),
-                            crate::utils::format_size(total)
-                        )
+                let view = BarView {
+                    label: &labels[k],
+                    state: st,
+                    ms: if st == RUNNING {
+                        start.elapsed().as_millis() as u64
                     } else {
-                        format!("{done}/{total}{unit}")
-                    };
-                    // A trailing note (e.g. `· comparing…`) when work continues past
-                    // a full bar — but only while running, so a finished `✓` bar
-                    // doesn't keep claiming to compare.
-                    let note = if st == RUNNING {
-                        progress[k].phase_note()
-                    } else {
-                        ""
-                    };
-                    (
-                        format!(
-                            "  {color}{}{RESET}{DIM}{}{RESET} {count}{DIM}{note}{RESET}",
-                            "━".repeat(filled),
-                            "━".repeat(BAR_COLS - filled),
-                        ),
-                        2 + BAR_COLS + 1 + count.chars().count() + note.chars().count(),
-                    )
-                } else if st == RUNNING {
-                    // Total not known yet (still connecting / listing the dir) or an
-                    // `s3://` read with no per-shard count: an indeterminate bar with
-                    // a bright window sweeping across, so a live bar shows from the
-                    // start instead of a bare spinner.
-                    let win = 3.min(BAR_COLS);
-                    let pos = sweep_pos(i, BAR_COLS, win);
-                    (
-                        format!(
-                            "  {DIM}{}{RESET}{color}{}{RESET}{DIM}{}{RESET}",
-                            "━".repeat(pos),
-                            "━".repeat(win),
-                            "━".repeat(BAR_COLS - pos - win),
-                        ),
-                        2 + BAR_COLS,
-                    )
-                } else {
-                    (String::new(), 0) // finished with no known total: mark + timer only
+                        durations[k].load(Ordering::Relaxed)
+                    },
+                    done,
+                    total,
+                    unit: progress[k].unit_label(),
+                    is_bytes: progress[k].is_bytes(),
+                    note: progress[k].phase_note(),
+                    stage: progress[k].stage(),
                 };
-                // No timer on an aborted line — a partial time reads as a failure.
-                let (timer, timer_cols) = if st == ABORTED {
-                    (String::new(), 0)
-                } else {
-                    let text = format!("{secs:.1}s");
-                    let cols = 1 + text.chars().count();
-                    (format!(" {color}{text}{RESET}"), cols)
-                };
-                // Which step is running, dimmed, after the timer — so a bar that sits
-                // at a steady count still says what it's doing. Only while running: a
-                // finished `✓` line shouldn't claim to still be reading. Sized to the
-                // columns left over, so it never pushes the line into wrapping.
-                let stage = match progress[k].stage().filter(|_| st == RUNNING) {
-                    None => String::new(),
-                    Some(s) => {
-                        let used = 4 + labels[k].chars().count() + bar_cols + timer_cols;
-                        match fit_stage(cols.saturating_sub(used), s.label(), s.short()) {
-                            "" => String::new(),
-                            text => format!("  {DIM}{text}{RESET}"),
-                        }
-                    }
-                };
-                // `\r` + text + clear-to-EOL (`\x1b[K` *after* the text, so there's
-                // no blank-then-fill flash) — overwrites the line in place.
-                frame.push_str(&format!(
-                    "\r  {color}{mark}{RESET} {DIM}{}{RESET}{bar}{timer}{stage}\x1b[K\n",
-                    labels[k]
-                ));
+                frame.push_str(&render_line(&view, i, cols));
             }
             let _ = err.write_all(frame.as_bytes());
             let _ = err.flush();
@@ -503,7 +579,8 @@ fn spawn(
 #[cfg(test)]
 mod tests {
     use super::{
-        LoadProgress, Phase, Stage, Unit, filled_cols, fit_stage, sweep_pos, truncate_middle,
+        ABORTED, BAR_COLS, BarView, DIM, ERR, LoadProgress, OK, Phase, RESET, RUN, RUNNING, Stage,
+        Unit, filled_cols, fit_stage, render_line, sweep_pos, truncate_middle,
     };
 
     #[test]
@@ -613,5 +690,245 @@ mod tests {
         assert!(t.chars().count() <= 24 && t.contains('…'), "{t}");
         let (head, tail) = t.split_once('…').unwrap();
         assert!(s.starts_with(head) && s.ends_with(tail), "{t}");
+    }
+
+    // --- the drawn line -----------------------------------------------------------
+    //
+    // `render_line` is what the animation thread emits, so these are the only tests that
+    // see what a user sees. They assert on the *visible* text (escape codes stripped)
+    // plus the one invariant the column arithmetic in there exists for: the line must
+    // never reach the terminal's width, because a wrapped line breaks the fixed-height
+    // in-place redraw and the bars start marching down the screen.
+
+    /// Drop the ANSI escape sequences, leaving what the terminal actually shows.
+    fn visible(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                if c != '\r' && c != '\n' {
+                    out.push(c);
+                }
+                continue;
+            }
+            // CSI: `\x1b[` … final byte in @-~
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn view<'a>(label: &'a str, state: u8) -> BarView<'a> {
+        BarView {
+            label,
+            state,
+            ms: 1234,
+            done: 0,
+            total: 0,
+            unit: "",
+            is_bytes: false,
+            note: "",
+            stage: None,
+        }
+    }
+
+    #[test]
+    fn a_determinate_bar_shows_the_count_its_unit_and_the_timer() {
+        let mut v = view("host:/ckpt", RUNNING);
+        v.done = 24;
+        v.total = 48;
+        v.unit = " shards";
+        let line = visible(&render_line(&v, 0, 120));
+        assert!(line.contains("host:/ckpt"), "{line}");
+        assert!(line.contains("24/48 shards"), "{line}");
+        assert!(line.contains("1.2s"), "{line}");
+        // Half done → half the bar is drawn in the bright colour, the rest dim. The
+        // escape codes are what carry that, so check the raw form for the split.
+        let raw = render_line(&v, 0, 120);
+        assert!(raw.contains(&format!(
+            "{RUN}{}{RESET}{DIM}{}",
+            "━".repeat(8),
+            "━".repeat(8)
+        )));
+    }
+
+    #[test]
+    fn a_byte_count_is_drawn_as_human_sizes() {
+        let mut v = view("host:/ckpt", RUNNING);
+        v.done = 3 << 30;
+        v.total = 12 << 30;
+        v.is_bytes = true;
+        v.unit = ""; // bytes carry their unit in the formatted size
+        let line = visible(&render_line(&v, 0, 120));
+        assert!(line.contains("3.0 GiB/12.0 GiB"), "{line}");
+    }
+
+    /// The `· comparing…` note says a full bar is still working — but only while it is.
+    #[test]
+    fn the_phase_note_disappears_once_the_bar_finishes() {
+        let mut v = view("host:/ckpt", RUNNING);
+        (v.done, v.total, v.note) = (48, 48, " · comparing…");
+        assert!(visible(&render_line(&v, 0, 120)).contains("· comparing…"));
+        v.state = OK;
+        let done = visible(&render_line(&v, 0, 120));
+        assert!(
+            !done.contains("comparing"),
+            "a ✓ line must not claim to work: {done}"
+        );
+        assert!(done.contains('✓'), "{done}");
+    }
+
+    #[test]
+    fn an_indeterminate_bar_sweeps_a_full_width_bar() {
+        let v = view("ckpt", RUNNING); // total 0 → no count to draw (and no `/` of its own)
+        for frame in 0..40 {
+            let line = visible(&render_line(&v, frame, 120));
+            let bar: String = line.chars().filter(|&c| c == '━').collect();
+            assert_eq!(bar.chars().count(), BAR_COLS, "frame {frame}: {line}");
+            assert!(
+                !line.contains('/'),
+                "no count while the total is unknown: {line}"
+            );
+        }
+    }
+
+    /// An aborted read is not a failure of *this* checkpoint, so it gets neither the red
+    /// ✗ nor a timer — a partial time reads as "died partway".
+    #[test]
+    fn an_aborted_line_explains_itself_and_drops_the_timer() {
+        let mut v = view("host:/ckpt", ABORTED);
+        (v.done, v.total) = (12, 48); // a partial count that must NOT be shown
+        let line = visible(&render_line(&v, 0, 120));
+        assert!(line.contains('⊘') && !line.contains('✗'), "{line}");
+        assert!(
+            line.contains("aborted — the other checkpoint failed to load"),
+            "{line}"
+        );
+        assert!(!line.contains("1.2s") && !line.contains("12/48"), "{line}");
+    }
+
+    #[test]
+    fn a_finished_read_with_no_total_is_just_the_mark_and_the_timer() {
+        let ok = visible(&render_line(&view("host:/ckpt", OK), 0, 120));
+        assert_eq!(ok, "  ✓ host:/ckpt 1.2s");
+        let err = visible(&render_line(&view("host:/ckpt", ERR), 0, 120));
+        assert_eq!(err, "  ✗ host:/ckpt 1.2s");
+    }
+
+    #[test]
+    fn the_stage_shows_only_while_running() {
+        let mut v = view("host:/ckpt", RUNNING);
+        v.stage = Some(Stage::Tensors);
+        assert!(visible(&render_line(&v, 0, 120)).contains("reading tensor metadata"));
+        v.state = OK;
+        let done = visible(&render_line(&v, 0, 120));
+        assert!(
+            !done.contains("reading"),
+            "a ✓ line still claims to read: {done}"
+        );
+    }
+
+    /// What a narrow pane gives up, in order: the ━ gauge first (a picture of the
+    /// progress), then the path, and never the `done/total` count — which is the part
+    /// actually worth reading.
+    #[test]
+    fn a_narrow_pane_drops_the_gauge_but_keeps_the_count() {
+        let mut v = view("s3://bucket/ckpt/260626", RUNNING);
+        (v.done, v.total, v.unit) = (823, 1155, " tensors");
+        let wide = visible(&render_line(&v, 0, 120));
+        assert!(
+            wide.contains('━') && wide.contains("823/1155 tensors"),
+            "{wide}"
+        );
+        let narrow = visible(&render_line(&v, 0, 60));
+        assert!(!narrow.contains('━'), "the gauge should go first: {narrow}");
+        assert!(
+            narrow.contains("823/1155 tensors"),
+            "the count must stay: {narrow}"
+        );
+        assert!(
+            narrow.contains("s3://") && narrow.contains("260626"),
+            "{narrow}"
+        );
+        // Narrower still: the path gives way next, keeping both its ends.
+        let tiny = visible(&render_line(&v, 0, 40));
+        assert!(
+            tiny.contains("823/1155 tensors") && tiny.contains('…'),
+            "{tiny}"
+        );
+    }
+
+    /// An aborted line must always say *why*, so its note has a terse form rather than a
+    /// fit that can come back empty — a bare `⊘` would be a mystery.
+    #[test]
+    fn the_aborted_reason_shortens_rather_than_vanishing() {
+        let v = view("s3://bucket/ckpt/260626", ABORTED);
+        assert!(visible(&render_line(&v, 0, 120)).contains("the other checkpoint failed"));
+        let narrow = visible(&render_line(&v, 0, 40));
+        assert!(narrow.contains("aborted"), "{narrow}");
+        assert!(!narrow.contains("other checkpoint"), "{narrow}");
+    }
+
+    /// The stage is what gives way on a narrow terminal — long form, then terse, then
+    /// nothing — and the path keeps its own budget either way.
+    #[test]
+    fn a_narrowing_terminal_degrades_the_stage_not_the_line() {
+        let mut v = view("host:/ckpt", RUNNING);
+        v.stage = Some(Stage::Index);
+        let at = |cols| visible(&render_line(&v, 0, cols));
+        assert!(at(120).contains("loading the checkpoint index"));
+        assert!(
+            at(46).contains("index") && !at(46).contains("loading"),
+            "{}",
+            at(46)
+        );
+        assert!(!at(20).contains("index"), "{}", at(20));
+    }
+
+    /// The invariant the whole `bar_cols`/`timer_cols` accounting is for. Swept across
+    /// every state, both bar kinds, the widest count and note, and terminal widths from
+    /// a narrow split pane to generous — the drawn line must always fit the terminal.
+    ///
+    /// Exactly filling the width is allowed: what advances the line is the trailing `\n`,
+    /// and nothing printable is written after it before the next frame's `\r`, so the
+    /// pending-wrap state is never resolved into a real wrap. One column *past* the width
+    /// is what breaks the fixed-height redraw and sends the bars marching down the screen.
+    #[test]
+    fn a_drawn_line_never_overruns_the_terminal_width() {
+        for cols in [20usize, 40, 60, 80, 100, 120, 200] {
+            // What `spawn` would hand us: the label is pre-truncated to its budget.
+            let budget = cols.saturating_sub(BAR_COLS + 48).max(20);
+            let label = truncate_middle("s3://inference-testing/kimi-k2.6/3bit-22s/260626", budget);
+            for state in [RUNNING, OK, ERR, ABORTED] {
+                for (done, total, is_bytes) in [
+                    (0, 0, false),
+                    (24, 48, false),
+                    (999 << 20, 1023 << 20, true),
+                ] {
+                    for stage in Stage::ALL.map(Some).into_iter().chain([None]) {
+                        let v = BarView {
+                            label: &label,
+                            state,
+                            ms: 999_999, // "1000.0s" — the widest timer we'd ever draw
+                            done,
+                            total,
+                            unit: " S3 objects", // the widest unit label
+                            is_bytes,
+                            note: " · comparing…",
+                            stage,
+                        };
+                        let drawn = visible(&render_line(&v, 7, cols)).chars().count();
+                        assert!(
+                            drawn <= cols,
+                            "{drawn} cols drawn in a {cols}-col terminal \
+                             (state {state}, {done}/{total}, stage {stage:?})",
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -9,6 +9,7 @@
 use std::io::Read;
 
 /// The decoded header of a `.npy` stream.
+#[derive(Debug)]
 pub struct NpyHeader {
     /// The explorer dtype name (`F32`, `I16`, …) the descriptor maps to.
     pub dtype: String,
@@ -132,12 +133,17 @@ fn dict_shape(header: &str) -> Result<Vec<usize>, String> {
 }
 
 /// The slice of the header following `'key':`.
+///
+/// The colon has to come straight after the key. Taking the *next* colon anywhere in the
+/// header instead walks into the following entry, and then the value read belongs to that
+/// one — a header missing a colon after `'descr'` reported `unsupported dtype: shape`,
+/// naming a key from further along, rather than saying the header was malformed.
 fn after_key(header: &str, key: &str) -> Result<String, String> {
     let pat = format!("'{key}'");
     let at = header.find(&pat).ok_or_else(|| missing(key))?;
-    let after = &header[at + pat.len()..];
-    let colon = after.find(':').ok_or_else(|| missing(key))?;
-    Ok(after[colon + 1..].to_string())
+    let after = header[at + pat.len()..].trim_start();
+    let rest = after.strip_prefix(':').ok_or_else(|| missing(key))?;
+    Ok(rest.to_string())
 }
 
 fn missing(key: &str) -> String {
@@ -196,5 +202,119 @@ mod tests {
         assert_eq!(dict_shape("'shape': (), ").unwrap(), Vec::<usize>::new());
         assert_eq!(dict_shape("'shape': (7,), ").unwrap(), vec![7]);
         assert_eq!(dict_shape("'shape': (2, 3, 4), ").unwrap(), vec![2, 3, 4]);
+    }
+
+    /// numpy has written v2 (4-byte header length) since 1.9 for headers over 64 KiB —
+    /// a real possibility for an array with many dimensions or a long structured dtype.
+    /// The `data_offset` differs by the two extra length bytes, so getting the version
+    /// wrong shifts every value read afterwards.
+    #[test]
+    fn parses_a_v2_header_with_its_wider_length_field() {
+        let dict = b"{'descr': '<i2', 'fortran_order': False, 'shape': (3, 2), }";
+        let mut bytes = b"\x93NUMPY\x02\x00".to_vec();
+        bytes.extend((dict.len() as u32).to_le_bytes());
+        bytes.extend(dict);
+        let h = parse_header(&mut std::io::Cursor::new(&bytes)).unwrap();
+        assert_eq!((h.dtype.as_str(), h.shape.clone()), ("I16", vec![3, 2]));
+        assert_eq!(
+            h.data_offset,
+            8 + 4 + dict.len(),
+            "v2 reserves 4 length bytes"
+        );
+        // The same dict as v1 sits two bytes earlier.
+        let mut v1 = b"\x93NUMPY\x01\x00".to_vec();
+        v1.extend((dict.len() as u16).to_le_bytes());
+        v1.extend(dict);
+        let h1 = parse_header(&mut std::io::Cursor::new(&v1)).unwrap();
+        assert_eq!(h1.data_offset + 2, h.data_offset);
+    }
+
+    /// Every dtype the reader claims to map, in one place — a missing arm silently
+    /// rejects a whole class of file, which is a support gap rather than a crash.
+    #[test]
+    fn maps_every_supported_width_and_kind() {
+        for (descr, want) in [
+            ("<f8", "F64"),
+            ("<f4", "F32"),
+            ("<f2", "F16"),
+            ("<i8", "I64"),
+            ("<i4", "I32"),
+            ("<i2", "I16"),
+            ("|i1", "I8"),
+            ("<u8", "U64"),
+            ("<u4", "U32"),
+            ("<u2", "U16"),
+            ("|u1", "U8"),
+            ("|b1", "BOOL"),
+        ] {
+            assert_eq!(map_descr(descr).unwrap(), want, "{descr}");
+        }
+        // A single-byte big-endian descriptor has no byte order to get wrong, so it's
+        // accepted where a multi-byte one is refused.
+        assert_eq!(map_descr(">u1").unwrap(), "U8");
+        assert!(map_descr(">u2").is_err());
+        // No order prefix at all is native order, which is the little-endian we assume.
+        assert_eq!(map_descr("f4").unwrap(), "F32");
+        // Widths that exist in numpy but that we have no decoder for.
+        assert!(map_descr("<f16").is_err()); // long double
+        assert!(map_descr("<i16").is_err());
+        assert!(map_descr("<f").is_err()); // no width at all
+        assert!(map_descr("").is_err());
+    }
+
+    /// The header is parsed as text, so malformed input must produce a message rather
+    /// than a panic on a slice — these files come off other people's machines.
+    #[test]
+    fn a_malformed_header_is_an_error_naming_what_is_missing() {
+        let header = |dict: &str| {
+            let mut bytes = b"\x93NUMPY\x01\x00".to_vec();
+            bytes.extend((dict.len() as u16).to_le_bytes());
+            bytes.extend(dict.as_bytes());
+            parse_header(&mut std::io::Cursor::new(bytes))
+        };
+        // Each key in turn: absent, or present with nothing usable after it.
+        let e = header("{'fortran_order': False, 'shape': (1,), }").unwrap_err();
+        assert!(e.contains("missing 'descr'"), "{e}");
+        let e = header("{'descr': '<f4', 'shape': (1,), }").unwrap_err();
+        assert!(e.contains("missing 'fortran_order'"), "{e}");
+        let e = header("{'descr': '<f4', 'fortran_order': False, }").unwrap_err();
+        assert!(e.contains("missing 'shape'"), "{e}");
+        // Present but unparseable.
+        let e = header("{'descr' '<f4', 'fortran_order': False, 'shape': (1,), }").unwrap_err();
+        assert!(e.contains("missing 'descr'"), "no colon after the key: {e}");
+        // An unquoted `descr` value: the string scan runs on to the next quoted token, so
+        // this one surfaces as an unsupported dtype rather than a missing key. Still an
+        // error naming the descriptor, which is the part the user has to fix.
+        let e = header("{'descr': <f4, 'fortran_order': False, 'shape': (1,), }").unwrap_err();
+        assert!(e.contains("unsupported dtype"), "unquoted value: {e}");
+        let e = header("{'descr': '<f4', 'fortran_order': Maybe, 'shape': (1,), }").unwrap_err();
+        assert!(e.contains("malformed 'fortran_order'"), "{e}");
+        let e = header("{'descr': '<f4', 'fortran_order': False, 'shape': 4, }").unwrap_err();
+        assert!(e.contains("missing 'shape'"), "no tuple: {e}");
+        let e = header("{'descr': '<f4', 'fortran_order': False, 'shape': (2, x), }").unwrap_err();
+        assert!(e.contains("bad dimension"), "{e}");
+        // `False` before `True` in the text is still False (the note is a real one: the
+        // *first* keyword after the key wins, not whichever appears anywhere).
+        let dict = "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3), 'x': 'True'}";
+        assert_eq!(header(dict).unwrap().shape, vec![2, 3], "not reversed");
+    }
+
+    /// Truncation at each stage of the read — the magic, the length field, the dict —
+    /// must be reported, not read past.
+    #[test]
+    fn a_truncated_stream_errors_at_every_stage() {
+        let dict = b"{'descr': '<f4', 'fortran_order': False, 'shape': (2, 2), }";
+        let mut full = b"\x93NUMPY\x01\x00".to_vec();
+        full.extend((dict.len() as u16).to_le_bytes());
+        full.extend(dict);
+        for cut in 0..full.len() {
+            let e = parse_header(&mut std::io::Cursor::new(&full[..cut]))
+                .expect_err("a truncated header must not parse");
+            assert!(e.contains(".npy"), "cut at {cut}: {e}");
+        }
+        assert!(parse_header(&mut std::io::Cursor::new(&full)).is_ok());
+        // Right length, wrong file.
+        let e = parse_header(&mut std::io::Cursor::new(b"PK\x03\x04zipfile")).unwrap_err();
+        assert!(e.contains("bad magic"), "{e}");
     }
 }

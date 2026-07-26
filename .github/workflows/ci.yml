@@ -64,7 +64,7 @@ jobs:
           HDF5_USE_FILE_LOCKING: "FALSE"
         run: |
           cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info \
-            --fail-under-lines 78
+            --fail-under-lines 80
 
       - name: Upload coverage (rust)
         uses: codecov/codecov-action@v4
