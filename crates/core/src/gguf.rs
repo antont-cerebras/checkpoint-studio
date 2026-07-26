@@ -362,8 +362,24 @@ impl GGUFFile {
         }
     }
 
+    /// Read a length-prefixed string.
+    ///
+    /// The length is read *from the file*, so a corrupt or truncated GGUF can claim a
+    /// string of exabytes — and `vec![0u8; len]` on that aborts the process (an
+    /// allocation failure isn't a catchable error). GGUF files arrive as user downloads
+    /// from HuggingFace, so a half-downloaded one is ordinary input and must produce an
+    /// error, not a dead process. Check the claim against the bytes actually left
+    /// before allocating.
     fn read_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {
         let len = Self::read_u64(cursor)?;
+        let remaining = (cursor.get_ref().len() as u64).saturating_sub(cursor.position());
+        if len > remaining {
+            return Err(anyhow::anyhow!(
+                "GGUF string at offset {} claims {len} bytes but only {remaining} remain \
+                 (truncated or corrupt file)",
+                cursor.position()
+            ));
+        }
         let mut bytes = vec![0u8; len as usize];
         cursor.read_exact(&mut bytes)?;
         Ok(String::from_utf8(bytes)?)
@@ -436,6 +452,220 @@ mod tests {
     /// mantissa bits and truncated the trailing partial block. Both errors are visible
     /// on realistic tensor sizes, and the result feeds the displayed size, the
     /// checkpoint totals, and the exact `size>N` filter.
+    /// A GGUF writer, so the reader can be tested against bytes rather than only
+    /// against whatever real file happens to be at hand. Little-endian throughout, as
+    /// the format specifies.
+    #[derive(Default)]
+    struct Gguf {
+        body: Vec<u8>,
+        tensors: u64,
+        kvs: u64,
+    }
+
+    impl Gguf {
+        fn str(&mut self, s: &str) -> &mut Self {
+            self.body.extend((s.len() as u64).to_le_bytes());
+            self.body.extend(s.as_bytes());
+            self
+        }
+        fn u32(&mut self, v: u32) -> &mut Self {
+            self.body.extend(v.to_le_bytes());
+            self
+        }
+        fn u64(&mut self, v: u64) -> &mut Self {
+            self.body.extend(v.to_le_bytes());
+            self
+        }
+        /// One metadata entry: key, value-type tag, then the value's bytes.
+        fn kv(&mut self, key: &str, ty: u32, value: &[u8]) -> &mut Self {
+            self.kvs += 1;
+            self.str(key).u32(ty);
+            self.body.extend(value);
+            self
+        }
+        fn tensor(&mut self, name: &str, dims: &[u64], ty: u32, offset: u64) -> &mut Self {
+            self.tensors += 1;
+            self.str(name).u32(dims.len() as u32);
+            for d in dims {
+                self.u64(*d);
+            }
+            self.u32(ty).u64(offset);
+            self
+        }
+        /// Header (magic `GGUF`, version, counts) followed by the body.
+        fn finish(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend(0x4655_4747u32.to_le_bytes());
+            out.extend(3u32.to_le_bytes());
+            out.extend(self.tensors.to_le_bytes());
+            out.extend(self.kvs.to_le_bytes());
+            out.extend(&self.body);
+            out
+        }
+    }
+
+    fn le_u64(v: u64) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+
+    #[test]
+    fn reads_a_whole_file_header_metadata_and_tensors() {
+        let mut g = Gguf::default();
+        g.kv("general.architecture", 8, &{
+            let mut v = Vec::new();
+            v.extend(5u64.to_le_bytes());
+            v.extend(b"llama");
+            v
+        })
+        .kv("block_count", 4, &32u32.to_le_bytes())
+        .kv("rope.freq_base", 6, &10000.0f32.to_le_bytes())
+        .kv("use_parallel", 7, &[1])
+        .kv("context_length", 10, &le_u64(4096))
+        .tensor("token_embd.weight", &[4096, 32000], 0, 0)
+        .tensor("blk.0.attn_q.weight", &[4096, 4096], 8, 512);
+        let file = GGUFFile::read(&g.finish()).expect("a well-formed file reads");
+
+        assert_eq!(file.header.version, 3);
+        assert_eq!(file.header.tensor_count, 2);
+        assert_eq!(file.metadata.len(), 5);
+        assert!(matches!(
+            file.metadata.get("general.architecture"),
+            Some(GGUFValue::String(s)) if s == "llama"
+        ));
+        assert!(matches!(
+            file.metadata.get("block_count"),
+            Some(GGUFValue::U32(32))
+        ));
+        assert!(matches!(
+            file.metadata.get("use_parallel"),
+            Some(GGUFValue::Bool(true))
+        ));
+        assert!(matches!(
+            file.metadata.get("context_length"),
+            Some(GGUFValue::U64(4096))
+        ));
+
+        assert_eq!(file.tensors[0].name, "token_embd.weight");
+        assert_eq!(file.tensors[0].dimensions, vec![4096, 32000]);
+        assert_eq!(file.tensors[0].tensor_type, GGMLType::F32);
+        assert_eq!(file.tensors[1].tensor_type, GGMLType::Q8_0);
+        assert_eq!(file.tensors[1].offset, 512);
+    }
+
+    #[test]
+    fn reads_a_nested_array_value() {
+        // Arrays carry their element type once, then the elements — and can hold
+        // strings, which is how tokenizer vocabularies arrive.
+        let mut elems = Vec::new();
+        elems.extend(8u32.to_le_bytes()); // element type: string
+        elems.extend(2u64.to_le_bytes()); // length
+        for s in ["<s>", "</s>"] {
+            elems.extend((s.len() as u64).to_le_bytes());
+            elems.extend(s.as_bytes());
+        }
+        let mut g = Gguf::default();
+        g.kv("tokenizer.ggml.tokens", 9, &elems);
+        let file = GGUFFile::read(&g.finish()).expect("an array value reads");
+        match file.metadata.get("tokenizer.ggml.tokens") {
+            Some(GGUFValue::Array(items)) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(&items[0], GGUFValue::String(s) if s == "<s>"));
+            }
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_a_file_that_is_not_gguf() {
+        let mut bytes = Gguf::default().finish();
+        bytes[0..4].copy_from_slice(b"XXXX");
+        let err = GGUFFile::read(&bytes)
+            .err()
+            .expect("bad magic must be refused");
+        assert!(format!("{err}").contains("magic"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_unknown_value_type_instead_of_guessing() {
+        let mut g = Gguf::default();
+        g.kv("weird", 99, &[0, 0, 0, 0]);
+        let err = GGUFFile::read(&g.finish())
+            .err()
+            .expect("an unknown tag must be refused");
+        assert!(format!("{err}").contains("Unknown value type"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_unknown_tensor_type() {
+        let mut g = Gguf::default();
+        g.tensor("t", &[4], 4242, 0);
+        let err = GGUFFile::read(&g.finish())
+            .err()
+            .expect("an unknown tensor type must be refused");
+        assert!(format!("{err}").contains("Unknown tensor type"), "{err}");
+    }
+
+    /// A truncated file must produce an error at every cut point — not a panic. These
+    /// files come from users and from HuggingFace; a half-downloaded one is ordinary.
+    #[test]
+    fn a_truncated_file_errors_at_every_cut_point() {
+        let mut g = Gguf::default();
+        g.kv("general.architecture", 8, &{
+            let mut v = Vec::new();
+            v.extend(5u64.to_le_bytes());
+            v.extend(b"llama");
+            v
+        })
+        .tensor("token_embd.weight", &[4096, 32000], 0, 0);
+        let full = g.finish();
+        for cut in 0..full.len() {
+            let result = GGUFFile::read(&full[..cut]);
+            assert!(result.is_err(), "truncating to {cut} bytes should error");
+        }
+        assert!(
+            GGUFFile::read(&full).is_ok(),
+            "the untruncated file still reads"
+        );
+    }
+
+    #[test]
+    fn rejects_a_non_utf8_string() {
+        let mut g = Gguf::default();
+        g.kv("bad", 8, &{
+            let mut v = Vec::new();
+            v.extend(2u64.to_le_bytes());
+            v.extend([0xff, 0xfe]); // not valid UTF-8
+            v
+        });
+        assert!(GGUFFile::read(&g.finish()).is_err());
+    }
+
+    /// A length field is attacker-controlled: a corrupt file can claim a string is
+    /// exabytes long. Reading it must fail on the missing bytes rather than trying to
+    /// allocate that much first.
+    #[test]
+    fn an_absurd_string_length_fails_without_allocating_it() {
+        let mut bytes = Vec::new();
+        bytes.extend(0x4655_4747u32.to_le_bytes());
+        bytes.extend(3u32.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes()); // no tensors
+        bytes.extend(1u64.to_le_bytes()); // one kv…
+        bytes.extend((u64::MAX / 2).to_le_bytes()); // …whose key claims to be enormous
+        assert!(GGUFFile::read(&bytes).is_err());
+    }
+
+    #[test]
+    fn ggml_types_round_trip_their_tags_and_reject_unknown_ones() {
+        for tag in [0u32, 1, 8, 10, 12] {
+            let ty = GGMLType::from_u32(tag).unwrap_or_else(|| panic!("tag {tag} should be known"));
+            // Every known type must describe itself and report a usable block layout.
+            let (elems, bytes) = ty.block_layout();
+            assert!(elems > 0 && bytes > 0, "{ty:?} has an empty block layout");
+            assert!(!format!("{ty}").is_empty());
+        }
+        assert!(GGMLType::from_u32(9999).is_none());
+    }
+
     #[test]
     fn stored_size_is_exact_and_rounds_up_to_whole_blocks() {
         // f32 rounding: 20_000_001 * 4.0 lost the last increment.
