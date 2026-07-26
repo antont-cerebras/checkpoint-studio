@@ -997,7 +997,11 @@ fn main() -> Result<()> {
 /// exit code: `0` healthy, `1` problems found (warnings only when `strict`), `2`
 /// trouble (a path couldn't be read). With `remote`, the structural (header-only)
 /// checks run over SSH; the `--values` scan needs the bytes locally.
-#[allow(clippy::too_many_arguments)] // a CLI entry point; each arg is a distinct flag
+// Four of these are bools, over clippy's threshold of three. They stay parameters because
+// this is a CLI entry point called from exactly one place, where clap's own field names sit
+// right next to the call — the readability problem the lint exists for (a bare
+// `true, false, true` at a call site) doesn't arise.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)] // one arg per flag
 fn run_check(
     paths: &[PathBuf],
     recursive: bool,

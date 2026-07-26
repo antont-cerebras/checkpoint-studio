@@ -104,7 +104,7 @@ impl FsNode {
     pub fn symlink_target(&self) -> Option<&str> {
         match self {
             Self::Symlink { target, .. } => Some(target),
-            _ => None,
+            Self::File { .. } | Self::Directory => None,
         }
     }
     /// Hard-link count (`st_nlink`) of the underlying inode; `>1` means the file

@@ -84,6 +84,10 @@ impl Report {
 /// Map a dataset's filter pipeline to the codec it uses, or `None` if it stores
 /// data uncompressed.
 fn dataset_codec(ds: &hdf5_metno::Dataset) -> Option<Codec> {
+    // `hdf5_metno's Filter / TypeDescriptor` is a foreign enum: it can gain a variant in a dependency upgrade without a decision
+    // on our side, so a wildcard here is the right shape — the point of
+    // `wildcard_enum_match_arm` is to catch a `_` that hides OUR OWN future variants.
+    #[allow(clippy::wildcard_enum_match_arm)]
     ds.filters().iter().find_map(|f| match f {
         Filter::Deflate(_) => Some(Codec::Gzip),
         Filter::User(crate::hdf5_lz4::LZ4_FILTER_ID, _) => Some(Codec::Lz4),
@@ -262,6 +266,10 @@ fn copy_dataset(
         }};
     }
 
+    // `hdf5_metno's Filter / TypeDescriptor` is a foreign enum: it can gain a variant in a dependency upgrade without a decision
+    // on our side, so a wildcard here is the right shape — the point of
+    // `wildcard_enum_match_arm` is to catch a `_` that hides OUR OWN future variants.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match descr {
         TypeDescriptor::Float(FloatSize::U2) => dispatch!(half::f16),
         TypeDescriptor::Float(FloatSize::U4) => dispatch!(f32),

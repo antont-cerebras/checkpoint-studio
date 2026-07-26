@@ -210,7 +210,7 @@ impl ViewDtype {
     fn packing(self, item_bytes: usize) -> usize {
         match self {
             Self::U4 | Self::I4 => item_bytes * 2,
-            _ => 1,
+            Self::Stored | Self::As(_) | Self::Unpacked => 1,
         }
     }
 
@@ -226,7 +226,7 @@ impl ViewDtype {
         match self {
             Self::Stored => dtype_is_integer(stored),
             Self::As(dt) => dtype_is_integer(dt),
-            _ => true, // all 4-bit views are integer-valued
+            Self::U4 | Self::I4 | Self::Unpacked => true, // all 4-bit views are integer-valued
         }
     }
 
@@ -238,7 +238,7 @@ impl ViewDtype {
         match self {
             Self::Stored => dtype_is_signed_integer(stored),
             Self::As(dt) => dtype_is_signed_integer(dt),
-            other => other.is_signed(),
+            other @ (Self::U4 | Self::I4 | Self::Unpacked) => other.is_signed(),
         }
     }
 
@@ -1112,7 +1112,7 @@ fn decode_view(view: ViewDtype, dtype: &str, bytes: &[u8], sub: usize) -> f64 {
         ViewDtype::Stored => return decode(dtype, bytes),
         // Same-width reinterpretation: decode the container as the chosen dtype.
         ViewDtype::As(dt) => return decode(dt, bytes),
-        _ => {}
+        ViewDtype::U4 | ViewDtype::I4 | ViewDtype::Unpacked => {}
     }
     // Little-endian integer value of the container (up to 8 bytes).
     let mut container: u64 = 0;
@@ -1142,7 +1142,7 @@ fn raw_bits(view: ViewDtype, bytes: &[u8], sub: usize) -> RawBits {
             bits: container,
             width: (bytes.len().min(8) * 8) as u8,
         },
-        _ => RawBits {
+        ViewDtype::U4 | ViewDtype::I4 | ViewDtype::Unpacked => RawBits {
             bits: (container >> (sub * 4)) & 0xF,
             width: 4,
         },
@@ -1315,12 +1315,14 @@ fn view_decoder(view: ViewDtype, dtype: &str) -> impl Fn(&[u8], usize) -> f64 {
     // For Stored / same-width `As`, decode the whole container as this primitive.
     let prim = match view {
         ViewDtype::As(dt) => parse_prim(dt),
-        _ => parse_prim(dtype),
+        ViewDtype::Stored | ViewDtype::U4 | ViewDtype::I4 | ViewDtype::Unpacked => {
+            parse_prim(dtype)
+        }
     };
     let signed = view.is_signed();
     move |bytes: &[u8], sub: usize| match view {
         ViewDtype::Stored | ViewDtype::As(_) => prim.map_or(f64::NAN, |p| decode_prim(p, bytes)),
-        _ => {
+        ViewDtype::U4 | ViewDtype::I4 | ViewDtype::Unpacked => {
             // 4-bit views: pull nibble `sub` from the little-endian container.
             let mut container: u64 = 0;
             for (i, &b) in bytes.iter().take(8).enumerate() {
@@ -1794,7 +1796,7 @@ impl<'a> Decoder<'a> {
                 let s = schema.ok_or_else(|| format!("no packing schema for {}", t.name))?;
                 (s.len_p(), None)
             }
-            _ => (view.packing(item), None), // U4 / I4
+            ViewDtype::U4 | ViewDtype::I4 => (view.packing(item), None), // U4 / I4
         };
         Ok(Self {
             item,
@@ -2079,7 +2081,7 @@ impl ViewDtype {
         match self {
             Self::U4 => Some((0, 15)),
             Self::I4 => Some((-8, 7)),
-            _ => None,
+            Self::Stored | Self::As(_) | Self::Unpacked => None,
         }
     }
 }

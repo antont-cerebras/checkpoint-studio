@@ -205,7 +205,7 @@ pub fn from_tensors(
                     shape: t.shape.clone(),
                 },
             }),
-            _ => None,
+            Layout::None | Layout::Offset(_) | Layout::Chunked { .. } => None,
         })
         .collect();
     let mut meta: Vec<(String, String)> = metadata

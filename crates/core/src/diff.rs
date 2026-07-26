@@ -2085,6 +2085,10 @@ fn pretty_json(v: &str, width: usize) -> Option<String> {
 /// A JSON value on one line with `: `/`, ` separators (no newlines) — the inline
 /// form the width test compares against.
 fn compact_json(v: &Value) -> String {
+    // `serde_json::Value` is a foreign enum: it can gain a variant in a dependency upgrade without a decision
+    // on our side, so a wildcard here is the right shape — the point of
+    // `wildcard_enum_match_arm` is to catch a `_` that hides OUR OWN future variants.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match v {
         Value::Object(m) => {
             let items: Vec<String> = m
@@ -2117,6 +2121,10 @@ fn write_json(out: &mut String, v: &Value, indent: usize, col: usize, width: usi
         return;
     }
     let (pad, cpad) = ("  ".repeat(indent), "  ".repeat(indent + 1));
+    // `serde_json::Value` is a foreign enum: it can gain a variant in a dependency upgrade without a decision
+    // on our side, so a wildcard here is the right shape — the point of
+    // `wildcard_enum_match_arm` is to catch a `_` that hides OUR OWN future variants.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match v {
         Value::Object(m) => {
             out.push_str("{\n");

@@ -18,7 +18,7 @@
 
 // An unwrap in a test IS the assertion: the panic is the failure report. (Product code
 // denies these — see `[workspace.lints.clippy]` in Cargo.toml.)
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::collections::HashMap;
 use std::path::Path;

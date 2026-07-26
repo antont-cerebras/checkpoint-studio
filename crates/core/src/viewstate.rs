@@ -123,7 +123,7 @@ impl NumBase {
     pub fn cell_width(self, view: ViewDtype, dtype: &str, range: Option<(f64, f64)>) -> usize {
         match self {
             Self::Decimal => view.cell_width(dtype, range),
-            _ => self.digits(view.bit_width(dtype)) + 1,
+            Self::Hex | Self::Octal | Self::Binary => self.digits(view.bit_width(dtype)) + 1,
         }
     }
 }

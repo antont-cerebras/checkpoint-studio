@@ -67,7 +67,7 @@ impl Codec {
         match self {
             Self::Gzip => 6, // 0–9
             Self::Zstd => 3, // 1–22; 3 is fast, raise for more compression
-            _ => 0,
+            Self::Lz4 | Self::Uncompressed => 0,
         }
     }
 
@@ -77,7 +77,7 @@ impl Codec {
         match self {
             Self::Gzip => level.min(9),
             Self::Zstd => level.clamp(1, 22),
-            _ => 0,
+            Self::Lz4 | Self::Uncompressed => 0,
         }
     }
 }

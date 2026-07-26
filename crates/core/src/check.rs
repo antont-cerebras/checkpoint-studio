@@ -407,7 +407,7 @@ impl CheckReport {
                     paint(&format!("— {text}"), color, DIM)
                 }
                 Status::Na => paint("— n/a for this checkpoint", color, DIM),
-                _ => paint(
+                Status::Warn | Status::Fail => paint(
                     &format!("({})", count_phrase(r.errors(), r.warnings())),
                     color,
                     DIM,

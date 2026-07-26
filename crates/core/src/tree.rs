@@ -56,7 +56,7 @@ impl TensorInfo {
     pub fn on_disk_size(&self) -> usize {
         match &self.storage {
             Storage::Compressed { stored_bytes, .. } => *stored_bytes,
-            _ => self.size_bytes,
+            Storage::Unknown | Storage::Raw => self.size_bytes,
         }
     }
 }
@@ -134,7 +134,7 @@ impl TreeNode {
                 total_size: *total_size,
                 stored_size: *stored_size,
             },
-            other => other.clone(),
+            other @ (Self::Tensor { .. } | Self::Metadata { .. }) => other.clone(),
         }
     }
 
@@ -160,7 +160,7 @@ impl TreeNode {
                 total_size: *total_size,
                 stored_size: *stored_size,
             },
-            other => other.clone(),
+            other @ (Self::Tensor { .. } | Self::Metadata { .. }) => other.clone(),
         }
     }
 }
@@ -497,7 +497,7 @@ impl TreeBuilder {
             TreeNode::Group {
                 expanded, children, ..
             } => *expanded == want && Self::all_groups(children, want),
-            _ => true,
+            TreeNode::Tensor { .. } | TreeNode::Metadata { .. } => true,
         })
     }
 
@@ -716,7 +716,9 @@ mod tests {
                 TreeNode::Group {
                     name: g, children, ..
                 } if g == name => Some(children.as_slice()),
-                _ => None,
+                TreeNode::Group { .. } | TreeNode::Tensor { .. } | TreeNode::Metadata { .. } => {
+                    None
+                }
             })
             .unwrap_or_else(|| {
                 panic!(
@@ -731,7 +733,7 @@ mod tests {
             .iter()
             .filter_map(|n| match n {
                 TreeNode::Tensor { info, .. } => Some(info.name.as_str()),
-                _ => None,
+                TreeNode::Group { .. } | TreeNode::Metadata { .. } => None,
             })
             .collect()
     }
@@ -787,7 +789,9 @@ mod tests {
                     Some("model.layers.0.self_attn.k_norm.weight")
                 );
             }
-            other => panic!("expected one compacted leaf, got group {:?}", other.name()),
+            other @ (TreeNode::Group { .. } | TreeNode::Metadata { .. }) => {
+                panic!("expected one compacted leaf, got group {:?}", other.name())
+            }
         }
     }
 
@@ -800,7 +804,7 @@ mod tests {
         let enc = group(&tree, "enc");
         let aw_label = enc.iter().find_map(|n| match n {
             TreeNode::Tensor { info, label } if info.name == "enc.a.w" => Some(label.clone()),
-            _ => None,
+            TreeNode::Group { .. } | TreeNode::Tensor { .. } | TreeNode::Metadata { .. } => None,
         });
         assert_eq!(aw_label, Some(Some("a.w".to_string())));
         let b = group(enc, "b");
@@ -822,7 +826,7 @@ mod tests {
             .iter()
             .filter_map(|n| match n {
                 TreeNode::Metadata { info } => Some(info.name.as_str()),
-                _ => None,
+                TreeNode::Group { .. } | TreeNode::Tensor { .. } => None,
             })
             .collect()
     }

@@ -265,6 +265,10 @@ fn unwrap_metadata_value(attr_name: &str, raw: &str) -> Option<(String, String)>
 /// Name the size-reducing compressor in an HDF5 filter, if any. Shuffle and
 /// Fletcher32 reorder/checksum but do not compress, so they map to `None`.
 fn compression_codec(filter: &Filter) -> Option<String> {
+    // `hdf5_metno's Filter / TypeDescriptor` is a foreign enum: it can gain a variant in a dependency upgrade without a decision
+    // on our side, so a wildcard here is the right shape — the point of
+    // `wildcard_enum_match_arm` is to catch a `_` that hides OUR OWN future variants.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match filter {
         Filter::Deflate(_) => Some("gzip".to_string()),
         Filter::SZip(..) => Some("szip".to_string()),
@@ -301,6 +305,10 @@ fn user_filter_codec(id: i32) -> Option<String> {
 /// UI (e.g. `F32`, `I64`, `U8`).
 fn dtype_name(desc: &TypeDescriptor) -> String {
     use hdf5_metno::types::{FloatSize, IntSize};
+    // `hdf5_metno's Filter / TypeDescriptor` is a foreign enum: it can gain a variant in a dependency upgrade without a decision
+    // on our side, so a wildcard here is the right shape — the point of
+    // `wildcard_enum_match_arm` is to catch a `_` that hides OUR OWN future variants.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match desc {
         TypeDescriptor::Integer(IntSize::U1) => "I8".to_string(),
         TypeDescriptor::Integer(IntSize::U2) => "I16".to_string(),
@@ -451,7 +459,9 @@ mod tests {
                 assert_eq!(codec, "gzip");
                 assert!(*stored_bytes < comp.size_bytes);
             }
-            other => panic!("expected compressed storage, got {other:?}"),
+            other @ (Storage::Unknown | Storage::Raw) => {
+                panic!("expected compressed storage, got {other:?}")
+            }
         }
         // The compressed dataset is chunked, so its layout is reported.
         assert!(matches!(comp.layout, Layout::Chunked { .. }));
