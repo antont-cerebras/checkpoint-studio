@@ -109,9 +109,9 @@ needless_pass_by_ref_mut = "allow"
 
 # Structs of 4-6 independent switches, each mapping 1:1 to a CLI flag. See `DiffOpts` for
 # the reasoning: the lint's real suggestion is an enum, which only helps when the options
-# are mutually exclusive — and these are not.
+# are mutually exclusive — and these are not. (The *parameter* form is denied below: a bool
+# in a signature is read at the call site with no field name to explain it.)
 struct_excessive_bools = "allow"
-fn_params_excessive_bools = "allow"
 
 # `&Option<T>` → `Option<&T>` on four internal signatures whose callers all hold an
 # `Option<T>` field; converting at each call site adds `.as_ref()` noise to say nothing.
@@ -148,6 +148,33 @@ rest_pat_in_fully_bound_structs = "deny"
 # IS the assertion.
 unwrap_used = "deny"
 expect_used = "deny"
+
+# --- The defensive-programming set -------------------------------------------
+#
+# From <https://corrode.dev/blog/defensive-programming/>, whose argument is the one this
+# codebase already runs on: make the compiler enforce the invariant instead of writing a
+# comment that says it holds.
+#
+# `indexing_slicing` is the substantive one. `v[i]` is a panic branch the type system can't
+# see, and a length check plus an index are two operations that drift apart independently —
+# which is exactly how three of the crashes fixed this week happened (the region gather
+# reading past an empty segment, `decode_prim` on a short tail, GGUF's unbounded string
+# length). Product code uses `get`/`get_mut`/`first`/`chunks_exact` and handles the `None`.
+indexing_slicing = "deny"
+# A `From` that can panic is a `TryFrom` wearing the wrong trait: the caller has no way to
+# see the failure coming.
+fallible_impl_from = "deny"
+# A `_` arm silently absorbs a variant added later. Measured: all 31 sites were over OUR
+# OWN enums (`ViewDtype`, `TreeNode`, `Storage`, `Layout`, `NumBase`, `Codec`, `FsNode`) —
+# precisely the ones we extend — so the wildcards were hiding future work, not shielding us
+# from a foreign crate's churn. Sites over an EXTERNAL enum keep a documented site allow.
+wildcard_enum_match_arm = "deny"
+# `..` where the fields could be named, so a new field is a decision rather than a default.
+unneeded_field_pattern = "deny"
+# A bool parameter is read at the call site as a bare `true`, with no field name to say what
+# it means. `struct_excessive_bools` stays allowed (see above) because a struct literal names
+# its fields; a call does not.
+fn_params_excessive_bools = "deny"
 # NOT enabled: `rc_buffer`. The static-body cache is `Arc<Vec<u8>>` on purpose — the
 # suggested `Arc<[u8]>` would copy every cached response body once to convert it, which is
 # the allocation that cache exists to avoid.

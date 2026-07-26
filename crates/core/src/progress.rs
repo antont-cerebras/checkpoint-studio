@@ -401,7 +401,11 @@ fn render_line(v: &BarView, frame: usize, cols: usize) -> String {
         OK => (DONE, '✓'),
         ERR => (FAIL, '✗'),
         ABORTED => (DIM, '⊘'), // cut short, not a failure — dim, not red
-        _ => (RUN, FRAMES[frame % FRAMES.len()]),
+        // `% FRAMES.len()` is the bound; a missing frame would mean an empty table.
+        _ => (
+            RUN,
+            FRAMES.get(frame % FRAMES.len()).copied().unwrap_or('*'),
+        ),
     };
     let secs = v.ms as f64 / 1000.0;
     // Each piece below carries the columns it actually occupies alongside its text, since
@@ -556,24 +560,33 @@ fn spawn(
             // line separately to the unbuffered stderr is what makes it flicker).
             let mut frame = String::with_capacity(n * 96);
             let _ = write!(frame, "\x1b[{n}A"); // back up to the first reserved line
-            for (k, &st) in now.iter().enumerate() {
+            // The four vectors are parallel — one entry per bar — so zip them instead of
+            // indexing each by the same `k`. That makes the invariant the compiler's
+            // business rather than a convention four separate `[k]`s have to keep.
+            let bars = now
+                .iter()
+                .zip(&labels)
+                .zip(&durations)
+                .zip(&progress)
+                .map(|(((st, label), duration), prog)| (*st, label, duration, prog));
+            for (st, label, duration, prog) in bars {
                 // A `[███░░░] done/total` bar once the total is known (e.g. after a
                 // remote dir is listed); until then just the spinner + timer.
-                let (done, total) = progress[k].snapshot();
+                let (done, total) = prog.snapshot();
                 let view = BarView {
-                    label: &labels[k],
+                    label,
                     state: st,
                     ms: if st == RUNNING {
                         start.elapsed().as_millis() as u64
                     } else {
-                        durations[k].load(Ordering::Relaxed)
+                        duration.load(Ordering::Relaxed)
                     },
                     done,
                     total,
-                    unit: progress[k].unit_label(),
-                    is_bytes: progress[k].is_bytes(),
-                    note: progress[k].phase_note(),
-                    stage: progress[k].stage(),
+                    unit: prog.unit_label(),
+                    is_bytes: prog.is_bytes(),
+                    note: prog.phase_note(),
+                    stage: prog.stage(),
                 };
                 frame.push_str(&render_line(&view, i, cols));
             }

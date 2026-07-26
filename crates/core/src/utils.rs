@@ -4,23 +4,22 @@
 pub fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    // The `& 0x3f` masks each sextet into `0..64`, which is exactly `ALPHABET`'s length —
+    // so `get` can only be `None` if the table were the wrong size, and `=` (base64's own
+    // padding) is the least surprising thing to emit if it ever were.
+    let sextet = |n: u32, shift: u32| {
+        ALPHABET
+            .get(((n >> shift) & 0x3f) as usize)
+            .map_or('=', |&b| b as char)
+    };
     for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[((n >> 6) & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(n & 0x3f) as usize] as char
-        } else {
-            '='
-        });
+        let byte = |i: usize| u32::from(chunk.get(i).copied().unwrap_or(0));
+        let n = (byte(0) << 16) | (byte(1) << 8) | byte(2);
+        out.push(sextet(n, 18));
+        out.push(sextet(n, 12));
+        // The last two characters are padding when the chunk was short.
+        out.push(if chunk.len() > 1 { sextet(n, 6) } else { '=' });
+        out.push(if chunk.len() > 2 { sextet(n, 0) } else { '=' });
     }
     out
 }
@@ -81,10 +80,13 @@ pub fn format_size(bytes: usize) -> String {
         unit_idx += 1;
     }
 
+    // The loop above stops at `UNITS.len() - 1`, so the unit is always there; `"B"` is the
+    // honest fallback for a table that had been emptied.
+    let unit = UNITS.get(unit_idx).copied().unwrap_or("B");
     if unit_idx == 0 {
-        format!("{} {}", bytes, UNITS[unit_idx])
+        format!("{bytes} {unit}")
     } else {
-        format!("{:.1} {}", size, UNITS[unit_idx])
+        format!("{size:.1} {unit}")
     }
 }
 

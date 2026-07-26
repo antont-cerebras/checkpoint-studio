@@ -61,14 +61,36 @@ pub fn compare_indices(
     let (mut max_delta, mut differing_gt1) = (0u32, 0u64);
     let mut zeros = 0u64;
     let mut first: Option<(u64, u64, u32, u32)> = None;
-    for ei in 0..e {
+    // `old` is one row per expert and `new` one row per folded word, so walk the sparse
+    // side by rows and look the matching dense row up. `verify_local` has already checked
+    // both lengths against the shapes; the `else break` is what makes that structural
+    // rather than a comment (a short slice ends the compare instead of panicking).
+    //
+    // The dense rows are collected ONCE: `chunks_exact(..).nth(word)` inside the loop would
+    // rescan from the start for every expert, turning a linear compare into a quadratic one
+    // on a path that runs over millions of elements.
+    //
+    // `inner == 0` means a tensor with a zero-length dimension — nothing to compare, and
+    // `chunks_exact(0)` panics, so it is answered here rather than reached.
+    let nrows: Vec<&[u16]> = if inner == 0 {
+        Vec::new()
+    } else {
+        new.chunks_exact(inner).collect()
+    };
+    let orows: Vec<&[u16]> = if inner == 0 {
+        Vec::new()
+    } else {
+        old.chunks_exact(inner).collect()
+    };
+    for (ei, orow) in orows.iter().enumerate().take(e) {
         let word = ei / fold;
         let shift = ((ei % fold) * bits) as u16;
-        let orow = &old[ei * inner..(ei + 1) * inner];
-        let nrow = &new[word * inner..(word + 1) * inner];
-        for n in 0..inner {
-            let o = (orow[n] & mask) as i64;
-            let nd = ((nrow[n] >> shift) & mask) as i64;
+        let Some(nrow) = nrows.get(word) else {
+            break;
+        };
+        for (n, (o, nd)) in orow.iter().zip(nrow.iter()).enumerate() {
+            let o = i64::from(*o & mask);
+            let nd = i64::from((*nd >> shift) & mask);
             sum_old += o as u64;
             sum_new += nd as u64;
             zeros += u64::from(o == 0) + u64::from(nd == 0);
@@ -129,17 +151,27 @@ fn build_sample(
     let off1 = (off0 + 48).min(inner);
     let mut oldg = Vec::with_capacity(e1 - e0);
     let mut newg = Vec::with_capacity(e1 - e0);
+    // Rows by slice rather than by index, so a window that runs past either side ends the
+    // sample instead of panicking mid-frame. The window is clamped to `e`/`inner` above, so
+    // in practice it stops only on a slice shorter than its declared shape.
+    // `inner > 0` is guaranteed by the early return above, so `chunks_exact` is safe here.
+    let orows: Vec<&[u16]> = old.chunks_exact(inner).collect();
+    let nrows: Vec<&[u16]> = new.chunks_exact(inner).collect();
     for ei in e0..e1 {
         let word = ei / fold;
         let shift = ((ei % fold) * bits) as u16;
-        let orow = &old[ei * inner..(ei + 1) * inner];
-        let nrow = &new[word * inner..(word + 1) * inner];
-        oldg.push((off0..off1).map(|n| (orow[n] & mask) as u32).collect());
-        newg.push(
-            (off0..off1)
-                .map(|n| ((nrow[n] >> shift) & mask) as u32)
-                .collect(),
-        );
+        let (Some(orow), Some(nrow)) = (orows.get(ei), nrows.get(word)) else {
+            break;
+        };
+        let decode = |row: &[u16], shift: u16| -> Vec<u32> {
+            row.get(off0..off1)
+                .unwrap_or_default()
+                .iter()
+                .map(|w| u32::from((w >> shift) & mask))
+                .collect()
+        };
+        oldg.push(decode(orow, 0));
+        newg.push(decode(nrow, shift));
     }
     Some(RepackSample {
         e0: e0 as u64,

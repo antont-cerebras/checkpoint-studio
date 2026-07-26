@@ -2,7 +2,10 @@
 // hundreds of them into `?` would make the tests harder to read for no gain. So
 // `unwrap_used`/`expect_used` (denied for product code in Cargo.toml) are allowed in test
 // builds only.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
+)]
 
 // This tool memory-maps multi-gigabyte checkpoints and converts 64-bit header offsets
 // and element counts to `usize` throughout. That is only sound on a 64-bit target, so

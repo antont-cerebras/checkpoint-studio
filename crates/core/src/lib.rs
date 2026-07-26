@@ -17,7 +17,12 @@
 // still has to say so at the site, with a reason.
 #![cfg_attr(
     test,
-    allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::indexing_slicing
+    )
 )]
 
 // This tool memory-maps multi-gigabyte checkpoints and converts 64-bit header offsets
