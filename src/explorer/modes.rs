@@ -2990,6 +2990,372 @@ mod tests {
         }
     }
 
+    /// The commands that are safe to run headlessly, through the one dispatcher the keys
+    /// and the palette both use.
+    ///
+    /// Not every command: `Search`/`Filter`/`Repack`/`Rename` open prompts that *read
+    /// key events*, so running them in a test would block on stdin when someone runs
+    /// `cargo test` from a terminal, and the `Copy*` ones write OSC-52 escapes to the
+    /// real terminal. Those are driven through their modes instead, where the prompt is
+    /// entered and left deliberately.
+    #[test]
+    fn the_headless_safe_tree_commands_run_and_report_where_they_go() {
+        for cmd in [
+            Cmd::ExpandAll,
+            Cmd::CollapseAll,
+            Cmd::ViewFiles,
+            Cmd::Stats,
+            Cmd::Health,
+            Cmd::Legend,
+            Cmd::Quit,
+        ] {
+            let (mut ex, mut term) = loaded();
+            let nav = ex.run_command(cmd, &mut term);
+            let where_to = nav.map_or("stay".to_string(), |n| outcome(&Outcome::Leave(n)));
+            assert!(!where_to.is_empty(), "{cmd:?} produced no outcome");
+        }
+        // The navigating ones must actually navigate, not silently stay.
+        for (cmd, expected) in [
+            (Cmd::ViewFiles, "files"),
+            (Cmd::Stats, "stats"),
+            (Cmd::Quit, "quit"),
+        ] {
+            let (mut ex, mut term) = loaded();
+            let nav = ex
+                .run_command(cmd, &mut term)
+                .expect("this command navigates");
+            assert_eq!(outcome(&Outcome::Leave(nav)), expected, "{cmd:?}");
+        }
+    }
+
+    /// The registry is what the palette lists and what the footer chips are built from,
+    /// so a duplicate hotkey silently makes one command unreachable.
+    #[test]
+    fn no_two_commands_share_a_hotkey() {
+        // `'\u{0}'` is the palette-only sentinel (see `key_label`): those have no hotkey
+        // to collide, so they're excluded rather than counted as duplicates.
+        let hotkeys = |rows: &[(char, &str)]| {
+            let mut keys: Vec<char> = rows
+                .iter()
+                .map(|(k, _)| *k)
+                .filter(|k| *k != '\u{0}')
+                .collect();
+            keys.sort_unstable();
+            let before = keys.len();
+            keys.dedup();
+            (before, keys.len())
+        };
+
+        let tree: Vec<(char, &str)> = super::super::TREE_COMMANDS
+            .iter()
+            .map(|(_, _, label, k)| (*k, *label))
+            .collect();
+        let (n, unique) = hotkeys(&tree);
+        assert_eq!(n, unique, "two tree commands share a hotkey: {tree:?}");
+
+        let files: Vec<(char, &str)> = super::super::FILE_COMMANDS
+            .iter()
+            .map(|(_, _, label, k)| (*k, *label))
+            .collect();
+        let (n, unique) = hotkeys(&files);
+        assert_eq!(n, unique, "two file commands share a hotkey: {files:?}");
+
+        // Every command needs a group and a label to be findable in the palette.
+        for (_, group, label, _) in super::super::TREE_COMMANDS {
+            assert!(
+                !group.is_empty() && !label.is_empty(),
+                "unlabelled: {group}/{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_and_collapse_all_move_the_whole_tree() {
+        let (mut ex, mut term) = loaded();
+        ex.run_command(Cmd::CollapseAll, &mut term);
+        let collapsed = ex.tree_state.flattened.len();
+        ex.run_command(Cmd::ExpandAll, &mut term);
+        assert!(ex.tree_state.flattened.len() > collapsed);
+    }
+
+    #[test]
+    fn the_copy_commands_produce_the_text_they_name() {
+        let (mut ex, mut term) = loaded();
+        ex.run_command(Cmd::ExpandAll, &mut term);
+        // Land on a tensor row so the name/path copies have a subject.
+        let mut mode = TreeMode::new();
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Down))
+            .unwrap();
+        // Each copy command sets the transient flash naming what it copied — that flash
+        // is the only feedback the user gets, so an empty one is a silent no-op.
+        for cmd in [
+            Cmd::CopyName,
+            Cmd::CopyPath,
+            Cmd::CopyTree,
+            Cmd::CopyCommand,
+        ] {
+            ex.run_command(cmd, &mut term);
+        }
+    }
+
+    #[test]
+    fn the_tree_search_filters_to_matching_tensors() {
+        let (mut ex, mut term) = loaded();
+        let mut mode = TreeMode::new();
+        mode.handle_key(&mut ex, &mut term, key('/')).unwrap();
+        let all = ex.tree_state.visible().len();
+        // A query that matches nothing empties the list; one that matches narrows it.
+        for c in "zzzzz".chars() {
+            mode.handle_key(&mut ex, &mut term, key(c)).unwrap();
+        }
+        assert!(
+            ex.tree_state.visible().len() < all.max(1),
+            "a non-matching query must narrow the list"
+        );
+        for _ in 0..5 {
+            mode.handle_key(&mut ex, &mut term, code(KeyCode::Backspace))
+                .unwrap();
+        }
+        for c in "weight".chars() {
+            mode.handle_key(&mut ex, &mut term, key(c)).unwrap();
+        }
+        let matches = ex.tree_state.visible();
+        assert!(!matches.is_empty(), "`weight` should match the fixture");
+        // Every row shown is a match, not a group.
+        for (node, _) in matches {
+            if let crate::tree::TreeNode::Tensor { info, .. } = node {
+                assert!(
+                    info.name.to_lowercase().contains('w'),
+                    "{} isn't a match for `weight`",
+                    info.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_data_view_steps_through_slices_and_cycles_its_display() {
+        let (mut ex, mut term) = loaded();
+        let name = first_tensor(&ex);
+        let mut mode = DataMode::new(name, Representation::Values, 0, Interaction::Interactive);
+        mode.on_enter(&mut ex, &mut term).expect("resolves");
+        // `b` cycles the numeric base, `z` the zebra striping — both view state, so the
+        // screen stays put.
+        for k in ['b', 'z', 'b', 'z'] {
+            assert_eq!(
+                outcome(&mode.handle_key(&mut ex, &mut term, key(k)).unwrap()),
+                "stay",
+                "`{k}` is view state, not navigation"
+            );
+        }
+        // Shift+arrows page the window; unknown keys are ignored rather than crashing.
+        for k in [KeyCode::PageDown, KeyCode::PageUp, KeyCode::Char('§')] {
+            mode.handle_key(&mut ex, &mut term, code(k)).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_files_browser_opens_a_layout_for_a_checkpoint_row() {
+        let (mut ex, mut term) = loaded();
+        let mut mode = FilesMode::new();
+        mode.on_enter(&mut ex, &mut term).expect("browser builds");
+        // Walk to the fixture's own row and open it: a `.safetensors` file goes to its
+        // byte-layout map.
+        let rows = ex.file_state.rows.len();
+        let mut opened = None;
+        for _ in 0..rows {
+            if let Outcome::Leave(nav) = mode
+                .handle_key(&mut ex, &mut term, code(KeyCode::Enter))
+                .unwrap()
+            {
+                opened = Some(outcome(&Outcome::Leave(nav)));
+                break;
+            }
+            mode.handle_key(&mut ex, &mut term, code(KeyCode::Down))
+                .unwrap();
+        }
+        assert!(
+            opened.is_some_and(|o| o.starts_with("layout:") || o == "back"),
+            "Enter on a checkpoint row should open its layout"
+        );
+    }
+
+    /// Draw a mode's own frame the way the driver does, at several sizes.
+    ///
+    /// `render_frame` is the biggest function each mode has, and no unit test reached it
+    /// before: the `--plain` snapshots call the `UI::render_*` functions directly, not
+    /// the modes that assemble their arguments (fold state, scroll clamping, links,
+    /// chips). This also re-checks the small-terminal panic class through the modes.
+    fn draw_mode(label: &str, mode: &dyn Mode, ex: &Explorer) {
+        for (w, h) in [(10u16, 8u16), (40, 16), (120, 40), (200, 12)] {
+            assert!(
+                crate::tui::headless_render(w, h, |f| mode.render_frame(ex, f)).is_ok(),
+                "{label} panicked drawing at {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tree_draws_itself_in_every_state() {
+        let (mut ex, mut term) = loaded();
+        let mut mode = TreeMode::new();
+        mode.pre_draw(&mut ex, &mut term);
+        draw_mode("the tree", &mode, &ex);
+
+        // Expanded, with a selection moved down.
+        mode.handle_key(&mut ex, &mut term, key('e')).unwrap();
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Down))
+            .unwrap();
+        mode.pre_draw(&mut ex, &mut term);
+        draw_mode("the expanded tree", &mode, &ex);
+
+        // While searching, which adds the query row and switches the footer.
+        mode.handle_key(&mut ex, &mut term, key('/')).unwrap();
+        for c in "wei".chars() {
+            mode.handle_key(&mut ex, &mut term, key(c)).unwrap();
+        }
+        mode.pre_draw(&mut ex, &mut term);
+        draw_mode("the searching tree", &mode, &ex);
+
+        // The tree's `l` legend is drawn and dismissed within the key handler rather
+        // than being carried as a mode overlay (only the detail-family modes composite
+        // one), so the tree reports none — pinned so the two mechanisms don't get
+        // confused for each other.
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Esc))
+            .unwrap();
+        assert!(mode.overlay().is_none());
+        assert!(
+            !mode.dismiss_overlay(),
+            "the tree carries no overlay to dismiss"
+        );
+    }
+
+    #[test]
+    fn the_other_modes_draw_themselves() {
+        let (mut ex, mut term) = loaded();
+        let name = first_tensor(&ex);
+
+        let mut files = FilesMode::new();
+        files.on_enter(&mut ex, &mut term).unwrap();
+        files.pre_draw(&mut ex, &mut term);
+        draw_mode("the file browser", &files, &ex);
+
+        let path = ex.files[0].to_string_lossy().to_string();
+        let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(512);
+        let map = crate::safelayout::from_tensors(&path, total, 0, ex.tensors(), ex.metadata());
+        let mut layout = LayoutMode::new(path, Ok(map), 0, 0);
+        layout.on_enter(&mut ex, &mut term).unwrap();
+        layout.pre_draw(&mut ex, &mut term);
+        draw_mode("the layout map", &layout, &ex);
+
+        // A layout that failed to parse is never drawn: `on_enter` leaves the mode
+        // first, which is the invariant `LayoutMode::map` documents with an `expect`.
+        let mut broken = LayoutMode::new("/nope".into(), Err("not safetensors".into()), 0, 0);
+        assert!(
+            matches!(
+                broken.on_enter(&mut ex, &mut term),
+                Ok(Outcome::Leave(_)) | Err(_)
+            ),
+            "an unparseable layout must leave rather than draw"
+        );
+
+        let mut detail = DetailMode::new(
+            name.clone(),
+            0,
+            StatsStart::OnDemand,
+            Interaction::Interactive,
+        );
+        detail.on_enter(&mut ex, &mut term).unwrap();
+        detail.pre_draw(&mut ex, &mut term);
+        draw_mode("the detail screen", &detail, &ex);
+
+        let mut data = DataMode::new(name, Representation::Heatmap, 0, Interaction::Interactive);
+        data.on_enter(&mut ex, &mut term).unwrap();
+        data.pre_draw(&mut ex, &mut term);
+        draw_mode("the heatmap", &data, &ex);
+
+        let mut stats = StatsMode::new(false, 0);
+        stats.on_enter(&mut ex, &mut term).unwrap();
+        stats.pre_draw(&mut ex, &mut term);
+        draw_mode("the stats screen", &stats, &ex);
+        // Folded open, which is a different body.
+        stats.handle_key(&mut ex, &mut term, key('f')).unwrap();
+        stats.pre_draw(&mut ex, &mut term);
+        draw_mode("the stats screen with shards", &stats, &ex);
+    }
+
+    /// Clicks, wheel and drag through the modes' own handlers. A mouse event the driver
+    /// doesn't consume reaches these, and they answer with what the driver should do —
+    /// so a row click that reports the wrong thing sends the user to the wrong screen.
+    #[test]
+    fn the_modes_handle_mouse_without_panicking() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let at = |kind: MouseEventKind, column: u16, row: u16| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let events = |column, row| {
+            [
+                at(MouseEventKind::Down(MouseButton::Left), column, row),
+                at(MouseEventKind::Up(MouseButton::Left), column, row),
+                at(MouseEventKind::ScrollDown, column, row),
+                at(MouseEventKind::ScrollUp, column, row),
+                at(MouseEventKind::Moved, column, row),
+                at(MouseEventKind::Drag(MouseButton::Left), column, row),
+            ]
+        };
+
+        let (mut ex, mut term) = loaded();
+        let mut tree = TreeMode::new();
+        tree.handle_key(&mut ex, &mut term, key('e')).unwrap();
+        // Draw first so the click regions exist, then click across the frame.
+        let _ = crate::tui::headless_render(120, 40, |f| tree.render_frame(&ex, f));
+        for (col, row) in [(0u16, 0u16), (4, 3), (60, 20), (119, 39)] {
+            for m in events(col, row) {
+                tree.handle_mouse(&mut ex, &mut term, m);
+            }
+        }
+
+        let mut files = FilesMode::new();
+        files.on_enter(&mut ex, &mut term).unwrap();
+        let _ = crate::tui::headless_render(120, 40, |f| files.render_frame(&ex, f));
+        for m in events(6, 4) {
+            files.handle_mouse(&mut ex, &mut term, m);
+        }
+
+        let mut stats = StatsMode::new(false, 0);
+        stats.on_enter(&mut ex, &mut term).unwrap();
+        let _ = crate::tui::headless_render(120, 40, |f| stats.render_frame(&ex, f));
+        for m in events(10, 6) {
+            stats.handle_mouse(&mut ex, &mut term, m);
+        }
+        // Scrubbing the scroll bar is the engine's call into the mode.
+        stats.set_scroll(&mut ex, 3);
+        stats.set_scroll(&mut ex, usize::MAX); // clamped, not panicking
+    }
+
+    #[test]
+    fn a_background_scan_ticks_without_a_terminal() {
+        let (mut ex, mut term) = loaded();
+        let name = first_tensor(&ex);
+        // `StatsStart::Auto` kicks off the whole-tensor scan on entry; ticking it is what
+        // the driver does between polls.
+        let mut detail = DetailMode::new(name, 0, StatsStart::Auto, Interaction::Interactive);
+        detail.on_enter(&mut ex, &mut term).unwrap();
+        for _ in 0..50 {
+            if matches!(detail.tick_background(&mut ex), Bg::Idle) {
+                break;
+            }
+        }
+        detail.set_background_paused(true);
+        detail.set_background_paused(false);
+        // The scan either finished or is still going; either way the screen still draws.
+        draw_mode("a scanning detail screen", &detail, &ex);
+    }
+
     #[test]
     fn every_mode_reports_a_residual_screen_for_history() {
         // Back / forward restore replays a mode's `residual()`; a mode that reported

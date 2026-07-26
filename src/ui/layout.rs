@@ -84,12 +84,7 @@ impl UI {
             )),
         ];
         Paragraph::new(header_lines).render(
-            Rect {
-                x: 0,
-                y: 0,
-                width,
-                height: LAYOUT_HEADER_ROWS as u16,
-            },
+            crate::ui::fit_rows(area, 0, LAYOUT_HEADER_ROWS as u16),
             frame.buffer_mut(),
         );
 
@@ -109,15 +104,14 @@ impl UI {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        // A narrow terminal wraps the hint chips onto more lines than the terminal has,
+        // so both the start row and the height need clamping — `fit_rows` does both.
         Paragraph::new(hint_lines).render(
-            Rect {
-                x: 0,
-                // saturating: a narrow terminal wraps the hint chips onto enough
-                // lines that `footer_rows` can exceed the height, which underflowed.
-                y: (height as usize).saturating_sub(footer_rows) as u16,
-                width,
-                height: footer_rows as u16,
-            },
+            crate::ui::fit_rows(
+                area,
+                (height as usize).saturating_sub(footer_rows) as u16,
+                footer_rows as u16,
+            ),
             frame.buffer_mut(),
         );
 
@@ -230,10 +224,8 @@ impl UI {
         }
         Paragraph::new(body).render(
             Rect {
-                x: 0,
-                y: LAYOUT_HEADER_ROWS as u16,
                 width: strip_width,
-                height: body_rows as u16,
+                ..crate::ui::fit_rows(area, LAYOUT_HEADER_ROWS as u16, body_rows as u16)
             },
             frame.buffer_mut(),
         );
