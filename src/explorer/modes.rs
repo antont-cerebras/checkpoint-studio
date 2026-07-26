@@ -2585,3 +2585,431 @@ impl Mode for DataMode {
         }
     }
 }
+
+/// Driving the modes as the interactive loop does: build a loaded [`Explorer`], hand a
+/// mode real [`KeyEvent`]s, and assert on the state it leaves behind.
+///
+/// These are the screens' *behaviour* — cursor movement, folding, the search box, the
+/// dtype/slice prompts, what a key navigates to. Until now they had no unit coverage at
+/// all (the `--plain` snapshots exercise the renderers, and the mode drivers only
+/// through whatever one static frame reaches), which is why a broken arrow key could
+/// ship twice. `crate::tui::test_terminal` is what makes it possible: the handlers take
+/// a `&mut LiveTerminal`, and a fixed viewport needs no tty.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::path::PathBuf;
+
+    /// A loaded explorer over the checked-in fixture, plus a terminal to drive it with.
+    fn loaded() -> (Explorer, crate::tui::LiveTerminal) {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.safetensors");
+        let mut ex = Explorer::new(vec![fixture], Vec::new(), None, false);
+        ex.load_quiet().expect("the fixture loads");
+        (ex, crate::tui::test_terminal(120, 40))
+    }
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn code(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    /// Where a mode's outcome leads, as a short label — so a test reads as
+    /// "this key opens the detail" rather than matching a nested enum.
+    fn outcome(o: &Outcome) -> String {
+        match o {
+            Outcome::Stay => "stay".into(),
+            Outcome::Leave(Nav::Quit) => "quit".into(),
+            Outcome::Leave(Nav::Back) => "back".into(),
+            Outcome::Leave(Nav::Forward) => "forward".into(),
+            Outcome::Leave(Nav::Open(s)) => match s {
+                Screen::Tree => "tree".into(),
+                Screen::Files => "files".into(),
+                Screen::Layout { path, .. } => format!("layout:{path}"),
+                Screen::Detail { tensor, .. } => format!("detail:{tensor}"),
+                Screen::Data { tensor, .. } => format!("data:{tensor}"),
+                Screen::Rename { .. } => "rename".into(),
+                Screen::Stats { .. } => "stats".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn the_tree_moves_its_cursor_and_clamps_at_both_ends() {
+        let (mut ex, mut term) = loaded();
+        let mut mode = TreeMode::new();
+        // Expand everything so there are rows to move through.
+        mode.handle_key(&mut ex, &mut term, key('e')).unwrap();
+        let rows = ex.tree_state.flattened.len();
+        assert!(rows > 2, "the fixture should flatten to several rows");
+
+        assert_eq!(ex.tree_state.selected, 0);
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Down))
+            .unwrap();
+        assert_eq!(ex.tree_state.selected, 1, "↓ moves down one row");
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Up))
+            .unwrap();
+        assert_eq!(ex.tree_state.selected, 0);
+        // Up at the top stays put rather than wrapping or underflowing.
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Up))
+            .unwrap();
+        assert_eq!(ex.tree_state.selected, 0, "↑ at the top clamps");
+
+        // PageDown pages, and clamps at the bottom instead of running off it.
+        for _ in 0..rows {
+            mode.handle_key(&mut ex, &mut term, code(KeyCode::PageDown))
+                .unwrap();
+        }
+        assert_eq!(
+            ex.tree_state.selected,
+            rows - 1,
+            "PageDown clamps at the last row"
+        );
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Down))
+            .unwrap();
+        assert_eq!(ex.tree_state.selected, rows - 1, "↓ at the bottom clamps");
+    }
+
+    /// Home/End move the selection to the first/last row **only while searching** —
+    /// outside the search box the tree leaves them unbound (unlike the file browser and
+    /// the layout map, which bind them unconditionally). Pinned because it's surprising:
+    /// if it ever changes, it should change deliberately.
+    #[test]
+    fn home_and_end_jump_to_the_ends_only_while_searching() {
+        let (mut ex, mut term) = loaded();
+        let mut mode = TreeMode::new();
+        mode.handle_key(&mut ex, &mut term, key('e')).unwrap();
+        let rows = ex.tree_state.flattened.len();
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Down))
+            .unwrap();
+        let before = ex.tree_state.selected;
+
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::End))
+            .unwrap();
+        assert_eq!(ex.tree_state.selected, before, "End is a no-op in the tree");
+
+        mode.handle_key(&mut ex, &mut term, key('/')).unwrap();
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::End))
+            .unwrap();
+        assert_eq!(
+            ex.tree_state.selected,
+            ex.tree_state.visible().len().saturating_sub(1),
+            "End jumps to the last visible row while searching"
+        );
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Home))
+            .unwrap();
+        assert_eq!(ex.tree_state.selected, 0);
+        assert!(rows > 1);
+    }
+
+    /// Shift+↑/↓ walk *siblings*, so a deep tree can be crossed a group at a time
+    /// without stepping through every child.
+    #[test]
+    fn shift_arrows_walk_siblings_not_rows() {
+        let (mut ex, mut term) = loaded();
+        let mut mode = TreeMode::new();
+        mode.handle_key(&mut ex, &mut term, key('e')).unwrap();
+        let rows: Vec<usize> = ex.tree_state.flattened.iter().map(|(_, d)| *d).collect();
+
+        // From the first row, Shift+↓ lands on the next row at the same depth (or stays
+        // put when there is no later sibling).
+        let start = ex.tree_state.selected;
+        mode.handle_key(
+            &mut ex,
+            &mut term,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        let landed = ex.tree_state.selected;
+        assert_eq!(
+            rows[landed], rows[start],
+            "a sibling has the same depth (row {start} → {landed}, depths {rows:?})"
+        );
+        mode.handle_key(
+            &mut ex,
+            &mut term,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        assert_eq!(rows[ex.tree_state.selected], rows[start]);
+    }
+
+    #[test]
+    fn the_tree_folds_and_unfolds_with_e_and_c() {
+        let (mut ex, mut term) = loaded();
+        let mut mode = TreeMode::new();
+        mode.handle_key(&mut ex, &mut term, key('c')).unwrap();
+        let collapsed = ex.tree_state.flattened.len();
+        mode.handle_key(&mut ex, &mut term, key('e')).unwrap();
+        let expanded = ex.tree_state.flattened.len();
+        assert!(
+            expanded > collapsed,
+            "expand-all must reveal rows: {collapsed} → {expanded}"
+        );
+        // Either case works for both (the TUI accepts `E`/`C` too — see the parity note
+        // in the key map).
+        mode.handle_key(&mut ex, &mut term, key('C')).unwrap();
+        assert_eq!(ex.tree_state.flattened.len(), collapsed);
+        mode.handle_key(&mut ex, &mut term, key('E')).unwrap();
+        assert_eq!(ex.tree_state.flattened.len(), expanded);
+    }
+
+    #[test]
+    fn the_tree_search_box_types_backspaces_and_escapes() {
+        let (mut ex, mut term) = loaded();
+        let mut mode = TreeMode::new();
+        assert!(!ex.tree_state.search_mode());
+
+        mode.handle_key(&mut ex, &mut term, key('/')).unwrap();
+        assert!(ex.tree_state.search_mode(), "/ opens the search box");
+        // While searching, letters are input — not shortcuts (`e` must not expand-all).
+        for c in "we".chars() {
+            mode.handle_key(&mut ex, &mut term, key(c)).unwrap();
+        }
+        assert_eq!(ex.tree_state.search_query(), "we");
+        assert!(mode.accepts_text(&ex), "typed letters are field input here");
+        assert!(
+            !mode.palette_on_space(&ex),
+            "Space types into the query instead of opening the palette"
+        );
+
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Backspace))
+            .unwrap();
+        assert_eq!(ex.tree_state.search_query(), "w");
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Esc))
+            .unwrap();
+        assert!(!ex.tree_state.search_mode(), "Esc leaves the search box");
+        assert_eq!(ex.tree_state.search_query(), "");
+    }
+
+    #[test]
+    fn the_tree_navigates_to_the_screens_its_keys_advertise() {
+        let (mut ex, mut term) = loaded();
+        let mut mode = TreeMode::new();
+        mode.handle_key(&mut ex, &mut term, key('e')).unwrap();
+        // Land on a tensor row (the fixture's first leaf).
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Down))
+            .unwrap();
+
+        let go = |mode: &mut TreeMode, ex: &mut Explorer, term: &mut _, k: KeyEvent| {
+            outcome(&mode.handle_key(ex, term, k).unwrap())
+        };
+        assert_eq!(go(&mut mode, &mut ex, &mut term, key('s')), "stats");
+        assert_eq!(
+            go(&mut mode, &mut ex, &mut term, code(KeyCode::Tab)),
+            "files"
+        );
+        assert_eq!(go(&mut mode, &mut ex, &mut term, key('q')), "quit");
+        // Enter on a tensor opens its detail; on a group it folds instead (stay).
+        let opened = go(&mut mode, &mut ex, &mut term, code(KeyCode::Enter));
+        assert!(
+            opened.starts_with("detail:") || opened == "stay",
+            "Enter opens a detail or folds a group, got {opened:?}"
+        );
+    }
+
+    #[test]
+    fn the_files_browser_moves_and_leaves() {
+        let (mut ex, mut term) = loaded();
+        let mut mode = FilesMode::new();
+        mode.on_enter(&mut ex, &mut term)
+            .expect("the browser builds");
+        let rows = ex.file_state.rows.len();
+        assert!(rows > 0, "the fixture's directory lists at least one file");
+
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Down))
+            .unwrap();
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Up))
+            .unwrap();
+        // Tab and Backspace both return to the tree.
+        assert_eq!(
+            outcome(
+                &mode
+                    .handle_key(&mut ex, &mut term, code(KeyCode::Tab))
+                    .unwrap()
+            ),
+            "back"
+        );
+        assert_eq!(
+            outcome(
+                &mode
+                    .handle_key(&mut ex, &mut term, code(KeyCode::Backspace))
+                    .unwrap()
+            ),
+            "back"
+        );
+    }
+
+    /// The name of the first tensor in the fixture, for the detail / data modes.
+    fn first_tensor(ex: &Explorer) -> String {
+        ex.tensors()
+            .first()
+            .expect("the fixture has tensors")
+            .name
+            .clone()
+    }
+
+    #[test]
+    fn the_detail_screen_steps_slices_and_opens_the_data_views() {
+        let (mut ex, mut term) = loaded();
+        let name = first_tensor(&ex);
+        let mut mode = DetailMode::new(
+            name.clone(),
+            0,
+            StatsStart::OnDemand, // don't kick off a byte scan in a test
+            Interaction::Interactive,
+        );
+        mode.on_enter(&mut ex, &mut term)
+            .expect("the tensor resolves");
+
+        // `m` / `v` open the heatmap and the numeric grid for the same tensor.
+        assert_eq!(
+            outcome(&mode.handle_key(&mut ex, &mut term, key('m')).unwrap()),
+            format!("data:{name}")
+        );
+        assert_eq!(
+            outcome(&mode.handle_key(&mut ex, &mut term, key('v')).unwrap()),
+            format!("data:{name}")
+        );
+        // Backspace leaves; `q` quits from anywhere.
+        assert_eq!(
+            outcome(
+                &mode
+                    .handle_key(&mut ex, &mut term, code(KeyCode::Backspace))
+                    .unwrap()
+            ),
+            "back"
+        );
+        // `q` quits only where the footer advertises it (the tree and the stats
+        // screen); on a sub-screen it steps back to the tree instead, so a stray `q`
+        // can't drop you out of the app.
+        assert_eq!(
+            outcome(&mode.handle_key(&mut ex, &mut term, key('q')).unwrap()),
+            "tree"
+        );
+    }
+
+    #[test]
+    fn the_data_view_pans_its_window_and_keeps_the_tensor() {
+        let (mut ex, mut term) = loaded();
+        let name = first_tensor(&ex);
+        let mut mode = DataMode::new(
+            name.clone(),
+            Representation::Values,
+            0,
+            Interaction::Interactive,
+        );
+        mode.on_enter(&mut ex, &mut term)
+            .expect("the tensor resolves");
+
+        // Arrow keys pan the window rather than leaving the screen — the bug the web
+        // UI shipped twice (V2), so it's worth pinning on the TUI side too.
+        for k in [KeyCode::Right, KeyCode::Down, KeyCode::Left, KeyCode::Up] {
+            let o = mode.handle_key(&mut ex, &mut term, code(k)).unwrap();
+            assert_eq!(outcome(&o), "stay", "{k:?} pans, it doesn't navigate");
+        }
+        // Switching representation stays on the same tensor.
+        let o = outcome(&mode.handle_key(&mut ex, &mut term, key('m')).unwrap());
+        assert!(
+            o == "stay" || o == format!("data:{name}"),
+            "`m` shows the heatmap for the same tensor, got {o:?}"
+        );
+        assert_eq!(
+            outcome(
+                &mode
+                    .handle_key(&mut ex, &mut term, code(KeyCode::Backspace))
+                    .unwrap()
+            ),
+            "back"
+        );
+    }
+
+    #[test]
+    fn the_layout_map_moves_between_segments_and_back() {
+        let (mut ex, mut term) = loaded();
+        let path = ex.files[0].to_string_lossy().to_string();
+        let total = std::fs::metadata(&path).expect("the fixture exists").len();
+        let map = crate::safelayout::from_tensors(&path, total, 0, ex.tensors(), ex.metadata());
+        let mut mode = LayoutMode::new(path, Ok(map), 0, 0);
+        mode.on_enter(&mut ex, &mut term).expect("the map opens");
+
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Down))
+            .unwrap();
+        let after_down = mode.selected;
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Up))
+            .unwrap();
+        assert!(
+            mode.selected <= after_down,
+            "↑ moves back towards the first segment"
+        );
+        // Home/End are bound here (unlike the tree — see the note on that test).
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::End))
+            .unwrap();
+        let last = mode.selected;
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Home))
+            .unwrap();
+        assert_eq!(mode.selected, 0, "Home returns to the first segment");
+        assert!(last > 0, "End moved somewhere (the map has segments)");
+        assert_eq!(
+            outcome(
+                &mode
+                    .handle_key(&mut ex, &mut term, code(KeyCode::Backspace))
+                    .unwrap()
+            ),
+            "back"
+        );
+    }
+
+    #[test]
+    fn the_stats_screen_scrolls_and_folds_the_shard_breakdown() {
+        let (mut ex, mut term) = loaded();
+        let mut mode = StatsMode::new(false, 0);
+        mode.on_enter(&mut ex, &mut term).expect("stats compute");
+        assert!(!mode.shards_expanded);
+        mode.handle_key(&mut ex, &mut term, key('f')).unwrap();
+        assert!(mode.shards_expanded, "`f` expands the per-shard breakdown");
+        mode.handle_key(&mut ex, &mut term, key('f')).unwrap();
+        assert!(!mode.shards_expanded, "and folds it again");
+
+        // The residual screen carries the fold + scroll, so Back restores the view.
+        match mode.residual() {
+            Screen::Stats {
+                shards_expanded,
+                scroll,
+            } => {
+                assert!(!shards_expanded);
+                assert_eq!(scroll, mode.scroll);
+            }
+            other => panic!(
+                "stats mode must reside as Stats, got {}",
+                outcome(&Outcome::Leave(Nav::Open(other)))
+            ),
+        }
+    }
+
+    #[test]
+    fn every_mode_reports_a_residual_screen_for_history() {
+        // Back / forward restore replays a mode's `residual()`; a mode that reported
+        // the wrong screen would send Backspace somewhere the user never was.
+        let (mut ex, mut term) = loaded();
+        assert_eq!(
+            outcome(&Outcome::Leave(Nav::Open(TreeMode::new().residual()))),
+            "tree"
+        );
+        let mut files = FilesMode::new();
+        files.on_enter(&mut ex, &mut term).unwrap();
+        assert_eq!(
+            outcome(&Outcome::Leave(Nav::Open(files.residual()))),
+            "files"
+        );
+        assert_eq!(
+            outcome(&Outcome::Leave(Nav::Open(
+                StatsMode::new(false, 0).residual()
+            ))),
+            "stats"
+        );
+    }
+}

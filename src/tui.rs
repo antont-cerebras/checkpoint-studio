@@ -51,6 +51,25 @@ pub fn init() -> Result<LiveTerminal> {
     Ok(terminal)
 }
 
+/// A [`LiveTerminal`] for tests: no raw mode, no alternate screen, no mouse capture —
+/// just a terminal over stdout with a **fixed** viewport.
+///
+/// The fixed viewport is what makes this work off a tty: `Viewport::Fullscreen` asks
+/// the backend for the real window size, which fails when stdout is a pipe (as it is
+/// under `cargo test`). With this, the mode drivers — whose `handle_key` /
+/// `handle_mouse` take `&mut LiveTerminal` — can be exercised in unit tests instead of
+/// only through the end-to-end `--plain` snapshots.
+#[cfg(test)]
+pub fn test_terminal(width: u16, height: u16) -> LiveTerminal {
+    Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Fixed(ratatui::layout::Rect::new(0, 0, width, height)),
+        },
+    )
+    .expect("a fixed viewport needs no terminal size query")
+}
+
 /// Restore the terminal after the interactive loop: stop mouse capture, leave the
 /// alternate screen (which brings back the pre-launch primary buffer + shell
 /// prompt), show the cursor, and leave raw mode.
