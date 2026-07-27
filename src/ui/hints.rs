@@ -581,6 +581,14 @@ pub(crate) fn tree_hint_lines(
         (letter("h"), "health"),
         (letter("s"), "stats"),
         (letter("d"), "compare"),
+        (
+            vec![
+                Seg::Key("o", hint_key('o')),
+                Seg::Sep("/"),
+                Seg::Key("O", hint_key('O')),
+            ],
+            "sort/reverse",
+        ),
         (letter("t"), "copy tree"),
         (letter("f"), "copy file"),
         (letter("n"), "copy name"),

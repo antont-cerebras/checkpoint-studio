@@ -89,6 +89,11 @@ pub struct TreeState {
     /// full tensor list, so it can be edited/cleared live without a destructive
     /// prune.
     pub filter: Option<FilterState>,
+    /// How the **flat** (search / filter) list is ordered — the tree itself is never
+    /// reordered. `SortKey::None` leaves the natural order (fuzzy score for a search,
+    /// tree order for a filter). Applied by the frontend when it (re)builds those rows,
+    /// because restoring the natural order means rebuilding them, not un-sorting them.
+    pub sort: (SortKey, SortDir),
 }
 
 /// Order a **flat** row list (a search or filter result) by one facet.
@@ -207,6 +212,40 @@ impl TreeState {
             return &f.filtered;
         }
         &self.flattened
+    }
+
+    /// Order the flat rows by the current [`Self::sort`]. Called by the frontend right
+    /// after it builds them; a no-op for `SortKey::None`, which is why the frontend must
+    /// rebuild (not un-sort) when returning to the natural order.
+    pub fn apply_sort(&mut self) {
+        let (key, dir) = self.sort;
+        if let Some(s) = self.search.as_mut() {
+            sort_rows(&mut s.filtered, key, dir);
+        }
+        if let Some(f) = self.filter.as_mut() {
+            sort_rows(&mut f.filtered, key, dir);
+        }
+    }
+
+    /// Advance the sort key through its cycle, keeping the direction. Returns the new key
+    /// so a caller can report it.
+    pub fn cycle_sort(&mut self) -> SortKey {
+        self.sort.0 = self.sort.0.next();
+        self.sort.0
+    }
+
+    /// Reverse the sort direction. A no-op in effect while the key is `None` (there is no
+    /// order to reverse), but the direction is still remembered for the next key.
+    pub fn flip_sort_dir(&mut self) -> SortDir {
+        self.sort.1 = self.sort.1.flip();
+        self.sort.1
+    }
+
+    /// Whether what's on screen is a **flat** list (a search or a filter result) rather
+    /// than the folded tree — i.e. whether sorting applies at all.
+    #[must_use]
+    pub fn flat_list_showing(&self) -> bool {
+        self.search.is_some() || self.filter.is_some()
     }
 
     /// Whether a persistent structured filter is active.

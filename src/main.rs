@@ -361,6 +361,14 @@ struct ExploreArgs {
     stats_shards: bool,
 
     #[arg(
+        long = "sort",
+        value_name = "KEY[.DIR]",
+        value_parser = viewstate::parse_sort,
+        help = "Order the flat search / filter list by name, size, params, dtype or rank (the `o` key) — optionally `.asc` / `.desc`, e.g. --sort size.desc. `none` restores the natural order. The tree itself is never reordered"
+    )]
+    sort: Option<(viewstate::SortKey, viewstate::SortDir)>,
+
+    #[arg(
         long = "diff-against",
         value_name = "PATH",
         help = "Open straight into the compare screen: a structural diff of this checkpoint against PATH (the tree's `d` command). Structure only — names, dtypes and shapes; `diff --values OLD NEW` compares the numbers"
@@ -3427,7 +3435,8 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.files
         || args.layout.is_some()
         || args.rename
-        || args.diff_against.is_some();
+        || args.diff_against.is_some()
+        || args.sort.is_some();
     let view = if args.values {
         OpenView::Values
     } else if args.heatmap {
@@ -3481,6 +3490,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.layout.is_some()
         || args.rename
         || args.diff_against.is_some()
+        || args.sort.is_some()
         || args.exit;
     // `--tensor`/`--metadata` are mutually exclusive (clap enforces it); fold into
     // one target, and the detail-implies-parent flag pairs into 3-state requests.
@@ -3534,6 +3544,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         layout_select: args.layout_select,
         rename: args.rename,
         diff_against: args.diff_against.clone(),
+        sort: args.sort,
         rename_rules: args.rename_rule,
     });
 

@@ -543,6 +543,10 @@ enum Cmd {
     Search,
     Filter,
     Diff,
+    /// Cycle which facet the flat (search / filter) list is ordered by.
+    SortCycle,
+    /// Reverse the current order.
+    SortFlip,
     ExpandAll,
     CollapseAll,
     ViewFiles,
@@ -663,6 +667,15 @@ const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
         "Filter tensors… (dtype/shape/size/name/…)",
         '\u{0}',
     ),
+    // Sorting applies to the flat search / filter list only — the tree keeps the
+    // checkpoint's own order. `o` cycles the facet, `O` reverses it.
+    (
+        Cmd::SortCycle,
+        "Tree",
+        "Sort by… (name/size/params/dtype/rank)",
+        'o',
+    ),
+    (Cmd::SortFlip, "Tree", "Reverse the sort order", 'O'),
     (Cmd::ExpandAll, "Tree", "Expand all groups", 'e'),
     (Cmd::CollapseAll, "Tree", "Collapse all groups", 'c'),
     (Cmd::ViewFiles, "View", "File browser", '\t'),
@@ -1555,6 +1568,9 @@ impl Explorer {
         if let Some(s) = self.tree_state.search.as_mut() {
             s.filtered = filtered;
         }
+        // Freshly built in score order, so apply the chosen sort on top (a no-op for
+        // `SortKey::None`, which is what leaves the fuzzy ranking intact).
+        self.tree_state.apply_sort();
     }
 
     /// Headless render (`--plain`): produce the requested screen once as plain
@@ -1589,6 +1605,9 @@ impl Explorer {
         let want_layout = self.open.as_ref().and_then(|r| r.layout_file.clone());
         let want_rename = self.open.as_ref().is_some_and(|r| r.rename);
         let want_diff = self.open.as_ref().and_then(|r| r.diff_against.clone());
+        if let Some(sort) = self.open.as_ref().and_then(|r| r.sort) {
+            self.tree_state.sort = sort;
+        }
         if let Some(n) = bins {
             self.data_view.histogram_bins.set(Some(n));
         }
@@ -2106,6 +2125,11 @@ impl Explorer {
         // `--rename-rule 'SRC=>TGT'` pairs. Local safetensors only.
         let want_rename = self.open.as_ref().is_some_and(|r| r.rename);
         let want_diff = self.open.as_ref().and_then(|r| r.diff_against.clone());
+        // The requested order, set before the flat rows are built so `--search` /
+        // `--filter` land already sorted (and so `y` reproduces the screen).
+        if let Some(sort) = self.open.as_ref().and_then(|r| r.sort) {
+            self.tree_state.sort = sort;
+        }
         let want_rename_rules = self
             .open
             .as_ref()
@@ -2534,6 +2558,9 @@ impl Explorer {
             })
             .collect();
         self.tree_state.set_filter(filter.query().to_string(), rows);
+        // The rows were just rebuilt in tree order, so this is where the chosen order is
+        // (re)applied — see `TreeState::apply_sort`.
+        self.tree_state.apply_sort();
     }
 
     // Text/JSON export + the copy menu (a third `impl Explorer` block in
@@ -2584,6 +2611,33 @@ impl Explorer {
             copy_to_clipboard(&text);
         }
         self.flash_copied("screen contents");
+    }
+
+    /// Rebuild the flat rows so a sort change takes effect — including a change *back*
+    /// to the natural order, which is a rebuild rather than an un-sort.
+    fn resort(&mut self) {
+        if self.tree_state.search_mode() {
+            self.update_filtered_tree();
+        } else {
+            self.refresh_filter();
+        }
+        self.tree_state.selected = 0;
+        self.tree_state.scroll = 0;
+    }
+
+    /// Say what the order now is, on the line the copy confirmations use — otherwise
+    /// cycling through six facets gives no feedback about which one you landed on.
+    fn flash_sort(&mut self, key: crate::viewstate::SortKey) {
+        use crate::viewstate::SortKey;
+
+        let (_, dir) = self.tree_state.sort;
+        let what = match key {
+            SortKey::None => "natural order".to_string(),
+            SortKey::Name | SortKey::Size | SortKey::Params | SortKey::Dtype | SortKey::Rank => {
+                format!("sorted by {} ({})", key.as_str(), dir.as_str())
+            }
+        };
+        self.copied_flash = Some((what, std::time::Instant::now()));
     }
 
     /// Note a copy confirmation to flash on the bottom line for `COPY_FLASH`.
@@ -2975,6 +3029,16 @@ impl Explorer {
             Cmd::Search => self.enter_search_mode(),
             Cmd::Filter => self.run_filter_prompt(term),
             Cmd::Diff => return Self::run_diff_prompt(term).map(Nav::Open),
+            Cmd::SortCycle => {
+                let key = self.tree_state.cycle_sort();
+                self.resort();
+                self.flash_sort(key);
+            }
+            Cmd::SortFlip => {
+                self.tree_state.flip_sort_dir();
+                self.resort();
+                self.flash_sort(self.tree_state.sort.0);
+            }
             Cmd::ExpandAll => self.tree_state.set_all_expanded(true),
             Cmd::CollapseAll => self.tree_state.set_all_expanded(false),
             Cmd::ViewFiles => {
@@ -3039,6 +3103,8 @@ impl Explorer {
                 Cmd::Repack => self.repack_input().is_some(),
                 Cmd::Rename => self.can_rename(),
                 Cmd::ViewFiles => self.file_view_available(),
+                // Sorting only means something where there is a flat list to sort.
+                Cmd::SortCycle | Cmd::SortFlip => self.tree_state.flat_list_showing(),
                 Cmd::Search
                 | Cmd::Filter
                 | Cmd::Diff
@@ -6126,9 +6192,17 @@ impl Explorer {
         } else {
             None
         };
-        state.map_or_else(Vec::new, |s| {
+        let mut args = state.map_or_else(Vec::new, |s| {
             vec!["--tree-state".to_string(), s.label().to_string()]
-        })
+        });
+        // The flat list's order, when it isn't the natural one — so `o` / `O` round-trip
+        // through `y` like every other view choice.
+        let (key, dir) = self.tree_state.sort;
+        if !matches!(key, crate::viewstate::SortKey::None) {
+            args.push("--sort".to_string());
+            args.push(format!("{}.{}", key.as_str(), dir.as_str()));
+        }
+        args
     }
 
     /// The command `y` copies from the tree: when a tensor row is highlighted
@@ -7476,7 +7550,29 @@ mod tests {
             !available.contains(&Cmd::Rename),
             "rename needs a local safetensors checkpoint: {available:?}"
         );
-        assert_eq!(available.len(), TREE_COMMANDS.len() - 2);
+        // Sorting applies to a flat search / filter list, and this context is the plain
+        // folded tree. Named rather than counted: an arithmetic `len() - N` says nothing
+        // about *which* commands were gated, and has to be edited every time one is added.
+        for gated in [Cmd::SortCycle, Cmd::SortFlip] {
+            assert!(
+                !available.contains(&gated),
+                "{gated:?} needs a flat list to sort: {available:?}"
+            );
+        }
+        let expected: Vec<Cmd> = TREE_COMMANDS
+            .iter()
+            .map(|&(c, ..)| c)
+            .filter(|c| {
+                !matches!(
+                    c,
+                    Cmd::Repack | Cmd::Rename | Cmd::SortCycle | Cmd::SortFlip
+                )
+            })
+            .collect();
+        assert_eq!(
+            available, expected,
+            "everything not gated off should be offered, in registry order"
+        );
 
         // A *writable* local safetensors checkpoint (even one shard) offers Rename.
         let dir = std::env::temp_dir().join(format!("ce_rename_gate_{}", std::process::id()));

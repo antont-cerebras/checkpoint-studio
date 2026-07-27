@@ -722,3 +722,110 @@ fn the_compact_tree_honours_the_filter() {
     let (status, _) = handlers::compact(&s, &query("q", "dtype:"));
     assert_eq!(status, 400, "a malformed filter must not fold everything");
 }
+
+/// **Sorting the flat list.** The live tree screen shows a *flat* list while a filter or
+/// search is active, and that list is what `o` / `O` order. Exercised through the
+/// `Explorer` rather than through `--plain`, because `--plain --filter` renders a pruned
+/// *tree* instead of the live flat list — a pre-existing difference between the two paths,
+/// and one a snapshot of the plain output would therefore not test.
+#[test]
+fn the_flat_filter_list_obeys_the_sort() {
+    use crate::viewstate::{SortDir, SortKey};
+
+    let sizes = |ex: &Explorer| -> Vec<usize> {
+        ex.tree_state
+            .visible()
+            .iter()
+            .filter_map(|(n, _)| match n {
+                crate::tree::TreeNode::Tensor { info, .. } => Some(info.size_bytes),
+                crate::tree::TreeNode::Group { .. } | crate::tree::TreeNode::Metadata { .. } => {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    let mut ex = Explorer::new(vec![fixture()], Vec::new(), None, false);
+    ex.set_tensor_filter(
+        crate::tensorfilter::TensorFilter::parse("rank:>=1").expect("the query parses"),
+    );
+    ex.load_quiet().expect("the fixture loads");
+
+    // Natural (tree) order: not sorted by size, or this test proves nothing.
+    let natural = sizes(&ex);
+    assert!(natural.len() > 2, "need several rows: {natural:?}");
+    assert!(
+        !natural.windows(2).all(|w| w[0] <= w[1]),
+        "the fixture's tree order should not already be size-ascending: {natural:?}"
+    );
+
+    ex.tree_state.sort = (SortKey::Size, SortDir::Asc);
+    ex.resort();
+    let asc = sizes(&ex);
+    assert!(
+        asc.windows(2).all(|w| w[0] <= w[1]),
+        "ascending by size: {asc:?}"
+    );
+
+    ex.tree_state.sort = (SortKey::Size, SortDir::Desc);
+    ex.resort();
+    let desc = sizes(&ex);
+    assert!(
+        desc.windows(2).all(|w| w[0] >= w[1]),
+        "descending by size: {desc:?}"
+    );
+
+    // Back to the natural order — a rebuild, not an un-sort, which is exactly the case
+    // that would silently stay sorted if `resort` only re-ordered in place.
+    ex.tree_state.sort = (SortKey::None, SortDir::Asc);
+    ex.resort();
+    assert_eq!(
+        sizes(&ex),
+        natural,
+        "`none` must restore the tree order, not leave the last sort applied"
+    );
+}
+
+/// `o` cycles the facet and `O` reverses it, and both round-trip through `y` — the project
+/// rule for any view state.
+#[test]
+fn the_sort_cycles_and_round_trips_through_the_reopen_command() {
+    use crate::viewstate::{SortDir, SortKey};
+
+    let mut ex = explorer();
+    assert_eq!(ex.tree_state.sort, (SortKey::None, SortDir::Asc));
+    // The cycle visits every facet and returns to the natural order.
+    let mut seen = Vec::new();
+    for _ in 0..6 {
+        seen.push(ex.tree_state.cycle_sort());
+    }
+    assert_eq!(
+        seen,
+        vec![
+            SortKey::Name,
+            SortKey::Size,
+            SortKey::Params,
+            SortKey::Dtype,
+            SortKey::Rank,
+            SortKey::None,
+        ],
+        "the cycle should reach every facet and come back"
+    );
+
+    // The natural order emits no flag (a plain view stays a plain command); a chosen one
+    // emits both halves.
+    let plain = ex.reopen_command(&super::Screen::Tree, false, false);
+    assert!(!plain.contains("--sort"), "{plain}");
+
+    ex.tree_state.sort = (SortKey::Size, SortDir::Desc);
+    let sorted = ex.reopen_command(&super::Screen::Tree, false, false);
+    assert!(
+        sorted.contains("--sort size.desc"),
+        "the reopen command should carry the order: {sorted}"
+    );
+    // And that spelling is what the flag parser accepts.
+    assert_eq!(
+        crate::viewstate::parse_sort("size.desc").expect("the emitted spelling parses"),
+        (SortKey::Size, SortDir::Desc)
+    );
+}

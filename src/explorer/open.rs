@@ -300,6 +300,9 @@ pub(crate) struct OpenRequest {
     /// Open the compare screen against this checkpoint (`--diff-against PATH`, the
     /// tree's `d` command). Round-trips through `y`.
     pub diff_against: Option<String>,
+    /// Order the flat search / filter list (`--sort KEY[.DIR]`, the `o` / `O` keys).
+    /// Round-trips through `y`.
+    pub sort: Option<(crate::viewstate::SortKey, crate::viewstate::SortDir)>,
     /// Render the view once and exit without interactive navigation.
     pub exit_after: bool,
     /// Land in the file browser (`--files`, the `Tab` toggle) once the tree is
