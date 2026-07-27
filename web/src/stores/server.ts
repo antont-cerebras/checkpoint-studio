@@ -3,9 +3,43 @@
 
 import { derived, writable } from 'svelte/store';
 import { api } from '../lib/api';
-import type { HistogramDto, SampleDto, StatsDto, TreeNode, TreeResponse } from '../lib/types';
+import type {
+  CompactTree,
+  HistogramDto,
+  SampleDto,
+  StatsDto,
+  TreeNode,
+  TreeResponse,
+} from '../lib/types';
 
 export const tree = writable<TreeResponse | null>(null);
+
+/// The compact (family-folded) tree for the current filter. A *store* rather than
+/// component state so the shared fold actions (`e` / `c`, the palette's expand/collapse
+/// all) can walk whichever tree is on screen — they used to walk only the full tree, so
+/// they silently did nothing while the compact view was showing.
+export const compactTree = writable<CompactTree | null>(null);
+export const compactError = writable<string>('');
+
+let compactSeq = 0;
+/** Fetch the compact tree for `q`, ignoring a response a later call superseded. Returns
+ * the tree it stored — so a caller can seed fold state from exactly the trees that
+ * actually landed, without keeping its own "have I seeded this one?" flag. */
+export async function loadCompact(q: string): Promise<CompactTree | null> {
+  const s = ++compactSeq;
+  compactError.set('');
+  try {
+    const r = await api.compact(q);
+    if (s !== compactSeq) return null; // superseded
+    compactTree.set(r);
+    return r;
+  } catch (e) {
+    if (s !== compactSeq) return null;
+    compactTree.set(null);
+    compactError.set(e instanceof Error ? e.message : String(e));
+    return null;
+  }
+}
 export const treeError = writable<string | null>(null);
 
 /** Every tensor name, and every shard basename, in the checkpoint. These back the

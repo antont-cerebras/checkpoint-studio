@@ -11,64 +11,30 @@
   //
   // The folding is `crate::compact::compact_tree`, which is `diff`'s own family
   // collapsing — so a "family" means the same thing here and in a diff.
-  import { api } from '../lib/api';
   import { expandedIds, flatten, type Row } from '../lib/flatten';
   import { humanCount, humanSize } from '../lib/format';
-  import { filterQuery } from '../stores/view';
-  import type { CompactTree, TreeNode } from '../lib/types';
+  import { expanded, filterQuery, toggle } from '../stores/view';
+  import { compactError, compactTree, loadCompact } from '../stores/server';
   import Dtype from './Dtype.svelte';
   import Shape from './Shape.svelte';
 
-  let data: CompactTree | null = null;
-  let err = '';
-  let loading = false;
-  let seq = 0;
-  let expanded = new Set<string>();
+  // Fold state is the *shared* `expanded` store, not this component's own — so the tree
+  // view's existing controls all work here unchanged: `e` / `c`, the palette's expand /
+  // collapse all, and clicking a group. (They used to do nothing in this view, because
+  // `setAllExpanded` walked the full tree, whose ids don't occur in the folded one.)
+  $: data = $compactTree;
+  $: err = $compactError;
+  $: void refresh($filterQuery);
 
-  async function load(q: string) {
-    const s = ++seq;
-    loading = true;
-    err = '';
-    try {
-      const r = await api.compact(q);
-      if (s !== seq) return;
-      data = r;
-      // Start from the fold state the server sent, as the tree view does — so the two
-      // open at the same depth instead of one of them arriving fully collapsed.
-      expanded = expandedIds(r.tree);
-    } catch (e) {
-      if (s !== seq) return;
-      err = e instanceof Error ? e.message : String(e);
-      data = null;
-    }
-    if (s === seq) loading = false;
-  }
-  $: void load($filterQuery);
-
-  function toggle(id: string) {
-    const next = new Set(expanded);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    expanded = next;
+  /** Load, then seed the fold state from what actually landed — so the view opens at the
+   * depth the server sent, the way the tree view does. After that the user owns folding,
+   * so this runs once per loaded tree rather than on every store change. */
+  async function refresh(q: string) {
+    const t = await loadCompact(q);
+    if (t) expanded.set(expandedIds(t.tree));
   }
 
-  /** Every group id, so "expand all" opens the whole fold. `flatten` only reveals the
-   * groups currently visible, so repeat until it stops finding new ones. */
-  function allGroupIds(tree: TreeNode[]): Set<string> {
-    const ids = new Set<string>();
-    let size = -1;
-    while (size !== ids.size) {
-      size = ids.size;
-      for (const r of flatten(tree, ids)) if (r.hasChildren) ids.add(r.id);
-    }
-    return ids;
-  }
-
-  function setAll(open: boolean) {
-    expanded = open && data ? allGroupIds(data.tree) : new Set<string>();
-  }
-
-  $: rows = data ? flatten(data.tree, expanded) : ([] as Row[]);
+  $: rows = data ? flatten(data.tree, $expanded) : ([] as Row[]);
   $: familyCount = data ? Object.keys(data.counts).length : 0;
 
   /** How many real tensors a family row stands for. */
@@ -86,7 +52,7 @@
 <div class="compact">
   {#if err}
     <p class="err">{err}</p>
-  {:else if loading && !data}
+  {:else if !data}
     <p class="dim">folding…</p>
   {:else if data}
     <div class="hdr">
@@ -94,9 +60,6 @@
         {humanCount(data.tensor_count)} tensors in <strong>{familyCount}</strong>
         {familyCount === 1 ? 'family' : 'families'}
       </span>
-      <span class="spacer"></span>
-      <button on:click={() => setAll(true)}>expand all</button>
-      <button on:click={() => setAll(false)}>collapse all</button>
     </div>
     <div class="rows">
       {#each rows as row (row.id)}
@@ -104,7 +67,7 @@
         <div class="row" style="padding-left:{row.depth * 14 + 4}px">
           {#if n.kind === 'group'}
             <button class="grp" on:click={() => toggle(row.id)}>
-              <span class="arrow">{expanded.has(row.id) ? '▾' : '▸'}</span>
+              <span class="arrow">{$expanded.has(row.id) ? '▾' : '▸'}</span>
               <span class="gname">{n.name}</span>
               <span class="dim">▦ {n.tensor_count} · {humanSize(n.total_size)}</span>
             </button>
@@ -153,9 +116,6 @@
     background: var(--bg-panel);
     position: sticky;
     top: 0;
-  }
-  .spacer {
-    flex: 1;
   }
   .rows {
     padding: 4px 0;

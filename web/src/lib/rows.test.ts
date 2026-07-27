@@ -200,3 +200,29 @@ describe('cursor', () => {
     expect(siblingIndex([], 0, true)).toBeNull();
   });
 });
+
+describe('expand/collapse reaches whichever tree is showing', () => {
+  // The compact view folds a *different* tree — templated family names — so its group ids
+  // do not occur in the full tree. `setAllExpanded` walked only the full one, which is why
+  // `e` / `c` and the palette's expand-all silently did nothing in the compact view.
+  // Pinned as an id-disjointness property, since that is the reason one shared walk could
+  // never have worked, and it will still hold if either view is rebuilt.
+  it('the two trees have disjoint group ids below the root', () => {
+    const groupIds = (nodes: TreeNode[], parentId = ''): string[] =>
+      nodes.flatMap((n) => {
+        if (n.kind !== 'group') return [];
+        const id = nodeId(n, parentId);
+        return [id, ...groupIds(n.children, id)];
+      });
+
+    const full = [grp('model', [grp('layers.0', [leaf('model.layers.0.w')])])];
+    const folded = [grp('model', [grp('layers.{0-47}', [leaf('model.layers.{0-47}.w')])])];
+
+    const a = new Set(groupIds(full));
+    const b = new Set(groupIds(folded));
+    // Only the root coincides; the folded level cannot be reached with the full tree's ids.
+    expect([...a].filter((id) => b.has(id))).toEqual(['model']);
+    expect([...b].some((id) => id.includes('{0-47}'))).toBe(true);
+    expect([...a].some((id) => id.includes('{0-47}'))).toBe(false);
+  });
+});

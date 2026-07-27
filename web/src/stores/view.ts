@@ -32,7 +32,8 @@ import {
   sortRows,
 } from '../lib/rows';
 import { SEARCH_LIMIT, searchTree } from '../lib/search';
-import { tree as treeData } from './server';
+import { compactTree, tree as treeData } from './server';
+import type { TreeNode } from '../lib/types';
 
 export { DV_KEYS };
 export type { DataTab, DvParams, Screen, SortKey };
@@ -356,10 +357,12 @@ export function setAllExpanded(on: boolean): void {
     expanded.set(new Set());
     return;
   }
-  const t = get(treeData);
-  if (!t) return;
+  // Whichever tree is on screen: the compact view folds a *different* tree (templated
+  // family names), so walking the full one would collect ids that match nothing there.
+  const nodes = get(compact) ? get(compactTree)?.tree : get(treeData)?.tree;
+  if (!nodes) return;
   const ids = new Set<string>();
-  const walk = (nodes: typeof t.tree, parentId: string) => {
+  const walk = (nodes: TreeNode[], parentId: string) => {
     for (const n of nodes) {
       if (n.kind === 'group') {
         const id = nodeId(n, parentId);
@@ -368,7 +371,7 @@ export function setAllExpanded(on: boolean): void {
       }
     }
   };
-  walk(t.tree, '');
+  walk(nodes, '');
   expanded.set(ids);
 }
 

@@ -110,6 +110,42 @@ fn family_as_tensor(f: &TensorFamily) -> TensorInfo {
     }
 }
 
+/// Fold each family's member count into its display label — `down_proj.weight ×48`.
+///
+/// For a frontend that renders one label per row and has nowhere to put a separate count
+/// column: the terminal. The browser reads [`CompactTree::counts`] instead and styles the
+/// multiplier itself. Both show the same fact; only the presentation differs, which is the
+/// kind of difference `shared/parity/README.md` records as deliberate.
+pub fn label_counts(tree: &mut [TreeNode], counts: &BTreeMap<String, usize>) {
+    for node in tree {
+        match node {
+            TreeNode::Group { children, .. } => label_counts(children, counts),
+            TreeNode::Tensor { info, label } => {
+                let Some(n) = counts.get(&info.name) else {
+                    continue;
+                };
+                // The label the tree builder already chose (a compacted chain), else the
+                // last dotted segment — the same text the row would otherwise show.
+                let base = label.clone().unwrap_or_else(|| {
+                    info.name
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(&info.name)
+                        .to_string()
+                });
+                // Idempotent: drop a suffix we already added, so calling this twice (a
+                // rebuild that re-labels an already-labelled tree) can't produce `w ×3 ×3`.
+                let base = base
+                    .rsplit_once(" ×")
+                    .filter(|(_, n)| !n.is_empty() && n.chars().all(char::is_numeric))
+                    .map_or(base.as_str(), |(head, _)| head);
+                *label = Some(format!("{base} ×{n}"));
+            }
+            TreeNode::Metadata { .. } => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +275,42 @@ mod tests {
         assert!(c.tree.is_empty());
         assert!(c.counts.is_empty());
         assert_eq!(c.tensor_count, 0);
+    }
+
+    /// The count ends up on the row's label, which is what a terminal renders.
+    #[test]
+    fn labels_carry_the_member_count() {
+        let tensors: Vec<TensorInfo> = (0..3)
+            .map(|i| tensor(&format!("model.layers.{i}.mlp.w"), "BF16", &[4, 4]))
+            .collect();
+        let mut c = compact_tree(&tensors);
+        label_counts(&mut c.tree, &c.counts);
+
+        let first = labels(&c.tree);
+        assert_eq!(first.len(), 1, "one family: {first:?}");
+        assert!(
+            first[0].ends_with("×3"),
+            "the label should carry the count: {:?}",
+            first[0]
+        );
+        // Idempotent: running it twice must not produce `w ×3 ×3`.
+        label_counts(&mut c.tree, &c.counts);
+        assert_eq!(labels(&c.tree), first, "labelling twice must not stack");
+    }
+
+    /// Every leaf label, depth-first.
+    fn labels(nodes: &[TreeNode]) -> Vec<String> {
+        let mut out = Vec::new();
+        for n in nodes {
+            match n {
+                TreeNode::Group { children, .. } => out.extend(labels(children)),
+                TreeNode::Tensor { info, label } => {
+                    out.push(label.clone().unwrap_or_else(|| info.name.clone()));
+                }
+                TreeNode::Metadata { .. } => {}
+            }
+        }
+        out
     }
 
     /// Every leaf of the tree, depth-first.
