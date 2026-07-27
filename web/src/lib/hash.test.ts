@@ -34,6 +34,9 @@ const SCREENS: Screen[] = [
   { kind: 'detail', tensor: 'model.layers.0.mlp.gate_proj.weight', tab: 'info' },
   { kind: 'detail', tensor: 'lm_head.weight', tab: 'heatmap' },
   { kind: 'preview', path: '/ckpt/config.json', name: 'config.json' },
+  { kind: 'diff', against: '/models/checkpoint_1000' },
+  // A path with characters that must survive percent-encoding in the hash.
+  { kind: 'diff', against: '/models/a b/model-00001-of-00002.safetensors' },
 ];
 
 describe('screen round-trip', () => {
@@ -169,5 +172,21 @@ describe('hashFor', () => {
     const full = `#${hashFor(s, g)}`;
     expect(parseScreen(full)).toEqual(s);
     expect(parseGlobals(full)).toEqual(g);
+  });
+});
+
+describe('the compare screen needs a baseline', () => {
+  it('falls back to the tree when `against` is missing', () => {
+    // A comparison with nothing to compare against is not a screen — a hand-edited or
+    // truncated link must land somewhere usable rather than on an empty compare view.
+    expect(parseScreen('#diff')).toEqual({ kind: 'tree' });
+    expect(parseScreen('#diff?against=')).toEqual({ kind: 'tree' });
+  });
+
+  it('percent-encodes the path so a space or hash cannot break the URL', () => {
+    const h = screenToHash({ kind: 'diff', against: '/a b/c#d' });
+    expect(h).not.toContain(' ');
+    expect(h.slice('diff?against='.length)).not.toContain('#');
+    expect(parseScreen(`#${h}`)).toEqual({ kind: 'diff', against: '/a b/c#d' });
   });
 });

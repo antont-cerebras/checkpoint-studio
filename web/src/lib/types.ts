@@ -122,3 +122,49 @@ export interface LayoutMap {
   metadata: [string, string][];
   segments: Segment[];
 }
+
+/** A tensor's comparable signature, as `diff::TensorSig` serializes it. */
+export interface TensorSig {
+  dtype: string;
+  shape: number[];
+}
+
+/** One tensor present in both checkpoints but not identical. */
+export interface TensorChange {
+  name: string;
+  old: TensorSig;
+  new: TensorSig;
+}
+
+/** One metadata entry present in both but with a different value. */
+export interface MetaChange {
+  name: string;
+  old: { value: string };
+  new: { value: string };
+}
+
+/** The structural diff `diff::DiffReport` serializes. Added/removed entries are
+ * `[name, value]` pairs (serde's representation of the Rust tuple). */
+export interface DiffReport {
+  tensors_added: [string, TensorSig][];
+  tensors_removed: [string, TensorSig][];
+  tensors_changed: TensorChange[];
+  tensors_unchanged: number;
+  meta_added: [string, { value: string }][];
+  meta_removed: [string, { value: string }][];
+  meta_changed: MetaChange[];
+  meta_unchanged: number;
+  old_bytes: number;
+  new_bytes: number;
+  old_params: number;
+  new_params: number;
+}
+
+/** `/api/diff`'s envelope: the baseline it compared against, the shared one-line
+ * verdict, the equivalent CLI command, and the report. */
+export interface DiffResponse {
+  against: string;
+  verdict: string;
+  command: string;
+  report: DiffReport;
+}

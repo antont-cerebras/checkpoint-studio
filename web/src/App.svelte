@@ -39,6 +39,7 @@
   import LayoutView from './components/LayoutView.svelte';
   import StatsView from './components/StatsView.svelte';
   import HealthView from './components/HealthView.svelte';
+  import DiffView from './components/DiffView.svelte';
   import FilePreview from './components/FilePreview.svelte';
   import StatusBar from './components/StatusBar.svelte';
   import Footer from './components/Footer.svelte';
@@ -78,6 +79,8 @@
         return '› Stats';
       case 'health':
         return '› Health';
+      case 'diff':
+        return s.against ? `› Compare: ${s.against}` : '› Compare';
       case 'preview':
         return `› ${s.name}`;
     }
@@ -443,6 +446,8 @@
       <StatsView />
     {:else if $screen.kind === 'health'}
       <HealthView />
+    {:else if $screen.kind === 'diff'}
+      <DiffView against={$screen.against} root={$tree.root} />
     {:else if $screen.kind === 'preview'}
       <FilePreview path={$screen.path} name={$screen.name} />
     {/if}

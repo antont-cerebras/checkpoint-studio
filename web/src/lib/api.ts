@@ -8,6 +8,7 @@ import type {
   SampleDto,
   StatsDto,
   TensorInfo,
+  DiffResponse,
   TreeResponse,
 } from './types';
 
@@ -64,6 +65,9 @@ export const api = {
         size_bytes: number;
       }[];
     }>(`/api/schema?q=${enc(q)}`),
+  /** Structural diff against another checkpoint on the server's filesystem. Rejects
+   * with the server's message (a 400) when the path is not a readable checkpoint. */
+  diff: (against: string) => getJson<DiffResponse>(`/api/diff?against=${enc(against)}`),
   stats: () => getJson<Record<string, unknown>>('/api/stats'),
   health: () => getJson<unknown[]>('/api/health'),
   check: () => getJson<Record<string, unknown> | null>('/api/check'),

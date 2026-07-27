@@ -39,6 +39,7 @@ export type Screen =
   | { kind: 'layout'; file?: string | undefined }
   | { kind: 'stats' }
   | { kind: 'health' }
+  | { kind: 'diff'; against: string }
   | { kind: 'preview'; path: string; name: string };
 
 /** Sorting for the flat (filter / search) tensor list. `none` keeps the natural
@@ -89,6 +90,8 @@ export function screenToHash(s: Screen): string {
       return 'stats';
     case 'health':
       return 'health';
+    case 'diff':
+      return `diff?against=${enc(s.against)}`;
     case 'preview':
       return `preview?path=${enc(s.path)}&name=${enc(s.name)}`;
   }
@@ -122,6 +125,13 @@ export function parseScreen(hash: string): Screen {
       return { kind: 'stats' };
     case 'health':
       return { kind: 'health' };
+    case 'diff': {
+      // No baseline means no comparison to show, so fall through to the tree rather
+      // than opening a screen that can only say "pick something".
+      const against = q.get('against');
+      if (against) return { kind: 'diff', against };
+      break;
+    }
     case 'preview': {
       const path = q.get('path');
       if (path) return { kind: 'preview', path, name: q.get('name') ?? path };

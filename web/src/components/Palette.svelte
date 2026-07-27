@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { get } from 'svelte/store';
   import {
     paletteOpen,
+    screen,
     navigate,
     setAllExpanded,
     startSearch,
@@ -23,6 +25,17 @@
     { group: 'Go', label: 'Byte layout map', run: () => navigate({ kind: 'layout' }) },
     { group: 'Go', label: 'Stats', run: () => navigate({ kind: 'stats' }) },
     { group: 'Go', label: 'Health check', run: () => navigate({ kind: 'health' }) },
+    {
+      group: 'Go',
+      label: 'Compare with another checkpoint…',
+      run: () => {
+        // The screen carries its own path input, so open it with whatever was compared
+        // last (or empty) and let the user type there — one place to enter a path rather
+        // than a prompt here and an input there.
+        const s = get(screen);
+        navigate({ kind: 'diff', against: s.kind === 'diff' ? s.against : '' });
+      },
+    },
     { group: 'Tree', label: 'Expand all groups', run: () => setAllExpanded(true) },
     { group: 'Tree', label: 'Collapse all groups', run: () => setAllExpanded(false) },
     { group: 'Tree', label: 'Search tensors', run: () => { navigate({ kind: 'tree' }); startSearch(); } },
