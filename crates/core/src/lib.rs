@@ -44,6 +44,7 @@ pub mod filetree;
 pub mod filter;
 pub mod gguf;
 pub mod health;
+pub mod hf;
 pub mod kernel;
 pub mod model;
 pub mod npy;

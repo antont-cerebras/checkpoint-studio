@@ -20,7 +20,7 @@ const _: () = assert!(
 // them at the crate root so the (still bin-side) `explorer`/`ui` keep resolving
 // their `crate::tree::…` / `crate::stats::…` paths unchanged during the refactor.
 pub use checkpoint_studio_core::{
-    check, codec, compact, config, diff, filetree, filter, gguf, health, kernel, model, npy,
+    check, codec, compact, config, diff, filetree, filter, gguf, health, hf, kernel, model, npy,
     progress, readers, remote, rename, repack, s3, safelayout, sample, sftp, stats, stheader,
     tensorfilter, tree, utils, viewstate,
 };
@@ -3295,7 +3295,10 @@ fn parse_fraction_pair(s: &str) -> Result<(f32, f32)> {
 /// Matches `scp`'s own rule: a `:` before any `/`, with a non-empty host to its
 /// left.
 fn split_scp(s: &str) -> Option<(String, String)> {
-    if s.starts_with("s3://") {
+    // A URI is not an scp path, however much `scheme:` looks like `host:`. Without this,
+    // `https://huggingface.co/owner/name` parsed as the host `https` and the tool tried to
+    // ssh to it — and `hf://…` did the same.
+    if s.contains("://") || hf::is_uri(s) {
         return None;
     }
     let colon = s.find(':')?;
@@ -3783,6 +3786,12 @@ fn collect_safetensors_files(
             eprintln!(
                 "Warning: {raw}: reading an s3:// checkpoint needs --ssh-proxy <[user@]host>"
             );
+            continue;
+        }
+        // A Hugging Face reference is a URI, not a path: it must not be globbed, tilde-
+        // expanded or checked for existence on this machine. `gather_checkpoint` reads it.
+        if hf::is_uri(&raw) {
+            files.push(path.clone());
             continue;
         }
 

@@ -453,18 +453,10 @@ fn read_npz_reader<R: Read + Seek>(
 fn read_indexes(root: &Path) -> Vec<IndexEntry> {
     let mut out = Vec::new();
     let index_path = root.join("model.safetensors.index.json");
-    if let Ok(bytes) = std::fs::read(&index_path)
-        && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
-        && let Some(wm) = v.get("weight_map").and_then(|w| w.as_object())
+    if let Ok(text) = std::fs::read_to_string(&index_path)
+        && let Some(entry) = IndexEntry::parse(&index_path.to_string_lossy(), &text)
     {
-        let weight_map = wm
-            .iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect();
-        out.push(IndexEntry {
-            path: index_path.to_string_lossy().into_owned(),
-            weight_map,
-        });
+        out.push(entry);
     }
     out
 }

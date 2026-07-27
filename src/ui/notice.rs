@@ -10,8 +10,8 @@ use ratatui::widgets::{Paragraph, Widget};
 use super::Overlay;
 use super::UI;
 use super::palette;
-// Only the (hdf5-gated) conversion progress screen draws a gauge.
-#[cfg(feature = "hdf5")]
+// The shared thin-line gauge — every progress readout in the TUI is this one widget
+// (the loading screen's shard count, the hdf5 conversion screen, the stats scan).
 use super::detail::render_line_gauge;
 use super::popup::{Backdrop, render_popup_box, render_titled_bar};
 use super::theme::{dim_span, key_span};
@@ -68,12 +68,16 @@ impl UI {
     /// header, a spinner on the row where the tree's first node will land, and the
     /// cancel hint pinned to the bottom — so the chrome is up immediately and the
     /// tree fills into the same frame once the read finishes.
+    /// `read` is `(done, total)` shard headers when the reader knows its denominator (a
+    /// Hugging Face repo learns it from the listing before the first header read) — then a
+    /// real bar replaces the spinner, because "17 of 96" is worth more than motion.
     pub(crate) fn render_loading(
         frame: &mut Frame,
         file: &str,
         total_files: usize,
         spinner: char,
         elapsed: std::time::Duration,
+        read: Option<(usize, usize)>,
     ) {
         let area = frame.area();
         let width = area.width as usize;
@@ -96,15 +100,44 @@ impl UI {
         for _ in lines.len() as u16..spinner_row {
             lines.push(Line::default());
         }
+        // With a known denominator the count replaces the spinner; the bar itself is the
+        // shared thin-line gauge drawn below (a widget, so it can't go in this Paragraph).
+        let counted = read.filter(|&(_, total)| total > 0);
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!("{spinner} reading checkpoint structure"),
+                match counted {
+                    Some(_) => "reading checkpoint structure".to_string(),
+                    None => format!("{spinner} reading checkpoint structure"),
+                },
                 Style::default().fg(palette::ACCENT),
             ),
             dim_span(format!("  ({:.1}s)", elapsed.as_secs_f64())),
         ]));
+        let gauge_row = lines.len() as u16;
         Paragraph::new(lines).render(area, frame.buffer_mut());
+
+        // The one progress widget the whole TUI uses — see `render_line_gauge`. Hand-rolling
+        // a `[███░░]` string here would give this screen a bar that looks like nothing else
+        // in the app.
+        if let Some((done, total)) = counted
+            && gauge_row + 1 < height
+        {
+            #[allow(clippy::cast_precision_loss)] // a ratio for display, over small counts
+            let ratio = done as f64 / total as f64;
+            render_line_gauge(
+                frame,
+                Rect {
+                    x: 2,
+                    y: gauge_row,
+                    width: area.width.saturating_sub(4),
+                    height: 1,
+                },
+                Line::from(format!("{done}/{total} shards")),
+                ratio,
+                Some(30),
+            );
+        }
 
         // Footer hint pinned to the bottom row.
         Paragraph::new(Line::from(vec![
@@ -373,6 +406,7 @@ mod tests {
                 16,
                 '⠋',
                 Duration::from_millis(2500),
+                None,
             );
         });
         assert!(out.contains("model-00001-of-00016.safetensors"), "{out}");
@@ -384,10 +418,62 @@ mod tests {
         assert!(out.contains("cancel"), "and how to abort:\n{out}");
     }
 
+    /// A read that knows its denominator shows a bar and the count instead of a spinner —
+    /// the Hugging Face reader learns "96 shards" from the listing before it reads any
+    /// header, so the wait is measurable rather than merely animated.
+    #[test]
+    fn a_countable_read_shows_a_bar_instead_of_a_spinner() {
+        let out = render(80, 12, |f| {
+            UI::render_loading(
+                f,
+                "hf://moonshotai/Kimi-K3",
+                1,
+                '⠋',
+                Duration::from_millis(1200),
+                Some((17, 96)),
+            );
+        });
+        assert!(out.contains("17/96 shards"), "the count shows:\n{out}");
+        // The shared thin-line gauge — the same widget the conversion screen and the stats
+        // scan draw, not a bar invented for this screen. Its fill is a *style* difference
+        // over one glyph, so the proportion isn't assertable from text; the count is what
+        // carries the number, which is why the label is there.
+        assert!(
+            out.contains('━'),
+            "the thin-line gauge should be drawn:\n{out}"
+        );
+        assert!(
+            !out.contains('⠋'),
+            "the spinner is redundant once there is a bar:\n{out}"
+        );
+    }
+
+    /// Until the denominator is known there is nothing to fill, so the spinner stays.
+    #[test]
+    fn an_uncountable_read_keeps_the_spinner() {
+        for read in [None, Some((0, 0))] {
+            let out = render(80, 12, |f| {
+                UI::render_loading(f, "ckpt", 1, '⠋', Duration::from_millis(50), read);
+            });
+            assert!(out.contains('⠋'), "{read:?} should still spin:\n{out}");
+            assert!(
+                !out.contains("shards"),
+                "{read:?} has no count to show:\n{out}"
+            );
+        }
+    }
+
     #[test]
     fn a_single_file_load_says_nothing_about_more_files() {
         let out = render(80, 10, |f| {
-            UI::render_loading(f, "model.safetensors", 1, '⠋', Duration::from_millis(100));
+            UI::render_loading(
+                f,
+                "model.safetensors",
+                1,
+                '⠋',
+                Duration::from_millis(100),
+                None,
+            );
         });
         assert!(!out.contains("more"), "{out}");
     }

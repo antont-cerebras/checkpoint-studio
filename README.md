@@ -251,6 +251,28 @@ carry their reason in `pyproject.toml`. That is why the versions are pinned: wit
 rule set at deny, a new ruff release would otherwise add rules to a red build on a commit
 that changed nothing. Upgrading is a deliberate commit where the new findings get triaged.
 
+### Hugging Face Hub (`hf://owner/name`)
+Explore a repo on the Hub without downloading it:
+
+```bash
+checkpoint-studio hf://moonshotai/Kimi-K3            # or paste the browser URL
+checkpoint-studio https://huggingface.co/moonshotai/Kimi-K3#2-model-summary
+checkpoint-studio hf://owner/name@refs/pr/3 --stats  # a branch, tag or commit
+```
+
+A safetensors file begins with an 8-byte header length and that many bytes of JSON
+describing every tensor — name, dtype, shape, and its byte range. The Hub serves files with
+HTTP `Range` support, so the whole structure of a multi-terabyte repo costs a couple of
+small requests per shard. Kimi-K3 is 96 shards and 1.4 TiB on the Hub; its 497,220 tensors
+come back from ~3 KB of header per shard, and the tree, the compact view, the statistics,
+the health check and the byte-layout map all work from that. **No weights are fetched.**
+
+Which means the data views (heatmap, values, histogram, whole-tensor statistics) are *not*
+available — they read tensor bytes, the one thing this never downloads. Same restriction as
+`--ssh-proxy`, reported the same way. `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) is sent as a
+bearer token, so gated and private repos work with the token you already have; `HF_ENDPOINT`
+points at a mirror.
+
 ### Remote checkpoints over SSH (`--ssh-proxy`)
 Browse a checkpoint that lives only on a remote host — either behind credentials
 you (rightly) don't want to copy to your laptop (a Cerebras **cstorch** checkpoint

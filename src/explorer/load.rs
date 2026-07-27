@@ -8,6 +8,7 @@
 
 #[allow(clippy::wildcard_imports)] // a submodule of the module it was split from
 use super::*;
+use std::sync::Arc;
 
 impl Explorer {
     /// Run `f` with an open reader for `t`, reusing the cached one when it is
@@ -264,7 +265,14 @@ impl Explorer {
         // spinner in place of the rows — until the worker finishes.
         let files = self.files.clone();
         let remote = self.remote_read().cloned();
-        let handle = std::thread::spawn(move || Self::gather_checkpoint(&files, remote.as_ref()));
+        // Shared with the worker so the draw loop below can show a real bar once the reader
+        // knows how many shards there are (a Hugging Face read learns that from the listing
+        // before its first header read). Local reads leave it at zero and keep the spinner.
+        let read_progress = Arc::new(crate::hf::ReadProgress::default());
+        let worker_progress = Arc::clone(&read_progress);
+        let handle = std::thread::spawn(move || {
+            Self::gather_checkpoint_with(&files, remote.as_ref(), &worker_progress)
+        });
 
         let label = self
             .files
@@ -293,7 +301,10 @@ impl Explorer {
             if let Some(term) = self.terminal.as_mut() {
                 let spinner = crate::progress::spinner_frame(frame);
                 let elapsed = started.elapsed();
-                let _ = term.draw(|f| UI::render_loading(f, &label, total, spinner, elapsed));
+                let read = read_progress.get();
+                let _ = term.draw(|f| {
+                    UI::render_loading(f, &label, total, spinner, elapsed, Some(read));
+                });
             }
             frame += 1;
         }
@@ -665,6 +676,16 @@ impl Explorer {
         files: &[PathBuf],
         remote: Option<&crate::remote::RemoteRead>,
     ) -> Result<(CheckpointParts, Option<crate::model::Checkpoint>)> {
+        Self::gather_checkpoint_with(files, remote, &crate::hf::ReadProgress::default())
+    }
+
+    /// [`Self::gather_checkpoint`] with somewhere to report read progress — the variant the
+    /// animated load uses so it can draw a bar rather than a spinner.
+    pub(crate) fn gather_checkpoint_with(
+        files: &[PathBuf],
+        remote: Option<&crate::remote::RemoteRead>,
+        progress: &crate::hf::ReadProgress,
+    ) -> Result<(CheckpointParts, Option<crate::model::Checkpoint>)> {
         // `--ssh-proxy`: every source is read on the remote (an s3:// cstorch
         // checkpoint, or a remote safetensors directory/file), keeping the
         // credentials and data there. (The central model is filled by the remote
@@ -704,6 +725,29 @@ impl Explorer {
                      (its credentials stay on the remote)"
                 );
             }
+        }
+        // A Hugging Face repo: read its structure over HTTPS (the listing, then each
+        // shard's safetensors header via a Range request) — no weights fetched. Handled
+        // here, at the one dispatch point, so every derived view works unchanged.
+        if let Some(first) = files.first()
+            && crate::hf::is_uri(&first.to_string_lossy())
+        {
+            if files.len() > 1 {
+                anyhow::bail!(
+                    "one Hugging Face repo at a time (got {} paths)",
+                    files.len()
+                );
+            }
+            let repo = crate::hf::parse(&first.to_string_lossy())?;
+            let cp = crate::hf::read_checkpoint(&repo, progress)?;
+            let parts = (
+                cp.tensors_vec(),
+                cp.metadata_vec(),
+                cp.config.clone(),
+                None,
+                Vec::new(),
+            );
+            return Ok((parts, Some(cp)));
         }
         // Read the whole local checkpoint into the central model in one pass (fs
         // walk + every header + config + index); the tuple is derived from it.

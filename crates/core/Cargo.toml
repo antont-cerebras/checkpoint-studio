@@ -27,6 +27,13 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
 # Read the SSH password from the tty when key/agent auth isn't available.
 rpassword = "7.5.4"
+# Blocking HTTP for the Hugging Face reader (`hf://…`): its API for the file listing
+# and Range requests for each shard's safetensors header. Blocking on purpose — the
+# whole tool is threads-and-blocking-IO (see the tiny_http web server), so an async
+# runtime would be the only async thing in the process. `rustls` rather than the system
+# OpenSSL so the build stays self-contained, matching the vendored ssh2 above.
+ureq = { version = "3", default-features = false, features = ["rustls", "json", "gzip"] }
+
 # Text diffing for the `diff` metadata line-diff.
 similar = "2.7"
 # `diff --map` rename rules (regex → replacement).

@@ -27,6 +27,9 @@ pub enum Source {
     Sftp { host: String, root: String },
     /// An `s3://…` cstorch checkpoint read via the remote host (`--ssh-proxy`).
     S3 { uri: String },
+    /// A Hugging Face Hub repository, read over HTTPS — headers only, no weights
+    /// (`crate::hf`).
+    Hf { repo: String, revision: String },
 }
 
 /// The filesystem kind of a [`FileEntry`], as a **tagged sum type**: a regular
@@ -204,6 +207,27 @@ pub struct IndexEntry {
     pub path: String,
     /// tensor name → shard file basename.
     pub weight_map: std::collections::BTreeMap<String, String>,
+}
+
+impl IndexEntry {
+    /// Parse a `model.safetensors.index.json` body into its weight map. `None` when the
+    /// JSON has no `weight_map` object — which is what "not an index" looks like.
+    ///
+    /// Shared by the local reader and the Hub reader: the file is the same JSON wherever
+    /// it is read from, and the health check compares it against the loaded tensors
+    /// identically in both cases.
+    #[must_use]
+    pub fn parse(path: &str, json: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(json).ok()?;
+        let wm = v.get("weight_map")?.as_object()?;
+        Some(Self {
+            path: path.to_string(),
+            weight_map: wm
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect(),
+        })
+    }
 }
 
 /// The one serializable checkpoint model. Read once; everything derives from it.
