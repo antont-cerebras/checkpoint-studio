@@ -59,6 +59,9 @@ pub(crate) fn tree(s: &WebState) -> Reply {
     ok(json!({
         "root": s.root,
         "tensor_count": s.tensors.len(),
+        // `null` unless the server is reachable off this machine — the client shows it as
+        // a banner. Carried on the tree because that is the first thing the UI fetches.
+        "access_warning": s.access_warning,
         // Already rooted by `Session::build_rooted_tree` — the same tree, with the same
         // summarising root and label, that the TUI renders.
         "tree": s.tree,
@@ -139,6 +142,44 @@ pub(crate) fn check(s: &WebState) -> Reply {
     s.check
         .as_ref()
         .map_or_else(|| ok(Value::Null), |report| ok(report.to_json(false)))
+}
+
+/// Structural diff against another checkpoint: `?against=PATH`, where PATH is a file,
+/// directory of shards, or glob on the server's filesystem. The checkpoint being served
+/// is the **new** side and `against` the baseline — see [`crate::compare`].
+///
+/// Reads shard headers only, so this is fast even for multi-GB checkpoints. Value
+/// comparison (`diff --values`) is deliberately not here: a scan that takes minutes needs
+/// progress and cancellation, which is the CLI's job.
+///
+/// The result is **not** cached. Every other cacheable endpoint is keyed by something
+/// fixed at startup; this one is keyed by a path from the request, so a cache would grow
+/// without bound under a client that asks about many paths. Re-reading headers is cheap.
+pub(crate) fn diff(s: &WebState, q: &Query) -> Reply {
+    let Some(against) = q
+        .get("against")
+        .map(String::as_str)
+        .filter(|p| !p.is_empty())
+    else {
+        return err(
+            400,
+            "diff needs ?against=PATH (a checkpoint to compare with)",
+        );
+    };
+    let metadata = s.checkpoint.metadata_vec();
+    match crate::compare::structural_diff(&s.tensors, &metadata, std::path::Path::new(against)) {
+        Ok(report) => ok(json!({
+            "against": against,
+            "verdict": crate::compare::verdict(&report),
+            // The equivalent CLI invocation, so a browser finding can be reproduced (and
+            // extended with --values) in a terminal.
+            "command": crate::compare::reopen_command(std::path::Path::new(against), &s.files),
+            "report": report,
+        })),
+        // A path that doesn't resolve to a checkpoint is a client mistake, not a server
+        // fault: the message is what the UI shows next to the input.
+        Err(e) => err(400, format!("{e:#}")),
+    }
 }
 
 pub(crate) fn model(s: &WebState) -> Reply {

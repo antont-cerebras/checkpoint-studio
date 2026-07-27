@@ -318,6 +318,13 @@
   <!-- The page had no <h1>. The visible title is a nav button, so give assistive tech
        a real document heading naming the app + the open checkpoint. -->
   <h1 class="visually-hidden">Checkpoint Studio — {$tree?.root ?? 'loading checkpoint'}</h1>
+  <!-- No authentication exists in front of this server. When it is bound anywhere but
+       loopback, say so on the page as well as in the terminal it was started from — the
+       person looking at the browser is not necessarily the person who read the banner.
+       One narrow strip, not dismissible: the condition lasts as long as the server does. -->
+  {#if $tree?.access_warning}
+    <div class="access-warning" role="alert">{$tree.access_warning}</div>
+  {/if}
   <header>
     <button class="nav" on:click={back} title="Back (Backspace)" aria-label="Back">‹</button>
     <button class="nav" on:click={forward} title="Forward (\\)" aria-label="Forward">›</button>
@@ -448,6 +455,17 @@
 </div>
 
 <style>
+  /* Light red on a tinted strip: a standing caution, not an error — it must not read as
+     something that broke. Narrow enough not to cost content height. */
+  .access-warning {
+    flex: none;
+    padding: 3px 12px;
+    font-size: 11.5px;
+    line-height: 1.4;
+    color: #ffb4b4;
+    background: #4a1f1f;
+    border-bottom: 1px solid #6b2b2b;
+  }
   .app {
     display: flex;
     flex-direction: column;

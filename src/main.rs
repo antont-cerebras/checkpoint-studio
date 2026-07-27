@@ -28,6 +28,9 @@ pub use checkpoint_studio_core::{
 pub use checkpoint_studio_core::{convert, hdf5, hdf5_lz4, hdf5_zstd};
 
 mod cli_config;
+/// Loading the other side of a structural comparison, shared by the TUI's compare
+/// screen and the web's `/api/diff` — see the module docs for which side is which.
+mod compare;
 mod explorer;
 mod tui;
 mod ui;
@@ -356,6 +359,13 @@ struct ExploreArgs {
         help = "Like --stats, but with the on-disk per-shard breakdown expanded (the view's `f` toggle)"
     )]
     stats_shards: bool,
+
+    #[arg(
+        long = "diff-against",
+        value_name = "PATH",
+        help = "Open straight into the compare screen: a structural diff of this checkpoint against PATH (the tree's `d` command). Structure only — names, dtypes and shapes; `diff --values OLD NEW` compares the numbers"
+    )]
+    diff_against: Option<String>,
 
     #[arg(
         long,
@@ -3312,7 +3322,7 @@ fn run_web(
         // Fetch the S3 object metadata: the browser shows the same stats S3 section
         // and health cross-check the TUI does, and this is a one-off at server start.
         let model = remote.read_checkpoint(&src, remote::ObjectMeta::Fetch)?;
-        let state = std::sync::Arc::new(web::WebState::build(model, &[], &[]));
+        let state = std::sync::Arc::new(web::WebState::build(model, &[], &[]).with_exposure(host));
         return web::serve_on(server, state, host);
     }
     let (files, index_specs) = collect_safetensors_files(paths, recursive, no_health_check)?;
@@ -3320,7 +3330,8 @@ fn run_web(
         anyhow::bail!("No checkpoint files found in the specified paths.");
     }
     let model = readers::read_local(&files)?;
-    let state = std::sync::Arc::new(web::WebState::build(model, &files, &index_specs));
+    let state =
+        std::sync::Arc::new(web::WebState::build(model, &files, &index_specs).with_exposure(host));
     web::serve(state, host, port)
 }
 
@@ -3415,7 +3426,8 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.stats_shards
         || args.files
         || args.layout.is_some()
-        || args.rename;
+        || args.rename
+        || args.diff_against.is_some();
     let view = if args.values {
         OpenView::Values
     } else if args.heatmap {
@@ -3468,6 +3480,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.files
         || args.layout.is_some()
         || args.rename
+        || args.diff_against.is_some()
         || args.exit;
     // `--tensor`/`--metadata` are mutually exclusive (clap enforces it); fold into
     // one target, and the detail-implies-parent flag pairs into 3-state requests.
@@ -3520,6 +3533,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         layout_file: args.layout,
         layout_select: args.layout_select,
         rename: args.rename,
+        diff_against: args.diff_against.clone(),
         rename_rules: args.rename_rule,
     });
 

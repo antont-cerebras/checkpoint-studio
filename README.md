@@ -186,6 +186,23 @@ while the data views (which need the bytes) report that the checkpoint is metada
 The UI is a Svelte single-page app **embedded in the binary**, so a released
 `checkpoint-studio` needs nothing extra to serve it.
 
+> [!WARNING]
+> **There is no access control.** The server has no authentication of any kind, and it
+> binds `0.0.0.0` by default so it is reachable at your machine's hostname. Anyone who can
+> reach the port can read the served checkpoint — and, through `/api/diff?against=PATH`,
+> the structure of **any checkpoint path the serving user can read**. Pass
+> `--host 127.0.0.1` to restrict it to your own machine. When the bind is not loopback,
+> the startup banner says so in the terminal and the page carries a strip saying the same.
+
+**What the web UI deliberately does not do.** It is **read-only**: renaming tensors in
+place and repacking an HDF5 codec are offered by the CLI (`convert`) and the TUI (`R` and
+the palette's repack command) but have no web equivalent, because they rewrite checkpoint
+files and the server accepts requests from anywhere it is reachable. Diffing is available
+everywhere, but only its **structural** half — the value comparison (`diff --values`) and
+repack verification (`diff --verify-repack`) stay on the CLI, where a scan that reads every
+byte of both checkpoints has a progress bar, cancellation, and somewhere to report
+per-tensor findings.
+
 **Rebuilding the UI** — only needed when changing `web/`. Requires **Node 20**
 (pinned in `web/.nvmrc` / `web/.node-version`; `engine-strict` makes npm enforce it,
 and the `pre*` scripts refuse to run on an older Node):

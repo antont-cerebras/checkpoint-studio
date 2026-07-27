@@ -47,9 +47,10 @@ use super::{
 // each (dispatch, palette, legend) against once or twice here, so moving them next to
 // each screen would invert the dependency rather than remove it.
 use super::{
-    Cmd, DataCmd, DetailCmd, FileCmd, LayoutCmd, RenameCmd, StatsCmd, available_data_commands,
-    available_detail_commands, available_rename_commands, available_stats_commands, data_cmd_key,
-    detail_cmd_key, file_command_for_key, layout_command_for_key, stats_cmd_key,
+    Cmd, DataCmd, DetailCmd, DiffCmd, FileCmd, LayoutCmd, RenameCmd, StatsCmd,
+    available_data_commands, available_detail_commands, available_diff_commands,
+    available_rename_commands, available_stats_commands, data_cmd_key, detail_cmd_key,
+    diff_cmd_key, file_command_for_key, layout_command_for_key, stats_cmd_key,
     tree_command_for_key,
 };
 
@@ -2073,19 +2074,17 @@ impl Mode for StatsMode {
                     std::time::Instant::now(),
                 ));
             }
-            KeyCode::Char('l') => ex.show_overlay(Overlay::Legend(Legend::Stats)),
-            KeyCode::Char('q') => return Ok(Outcome::Leave(Nav::Quit)),
-            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::Down => self.scroll = (self.scroll + 1).min(self.scroll_max.get()),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(SCROLL_PAGE),
-            KeyCode::PageDown => {
-                self.scroll = (self.scroll + SCROLL_PAGE).min(self.scroll_max.get());
+            code => {
+                if let ReportKey::Leave(nav) = report_key(
+                    ex,
+                    Legend::Stats,
+                    &mut self.scroll,
+                    self.scroll_max.get(),
+                    code,
+                ) {
+                    return Ok(Outcome::Leave(nav));
+                }
             }
-            KeyCode::Home => self.scroll = 0,
-            KeyCode::End => self.scroll = self.scroll_max.get(),
-            KeyCode::Esc | KeyCode::Backspace => return Ok(Outcome::Leave(Nav::Back)),
-            KeyCode::Char('\\') => return Ok(Outcome::Leave(Nav::Forward)),
-            _ => {}
         }
         Ok(Outcome::Stay)
     }
@@ -2096,19 +2095,7 @@ impl Mode for StatsMode {
         _term: &mut crate::tui::LiveTerminal,
         m: MouseEvent,
     ) -> MouseOutcome {
-        // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        match m.kind {
-            MouseEventKind::ScrollUp => {
-                self.scroll = self.scroll.saturating_sub(WHEEL_STEP);
-                MouseOutcome::Redraw
-            }
-            MouseEventKind::ScrollDown => {
-                self.scroll = (self.scroll + WHEEL_STEP).min(self.scroll_max.get());
-                MouseOutcome::Redraw
-            }
-            _ => MouseOutcome::Ignored,
-        }
+        scroll_wheel(&mut self.scroll, self.scroll_max.get(), m.kind)
     }
 
     fn set_scroll(&mut self, _ex: &mut Explorer, offset: usize) {
@@ -2118,6 +2105,231 @@ impl Mode for StatsMode {
     fn residual(&self) -> Screen {
         Screen::Stats {
             shards_expanded: self.shards_expanded,
+            scroll: self.scroll,
+        }
+    }
+}
+
+/// What a report screen's shared keys did — nothing that concerns the caller, or leave.
+enum ReportKey {
+    Handled,
+    Leave(Nav),
+}
+
+/// The keys every scrollable **report** screen (statistics, compare) binds identically:
+/// the legend, quit, Back, Forward, and scrolling. A screen matches its own keys first and
+/// falls through to here, so "what Esc does on a report screen" has one definition instead
+/// of one per screen — they were a line-for-line copy of each other.
+fn report_key(
+    ex: &Explorer,
+    legend: Legend,
+    scroll: &mut usize,
+    max: usize,
+    code: KeyCode,
+) -> ReportKey {
+    // A foreign key enum; see FOREIGN_ENUM_WILDCARDS.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match code {
+        KeyCode::Char('l') => ex.show_overlay(Overlay::Legend(legend)),
+        KeyCode::Char('q') => return ReportKey::Leave(Nav::Quit),
+        KeyCode::Esc | KeyCode::Backspace => return ReportKey::Leave(Nav::Back),
+        KeyCode::Char('\\') => return ReportKey::Leave(Nav::Forward),
+        code => {
+            scroll_key(scroll, max, code);
+        }
+    }
+    ReportKey::Handled
+}
+
+/// Apply a scrolling key to `scroll`, clamped to the last render's `max`. Returns whether
+/// the key *was* a scrolling one, so a caller can fall through to its own arms.
+fn scroll_key(scroll: &mut usize, max: usize, code: KeyCode) -> bool {
+    // A foreign key enum; see FOREIGN_ENUM_WILDCARDS.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match code {
+        KeyCode::Up => *scroll = scroll.saturating_sub(1),
+        KeyCode::Down => *scroll = (*scroll + 1).min(max),
+        KeyCode::PageUp => *scroll = scroll.saturating_sub(SCROLL_PAGE),
+        KeyCode::PageDown => *scroll = (*scroll + SCROLL_PAGE).min(max),
+        KeyCode::Home => *scroll = 0,
+        KeyCode::End => *scroll = max,
+        _ => return false,
+    }
+    true
+}
+
+/// Apply a wheel event to `scroll`, clamped to the last render's `max`. `Ignored` for
+/// anything that isn't a wheel, so the caller can handle its own mouse actions.
+fn scroll_wheel(scroll: &mut usize, max: usize, kind: MouseEventKind) -> MouseOutcome {
+    // A foreign mouse enum; see FOREIGN_ENUM_WILDCARDS.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match kind {
+        MouseEventKind::ScrollUp => {
+            *scroll = scroll.saturating_sub(WHEEL_STEP);
+            MouseOutcome::Redraw
+        }
+        MouseEventKind::ScrollDown => {
+            *scroll = (*scroll + WHEEL_STEP).min(max);
+            MouseOutcome::Redraw
+        }
+        _ => MouseOutcome::Ignored,
+    }
+}
+
+/// The compare screen ([`Screen::Diff`]) as a [`Mode`]: a structural diff of the open
+/// checkpoint against another one, scrollable.
+///
+/// The report is computed once in `on_enter` (it reads the baseline's shard headers, no
+/// tensor bytes) and held here, because a diff of an immutable pair cannot change while
+/// the screen is up. `report` is `None` only when the baseline could not be read, in which
+/// case the screen shows the error instead — a path the user typed is the likeliest thing
+/// to be wrong, so it has to be reportable rather than a reason to bail back to the tree.
+pub(super) struct DiffMode {
+    pub(super) against: std::path::PathBuf,
+    pub(super) report: Option<crate::diff::DiffReport>,
+    /// The failure from reading `against`, shown in place of the report.
+    pub(super) error: Option<String>,
+    pub(super) scroll: usize,
+    /// The last render's maximum scroll (render is `&self`), so the key / wheel handlers
+    /// can clamp downward scrolling to the content.
+    pub(super) scroll_max: Cell<usize>,
+}
+
+impl DiffMode {
+    pub(super) fn new(against: std::path::PathBuf, scroll: usize) -> Self {
+        Self {
+            against,
+            report: None,
+            error: None,
+            scroll,
+            scroll_max: Cell::new(0),
+        }
+    }
+
+    /// The baseline's display label — its path as the user gave it.
+    fn old_label(&self) -> String {
+        self.against.display().to_string()
+    }
+}
+
+impl Mode for DiffMode {
+    fn help_ctx(&self) -> HelpCtx {
+        HelpCtx::Diff
+    }
+
+    fn on_enter(
+        &mut self,
+        ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+    ) -> Result<Outcome> {
+        if self.report.is_some() || self.error.is_some() {
+            return Ok(Outcome::Stay); // already computed (returning via history)
+        }
+        let metadata = ex.metadata().to_vec();
+        match crate::compare::structural_diff(ex.tensors(), &metadata, &self.against) {
+            Ok(report) => self.report = Some(report),
+            Err(e) => self.error = Some(format!("{e:#}")),
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn pre_draw(&mut self, _ex: &mut Explorer, _term: &mut crate::tui::LiveTerminal) {
+        self.scroll = self.scroll.min(self.scroll_max.get());
+    }
+
+    fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
+        let Some(report) = self.report.as_ref() else {
+            let msg = self
+                .error
+                .clone()
+                .unwrap_or_else(|| "the comparison has not run".to_string());
+            UI::render_message(f, "Cannot compare", &msg);
+            return;
+        };
+        let max = ex.render_diff_screen(f, &self.old_label(), report, self.scroll);
+        self.scroll_max.set(max);
+        if let Some((what, _)) = &ex.copied_flash {
+            UI::render_copied_flash(f, what);
+        }
+    }
+
+    fn open_palette(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> PaletteResult {
+        let (old, scroll) = (self.old_label(), self.scroll);
+        let report = self.report.as_ref();
+        let chosen = ex.run_palette(term, available_diff_commands(), HelpCtx::Diff, |s, f| {
+            if let Some(r) = report {
+                s.render_diff_screen(f, &old, r, scroll);
+            }
+        });
+        match chosen {
+            Some(DiffCmd::CopyCommand) => PaletteResult::CopyCommand,
+            Some(cmd) => PaletteResult::SynthKey(diff_cmd_key(cmd)),
+            None => PaletteResult::Handled,
+        }
+    }
+
+    fn handle_key(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+        key: KeyEvent,
+    ) -> Result<Outcome> {
+        // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match key.code {
+            // Copy the whole screen's text at the live terminal size.
+            KeyCode::Char('c') => {
+                let (w, h) = term.size().map_or((120, 40), |s| (s.width, s.height));
+                if let Some(report) = self.report.as_ref() {
+                    let (old, scroll) = (self.old_label(), self.scroll);
+                    let new = ex.root_label();
+                    let verdict = crate::compare::verdict(report);
+                    if let Ok(text) = crate::tui::headless_render(w, h, |f| {
+                        UI::render_diff(f, &old, &new, &verdict, report, scroll, false);
+                    }) {
+                        copy_to_clipboard(&text);
+                    }
+                }
+                ex.copied_flash = Some((
+                    "copied the screen to the clipboard".to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
+            code => {
+                if let ReportKey::Leave(nav) = report_key(
+                    ex,
+                    Legend::Diff,
+                    &mut self.scroll,
+                    self.scroll_max.get(),
+                    code,
+                ) {
+                    return Ok(Outcome::Leave(nav));
+                }
+            }
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn handle_mouse(
+        &mut self,
+        _ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+        m: MouseEvent,
+    ) -> MouseOutcome {
+        scroll_wheel(&mut self.scroll, self.scroll_max.get(), m.kind)
+    }
+
+    fn set_scroll(&mut self, _ex: &mut Explorer, offset: usize) {
+        self.scroll = offset;
+    }
+
+    fn residual(&self) -> Screen {
+        Screen::Diff {
+            against: self.against.display().to_string(),
             scroll: self.scroll,
         }
     }
@@ -2561,6 +2773,7 @@ mod tests {
                 Screen::Data { tensor, .. } => format!("data:{tensor}"),
                 Screen::Rename { .. } => "rename".into(),
                 Screen::Stats { .. } => "stats".into(),
+                Screen::Diff { against, .. } => format!("diff:{against}"),
             },
         }
     }
@@ -2915,7 +3128,8 @@ mod tests {
             | Screen::Layout { .. }
             | Screen::Detail { .. }
             | Screen::Data { .. }
-            | Screen::Rename { .. }) => panic!(
+            | Screen::Rename { .. }
+            | Screen::Diff { .. }) => panic!(
                 "stats mode must reside as Stats, got {}",
                 outcome(&Outcome::Leave(Nav::Open(other)))
             ),
@@ -3213,6 +3427,75 @@ mod tests {
         stats.handle_key(&mut ex, &mut term, key('f')).unwrap();
         stats.pre_draw(&mut ex, &mut term);
         draw_mode("the stats screen with shards", &stats, &ex);
+    }
+
+    /// The compare screen: it computes its report on entry, draws at every size, scrolls
+    /// within the report, and records `against` + scroll in its residual so Back returns
+    /// to the same place. The report content itself is checked against the CLI and the web
+    /// in `explorer::differential`.
+    #[test]
+    fn the_compare_screen_draws_and_scrolls() {
+        let (mut ex, mut term) = loaded();
+        let baseline =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_old.safetensors");
+
+        let mut mode = DiffMode::new(baseline.clone(), 0);
+        mode.on_enter(&mut ex, &mut term).unwrap();
+        assert!(
+            mode.report.is_some() && mode.error.is_none(),
+            "the baseline should have been read: {:?}",
+            mode.error
+        );
+        draw_mode("the compare screen", &mode, &ex);
+
+        // Scrolling is clamped to the content the last render measured.
+        mode.pre_draw(&mut ex, &mut term);
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::End))
+            .unwrap();
+        let at_end = mode.scroll;
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Down))
+            .unwrap();
+        assert_eq!(
+            mode.scroll, at_end,
+            "End then Down must not scroll past the end"
+        );
+        mode.handle_key(&mut ex, &mut term, code(KeyCode::Home))
+            .unwrap();
+        assert_eq!(mode.scroll, 0, "Home returns to the top");
+
+        // The residual round-trips the baseline and the scroll position.
+        match mode.residual() {
+            Screen::Diff { against, scroll } => {
+                assert_eq!(against, baseline.display().to_string());
+                assert_eq!(scroll, mode.scroll);
+            }
+            Screen::Tree
+            | Screen::Files
+            | Screen::Layout { .. }
+            | Screen::Detail { .. }
+            | Screen::Data { .. }
+            | Screen::Rename { .. }
+            | Screen::Stats { .. } => {
+                panic!("the compare screen's residual should be Screen::Diff")
+            }
+        }
+    }
+
+    /// A baseline that isn't a checkpoint must be *reportable*, not fatal: the path came
+    /// from something the user typed, so the screen explains itself instead of bailing.
+    #[test]
+    fn the_compare_screen_reports_an_unreadable_baseline() {
+        let (mut ex, mut term) = loaded();
+        let mut mode = DiffMode::new(PathBuf::from("/nonexistent/checkpoint"), 0);
+        mode.on_enter(&mut ex, &mut term).unwrap();
+        assert!(mode.report.is_none(), "there is no report to show");
+        let err = mode.error.clone().expect("the failure is recorded");
+        assert!(
+            err.contains("/nonexistent/checkpoint"),
+            "the message should name the path: {err}"
+        );
+        // And it still draws, at every size, rather than panicking on the empty state.
+        draw_mode("the compare screen with an unreadable baseline", &mode, &ex);
     }
 
     /// The engine-owned overlay slot, end to end: a screen asks for one from its key

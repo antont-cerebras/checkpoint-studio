@@ -68,6 +68,28 @@ impl Explorer {
         max
     }
 
+    /// Render the compare screen and record its clickables / scroll bar, returning the
+    /// maximum scroll offset — the compare-screen twin of [`Self::render_stats_screen`].
+    /// `old_label` names the baseline; the open checkpoint names itself.
+    pub(super) fn render_diff_screen(
+        &self,
+        frame: &mut ratatui::Frame,
+        old_label: &str,
+        report: &crate::diff::DiffReport,
+        scroll: usize,
+    ) -> usize {
+        let new_label = self.root_label();
+        let verdict = crate::compare::verdict(report);
+        let regions = UI::render_diff(frame, old_label, &new_label, &verdict, report, scroll, true);
+        *self.clickable.borrow_mut() = regions;
+        let (w, h) = (frame.area().width, frame.area().height);
+        let total = UI::diff_total_rows(report, w);
+        *self.vscrollbar.borrow_mut() = UI::diff_scrollbar(w, h, total, scroll);
+        let badges = self.screen_badges(HelpCtx::Diff);
+        UI::render_badge_bar(frame, &badges, self.hovered_badge.get());
+        total.saturating_sub(UI::diff_visible_rows(w, h))
+    }
+
     /// Render a tensor's detail screen to plain text via an in-memory Ratatui
     /// backend — the headless (`--plain`) detail and the `c` screen-copy share
     /// this. Mirrors [`Self::tree_plain`].

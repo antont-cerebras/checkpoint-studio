@@ -31,6 +31,16 @@ use handlers::{Query, Reply};
 /// Everything the API serves, computed once from a local read. Shared read-only.
 pub(crate) struct WebState {
     pub root: String,
+    /// The no-access-control caution to show in the UI, or `None` when the server is
+    /// bound to loopback and so only reachable from this machine. Set by
+    /// [`Self::with_exposure`] from the bind address; the *same string* the startup
+    /// banner prints, so the terminal and the page cannot say different things.
+    pub access_warning: Option<String>,
+    /// The checkpoint's files as resolved at startup. Kept so `/api/diff` can emit the
+    /// `checkpoint-studio diff OLD NEW` command that reproduces its report: `root` is the
+    /// containing *directory* for a single-file checkpoint, which would name a different
+    /// (larger) comparison than the one being served.
+    pub files: Vec<PathBuf>,
     /// The full serializable model (backs `/api/model`).
     pub checkpoint: model::Checkpoint,
     /// The tensor-tree hierarchy (client folds/selects/searches it).
@@ -166,6 +176,10 @@ impl WebState {
 
         Self {
             root,
+            // Loopback until told otherwise, so a state built in a test or a headless
+            // context never claims to be exposed.
+            access_warning: None,
+            files: files.to_vec(),
             checkpoint,
             tree,
             file_tree,
@@ -179,6 +193,14 @@ impl WebState {
             stats_cache: Mutex::new(HashMap::new()),
             static_bodies: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record how the server is bound. A non-loopback bind means anyone who can reach
+    /// the port gets everything this UI serves — there is no authentication — so the UI
+    /// says so. Loopback leaves it `None` and no banner appears.
+    pub(crate) fn with_exposure(mut self, host: IpAddr) -> Self {
+        self.access_warning = (!host.is_loopback()).then(|| access_warning(host));
+        self
     }
 
     /// The encoded body for a fixed-content endpoint, building (and caching) it on
@@ -275,7 +297,7 @@ pub(crate) fn serve_on(
         host.to_string()
     };
     let url = format!("http://{display}:{bound}/");
-    print_serve_banner(&url);
+    print_serve_banner(&url, host);
 
     // A small worker pool so a static-asset / metadata request stays responsive
     // while another worker is inside a multi-second tensor scan.
@@ -303,14 +325,19 @@ pub(crate) fn serve_on(
 /// underlined, bright cyan on its own padded line — so it stands out even when a
 /// coloured load-progress bar was printed just above it. Plain (unstyled, one line)
 /// when stdout isn't a terminal or `NO_COLOR` is set, so a captured log stays clean.
-fn print_serve_banner(url: &str) {
+fn print_serve_banner(url: &str, host: IpAddr) {
     const DIM: &str = "\x1b[2m";
     const URL: &str = "\x1b[1;4;96m"; // bold + underline + bright cyan (link-like)
+    const WARN: &str = "\x1b[38;5;210m"; // light red — a caution, not an error
     const RESET: &str = "\x1b[0m";
     use std::io::IsTerminal;
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let exposed = !host.is_loopback();
     if !color {
         println!("checkpoint-studio web UI: {url}  (Ctrl-C to stop)");
+        if exposed {
+            println!("{}", access_warning(host));
+        }
         return;
     }
     // Raw ANSI via named consts + a terminal/NO_COLOR guard — the same convention
@@ -319,8 +346,32 @@ fn print_serve_banner(url: &str) {
     // Blank line to break from the finished ✓ load bar above; the label dim, the URL
     // the one bright thing on the line so it wins the eye.
     println!(
-        "\n  {DIM}checkpoint-studio web UI ▸{RESET}  {URL}{url}{RESET}\n  {DIM}Ctrl-C to stop{RESET}\n"
+        "\n  {DIM}checkpoint-studio web UI ▸{RESET}  {URL}{url}{RESET}\n  {DIM}Ctrl-C to stop{RESET}"
     );
+    // The server has no authentication of any kind. On a wildcard or specific
+    // non-loopback bind that means anyone who can reach the port gets everything this
+    // UI can show — including `/api/diff?against=PATH`, which will read any checkpoint
+    // path the serving user can read. Light red: worth reading, not a failure.
+    if exposed {
+        println!("  {WARN}{}{RESET}\n", access_warning(host));
+    } else {
+        println!();
+    }
+}
+
+/// The no-access-control caution, shared by the terminal banner and (via
+/// `/api/tree`'s envelope) the banner the web page shows.
+fn access_warning(host: IpAddr) -> String {
+    let where_ = if host.is_unspecified() {
+        "all interfaces"
+    } else {
+        "a network interface"
+    };
+    format!(
+        "⚠ No access control: bound to {where_}, so anyone who can reach this port can \
+         read this checkpoint — and any checkpoint path this user can read (see /api/diff). \
+         Use --host 127.0.0.1 to restrict it to this machine."
+    )
 }
 
 const JSON_CT: &str = "application/json; charset=utf-8";
@@ -438,6 +489,7 @@ fn route_api(s: &WebState, path: &str, q: &Query) -> Reply {
         "tensor" => handlers::tensor(s, q),
         "layout" => handlers::layout(s, q),
         "file" => handlers::file(s, q),
+        "diff" => handlers::diff(s, q),
         "tensor/stats" => handlers::tensor_stats(s, q),
         "tensor/sample" => handlers::tensor_sample(s, q),
         "tensor/histogram" => handlers::tensor_histogram(s, q),

@@ -456,3 +456,145 @@ fn the_tui_and_the_web_agree_on_a_directory_of_shards() {
         "the tree the web serves is not the tree the TUI renders"
     );
 }
+
+/// **The structural diff.** `diff OLD NEW` on the command line, `/api/diff?against=OLD`
+/// in the browser, and the compare screen in the terminal must all produce the same
+/// report for the same pair — that is the whole point of putting the comparison in
+/// `crate::compare` rather than in each surface.
+#[test]
+fn the_structural_diff_agrees_between_the_cli_and_the_web() {
+    let old = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_old.safetensors");
+    let new = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_new.safetensors");
+
+    // The web: serve `diff_new`, ask it to compare against `diff_old`.
+    let files = vec![new];
+    let model = crate::readers::read_local(&files).expect("the fixture reads");
+    let state = WebState::build(model, &files, &[]);
+    let served = body(handlers::diff(
+        &state,
+        &query("against", &old.display().to_string()),
+    ));
+
+    // The CLI: the same pair through the shared comparison the `diff` subcommand uses.
+    let expected =
+        crate::compare::structural_diff(&state.tensors, &state.checkpoint.metadata_vec(), &old)
+            .expect("the pair compares");
+
+    assert_eq!(
+        served["report"],
+        serde_json::to_value(&expected).unwrap(),
+        "the served diff is not the one the shared comparison produces"
+    );
+    assert!(
+        served["report"]["tensors_changed"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+            || served["report"]["tensors_added"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+        "the diff fixtures should differ, or this test proves nothing: {}",
+        served["verdict"]
+    );
+    // The emitted command names the baseline first (`diff OLD NEW`), so pasting it
+    // reproduces this report rather than the inverse one.
+    let command = served["command"].as_str().unwrap();
+    assert!(
+        command.contains("diff_old.safetensors") && command.contains("diff_new.safetensors"),
+        "the reopen command should name both sides: {command}"
+    );
+    let (o, n) = (
+        command.find("diff_old").unwrap(),
+        command.find("diff_new").unwrap(),
+    );
+    assert!(
+        o < n,
+        "the baseline must come first in `diff OLD NEW`: {command}"
+    );
+}
+
+/// Comparing a checkpoint with itself must report no differences through the endpoint,
+/// not merely through the core — the projection could drop a section and look clean.
+#[test]
+fn the_web_reports_no_differences_against_itself() {
+    let s = web();
+    let served = body(handlers::diff(
+        &s,
+        &query("against", &fixture().display().to_string()),
+    ));
+    assert_eq!(served["verdict"], "structurally identical");
+    for section in [
+        "tensors_added",
+        "tensors_removed",
+        "tensors_changed",
+        "meta_added",
+        "meta_removed",
+        "meta_changed",
+    ] {
+        assert_eq!(
+            served["report"][section].as_array().map(Vec::len),
+            Some(0),
+            "{section} should be empty when comparing a checkpoint with itself"
+        );
+    }
+}
+
+/// A bad `?against=` is a 400 whose message the UI shows — not a 500, and not a silent
+/// empty report that would read as "no differences".
+#[test]
+fn the_diff_endpoint_rejects_a_path_that_is_not_a_checkpoint() {
+    let s = web();
+    for bad in ["", "/nonexistent/checkpoint"] {
+        let (status, bytes) = handlers::diff(&s, &query("against", bad));
+        assert_eq!(status, 400, "'{bad}' should be a client error");
+        let msg: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            msg["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "the rejection should carry a message: {msg}"
+        );
+    }
+}
+
+/// **The no-access-control caution.** The server has no authentication, so when it is
+/// bound anywhere but loopback both the terminal banner and the page must say so — and
+/// say the *same* thing, which is why the state carries one string rather than each
+/// surface phrasing its own.
+#[test]
+fn the_access_warning_appears_exactly_when_the_server_is_reachable_off_the_machine() {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let loopback = web().with_exposure(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(
+        loopback.access_warning, None,
+        "a loopback bind is not exposed, so there is nothing to warn about"
+    );
+    assert_eq!(
+        body(handlers::tree(&loopback))["access_warning"],
+        Value::Null,
+        "the page must get no banner for a loopback bind"
+    );
+
+    for host in [
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),      // 0.0.0.0 — the default
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), // a specific interface
+    ] {
+        let exposed = web().with_exposure(host);
+        let warning = exposed
+            .access_warning
+            .clone()
+            .unwrap_or_else(|| panic!("{host} should be treated as exposed"));
+        assert!(
+            warning.contains("No access control"),
+            "the caution should name the problem: {warning}"
+        );
+        assert!(
+            warning.contains("127.0.0.1"),
+            "the caution should say how to restrict it: {warning}"
+        );
+        // The page gets the identical sentence the terminal printed.
+        assert_eq!(
+            body(handlers::tree(&exposed))["access_warning"].as_str(),
+            Some(warning.as_str()),
+            "the page banner and the terminal banner must be the same text"
+        );
+    }
+}

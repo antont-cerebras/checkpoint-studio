@@ -297,6 +297,9 @@ pub(crate) struct OpenRequest {
     /// The checkpoint-stats view request (`--stats` / `--stats-shards`, the `s`
     /// key + its `f` toggle). Round-trips through `y`.
     pub stats: StatsReq,
+    /// Open the compare screen against this checkpoint (`--diff-against PATH`, the
+    /// tree's `d` command). Round-trips through `y`.
+    pub diff_against: Option<String>,
     /// Render the view once and exit without interactive navigation.
     pub exit_after: bool,
     /// Land in the file browser (`--files`, the `Tab` toggle) once the tree is

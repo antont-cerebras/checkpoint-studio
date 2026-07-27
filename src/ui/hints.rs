@@ -202,6 +202,8 @@ pub(super) fn chip_regions(chips: &[ChipHit], base_row: u16) -> ChipRegions {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HelpCtx {
     Tree,
+    /// The compare screen (a structural diff against another checkpoint).
+    Diff,
     Files,
     Layout,
     Detail,
@@ -578,6 +580,7 @@ pub(crate) fn tree_hint_lines(
         (letter("l"), "legend"),
         (letter("h"), "health"),
         (letter("s"), "stats"),
+        (letter("d"), "compare"),
         (letter("t"), "copy tree"),
         (letter("f"), "copy file"),
         (letter("n"), "copy name"),
@@ -734,6 +737,30 @@ pub(super) fn wrap_hint_items(
 /// The file browser's key-hint line(s), wrapped to `width` like
 /// [`tree_hint_lines`] — the same `key label · …` chips and clickable
 /// [`ChipHit`]s, for the file-view footer.
+/// The footer tail every non-editing screen ends with: the palette, the legend, the two
+/// copies, history, quit. Extracted because it is genuinely the same list on every screen
+/// — the compare screen made it a third copy, and a screen that quietly lost `y` from its
+/// footer while still binding it is exactly the drift this removes.
+fn common_hint_tail() -> Vec<(Vec<Seg>, &'static str)> {
+    vec![
+        (palette_keys(), "commands"),
+        (letter("l"), "legend"),
+        (letter("c"), "copy screen"),
+        (letter("y"), "copy command"),
+        (history_keys(), "back/fwd"),
+        (letter("q"), "quit"),
+    ]
+}
+
+/// The compare screen's key hints. No `Tab` (it is reached from the tree's palette, and
+/// Backspace goes back), and it advertises the CLI command for the value comparison this
+/// screen deliberately doesn't do.
+pub(crate) fn diff_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
+    let mut items: Vec<(Vec<Seg>, &str)> = vec![(nav_updown(), "scroll"), (nav_pages(), "page")];
+    items.extend(common_hint_tail());
+    wrap_hint_items(items, width)
+}
+
 pub(crate) fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
     use KeyCode::{Enter, Tab};
     let plain = KeyModifiers::NONE;
@@ -765,7 +792,7 @@ pub(crate) fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>)
 pub(crate) fn layout_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
     use KeyCode::{Enter, Tab};
     let plain = KeyModifiers::NONE;
-    let items: Vec<(Vec<Seg>, &str)> = vec![
+    let mut items: Vec<(Vec<Seg>, &str)> = vec![
         (nav_updown(), "select"),
         (nav_pages(), "page"),
         (vec![Seg::Key("↵", KeyEvent::new(Enter, plain))], "in tree"),
@@ -773,13 +800,8 @@ pub(crate) fn layout_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>
             vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))],
             "tensor tree",
         ),
-        (palette_keys(), "commands"),
-        (letter("l"), "legend"),
-        (letter("c"), "copy screen"),
-        (letter("y"), "copy command"),
-        (history_keys(), "back/fwd"),
-        (letter("q"), "quit"),
     ];
+    items.extend(common_hint_tail());
     wrap_hint_items(items, width)
 }
 

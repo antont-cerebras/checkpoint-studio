@@ -36,6 +36,10 @@ export interface TreeResponse {
   root: string;
   tensor_count: number;
   tree: TreeNode[];
+  /** The server's no-access-control caution, or null when it is bound to loopback and so
+   * only reachable from the machine it runs on. The server sends the same sentence it
+   * prints to its terminal at startup. */
+  access_warning: string | null;
 }
 
 export type FileNode =

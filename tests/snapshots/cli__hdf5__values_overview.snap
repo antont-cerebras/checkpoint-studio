@@ -1,6 +1,5 @@
 ---
 source: tests/cli.rs
-assertion_line: 679
 expression: "plain(&[\"--tensor\", &t, \"--values\", \"--overview\"])"
 ---
 Values: model.layers.0.block_sparse_moe.experts.down_proj.weight                                                     [×]

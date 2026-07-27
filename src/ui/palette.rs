@@ -61,3 +61,10 @@ pub(super) const PANEL_BG: Color = Color::Indexed(236);
 /// dark field. (Floating pop-ups like the legend keep the live screen behind
 /// them and don't use this.)
 pub(super) const SCRIM: Color = Color::Indexed(234);
+
+// A structural diff's three outcomes. Aliases rather than new colours, so a change reads
+// the same in the terminal as in `diff`'s own ANSI output (green 32 / yellow 33 / red 31)
+// and in the browser's diff view.
+pub(super) const ADDED: Color = SUCCESS;
+pub(super) const REMOVED: Color = ERROR;
+pub(super) const CHANGED: Color = WARN;

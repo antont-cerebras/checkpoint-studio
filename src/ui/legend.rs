@@ -19,6 +19,8 @@ use super::theme::{
 /// from.
 #[derive(Clone, Copy)]
 pub(crate) enum Legend {
+    /// The compare screen's glyphs (`+` added, `-` removed, `~` changed).
+    Diff,
     Tree,
     Detail,
     Heatmap,
@@ -101,6 +103,7 @@ fn legend_title(legend: Legend) -> &'static str {
         Legend::Values => "Legend — numeric values",
         Legend::Rename => "Legend — rename tensors in place",
         Legend::Stats => "Legend — checkpoint stats",
+        Legend::Diff => "Legend — compare checkpoints",
     }
 }
 
@@ -373,6 +376,40 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
                     Some(palette::META),
                     "░",
                     "composition bar: everything else (norms, router, rotary, …)",
+                ),
+            ];
+            let col = legend_desc_col(&rows, 0);
+            for (color, sym, desc) in rows {
+                lines.push(legend_row_line(color, sym, desc, col));
+            }
+        }
+        Legend::Diff => {
+            let rows = [
+                (
+                    Some(palette::ADDED),
+                    "+",
+                    "in the open checkpoint but not in the baseline",
+                ),
+                (
+                    Some(palette::REMOVED),
+                    "-",
+                    "in the baseline but not in the open checkpoint",
+                ),
+                (
+                    Some(palette::CHANGED),
+                    "~",
+                    "in both, with a different dtype or shape",
+                ),
+                (
+                    Some(palette::REMOVED),
+                    "old",
+                    "the baseline you are comparing against (`diff OLD NEW`'s first argument)",
+                ),
+                (Some(palette::ADDED), "new", "the checkpoint you have open"),
+                (
+                    None,
+                    "structure only",
+                    "names, dtypes and shapes — no tensor bytes are read. `diff --values OLD NEW` compares the numbers",
                 ),
             ];
             let col = legend_desc_col(&rows, 0);

@@ -337,6 +337,14 @@ enum Screen {
         shards_expanded: bool,
         scroll: usize,
     },
+    /// The compare screen: a structural diff of the open checkpoint against the
+    /// checkpoint at `against` (the baseline / "old" side — see [`crate::compare`]).
+    /// `scroll` is recorded back into the history on leaving, like the other scrollable
+    /// screens, so stepping away and back returns to the same place in the report.
+    Diff {
+        against: String,
+        scroll: usize,
+    },
 }
 
 /// Which live frame stays behind a [`Explorer::float_scroll_popup`] box — the
@@ -383,7 +391,9 @@ impl HelpCtx {
     /// What Ctrl-C means on this screen — see [`CtrlC`].
     const fn ctrlc(self) -> CtrlC {
         match self {
-            Self::Detail | Self::Data | Self::Stats | Self::Rename => CtrlC::QuitProcess,
+            Self::Detail | Self::Data | Self::Stats | Self::Diff | Self::Rename => {
+                CtrlC::QuitProcess
+            }
             Self::Tree | Self::Files | Self::Layout => CtrlC::LeaveToNavigator,
         }
     }
@@ -520,7 +530,9 @@ trait Mode {
 // The six screens as `Mode` impls (see `modes.rs`). They are constructed by the
 // dispatch below and only referenced within this module tree.
 mod modes;
-use modes::{DataMode, DetailMode, FilesMode, LayoutMode, RenameMode2, StatsMode, TreeMode};
+use modes::{
+    DataMode, DetailMode, DiffMode, FilesMode, LayoutMode, RenameMode2, StatsMode, TreeMode,
+};
 
 /// A command the palette lists and runs, and the single action every tree
 /// shortcut dispatches through ([`Explorer::run_command`]). Keeping the command
@@ -530,6 +542,7 @@ use modes::{DataMode, DetailMode, FilesMode, LayoutMode, RenameMode2, StatsMode,
 enum Cmd {
     Search,
     Filter,
+    Diff,
     ExpandAll,
     CollapseAll,
     ViewFiles,
@@ -653,6 +666,7 @@ const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
     (Cmd::ExpandAll, "Tree", "Expand all groups", 'e'),
     (Cmd::CollapseAll, "Tree", "Collapse all groups", 'c'),
     (Cmd::ViewFiles, "View", "File browser", '\t'),
+    (Cmd::Diff, "View", "Compare with another checkpoint…", 'd'),
     (Cmd::Stats, "View", "Checkpoint stats", 's'),
     (Cmd::Health, "View", "Health report", 'h'),
     (Cmd::Legend, "View", "Legend", 'l'),
@@ -773,6 +787,44 @@ const STATS_COMMANDS: &[(StatsCmd, &str, &str, char)] = &[
     ),
     (StatsCmd::Quit, "App", "Quit", 'q'),
 ];
+
+/// A command the compare screen's palette lists and runs. No fold/report variants: the
+/// screen has one body, and the report is copied as screen text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiffCmd {
+    Legend,
+    CopyScreen,
+    CopyCommand,
+    Quit,
+}
+
+/// The compare screen's command registry, in palette order.
+const DIFF_COMMANDS: &[(DiffCmd, &str, &str, char)] = &[
+    (DiffCmd::Legend, "View", "Legend", 'l'),
+    (DiffCmd::CopyScreen, "Copy", "Screen text", 'c'),
+    (
+        DiffCmd::CopyCommand,
+        "Copy",
+        "Command to reopen this view",
+        'y',
+    ),
+    (DiffCmd::Quit, "App", "Quit", 'q'),
+];
+
+/// The compare screen's palette entries — every command applies, so this is the whole
+/// registry (kept as a function for symmetry with the screens that filter theirs).
+fn available_diff_commands() -> Vec<(DiffCmd, &'static str, &'static str, char)> {
+    DIFF_COMMANDS.to_vec()
+}
+
+/// The shortcut the palette synthesizes for a chosen [`DiffCmd`].
+fn diff_cmd_key(cmd: DiffCmd) -> KeyEvent {
+    let key = DIFF_COMMANDS
+        .iter()
+        .find(|(c, ..)| *c == cmd)
+        .map_or('\0', |(_, _, _, key)| *key);
+    KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
+}
 
 /// The rename editor's command registry (palette order). The `char` is a *sentinel*
 /// naming the real **Ctrl** trigger — Ctrl keys so every character stays typeable in
@@ -1309,6 +1361,7 @@ impl Explorer {
             HelpCtx::Layout => Vec::new(),
             HelpCtx::Tree
             | HelpCtx::Files
+            | HelpCtx::Diff
             | HelpCtx::Detail
             | HelpCtx::Data
             | HelpCtx::Rename
@@ -1535,6 +1588,7 @@ impl Explorer {
         let want_files = self.open.as_ref().is_some_and(|r| r.files_view);
         let want_layout = self.open.as_ref().and_then(|r| r.layout_file.clone());
         let want_rename = self.open.as_ref().is_some_and(|r| r.rename);
+        let want_diff = self.open.as_ref().and_then(|r| r.diff_against.clone());
         if let Some(n) = bins {
             self.data_view.histogram_bins.set(Some(n));
         }
@@ -1576,6 +1630,12 @@ impl Explorer {
                     }
                 );
             }
+            // The compare screen, like `--stats`, is opened *over* the tree rather than
+            // resolved to a `Screen` here, so its flag is appended rather than coming
+            // out of `reopen_command`.
+            if let Some(against) = &want_diff {
+                cmd = format!("{cmd} --diff-against {}", shell_quote(against));
+            }
             println!("{cmd}");
             return Ok(());
         }
@@ -1589,6 +1649,24 @@ impl Explorer {
                 self.file_state.rebuild_rows();
             }
             let text = crate::tui::headless_render(120, 40, |f| self.render_files_frame(f, false))?;
+            println!("{text}");
+            return Ok(());
+        }
+        // `--diff-against PATH`: the compare screen, rendered headlessly like the rest
+        // — so `--plain` really does cover every screen, and the snapshot tests can see
+        // this one.
+        if let Some(against) = &want_diff {
+            let metadata = self.metadata().to_vec();
+            let against = Path::new(against);
+            let report = crate::compare::structural_diff(self.tensors(), &metadata, against)?;
+            let (old_label, new_label) = (against.display().to_string(), self.root_label());
+            let verdict = crate::compare::verdict(&report);
+            let text = crate::tui::headless_render(120, 40, |f| {
+                UI::render_diff(f, &old_label, &new_label, &verdict, &report, 0, false);
+                if want_legend {
+                    UI::render_legend_band(f, Legend::Diff);
+                }
+            })?;
             println!("{text}");
             return Ok(());
         }
@@ -1771,6 +1849,16 @@ impl Explorer {
                 self.command_for_data(&t, *repr, *slice)
             }
             Screen::Rename { pairs } => self.command_for_rename(pairs),
+            // `--diff-against PATH` reopens the interactive compare screen. (The web's
+            // diff view additionally offers `diff OLD NEW`, the batch equivalent that can
+            // be extended with --values; see `crate::compare`.)
+            Screen::Diff { against, .. } => {
+                let mut parts = self.command_prefix();
+                parts.extend(self.checkpoint_path_parts());
+                parts.push("--diff-against".to_string());
+                parts.push(shell_quote(against));
+                parts.join(" ")
+            }
             Screen::Stats {
                 shards_expanded, ..
             } => {
@@ -2017,6 +2105,7 @@ impl Explorer {
         // `--rename` lands in the in-place rename editor, seeded with any
         // `--rename-rule 'SRC=>TGT'` pairs. Local safetensors only.
         let want_rename = self.open.as_ref().is_some_and(|r| r.rename);
+        let want_diff = self.open.as_ref().and_then(|r| r.diff_against.clone());
         let want_rename_rules = self
             .open
             .as_ref()
@@ -2079,6 +2168,13 @@ impl Explorer {
                 shards_expanded: want_stats_shards,
                 scroll: 0,
             });
+            cursor = history.len() - 1;
+        }
+        // `--diff-against PATH`: open straight into the compare screen (Esc / `⌫`
+        // drops back to the tree), which is what `y` there reproduces.
+        if let Some(against) = want_diff {
+            self.ensure_full_load()?;
+            history.push(Screen::Diff { against, scroll: 0 });
             cursor = history.len() - 1;
         }
         // `--files`: open the file browser on top of the tree, so `Tab`/Backspace
@@ -2147,7 +2243,8 @@ impl Explorer {
                 | Screen::Files
                 | Screen::Layout { .. }
                 | Screen::Rename { .. }
-                | Screen::Stats { .. } => None,
+                | Screen::Stats { .. }
+                | Screen::Diff { .. } => None,
             };
 
             let nav = match current {
@@ -2212,6 +2309,14 @@ impl Explorer {
                     // Record the fold state / scroll where the user left them, so
                     // back/forward (and the `--stats` reopen command) restore it.
                     let mut mode = StatsMode::new(shards_expanded, scroll);
+                    let nav = self.run_mode(&mut mode)?;
+                    if let Some(slot) = history.get_mut(cursor) {
+                        *slot = mode.residual();
+                    }
+                    nav
+                }
+                Screen::Diff { against, scroll } => {
+                    let mut mode = DiffMode::new(PathBuf::from(against), scroll);
                     let nav = self.run_mode(&mut mode)?;
                     if let Some(slot) = history.get_mut(cursor) {
                         *slot = mode.residual();
@@ -2869,6 +2974,7 @@ impl Explorer {
         match cmd {
             Cmd::Search => self.enter_search_mode(),
             Cmd::Filter => self.run_filter_prompt(term),
+            Cmd::Diff => return Self::run_diff_prompt(term).map(Nav::Open),
             Cmd::ExpandAll => self.tree_state.set_all_expanded(true),
             Cmd::CollapseAll => self.tree_state.set_all_expanded(false),
             Cmd::ViewFiles => {
@@ -2935,6 +3041,7 @@ impl Explorer {
                 Cmd::ViewFiles => self.file_view_available(),
                 Cmd::Search
                 | Cmd::Filter
+                | Cmd::Diff
                 | Cmd::ExpandAll
                 | Cmd::CollapseAll
                 | Cmd::Stats
@@ -4541,6 +4648,9 @@ impl Explorer {
                 // The tree renders itself; the file browser, layout map, rename
                 // editor and stats view are interactive-only (a `--files` / `--layout`
                 // / `--stats` with `--exit` falls back to the headless render).
+                Screen::Diff { against, scroll } => {
+                    self.run_mode_once(&mut DiffMode::new(PathBuf::from(against), *scroll))?;
+                }
                 Screen::Tree
                 | Screen::Files
                 | Screen::Layout { .. }
@@ -5442,6 +5552,29 @@ impl Explorer {
             crate::tensorfilter::TensorFilter::parse(&query).ok()
         };
         self.refresh_filter();
+    }
+
+    /// Prompt for a checkpoint to compare against, then open the compare screen. The
+    /// path is validated on Enter by actually reading it, so a typo is reported in the
+    /// prompt (where it can be corrected) rather than on a screen that has to explain
+    /// itself. `None` on Esc (cancel).
+    fn run_diff_prompt(term: &mut crate::tui::LiveTerminal) -> Option<Screen> {
+        let against = run_text_prompt(
+            term,
+            "Compare with checkpoint (file, directory, or glob)",
+            String::new(),
+            |_| {},
+            |input| {
+                if input.trim().is_empty() {
+                    return Submit::Reject("give a path to compare with".to_string());
+                }
+                match crate::compare::summarize(Path::new(input.trim())) {
+                    Ok(_) => Submit::Accept(input.trim().to_string()),
+                    Err(e) => Submit::Reject(format!("{e:#}")),
+                }
+            },
+        )?;
+        Some(Screen::Diff { against, scroll: 0 })
     }
 
     /// Prompt for a rich filter query, pre-filled with the active one, validating

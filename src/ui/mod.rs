@@ -35,6 +35,7 @@ mod badge;
 mod check;
 mod data;
 mod detail;
+mod diff;
 mod files;
 mod hints;
 mod json;
