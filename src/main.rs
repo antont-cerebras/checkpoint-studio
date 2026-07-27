@@ -32,6 +32,9 @@ mod cli_config;
 /// screen and the web's `/api/diff` — see the module docs for which side is which.
 mod compare;
 mod explorer;
+/// Data sources behind one trait — a new kind is an impl plus an arm in
+/// [`source::resolve`], not another branch in the loader.
+mod source;
 mod tui;
 mod ui;
 mod web;

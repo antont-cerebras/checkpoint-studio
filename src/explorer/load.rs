@@ -274,10 +274,10 @@ impl Explorer {
             Self::gather_checkpoint_with(&files, remote.as_ref(), &worker_progress)
         });
 
-        let label = self
-            .files
-            .first()
-            .map(|p| p.display().to_string())
+        // The source names itself — a Hub repo as `hf://owner/name`, a local checkpoint by
+        // its path — instead of the loading screen guessing from the first path.
+        let label = crate::source::resolve(&self.files, self.remote_read())
+            .map(|s| s.describe())
             .unwrap_or_default();
         let total = self.files.len();
         let started = std::time::Instant::now();
@@ -686,82 +686,9 @@ impl Explorer {
         remote: Option<&crate::remote::RemoteRead>,
         progress: &crate::hf::ReadProgress,
     ) -> Result<(CheckpointParts, Option<crate::model::Checkpoint>)> {
-        // `--ssh-proxy`: every source is read on the remote (an s3:// cstorch
-        // checkpoint, or a remote safetensors directory/file), keeping the
-        // credentials and data there. (The central model is filled by the remote
-        // reader in a later step; the remote path returns the parts tuple only.)
-        if let Some(r) = remote {
-            let mut tensors: Vec<TensorInfo> = Vec::new();
-            let mut metadata: Vec<MetadataInfo> = Vec::new();
-            let mut config: Option<crate::config::ModelConfig> = None;
-            let mut disk_shards: Vec<crate::stats::ShardDisk> = Vec::new();
-            let mut remote_health: Vec<crate::health::HealthReport> = Vec::new();
-            for file_path in files {
-                let as_str = file_path.to_string_lossy();
-                let (t, m, cfg, disk, health) = r.fetch_with_config(&as_str)?;
-                tensors.extend(t);
-                metadata.extend(m);
-                config = config.or(cfg);
-                if let Some(d) = disk {
-                    disk_shards.extend(d.shards);
-                }
-                remote_health.extend(health);
-            }
-            let parts = (
-                tensors,
-                metadata,
-                config,
-                crate::stats::DiskUsage::from_shards(disk_shards),
-                remote_health,
-            );
-            return Ok((parts, None));
-        }
-        // Local: a bare s3:// URI has no local credentials to read.
-        for file_path in files {
-            let as_str = file_path.to_string_lossy();
-            if crate::s3::is_uri(&as_str) {
-                // Same reason as the CLI's refusal, from `capability::Location::proxy_note`.
-                anyhow::bail!(
-                    "{as_str}: {}",
-                    crate::capability::Location::S3
-                        .proxy_note()
-                        .unwrap_or("cannot be read from here")
-                );
-            }
-        }
-        // A Hugging Face repo: read its structure over HTTPS (the listing, then each
-        // shard's safetensors header via a Range request) — no weights fetched. Handled
-        // here, at the one dispatch point, so every derived view works unchanged.
-        if let Some(first) = files.first()
-            && crate::hf::is_uri(&first.to_string_lossy())
-        {
-            if files.len() > 1 {
-                anyhow::bail!(
-                    "one Hugging Face repo at a time (got {} paths)",
-                    files.len()
-                );
-            }
-            let repo = crate::hf::parse(&first.to_string_lossy())?;
-            let cp = crate::hf::read_checkpoint(&repo, progress)?;
-            let parts = (
-                cp.tensors_vec(),
-                cp.metadata_vec(),
-                cp.config.clone(),
-                None,
-                Vec::new(),
-            );
-            return Ok((parts, Some(cp)));
-        }
-        // Read the whole local checkpoint into the central model in one pass (fs
-        // walk + every header + config + index); the tuple is derived from it.
-        let cp = crate::readers::read_local(files)?;
-        let parts = (
-            cp.tensors_vec(),
-            cp.metadata_vec(),
-            cp.config.clone(),
-            None,
-            Vec::new(),
-        );
-        Ok((parts, Some(cp)))
+        // One line, because the choice of source and the reading of it live behind the
+        // `crate::source::Source` trait — see that module for why the chain of `if`s that
+        // used to be here was the thing making a new data source expensive.
+        crate::source::resolve(files, remote)?.read(progress)
     }
 }

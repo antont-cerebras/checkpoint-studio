@@ -98,7 +98,7 @@ const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 /// `config.json`, the shards' on-disk footprint, and any remote health reports
 /// (index/file mismatch — empty for a local read, whose health is gathered up
 /// front instead).
-type CheckpointParts = (
+pub(crate) type CheckpointParts = (
     Vec<TensorInfo>,
     Vec<MetadataInfo>,
     Option<crate::config::ModelConfig>,
@@ -1491,14 +1491,11 @@ impl Explorer {
     /// terminal and the browser give the same explanation, and each *source* gives its own
     /// (telling someone to copy a Hugging Face repo "down" is not advice).
     fn data_view_note(&self) -> &'static str {
-        let location = self
-            .session
-            .as_ref()
-            .and_then(crate::kernel::Session::model)
-            .map_or(
-                crate::capability::Location::Local,
-                crate::model::Checkpoint::location,
-            );
+        // Ask the SOURCE, not the loaded model: this has to answer before a read finishes
+        // (the notice is what a keypress gets when data views are unavailable), and a source
+        // knows where it lives without one.
+        let location = crate::source::resolve(&self.files, self.remote_read())
+            .map_or(crate::capability::Location::Local, |s| s.location());
         crate::capability::Capabilities::data_view_note(location)
             .unwrap_or("This checkpoint's tensor data is not reachable from here.")
     }
