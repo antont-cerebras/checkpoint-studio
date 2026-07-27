@@ -35,6 +35,7 @@ const _: () = assert!(
      converted to usize"
 );
 
+pub mod capability;
 pub mod check;
 pub mod codec;
 pub mod compact;

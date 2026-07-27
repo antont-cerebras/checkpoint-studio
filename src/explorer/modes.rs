@@ -1764,12 +1764,10 @@ impl Mode for DetailMode {
                 KeyCode::Char('m' | 'v' | 'h' | 's' | 'S' | 'b' | 'B')
             )
         {
-            ex.show_overlay(Overlay::Notice(
-                "Read remotely with --ssh-proxy: only the structure is here. Data views \
-                 (heatmap, values, histogram, statistics) need the file locally — copy the \
-                 checkpoint down to preview its values."
-                    .to_string(),
-            ));
+            // The shared explanation, so the terminal and the browser cannot word this
+            // differently — and so a Hugging Face source gets *its* reason, not advice to
+            // copy an ssh-proxied directory down.
+            ex.show_overlay(Overlay::Notice(ex.data_view_note().to_string()));
             return Ok(Outcome::Stay);
         }
         match key.code {

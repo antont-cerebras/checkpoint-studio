@@ -1,0 +1,284 @@
+//! What a checkpoint source **can do** — the two axes it depends on, and the capabilities
+//! derived from them.
+//!
+//! A source is a pair: the **format** (safetensors, HDF5, GGUF, `NumPy`) and the **location**
+//! (a local filesystem, an SFTP host, an S3 prefix behind a proxy, a Hugging Face repo).
+//! Almost every feature's availability is a function of that pair, not of either half:
+//! renaming needs safetensors *and* local; the byte-layout map needs safetensors over any
+//! transport that can read a header; per-object metadata is S3 and only S3.
+//!
+//! Before this, each feature asked its own ad-hoc question — `require_local`,
+//! `file_view_available`, `remote_read().is_some()`, `can_rename`, `repack_input`,
+//! `open_reader` erroring on a remote path — and adding the Hugging Face location meant
+//! finding all of them. Now a feature asks the capability, and a new location answers every
+//! question at once by filling in one row.
+//!
+//! **Capabilities are facts about the source, not policy.** `read_bytes` says whether the
+//! bytes are *reachable*, not whether we currently bother: HTTP `Range` on the Hub and SFTP
+//! reads could both serve tensor data, and modelling that as a capability rather than as
+//! "is it local" is what will let those turn on without another sweep of conditionals.
+//! Where a capability is reachable-but-unimplemented, [`Capabilities::data_view_note`] says
+//! so, so a
+//! UI can explain the difference instead of implying the data doesn't exist.
+
+use crate::model::{Checkpoint, Source};
+
+/// The on-disk (or on-the-wire) format of a checkpoint's shards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Format {
+    /// `.safetensors` — a JSON header with per-tensor byte ranges.
+    Safetensors,
+    /// HDF5 (`.h5` / `.hdf5`) — chunked, optionally compressed datasets.
+    Hdf5,
+    /// GGUF — llama.cpp's single-file format.
+    Gguf,
+    /// `NumPy` `.npy` / `.npz`.
+    Numpy,
+    /// More than one format in the same checkpoint, or none recognised. Capabilities take
+    /// the pessimistic reading, since a feature that works for one shard and not another
+    /// is worse than one that is simply unavailable.
+    Mixed,
+}
+
+impl Format {
+    /// Classify by file extension, the way the readers dispatch.
+    #[must_use]
+    pub fn of_path(path: &str) -> Option<Self> {
+        let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
+        match ext.as_str() {
+            "safetensors" => Some(Self::Safetensors),
+            "h5" | "hdf5" => Some(Self::Hdf5),
+            "gguf" => Some(Self::Gguf),
+            "npy" | "npz" => Some(Self::Numpy),
+            _ => None,
+        }
+    }
+
+    /// The one format every path in `paths` has, or [`Self::Mixed`].
+    #[must_use]
+    pub fn of_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut seen: Option<Self> = None;
+        for p in paths {
+            match (Self::of_path(p), seen) {
+                (Some(f), None) => seen = Some(f),
+                (Some(f), Some(prev)) if f == prev => {}
+                // Two formats, or an unrecognised one alongside a known one.
+                (_, _) => return Self::Mixed,
+            }
+        }
+        seen.unwrap_or(Self::Mixed)
+    }
+
+    /// Whether this format carries per-tensor byte ranges, which the layout map needs.
+    #[must_use]
+    pub const fn has_byte_ranges(self) -> bool {
+        matches!(self, Self::Safetensors)
+    }
+}
+
+/// Where a checkpoint's bytes live — the transport half of the pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Location {
+    Local,
+    /// A directory on an SSH host, read over SFTP.
+    Sftp,
+    /// An `s3://` prefix, read by a script on the proxy host.
+    S3,
+    /// A Hugging Face Hub repository, read over HTTPS.
+    Hf,
+}
+
+impl Location {
+    #[must_use]
+    pub const fn of(source: &Source) -> Self {
+        match source {
+            Source::Local => Self::Local,
+            Source::Sftp { .. } => Self::Sftp,
+            Source::S3 { .. } => Self::S3,
+            Source::Hf { .. } => Self::Hf,
+        }
+    }
+
+    /// Whether the bytes are on this machine. Not the same question as "can we read tensor
+    /// data" — see [`Capabilities::read_bytes`].
+    #[must_use]
+    pub const fn is_local(self) -> bool {
+        matches!(self, Self::Local)
+    }
+}
+
+/// What a given (format, location) pair supports. Serializable, so a server can hand the
+/// set to a browser rather than have the client re-derive it from the source's shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Capabilities {
+    /// Read tensor **bytes** — what the heatmap, value grid, histogram and whole-tensor
+    /// statistics need. Currently local-only; see the module note on why that is a
+    /// capability rather than a synonym for `is_local`.
+    pub read_bytes: bool,
+    /// Rewrite the checkpoint **in place** (the tensor-rename editor).
+    pub modify_in_place: bool,
+    /// Repack into a **new** file with a different codec (HDF5). Distinct from
+    /// `modify_in_place`: it writes a copy and never touches the input.
+    pub repack: bool,
+    /// Show the byte-layout map — needs per-tensor byte ranges in the format, and a
+    /// readable header, which every location provides.
+    pub layout_map: bool,
+    /// Browse the checkpoint's file tree — needs a listing, which every location has
+    /// except a single local file (nothing to list).
+    pub browse_files: bool,
+    /// Per-object storage metadata (`ETag`, checksums, storage class) — S3 only.
+    pub object_metadata: bool,
+    /// Per-dataset compression codec and stored-vs-logical size — HDF5 only.
+    pub codec_info: bool,
+}
+
+impl Capabilities {
+    /// Derive the set from the pair. `multi_file` distinguishes a single local file (which
+    /// has no file tree worth browsing) from a directory of shards.
+    #[must_use]
+    pub const fn of(format: Format, location: Location, multi_file: bool) -> Self {
+        let local = location.is_local();
+        Self {
+            // Only the local readers open tensor data today. The Hub could serve it by
+            // `Range` and SFTP by a remote read; when they do, this row changes and every
+            // caller follows, because they ask this and not "is it local".
+            read_bytes: local,
+            // Rewriting a header in place is a safetensors operation, and only where we
+            // hold the file.
+            modify_in_place: local && matches!(format, Format::Safetensors),
+            repack: local && matches!(format, Format::Hdf5),
+            layout_map: format.has_byte_ranges(),
+            browse_files: !local || multi_file,
+            object_metadata: matches!(location, Location::S3),
+            codec_info: matches!(format, Format::Hdf5),
+        }
+    }
+
+    /// Why a data view is unavailable, phrased for a user, or `None` when it is available.
+    ///
+    /// One sentence in one place: the terminal floats it as a notice and the browser shows
+    /// it in the data pane, and they used to word it separately.
+    #[must_use]
+    pub fn data_view_note(location: Location) -> Option<&'static str> {
+        match location {
+            Location::Local => None,
+            Location::Sftp | Location::S3 => Some(
+                "Read remotely with --ssh-proxy: only the structure is here. Data views \
+                 (heatmap, values, histogram, statistics) need the file locally — copy the \
+                 checkpoint down to preview its values.",
+            ),
+            Location::Hf => Some(
+                "Read from the Hugging Face Hub: only the structure is here — the shard \
+                 headers, not the weights. Data views (heatmap, values, histogram, \
+                 statistics) need the tensor bytes; download the repo to preview its values.",
+            ),
+        }
+    }
+}
+
+impl Checkpoint {
+    /// The format of this checkpoint's shards.
+    #[must_use]
+    pub fn format(&self) -> Format {
+        Format::of_paths(self.shards.iter().map(|s| s.path.as_str()))
+    }
+
+    /// Where this checkpoint lives.
+    #[must_use]
+    pub const fn location(&self) -> Location {
+        Location::of(&self.source)
+    }
+
+    /// What this checkpoint supports — the one question a feature should ask.
+    #[must_use]
+    pub fn capabilities(&self) -> Capabilities {
+        Capabilities::of(self.format(), self.location(), self.shards.len() > 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_format_comes_from_the_extension_and_disagreement_is_mixed() {
+        assert_eq!(
+            Format::of_path("a/model.safetensors"),
+            Some(Format::Safetensors)
+        );
+        assert_eq!(
+            Format::of_path("m.HDF5"),
+            Some(Format::Hdf5),
+            "case-insensitive"
+        );
+        assert_eq!(Format::of_path("m.gguf"), Some(Format::Gguf));
+        assert_eq!(Format::of_path("m.npz"), Some(Format::Numpy));
+        assert_eq!(Format::of_path("README"), None, "no extension");
+
+        assert_eq!(
+            Format::of_paths(["a.safetensors", "b.safetensors"]),
+            Format::Safetensors
+        );
+        // A checkpoint whose shards disagree takes the pessimistic reading: a feature that
+        // works for one shard and not another is worse than one that is plainly absent.
+        assert_eq!(Format::of_paths(["a.safetensors", "b.gguf"]), Format::Mixed);
+        let none: [&str; 0] = [];
+        assert_eq!(Format::of_paths(none), Format::Mixed, "nothing known");
+    }
+
+    /// The table this type exists to make explicit. Each row is a claim about the *pair*,
+    /// which is the point — none of these follow from the format or the location alone.
+    #[test]
+    fn capabilities_depend_on_both_axes() {
+        let st_local = Capabilities::of(Format::Safetensors, Location::Local, true);
+        let st_hf = Capabilities::of(Format::Safetensors, Location::Hf, true);
+        let h5_local = Capabilities::of(Format::Hdf5, Location::Local, false);
+        let st_s3 = Capabilities::of(Format::Safetensors, Location::S3, true);
+
+        // Renaming in place needs safetensors AND local — neither half suffices.
+        assert!(st_local.modify_in_place);
+        assert!(!st_hf.modify_in_place, "local safetensors only");
+        assert!(!h5_local.modify_in_place, "hdf5 is repacked, not rewritten");
+        assert!(h5_local.repack && !st_local.repack);
+
+        // The layout map follows the FORMAT over any transport — this is the row that a
+        // "remote means no" rule got wrong, and it is why the Hub can show a layout map.
+        assert!(st_local.layout_map && st_hf.layout_map && st_s3.layout_map);
+        assert!(!h5_local.layout_map, "hdf5 has chunks, not byte ranges");
+
+        // Bytes are local-only today, everywhere else structure-only.
+        assert!(st_local.read_bytes);
+        assert!(!st_hf.read_bytes && !st_s3.read_bytes);
+
+        // Location-specific extras.
+        assert!(st_s3.object_metadata && !st_hf.object_metadata);
+        assert!(h5_local.codec_info && !st_local.codec_info);
+    }
+
+    /// A single local file has no file tree worth browsing; everything else does.
+    #[test]
+    fn browsing_needs_something_to_list() {
+        assert!(
+            !Capabilities::of(Format::Safetensors, Location::Local, false).browse_files,
+            "one local file is not a directory"
+        );
+        assert!(Capabilities::of(Format::Safetensors, Location::Local, true).browse_files);
+        // A remote source always has a listing (the SFTP dir, the S3 keys, the Hub tree).
+        assert!(Capabilities::of(Format::Safetensors, Location::Hf, false).browse_files);
+    }
+
+    /// The unavailability message names the actual reason, and each remote kind explains
+    /// itself — "copy it down" is wrong advice for a Hub repo.
+    #[test]
+    fn the_data_view_note_explains_the_specific_location() {
+        assert_eq!(Capabilities::data_view_note(Location::Local), None);
+        let hf = Capabilities::data_view_note(Location::Hf).expect("a note");
+        assert!(hf.contains("Hugging Face"), "{hf}");
+        assert!(hf.contains("download"), "and what to do about it: {hf}");
+        let sftp = Capabilities::data_view_note(Location::Sftp).expect("a note");
+        assert!(sftp.contains("--ssh-proxy"), "{sftp}");
+        assert_ne!(hf, sftp, "the two reasons are not the same reason");
+    }
+}

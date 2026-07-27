@@ -1487,6 +1487,22 @@ impl Explorer {
         self.flatten_tree();
     }
 
+    /// Why a data view is unavailable here, from the shared capability table — so the
+    /// terminal and the browser give the same explanation, and each *source* gives its own
+    /// (telling someone to copy a Hugging Face repo "down" is not advice).
+    fn data_view_note(&self) -> &'static str {
+        let location = self
+            .session
+            .as_ref()
+            .and_then(crate::kernel::Session::model)
+            .map_or(
+                crate::capability::Location::Local,
+                crate::model::Checkpoint::location,
+            );
+        crate::capability::Capabilities::data_view_note(location)
+            .unwrap_or("This checkpoint's tensor data is not reachable from here.")
+    }
+
     /// A concise name for the checkpoint root — the shared rule, so the web UI's
     /// tree header cannot say something else (see [`crate::model::root_label`]).
     fn root_label(&self) -> String {

@@ -42,15 +42,20 @@ pub(crate) fn err(status: u16, msg: impl Into<String>) -> Reply {
 /// Data-value views need the tensor bytes locally; a remote (`--ssh-proxy`) source
 /// only carries its structure. Returns a friendly 400 for a remote tensor (so the
 /// UI shows a clear note instead of a cryptic open-file failure), else `None`.
-fn require_local(t: &TensorInfo) -> Option<Reply> {
-    crate::remote::is_remote_source(&t.source_path).then(|| {
-        err(
-            400,
-            "This checkpoint was read remotely (--ssh-proxy): only its structure is available. \
-             Data views (heatmap, values, histogram, statistics) need the file locally — copy \
-             the checkpoint down to preview its values.",
-        )
-    })
+/// Reject a data request when the source can't give us tensor bytes, with the reason that
+/// source has. Asks the **capability**, not "is the path remote": a Hugging Face repo and an
+/// ssh-proxied directory both lack byte access but for different reasons, and the note that
+/// explains it lives with the capability so the terminal says the same thing.
+fn require_bytes(s: &WebState) -> Option<Reply> {
+    let caps = s.checkpoint.capabilities();
+    if caps.read_bytes {
+        return None;
+    }
+    Some(err(
+        400,
+        crate::capability::Capabilities::data_view_note(s.checkpoint.location())
+            .unwrap_or("This checkpoint's tensor data is not reachable from here."),
+    ))
 }
 
 // ---- metadata / derived-view routes (served from precomputed state) ----
@@ -59,6 +64,11 @@ pub(crate) fn tree(s: &WebState) -> Reply {
     ok(json!({
         "root": s.root,
         "tensor_count": s.tensors.len(),
+        // What this source can do, so the client asks a capability instead of guessing from
+        // the source's shape (see `crate::capability`).
+        "capabilities": s.checkpoint.capabilities(),
+        "format": s.checkpoint.format(),
+        "location": s.checkpoint.location(),
         // `null` unless the server is reachable off this machine — the client shows it as
         // a banner. Carried on the tree because that is the first thing the UI fetches.
         "access_warning": s.access_warning,
@@ -388,7 +398,7 @@ fn scan_stats(s: &WebState, t: &TensorInfo, view: ViewDtype) -> Result<StatsDto,
 /// changing any of them meant changing it in three places.
 fn data_request<'a>(s: &'a WebState, q: &Query) -> Result<(&'a TensorInfo, ViewDtype), Reply> {
     let t = lookup(s, q)?;
-    if let Some(e) = require_local(t) {
+    if let Some(e) = require_bytes(s) {
         return Err(e);
     }
     Ok((t, view_of(q)?))

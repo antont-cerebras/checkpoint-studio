@@ -20,9 +20,9 @@ const _: () = assert!(
 // them at the crate root so the (still bin-side) `explorer`/`ui` keep resolving
 // their `crate::tree::…` / `crate::stats::…` paths unchanged during the refactor.
 pub use checkpoint_studio_core::{
-    check, codec, compact, config, diff, filetree, filter, gguf, health, hf, kernel, model, npy,
-    progress, readers, remote, rename, repack, s3, safelayout, sample, sftp, stats, stheader,
-    tensorfilter, tree, utils, viewstate,
+    capability, check, codec, compact, config, diff, filetree, filter, gguf, health, hf, kernel,
+    model, npy, progress, readers, remote, rename, repack, s3, safelayout, sample, sftp, stats,
+    stheader, tensorfilter, tree, utils, viewstate,
 };
 #[cfg(feature = "hdf5")]
 pub use checkpoint_studio_core::{convert, hdf5, hdf5_lz4, hdf5_zstd};
