@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { tree, treeError, ensureTree } from './stores/server';
+  import { warningDismissed } from './stores/warning';
   import {
     screen,
     searching,
@@ -341,8 +342,16 @@
        loopback, say so on the page as well as in the terminal it was started from — the
        person looking at the browser is not necessarily the person who read the banner.
        One narrow strip, not dismissible: the condition lasts as long as the server does. -->
-  {#if $tree?.access_warning}
-    <div class="access-warning" role="alert">{$tree.access_warning}</div>
+  {#if $tree?.access_warning && !$warningDismissed}
+    <div class="access-warning" role="alert">
+      <span>{$tree.access_warning}</span>
+      <button
+        class="dismiss"
+        title="Hide this (reachable again from the command palette)"
+        aria-label="Hide the access-control warning"
+        on:click={() => warningDismissed.set(true)}>×</button
+      >
+    </div>
   {/if}
   <header>
     <button class="nav" on:click={back} title="Back (Backspace)" aria-label="Back">‹</button>
@@ -479,6 +488,9 @@
   /* Light red on a tinted strip: a standing caution, not an error — it must not read as
      something that broke. Narrow enough not to cost content height. */
   .access-warning {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
     flex: none;
     padding: 3px 12px;
     font-size: 11.5px;
@@ -486,6 +498,23 @@
     color: #ffb4b4;
     background: #4a1f1f;
     border-bottom: 1px solid #6b2b2b;
+  }
+  .access-warning span {
+    flex: 1;
+  }
+  .dismiss {
+    flex: none;
+    padding: 0 4px;
+    font: inherit;
+    line-height: 1;
+    color: inherit;
+    background: none;
+    border: 0;
+    cursor: pointer;
+    opacity: 0.8;
+  }
+  .dismiss:hover {
+    opacity: 1;
   }
   .app {
     display: flex;

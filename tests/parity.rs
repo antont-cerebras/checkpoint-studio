@@ -26,11 +26,12 @@
 
 use std::path::PathBuf;
 
-use checkpoint_studio_core::kernel::Session;
+use checkpoint_studio_core::kernel::{Session, sort_rows};
 use checkpoint_studio_core::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode,
 };
 use checkpoint_studio_core::utils::{format_parameters, format_percent, format_size};
+use checkpoint_studio_core::viewstate::{SortDir, SortKey};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use serde_json::{Value, json};
@@ -200,6 +201,72 @@ fn row_projection(node: &TreeNode, depth: usize) -> Value {
     json!([depth, kind, node.name(), has_children])
 }
 
+/// Tensors for the sort contract, deliberately in an order no facet already agrees with,
+/// and chosen so each key produces a *different* winner — otherwise the fixture would pass
+/// for a sort that silently ignored its key. `layers.2` / `layers.10` are here for the
+/// numeric-collation rule the two languages implement differently by default.
+fn sort_sample() -> Vec<TreeNode> {
+    let t = |name: &str, dtype: &str, shape: &[usize]| {
+        let n: usize = shape.iter().product();
+        TreeNode::Tensor {
+            info: TensorInfo {
+                name: name.to_string(),
+                dtype: dtype.to_string(),
+                shape: shape.to_vec(),
+                size_bytes: n * 4,
+                num_elements: n,
+                storage: Storage::Unknown,
+                source_path: "model.safetensors".to_string(),
+                layout: Layout::None,
+            },
+            label: None,
+        }
+    };
+    vec![
+        t("model.layers.10.mlp.w", "F32", &[4, 4]),
+        t("model.layers.2.mlp.w", "BF16", &[64]),
+        t("a.big.tensor", "I32", &[8, 8, 8]),
+        t("z.small.tensor", "U8", &[2]),
+    ]
+}
+
+/// The sort contract: the sample tensors, and the order each `(key, direction)` puts them
+/// in. Built outside `json!` because a method chain can't live inside the macro.
+fn sort_section() -> Value {
+    let tensors: Vec<Value> = sort_sample()
+        .iter()
+        .map(|n| match n {
+            TreeNode::Tensor { info, .. } => json!({
+                "name": info.name,
+                "dtype": info.dtype,
+                "shape": info.shape,
+                "size_bytes": info.size_bytes,
+                "num_elements": info.num_elements,
+            }),
+            TreeNode::Group { .. } | TreeNode::Metadata { .. } => Value::Null,
+        })
+        .collect();
+
+    let keys = [
+        ("name", SortKey::Name),
+        ("size", SortKey::Size),
+        ("params", SortKey::Params),
+        ("dtype", SortKey::Dtype),
+        ("rank", SortKey::Rank),
+    ];
+    let mut orders: Vec<Value> = Vec::new();
+    for (label, key) in keys {
+        for (dir, dlabel) in [(SortDir::Asc, "asc"), (SortDir::Desc, "desc")] {
+            let mut rows: Vec<(TreeNode, usize)> =
+                sort_sample().into_iter().map(|n| (n, 0)).collect();
+            sort_rows(&mut rows, key, dir);
+            let names: Vec<&str> = rows.iter().map(|(n, _)| n.name()).collect();
+            orders.push(json!([format!("{label}.{dlabel}"), names]));
+        }
+    }
+    json!({ "tensors": tensors, "orders": orders })
+}
+
 fn build() -> Value {
     let matcher = SkimMatcherV2::default();
     json!({
@@ -227,6 +294,7 @@ fn build() -> Value {
                 .map(|(node, depth)| row_projection(node, *depth))
                 .collect::<Vec<_>>(),
         },
+        "sort": sort_section(),
         "search": {
             "names": NAMES,
             // Which names each query matches. Only the SET is a contract: the two

@@ -30,8 +30,12 @@ export function sortRows(rows: Row[], key: Exclude<SortKey, 'none'>, dir: 'asc' 
         return ia.dtype.localeCompare(ib.dtype);
     }
   };
-  const sorted = [...rows].sort(cmp);
-  return dir === 'asc' ? sorted : sorted.reverse();
+  // Negate the comparator for descending rather than reversing the sorted array:
+  // `Array.sort` is stable, and reversing afterwards flips the order of *equal* rows too,
+  // so two same-rank tensors came out in the opposite order from the Rust side (which
+  // negates). Caught by the sort case in `shared/parity/format.json`.
+  const sign = dir === 'asc' ? 1 : -1;
+  return [...rows].sort((a, b) => sign * cmp(a, b));
 }
 
 /** Flat list of the tensor rows whose names the server said pass the filter. */

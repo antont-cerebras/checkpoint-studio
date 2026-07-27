@@ -391,6 +391,141 @@
       ]
     ]
   },
+  "sort": {
+    "tensors": [
+      {
+        "name": "model.layers.10.mlp.w",
+        "dtype": "F32",
+        "shape": [
+          4,
+          4
+        ],
+        "size_bytes": 64,
+        "num_elements": 16
+      },
+      {
+        "name": "model.layers.2.mlp.w",
+        "dtype": "BF16",
+        "shape": [
+          64
+        ],
+        "size_bytes": 256,
+        "num_elements": 64
+      },
+      {
+        "name": "a.big.tensor",
+        "dtype": "I32",
+        "shape": [
+          8,
+          8,
+          8
+        ],
+        "size_bytes": 2048,
+        "num_elements": 512
+      },
+      {
+        "name": "z.small.tensor",
+        "dtype": "U8",
+        "shape": [
+          2
+        ],
+        "size_bytes": 8,
+        "num_elements": 2
+      }
+    ],
+    "orders": [
+      [
+        "name.asc",
+        [
+          "a.big.tensor",
+          "model.layers.2.mlp.w",
+          "model.layers.10.mlp.w",
+          "z.small.tensor"
+        ]
+      ],
+      [
+        "name.desc",
+        [
+          "z.small.tensor",
+          "model.layers.10.mlp.w",
+          "model.layers.2.mlp.w",
+          "a.big.tensor"
+        ]
+      ],
+      [
+        "size.asc",
+        [
+          "z.small.tensor",
+          "model.layers.10.mlp.w",
+          "model.layers.2.mlp.w",
+          "a.big.tensor"
+        ]
+      ],
+      [
+        "size.desc",
+        [
+          "a.big.tensor",
+          "model.layers.2.mlp.w",
+          "model.layers.10.mlp.w",
+          "z.small.tensor"
+        ]
+      ],
+      [
+        "params.asc",
+        [
+          "z.small.tensor",
+          "model.layers.10.mlp.w",
+          "model.layers.2.mlp.w",
+          "a.big.tensor"
+        ]
+      ],
+      [
+        "params.desc",
+        [
+          "a.big.tensor",
+          "model.layers.2.mlp.w",
+          "model.layers.10.mlp.w",
+          "z.small.tensor"
+        ]
+      ],
+      [
+        "dtype.asc",
+        [
+          "model.layers.2.mlp.w",
+          "model.layers.10.mlp.w",
+          "a.big.tensor",
+          "z.small.tensor"
+        ]
+      ],
+      [
+        "dtype.desc",
+        [
+          "z.small.tensor",
+          "a.big.tensor",
+          "model.layers.10.mlp.w",
+          "model.layers.2.mlp.w"
+        ]
+      ],
+      [
+        "rank.asc",
+        [
+          "model.layers.2.mlp.w",
+          "z.small.tensor",
+          "model.layers.10.mlp.w",
+          "a.big.tensor"
+        ]
+      ],
+      [
+        "rank.desc",
+        [
+          "a.big.tensor",
+          "model.layers.10.mlp.w",
+          "model.layers.2.mlp.w",
+          "z.small.tensor"
+        ]
+      ]
+    ]
+  },
   "search": {
     "names": [
       "model.embed_tokens.weight",

@@ -15,7 +15,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { expandedIds, flatten } from './flatten';
+import { expandedIds, flatten, nodeId, type Row } from './flatten';
+import { sortRows } from './rows';
 import { humanCount, humanSize, percent } from './format';
 import { searchTree } from './search';
 import type { TreeNode } from './types';
@@ -23,11 +24,23 @@ import type { TreeNode } from './types';
 /** `[depth, kind, name, hasChildren]` — one tree row, as both flatteners see it. */
 type RowProjection = [number, string, string, boolean];
 
+/** A sort case: `key.dir` and the order it must produce. */
+type SortCase = [string, string[]];
+
+interface SortFixtureTensor {
+  name: string;
+  dtype: string;
+  shape: number[];
+  size_bytes: number;
+  num_elements: number;
+}
+
 interface Fixture {
   size: [number, string][];
   count: [number, string][];
   percent: [number, number, string][];
   tree: { nodes: TreeNode[]; rows: RowProjection[] };
+  sort: { tensors: SortFixtureTensor[]; orders: SortCase[] };
   search: { names: string[]; matches: [string, string[]][] };
 }
 
@@ -131,5 +144,34 @@ describe('the tree flattens to the same rows as the Rust flattener', () => {
     expect(ids.size, 'the fixture should have an expanded group to find').toBeGreaterThan(0);
     const deepest = Math.max(...flatten(nodes, ids).map((r) => r.depth));
     expect(deepest, 'a group the server sent expanded must contribute deeper rows').toBeGreaterThan(0);
+  });
+});
+
+describe('the flat list sorts the same way the Rust side sorts', () => {
+  // `sortRows` and `kernel::sort_rows` are two implementations of one rule. The cases
+  // are chosen so each key produces a different winner — a sort that ignored its key
+  // would pass a fixture where every order happened to coincide.
+  const rows = (): Row[] =>
+    fixture.sort.tensors.map((info) => {
+      const node = { kind: 'tensor', info, label: null } as unknown as TreeNode;
+      return { id: nodeId(node, ''), node, depth: 0, hasChildren: false };
+    });
+
+  it.each(fixture.sort.orders)('%s', (label, expected) => {
+    const [key, dir] = label.split('.') as [Parameters<typeof sortRows>[1], 'asc' | 'desc'];
+    const got = sortRows(rows(), key, dir).map((r) =>
+      r.node.kind === 'tensor' ? r.node.info.name : '',
+    );
+    expect(got, HINT).toEqual(expected);
+  });
+
+  it('leaves the natural order alone for the sortless case', () => {
+    // `none` is not in the fixture because it is a no-op by definition; pin that it
+    // really is one, since a "sort by nothing" that reordered would be invisible above.
+    const before = rows().map((r) => (r.node.kind === 'tensor' ? r.node.info.name : ''));
+    const after = sortRows(rows(), 'name', 'asc').map((r) =>
+      r.node.kind === 'tensor' ? r.node.info.name : '',
+    );
+    expect(after).not.toEqual(before); // the sample is deliberately unsorted
   });
 });

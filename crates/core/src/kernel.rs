@@ -24,7 +24,7 @@ use crate::model::Checkpoint;
 use crate::sample::ViewDtype;
 use crate::stats::CheckpointStats;
 use crate::tree::{MetadataInfo, TensorInfo, TreeBuilder, TreeNode, natural_sort_key};
-use crate::viewstate::{DataLayout, NumBase, StripeMode};
+use crate::viewstate::{DataLayout, NumBase, SortDir, SortKey, StripeMode};
 
 /// Which screen the session is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -89,6 +89,51 @@ pub struct TreeState {
     /// full tensor list, so it can be edited/cleared live without a destructive
     /// prune.
     pub filter: Option<FilterState>,
+}
+
+/// Order a **flat** row list (a search or filter result) by one facet.
+///
+/// Rows carrying no tensor — a group header, a metadata entry — compare equal, and the
+/// sort is stable, so they keep their relative position instead of being herded to one
+/// end. The tree itself is never sorted: its order *is* the checkpoint's structure.
+///
+/// `SortKey::None` is a no-op, leaving the natural order (fuzzy score for a search, tree
+/// order for a filter).
+///
+/// Mirrored by the web client's `rows.ts: sortRows`, with `shared/parity/format.json`
+/// holding the two to the same answers — including the two details most likely to drift:
+/// names collate **numerically** (so `layers.2` precedes `layers.10`, not follows it), and
+/// dtype collates as plain text.
+pub fn sort_rows(rows: &mut [(TreeNode, usize)], key: SortKey, dir: SortDir) {
+    /// A row's tensor, or `None` for a group header / metadata row.
+    fn facet(node: &TreeNode) -> Option<&TensorInfo> {
+        match node {
+            TreeNode::Tensor { info, .. } => Some(info),
+            TreeNode::Group { .. } | TreeNode::Metadata { .. } => None,
+        }
+    }
+
+    if matches!(key, SortKey::None) {
+        return;
+    }
+    rows.sort_by(|(a, _), (b, _)| {
+        let (Some(x), Some(y)) = (facet(a), facet(b)) else {
+            return std::cmp::Ordering::Equal;
+        };
+        let ord = match key {
+            // Numeric collation, so `layers.2` sorts before `layers.10`.
+            SortKey::Name => natural_sort_key(&x.name).cmp(&natural_sort_key(&y.name)),
+            SortKey::Size => x.size_bytes.cmp(&y.size_bytes),
+            SortKey::Params => x.num_elements.cmp(&y.num_elements),
+            SortKey::Rank => x.shape.len().cmp(&y.shape.len()),
+            SortKey::Dtype => x.dtype.cmp(&y.dtype),
+            SortKey::None => std::cmp::Ordering::Equal,
+        };
+        match dir {
+            SortDir::Asc => ord,
+            SortDir::Desc => ord.reverse(),
+        }
+    });
 }
 
 /// The tree screen's persistent structured filter: the query text and the flat

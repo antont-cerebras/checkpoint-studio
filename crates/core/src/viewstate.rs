@@ -156,3 +156,111 @@ mod tests {
         assert_eq!(NumBase::Binary.label(), "bin");
     }
 }
+
+/// Which facet the flat tensor list (a search or filter result) is ordered by.
+///
+/// The **tree** is never reordered — its order is the checkpoint's own structure, and
+/// scrambling that would destroy the grouping. Sorting applies only to the flat lists,
+/// where "which are the biggest tensors" is a real question.
+///
+/// Mirrored in the web client (`rows.ts: sortRows`), and the two are held to the same
+/// answers by `shared/parity/format.json`.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
+pub enum SortKey {
+    /// The natural order: fuzzy-match score for a search, tree order for a filter.
+    #[default]
+    None,
+    Name,
+    Size,
+    Params,
+    Dtype,
+    Rank,
+}
+
+impl SortKey {
+    /// The next key in the cycle, ending back at `None` so the natural order is always
+    /// one more press away rather than needing a different key.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::None => Self::Name,
+            Self::Name => Self::Size,
+            Self::Size => Self::Params,
+            Self::Params => Self::Dtype,
+            Self::Dtype => Self::Rank,
+            Self::Rank => Self::None,
+        }
+    }
+
+    /// The CLI / URL spelling, and what `y` records.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Name => "name",
+            Self::Size => "size",
+            Self::Params => "params",
+            Self::Dtype => "dtype",
+            Self::Rank => "rank",
+        }
+    }
+}
+
+/// Ascending or descending. Separate from [`SortKey`] because reversing is its own action
+/// (and its own keypress) — folding the direction into the key would double the cycle.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
+pub enum SortDir {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl SortDir {
+    #[must_use]
+    pub fn flip(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+}
+
+/// Parse `--sort KEY[.DIR]` — `size`, `size.desc`, `name.asc`, or `none`.
+///
+/// One flag carries both halves because they are one user decision ("biggest first"), and
+/// because it keeps the `y` round-trip to a single argument.
+pub fn parse_sort(s: &str) -> Result<(SortKey, SortDir), String> {
+    let (key_s, dir_s) = s.split_once('.').map_or((s, None), |(k, d)| (k, Some(d)));
+    let key = match key_s.trim().to_ascii_lowercase().as_str() {
+        "none" => SortKey::None,
+        "name" => SortKey::Name,
+        "size" => SortKey::Size,
+        "params" => SortKey::Params,
+        "dtype" => SortKey::Dtype,
+        "rank" => SortKey::Rank,
+        other => {
+            return Err(format!(
+                "invalid sort key '{other}' (use none, name, size, params, dtype, rank)"
+            ));
+        }
+    };
+    let dir = match dir_s.map(|d| d.trim().to_ascii_lowercase()) {
+        None => SortDir::Asc,
+        Some(d) if d == "asc" => SortDir::Asc,
+        Some(d) if d == "desc" => SortDir::Desc,
+        Some(other) => {
+            return Err(format!(
+                "invalid sort direction '{other}' (use asc or desc)"
+            ));
+        }
+    };
+    Ok((key, dir))
+}

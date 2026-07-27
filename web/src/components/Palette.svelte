@@ -11,6 +11,7 @@
   } from '../stores/view';
   import { dtypesPresent } from '../stores/server';
   import { theme } from '../stores/theme';
+  import { warningDismissed } from '../stores/warning';
   import { fuzzyScore } from '../lib/search';
 
   interface Cmd {
@@ -39,6 +40,11 @@
     { group: 'Tree', label: 'Expand all groups', run: () => setAllExpanded(true) },
     { group: 'Tree', label: 'Collapse all groups', run: () => setAllExpanded(false) },
     { group: 'Tree', label: 'Search tensors', run: () => { navigate({ kind: 'tree' }); startSearch(); } },
+    {
+      group: 'View',
+      label: 'Show the access-control warning',
+      run: () => warningDismissed.set(false),
+    },
     { group: 'Theme', label: 'Theme: System', run: () => theme.set('system') },
     { group: 'Theme', label: 'Theme: Dark', run: () => theme.set('dark') },
     { group: 'Theme', label: 'Theme: Light', run: () => theme.set('light') },
