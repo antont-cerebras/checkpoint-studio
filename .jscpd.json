@@ -1,0 +1,32 @@
+{
+  "//": [
+    "Copy-paste detection (jscpd, token-based Rabin-Karp). Run it with:",
+    "    npx jscpd@4 --config .jscpd.json",
+    "CI runs the same command, so the `threshold` below is a real gate: duplication cannot",
+    "grow past it. Lower it when a refactor brings the number down; raising it needs a reason",
+    "in the commit, the same rule the coverage floor follows.",
+    "",
+    "min-lines 10 / min-tokens 60 is deliberately not sensitive: below that it reports every",
+    "`match` arm and every three-line builder, which is noise rather than duplication. What it",
+    "does catch at this setting has been worth catching — five copies of a Braille spinner",
+    "table, two identical dtype/shape span builders, the same unsafe HDF5 buffer handoff in two",
+    "filters, and a 40-line render tail (rect clamping included) in two screen renderers.",
+    "",
+    "Tests are excluded: a test's whole job is to spell the case out, and near-identical",
+    "fixtures are usually clearer than a parameterised helper.",
+    "",
+    "The threshold sits just above the measurement (0.78% at the time of writing), not at a",
+    "round number: 1.0 would have allowed ~125 lines of new duplication before firing, which",
+    "is not a ratchet."
+  ],
+  "threshold": 0.8,
+  "minLines": 10,
+  "minTokens": 60,
+  "format": ["rust"],
+  "reporters": ["console", "json"],
+  "output": "target/jscpd",
+  "absolute": false,
+  "gitignore": true,
+  "path": ["crates/core/src", "src"],
+  "ignore": ["**/tests/**", "**/target/**", "**/node_modules/**"]
+}

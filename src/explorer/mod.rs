@@ -48,6 +48,19 @@ use cache::{
     scan_stats_view,
 };
 
+// Why the `wildcard_enum_match_arm` allows in this module and `modes.rs` are correct
+// (referred to as FOREIGN_ENUM_WILDCARDS from each site).
+//
+// The key and mouse handlers match on crossterm's `KeyCode`, `MouseEventKind` and `Event`.
+// Those are foreign enums with a dozen-plus variants each, several of them data-carrying
+// (`F(u8)`, `Media(_)`, `Modifier(_)`, `Down(MouseButton)`), and they gain variants between
+// crossterm releases. A handler that listed them all would not compile after an upgrade, and
+// would say nothing useful in the meantime — every screen genuinely wants "any other key".
+//
+// The lint is worth keeping on for the enums we own: a `_` over `Cmd`, `DetailCmd`, `HelpCtx`
+// or `TreeNode` hides a variant WE added, which is a real bug the compiler can catch. Those
+// are all spelled out. The sites tagged `see FOREIGN_ENUM_WILDCARDS` are the foreign ones.
+
 /// The program name used when building the copyable CLI commands (`y`).
 const PROGRAM: &str = "checkpoint-studio";
 
@@ -175,11 +188,7 @@ enum Submit<T> {
     Reject(String),
 }
 
-// One `_` arm here is over crossterm's `KeyCode` / `MouseEventKind` / `Event`: foreign,
-// wide (a dozen-plus variants, several data-carrying), and listing them all would break
-// on every crossterm release. `wildcard_enum_match_arm` is for a `_` that hides OUR own
-// new variants, so it is allowed for this function.
-#[allow(clippy::wildcard_enum_match_arm)]
+#[allow(clippy::wildcard_enum_match_arm)] // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
 /// Run a single-line text prompt until it is submitted or cancelled (`None`).
 ///
 /// The prompts for histogram bins, the streaming buffer size, the tensor filter and the
@@ -213,10 +222,8 @@ fn run_text_prompt<T>(
         match event::read() {
             Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
             Ok(Event::Key(KeyEvent { code, .. })) => match code {
-                // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                // variants, several of them data-carrying); a handler that listed them all would break on
-                // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                 #[allow(clippy::wildcard_enum_match_arm)]
+                // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                 KeyCode::Enter => match submit(input.trim()) {
                     Submit::Accept(value) => return Some(value),
                     Submit::Reject(message) => error = Some(message),
@@ -2522,11 +2529,7 @@ impl Explorer {
             .unwrap_or_else(|| Err(anyhow::anyhow!("no live terminal to run a screen on")))
     }
 
-    // One `_` arm here is over crossterm's `KeyCode` / `MouseEventKind` / `Event`: foreign,
-    // wide (a dozen-plus variants, several data-carrying), and listing them all would break
-    // on every crossterm release. `wildcard_enum_match_arm` is for a `_` that hides OUR own
-    // new variants, so it is allowed for this function.
-    #[allow(clippy::wildcard_enum_match_arm)]
+    #[allow(clippy::wildcard_enum_match_arm)] // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
     /// The mode event loop proper, with the terminal already borrowed out of `self` by
     /// [`Self::with_terminal`] — so an early return here cannot strand it.
     fn drive_mode(
@@ -2618,10 +2621,8 @@ impl Explorer {
             // A floating overlay (detail/data legend/command/notice) swallows the
             // next input: any key or click closes it; Ctrl-C still quits.
             if mode.overlay().is_some() {
-                // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                // variants, several of them data-carrying); a handler that listed them all would break on
-                // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                 #[allow(clippy::wildcard_enum_match_arm)]
+                // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                 match &ev {
                     Event::Key(k) if is_ctrl_c(k) => {
                         if spec.ctrlc_quits_immediately {
@@ -2657,10 +2658,8 @@ impl Explorer {
             // mouse action.
             let key = match ev {
                 Event::Key(k) => k,
-                // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                // variants, several of them data-carrying); a handler that listed them all would break on
-                // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                 #[allow(clippy::wildcard_enum_match_arm)]
+                // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                 Event::Mouse(m) => match self.route_mouse(term, mode, &spec, m)? {
                     MouseOutcome::Leave(nav) => break nav,
                     MouseOutcome::SynthKey(k) => k,
@@ -2753,10 +2752,8 @@ impl Explorer {
         m: MouseEvent,
     ) -> Result<MouseOutcome> {
         let (col, row) = (m.column, m.row);
-        // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-        // variants, several of them data-carrying); a handler that listed them all would break on
-        // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
         #[allow(clippy::wildcard_enum_match_arm)]
+        // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
         match m.kind {
             MouseEventKind::Moved => {
                 if let Ok(sz) = term.size() {
@@ -3040,10 +3037,8 @@ impl Explorer {
                     if is_ctrl_c(&key) {
                         quit_immediately();
                     }
-                    // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                    // variants, several of them data-carrying); a handler that listed them all would break on
-                    // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                     #[allow(clippy::wildcard_enum_match_arm)]
+                    // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                     match key.code {
                         KeyCode::Esc => return None,
                         KeyCode::Up => sel = sel.saturating_sub(1),
@@ -3060,10 +3055,8 @@ impl Explorer {
                         _ => {}
                     }
                 }
-                // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                // variants, several of them data-carrying); a handler that listed them all would break on
-                // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                 #[allow(clippy::wildcard_enum_match_arm)]
+                // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                 Ok(Event::Mouse(m)) => match m.kind {
                     MouseEventKind::ScrollUp => sel = sel.saturating_sub(1),
                     MouseEventKind::ScrollDown if sel + 1 < filtered.len() => sel += 1,
@@ -3509,10 +3502,8 @@ impl Explorer {
                     }
                     layout_hint = None;
                     // Held-key acceleration, matching the tree / layout views.
-                    // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                    // variants, several of them data-carrying); a handler that listed them all would break on
-                    // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                     #[allow(clippy::wildcard_enum_match_arm)]
+                    // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                     match key.code {
                         KeyCode::Up => {
                             scroll =
@@ -3547,10 +3538,8 @@ impl Explorer {
                         _ => {}
                     }
                 }
-                // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                // variants, several of them data-carrying); a handler that listed them all would break on
-                // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                 #[allow(clippy::wildcard_enum_match_arm)]
+                // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                 Ok(Event::Mouse(m)) => match m.kind {
                     MouseEventKind::ScrollUp => scroll = scroll.saturating_sub(WHEEL_STEP),
                     MouseEventKind::ScrollDown => scroll = (scroll + WHEEL_STEP).min(scroll_max),
@@ -4731,10 +4720,8 @@ impl Explorer {
                 if overlay.is_some() {
                     overlay = None; // dismiss the pop-up; the scan kept running
                 } else {
-                    // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                    // variants, several of them data-carrying); a handler that listed them all would break on
-                    // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                     #[allow(clippy::wildcard_enum_match_arm)]
+                    // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                     match kev.code {
                         KeyCode::Char('l') => overlay = Some(Overlay::Legend(Legend::Detail)),
                         KeyCode::Char('y') => {
@@ -4995,10 +4982,8 @@ impl Explorer {
             }
             match event::read() {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
-                // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                // variants, several of them data-carrying); a handler that listed them all would break on
-                // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                 #[allow(clippy::wildcard_enum_match_arm)]
+                // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                 Ok(Event::Key(KeyEvent { code, .. })) => match code {
                     KeyCode::Right | KeyCode::Char('d') => idx = (idx + 1) % options.len(),
                     KeyCode::Left | KeyCode::Char('D') => {
@@ -5014,11 +4999,7 @@ impl Explorer {
         }
     }
 
-    // One `_` arm here is over crossterm's `KeyCode` / `MouseEventKind` / `Event`: foreign,
-    // wide (a dozen-plus variants, several data-carrying), and listing them all would break
-    // on every crossterm release. `wildcard_enum_match_arm` is for a `_` that hides OUR own
-    // new variants, so it is allowed for this function.
-    #[allow(clippy::wildcard_enum_match_arm)]
+    #[allow(clippy::wildcard_enum_match_arm)] // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
     /// Prompt for a slice to jump to — either an absolute index (`123`) or a
     /// percentage of the way through (`50%`, where 0% is the first slice and
     /// 100% the last). Returns the chosen slice, or `None` if cancelled / left
@@ -5066,10 +5047,8 @@ impl Explorer {
                         if input.trim().is_empty() {
                             return ReshapeChoice::Clear;
                         }
-                        // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                        // variants, several of them data-carrying); a handler that listed them all would break on
-                        // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                         #[allow(clippy::wildcard_enum_match_arm)]
+                        // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                         match parse_shape_input(&input, tensor.num_elements) {
                             Ok(shape) => return ReshapeChoice::Set(shape),
                             Err(msg) => error = Some(msg),
@@ -5095,11 +5074,7 @@ impl Explorer {
         }
     }
 
-    // One `_` arm here is over crossterm's `KeyCode` / `MouseEventKind` / `Event`: foreign,
-    // wide (a dozen-plus variants, several data-carrying), and listing them all would break
-    // on every crossterm release. `wildcard_enum_match_arm` is for a `_` that hides OUR own
-    // new variants, so it is allowed for this function.
-    #[allow(clippy::wildcard_enum_match_arm)]
+    #[allow(clippy::wildcard_enum_match_arm)] // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
     fn prompt_slice(
         term: &mut crate::tui::LiveTerminal,
         background: impl Fn(&mut ratatui::Frame),
@@ -5120,10 +5095,8 @@ impl Explorer {
             match event::read() {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
                 Ok(Event::Key(KeyEvent { code, .. })) => match code {
-                    // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                    // variants, several of them data-carrying); a handler that listed them all would break on
-                    // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                     #[allow(clippy::wildcard_enum_match_arm)]
+                    // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                     KeyCode::Enter => match parse_slice_input(&input, slices) {
                         Ok(Some(n)) => return Some(n),
                         Ok(None) => return None, // empty + Enter cancels
@@ -5333,10 +5306,8 @@ impl Explorer {
             }
             match event::read() {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
-                // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                // variants, several of them data-carrying); a handler that listed them all would break on
-                // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                 #[allow(clippy::wildcard_enum_match_arm)]
+                // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                 Ok(Event::Key(KeyEvent { code, .. })) => match code {
                     KeyCode::Left | KeyCode::Right => idx = 1 - idx,
                     KeyCode::Enter => return idx == 0,
@@ -5373,10 +5344,8 @@ impl Explorer {
             }
             match event::read() {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
-                // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                // variants, several of them data-carrying); a handler that listed them all would break on
-                // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                 #[allow(clippy::wildcard_enum_match_arm)]
+                // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                 Ok(Event::Key(KeyEvent { code, .. })) => match code {
                     KeyCode::Right => idx = (idx + 1) % codecs.len(),
                     KeyCode::Left => idx = (idx + codecs.len() - 1) % codecs.len(),
@@ -5682,10 +5651,8 @@ impl Explorer {
                         quit_immediately();
                     }
                     let now = std::time::Instant::now();
-                    // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                    // variants, several of them data-carrying); a handler that listed them all would break on
-                    // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
                     #[allow(clippy::wildcard_enum_match_arm)]
+                    // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                     match key.code {
                         // `v` runs the value scan on a worker; the popup animates a
                         // spinner + progress bar meanwhile, and `Esc` cancels.
@@ -6862,10 +6829,8 @@ fn wrong_layout_char(key: &KeyEvent) -> Option<char> {
     {
         return None;
     }
-    // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-    // variants, several of them data-carrying); a handler that listed them all would break on
-    // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
     #[allow(clippy::wildcard_enum_match_arm)]
+    // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
     match key.code {
         KeyCode::Char(c) if !c.is_ascii() && c.is_alphabetic() => Some(c),
         _ => None,

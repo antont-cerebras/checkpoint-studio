@@ -196,12 +196,20 @@ npm ci
 npm run check    # svelte-check (types)
 npm run lint     # eslint — type-aware, incl. Svelte templates
 npm run build    # regenerates web/dist
+npm run dup      # jscpd — copy-paste detection over the RUST sources (see below)
 ```
 `web/dist` is **committed** and embedded at compile time, and CI rebuilds it on the
 `.nvmrc` Node and fails if the result differs — so commit the regenerated `dist`
 alongside your `web/src` change, built on Node 20. (Why 20: Node 16 is EOL and ESLint
 10 won't run on it.) For development, `npm run dev` runs Vite with hot-reload and
 proxies `/api` to a running `web` instance.
+
+**Duplication** is a gate too. `npm run dup` (or `npx jscpd@5.0.12 --config .jscpd.json` from the
+repo root — it needs only Node, not the web toolchain) runs token-based copy-paste detection
+over `crates/core/src` and `src`, and fails if duplication rises above the `threshold` in
+`.jscpd.json`. That number is the current measurement, not an aspiration: lower it when a
+refactor earns it, and raising it needs a reason in the commit — the same rule the coverage
+floor follows. Tests are excluded, because a test's job is to spell its case out.
 
 ### Remote checkpoints over SSH (`--ssh-proxy`)
 Browse a checkpoint that lives only on a remote host — either behind credentials

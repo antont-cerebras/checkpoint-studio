@@ -168,6 +168,33 @@ jobs:
             exit 1
           fi
 
+  # ------------------------------------------------------- Duplication --------
+  # Copy-paste detection over the Rust sources (jscpd, token-based). A gate rather than a
+  # report: `threshold` in `.jscpd.json` is the current number, so duplication cannot grow
+  # without someone deciding to raise it — the same ratchet the coverage floor uses.
+  #
+  # Its own job because it needs Node and the Rust job does not; it takes seconds and runs in
+  # parallel with everything else.
+  duplication:
+    name: Duplication (jscpd)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: web/.nvmrc
+
+      # Pinned EXACTLY, for two reasons: jscpd's percentage moves between versions (its
+      # tokenizer changes), and a gate that drifts on its own is not a gate — and `jscpd@4`
+      # pulls `commander@15`, which requires Node >= 22.12 and so cannot install on the Node
+      # this repo pins. The threshold in `.jscpd.json` was measured with this version.
+      - name: Check for duplicated code
+        run: npx --yes jscpd@5.0.12 --config .jscpd.json
+
   # ---------------------------------------------------------------- Python ----
   # The remote reader/compare scripts run on the ssh proxy against S3/cstorch, so a
   # typo there fails in front of a user minutes into a job rather than at build

@@ -176,9 +176,7 @@ impl Mode for FilesMode {
             }
             return Ok(Outcome::Stay);
         }
-        // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-        // variants, several of them data-carrying); a handler that listed them all would break on
-        // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+        // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
         #[allow(clippy::wildcard_enum_match_arm)]
         match key.code {
             KeyCode::Tab | KeyCode::Backspace => return Ok(Outcome::Leave(Nav::Back)),
@@ -227,9 +225,7 @@ impl Mode for FilesMode {
             return MouseOutcome::Ignored;
         };
         let (col, row) = (m.column, m.row);
-        // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-        // variants, several of them data-carrying); a handler that listed them all would break on
-        // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+        // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
         #[allow(clippy::wildcard_enum_match_arm)]
         match m.kind {
             // (Scroll-bar clicks / drags are handled by the engine's `route_mouse`.)
@@ -420,11 +416,7 @@ impl Mode for LayoutMode {
         PaletteResult::Handled
     }
 
-    // One `_` arm here is over crossterm's `KeyCode` / `MouseEventKind` / `Event`: foreign,
-    // wide (a dozen-plus variants, several data-carrying), and listing them all would break
-    // on every crossterm release. `wildcard_enum_match_arm` is for a `_` that hides OUR own
-    // new variants, so it is allowed for this function.
-    #[allow(clippy::wildcard_enum_match_arm)]
+    #[allow(clippy::wildcard_enum_match_arm)] // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
     fn handle_key(
         &mut self,
         ex: &mut Explorer,
@@ -487,9 +479,7 @@ impl Mode for LayoutMode {
             KeyCode::End => self.selected = n.saturating_sub(1),
             // Enter on the header previews the raw JSON header; on a tensor it jumps
             // to that tensor's place in the tree.
-            // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-            // variants, several of them data-carrying); a handler that listed them all would break on
-            // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+            // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
             #[allow(clippy::wildcard_enum_match_arm)]
             KeyCode::Enter => match self.map().segments.get(self.selected).map(|s| &s.kind) {
                 Some(crate::safelayout::SegmentKind::Header) => {
@@ -520,9 +510,7 @@ impl Mode for LayoutMode {
         m: MouseEvent,
     ) -> MouseOutcome {
         let (col, row) = (m.column, m.row);
-        // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-        // variants, several of them data-carrying); a handler that listed them all would break on
-        // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+        // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
         #[allow(clippy::wildcard_enum_match_arm)]
         match m.kind {
             // A click on a band selects it (link / chip clicks are handled by the
@@ -820,9 +808,7 @@ impl Mode for TreeMode {
             return MouseOutcome::Ignored;
         };
         let (col, row) = (m.column, m.row);
-        // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-        // variants, several of them data-carrying); a handler that listed them all would break on
-        // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+        // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
         #[allow(clippy::wildcard_enum_match_arm)]
         match m.kind {
             // (Scroll-bar clicks / drags are handled by the engine's `route_mouse`.)
@@ -1070,9 +1056,7 @@ impl RenameMode2 {
             }
             match event::read() {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
-                // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                // variants, several of them data-carrying); a handler that listed them all would break on
-                // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+                // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
                 #[allow(clippy::wildcard_enum_match_arm)]
                 Ok(Event::Key(KeyEvent { code, .. })) => match code {
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => idx = 1 - idx,
@@ -1348,9 +1332,7 @@ impl Mode for RenameMode2 {
         // accepts the highlight (pgcli-style); otherwise Enter moves between fields.
         let cands = self.editor.completions(&self.schemas);
         let menu_open = self.editor.menu.is_some() && !cands.is_empty();
-        // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-        // variants, several of them data-carrying); a handler that listed them all would break on
-        // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+        // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
         #[allow(clippy::wildcard_enum_match_arm)]
         match code {
             KeyCode::Esc if menu_open => self.editor.close_menu(),
@@ -1457,9 +1439,7 @@ impl Mode for RenameMode2 {
         _term: &mut crate::tui::LiveTerminal,
         m: MouseEvent,
     ) -> MouseOutcome {
-        // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-        // variants, several of them data-carrying); a handler that listed them all would break on
-        // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+        // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
         #[allow(clippy::wildcard_enum_match_arm)]
         match m.kind {
             // A click on a dropdown row highlights and accepts that candidate.
@@ -1573,6 +1553,45 @@ impl DetailMode {
         scan_stats_view(scan, &self.spin, stats)
     }
 
+    /// A painter that redraws this screen behind a modal prompt, so `prompt_bins` and
+    /// `prompt_reshape` float over the live frame rather than a blank one.
+    ///
+    /// Both prompts needed the same twenty-line preamble — the cached stats, the stats view,
+    /// the cached histogram, then a ten-argument frame call — so it lives here once.
+    ///
+    /// The stats view is computed per frame rather than once up front: it advances the scan
+    /// spinner, so the background now keeps animating behind the prompt instead of freezing on
+    /// the frame the prompt opened over. (It also has to be, since it borrows the stats the
+    /// closure owns.)
+    fn modal_background<'a>(
+        &'a self,
+        ex: &'a Explorer,
+        tensor: &'a TensorInfo,
+        shape: &'a [usize],
+        view: crate::sample::ViewDtype,
+    ) -> impl Fn(&mut ratatui::Frame) + 'a {
+        let (overridable, unindexed) = (self.overridable, self.unindexed);
+        let stats = ex.cached_stats(tensor, view);
+        let hist = ex
+            .histogram_cache
+            .borrow()
+            .get(&(tensor.name.clone(), view, ex.data_view.histogram_bins.get()))
+            .cloned();
+        move |f: &mut ratatui::Frame| {
+            paint_detail_background(
+                f,
+                ex,
+                tensor,
+                shape,
+                view,
+                overridable,
+                unindexed,
+                self.stats_view(&stats),
+                hist.as_ref(),
+            );
+        }
+    }
+
     pub(super) fn layout_ok(&self) -> bool {
         !self.remote
             && std::path::Path::new(&self.tensor().source_path)
@@ -1580,6 +1599,37 @@ impl DetailMode {
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"))
     }
+}
+
+/// The detail screen repainted behind a modal prompt, so `prompt_bins` / `prompt_reshape`
+/// float over the live frame instead of a blank one.
+///
+/// Exists because `render_detail_frame` takes ten arguments and both prompts pass the same
+/// ten: the risk isn't the length, it's that adding an argument meant finding every copy.
+#[allow(clippy::too_many_arguments)] // mirrors `render_detail_frame`'s own parameter list
+fn paint_detail_background(
+    f: &mut ratatui::Frame,
+    ex: &Explorer,
+    tensor: &TensorInfo,
+    shape: &[usize],
+    view: crate::sample::ViewDtype,
+    overridable: bool,
+    unindexed: bool,
+    stats_view: StatsView<'_>,
+    hist: Option<&crate::sample::Histogram>,
+) {
+    ex.render_detail_frame(
+        f,
+        tensor,
+        shape,
+        view,
+        overridable,
+        unindexed,
+        stats_view,
+        hist,
+        None,
+        None,
+    );
 }
 
 impl Mode for DetailMode {
@@ -1724,11 +1774,7 @@ impl Mode for DetailMode {
         }
     }
 
-    // One `_` arm here is over crossterm's `KeyCode` / `MouseEventKind` / `Event`: foreign,
-    // wide (a dozen-plus variants, several data-carrying), and listing them all would break
-    // on every crossterm release. `wildcard_enum_match_arm` is for a `_` that hides OUR own
-    // new variants, so it is allowed for this function.
-    #[allow(clippy::wildcard_enum_match_arm)]
+    #[allow(clippy::wildcard_enum_match_arm)] // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
     fn handle_key(
         &mut self,
         ex: &mut Explorer,
@@ -1785,28 +1831,7 @@ impl Mode for DetailMode {
                 );
             }
             KeyCode::Char('b' | 'B') => {
-                let (overridable, unindexed) = (self.overridable, self.unindexed);
-                let stats = ex.cached_stats(&tensor, view);
-                let stats_view = self.stats_view(&stats);
-                let hist = ex
-                    .histogram_cache
-                    .borrow()
-                    .get(&(tensor.name.clone(), view, ex.data_view.histogram_bins.get()))
-                    .cloned();
-                let background = |f: &mut ratatui::Frame| {
-                    ex.render_detail_frame(
-                        f,
-                        &tensor,
-                        &shape,
-                        view,
-                        overridable,
-                        unindexed,
-                        stats_view,
-                        hist.as_ref(),
-                        None,
-                        None,
-                    );
-                };
+                let background = self.modal_background(ex, &tensor, &shape, view);
                 let changed = match Explorer::prompt_bins(
                     term,
                     background,
@@ -1877,31 +1902,8 @@ impl Mode for DetailMode {
                     .borrow()
                     .get(&tensor.name)
                     .cloned();
-                let (overridable, unindexed) = (self.overridable, self.unindexed);
-                let stats = ex.cached_stats(&tensor, view);
-                let stats_view = self.stats_view(&stats);
-                let hist = ex
-                    .histogram_cache
-                    .borrow()
-                    .get(&(tensor.name.clone(), view, ex.data_view.histogram_bins.get()))
-                    .cloned();
-                let background = |f: &mut ratatui::Frame| {
-                    ex.render_detail_frame(
-                        f,
-                        &tensor,
-                        &shape,
-                        view,
-                        overridable,
-                        unindexed,
-                        stats_view,
-                        hist.as_ref(),
-                        None,
-                        None,
-                    );
-                };
-                // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                // variants, several of them data-carrying); a handler that listed them all would break on
-                // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+                let background = self.modal_background(ex, &tensor, &shape, view);
+                // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
                 #[allow(clippy::wildcard_enum_match_arm)]
                 match Explorer::prompt_reshape(term, background, &tensor, current.as_deref()) {
                     ReshapeChoice::Set(s) => {
@@ -2079,9 +2081,7 @@ impl Mode for StatsMode {
         term: &mut crate::tui::LiveTerminal,
         key: KeyEvent,
     ) -> Result<Outcome> {
-        // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-        // variants, several of them data-carrying); a handler that listed them all would break on
-        // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+        // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
         #[allow(clippy::wildcard_enum_match_arm)]
         match key.code {
             // Fold / expand the on-disk per-shard breakdown (a no-op without one).
@@ -2137,9 +2137,7 @@ impl Mode for StatsMode {
         _term: &mut crate::tui::LiveTerminal,
         m: MouseEvent,
     ) -> MouseOutcome {
-        // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-        // variants, several of them data-carrying); a handler that listed them all would break on
-        // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+        // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
         #[allow(clippy::wildcard_enum_match_arm)]
         match m.kind {
             MouseEventKind::ScrollUp => {
@@ -2315,11 +2313,7 @@ impl Mode for DataMode {
         }
     }
 
-    // One `_` arm here is over crossterm's `KeyCode` / `MouseEventKind` / `Event`: foreign,
-    // wide (a dozen-plus variants, several data-carrying), and listing them all would break
-    // on every crossterm release. `wildcard_enum_match_arm` is for a `_` that hides OUR own
-    // new variants, so it is allowed for this function.
-    #[allow(clippy::wildcard_enum_match_arm)]
+    #[allow(clippy::wildcard_enum_match_arm)] // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
     fn handle_key(
         &mut self,
         ex: &mut Explorer,
@@ -2460,9 +2454,7 @@ impl Mode for DataMode {
                 let background = |f: &mut ratatui::Frame| {
                     ex.render_cached_data(f, &tensor, repr, stats_view, stripe, base);
                 };
-                // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-                // variants, several of them data-carrying); a handler that listed them all would break on
-                // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+                // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
                 #[allow(clippy::wildcard_enum_match_arm)]
                 match Explorer::prompt_reshape(term, background, &tensor, current.as_deref()) {
                     ReshapeChoice::Set(s) => {
@@ -2553,9 +2545,7 @@ impl Mode for DataMode {
         m: MouseEvent,
     ) -> MouseOutcome {
         let slices = self.slices.get();
-        // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
-        // variants, several of them data-carrying); a handler that listed them all would break on
-        // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+        // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
         #[allow(clippy::wildcard_enum_match_arm)]
         match m.kind {
             MouseEventKind::ScrollDown if slices > 1 => {

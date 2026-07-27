@@ -19,7 +19,8 @@
     "test": "vitest run",
     "pretest": "node scripts/require-node.mjs",
     "precoverage": "node scripts/require-node.mjs",
-    "coverage": "vitest run --coverage"
+    "coverage": "vitest run --coverage",
+    "dup": "cd .. && npx --yes jscpd@5.0.12 --config .jscpd.json"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

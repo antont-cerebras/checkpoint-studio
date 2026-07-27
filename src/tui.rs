@@ -153,7 +153,12 @@ pub(crate) fn buffer_to_string(buffer: &Buffer) -> String {
         // 2-cell emoji doesn't leak a stray space.
         let mut skip = 0usize;
         for col in 0..width {
-            let symbol = cells[row * width + col].symbol();
+            let Some(symbol) = cells
+                .get(row * width + col)
+                .map(ratatui::buffer::Cell::symbol)
+            else {
+                break; // `row`/`col` come from the buffer's own dimensions
+            };
             if skip == 0 {
                 line.push_str(symbol);
             }
