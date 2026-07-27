@@ -24,6 +24,34 @@ pub fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// Expand a leading `~` to `$HOME` — `~`, `~/`, and `~/rest` only, never `~user`.
+///
+/// A shell does this before a CLI ever sees the argument, which is exactly why paths
+/// typed *inside* the app need it done here: the web UI's compare box and the TUI's
+/// compare prompt both send the literal `~`, and `~/ws/model` then resolves to nothing.
+/// `~user` is deliberately not handled — resolving another account's home needs passwd
+/// lookups, and silently treating `~bob/x` as a relative directory called `~bob` would be
+/// worse than the error.
+#[must_use]
+pub fn expand_tilde(path: &str) -> std::path::PathBuf {
+    let Some(rest) = path.strip_prefix('~') else {
+        return std::path::PathBuf::from(path);
+    };
+    // `~user/...` — not ours to expand; hand it back unchanged so the error names what
+    // was actually typed.
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return std::path::PathBuf::from(path);
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return std::path::PathBuf::from(path);
+    };
+    let home = std::path::PathBuf::from(home);
+    match rest.strip_prefix('/') {
+        None | Some("") => home,
+        Some(tail) => home.join(tail),
+    }
+}
+
 /// Parse a human size like `1G`, `256M`, `64K` (binary, ×1024) or a bare byte
 /// count, returning the number of bytes.
 pub fn parse_size(s: &str) -> Result<usize, String> {
@@ -122,5 +150,38 @@ pub fn format_percent(fraction: f64, is_zero: bool) -> String {
         format!("{pct:.1e}%")
     } else {
         format!("{pct:.1}%")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_tilde;
+    use std::path::PathBuf;
+
+    #[test]
+    fn tilde_expands_only_the_forms_a_shell_would() {
+        // SAFETY-ish: tests in this module are the only ones touching HOME, and the value
+        // is restored below, so no other test observes the change.
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", "/home/u") };
+
+        assert_eq!(expand_tilde("~"), PathBuf::from("/home/u"));
+        assert_eq!(expand_tilde("~/"), PathBuf::from("/home/u"));
+        assert_eq!(
+            expand_tilde("~/ws/model"),
+            PathBuf::from("/home/u/ws/model")
+        );
+        // Not a tilde path at all.
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde("rel/path"), PathBuf::from("rel/path"));
+        // `~user` is left alone rather than being mangled into a relative directory.
+        assert_eq!(expand_tilde("~bob/x"), PathBuf::from("~bob/x"));
+        // A tilde inside the path is just a character.
+        assert_eq!(expand_tilde("/a/~/b"), PathBuf::from("/a/~/b"));
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
     }
 }

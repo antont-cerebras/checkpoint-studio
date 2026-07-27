@@ -226,6 +226,28 @@ pub struct Checkpoint {
     pub s3: Option<S3Meta>,
 }
 
+/// The single path that denotes a checkpoint made of `files`: the file itself when there
+/// is one, the directory its shards share when they all sit in one, and `None` when they
+/// span directories — then no single path names them and a caller must list them all.
+///
+/// This is the decision behind both "what to call the checkpoint" ([`root_label`]) and
+/// "what to write on a command line", which is why it is one function. Getting it wrong
+/// is not cosmetic: naming *a shard* where the checkpoint was meant produces a command
+/// that compares something else. (It did — the web compare screen offered
+/// `diff OLD <dir>/codebooks.safetensors` for a sharded checkpoint, because it took the
+/// first resolved file instead of asking this question.)
+#[must_use]
+pub fn checkpoint_path(files: &[std::path::PathBuf]) -> Option<&std::path::Path> {
+    match files.split_first() {
+        None => None,
+        Some((only, [])) => Some(only.as_path()),
+        Some((first, _)) => {
+            let dir = first.parent()?;
+            files.iter().all(|f| f.parent() == Some(dir)).then_some(dir)
+        }
+    }
+}
+
 /// A concise display name for a checkpoint made of `files`: the file's own name for a
 /// single file; the shared parent directory's name when every file sits in one
 /// directory; `"checkpoint"` when neither applies (no files, or a glob spanning
@@ -239,24 +261,12 @@ pub struct Checkpoint {
 /// is how that happens, so it is derived once, here.
 #[must_use]
 pub fn root_label(files: &[std::path::PathBuf]) -> String {
-    fn name_of(p: &std::path::Path) -> String {
-        p.file_name().map_or_else(
+    checkpoint_path(files)
+        .and_then(std::path::Path::file_name)
+        .map_or_else(
             || "checkpoint".to_string(),
             |s| s.to_string_lossy().into_owned(),
         )
-    }
-    match files.split_first() {
-        None => "checkpoint".to_string(),
-        Some((only, [])) => name_of(only),
-        Some((first, _)) => {
-            let dir = first.parent();
-            if dir.is_some() && files.iter().all(|f| f.parent() == dir) {
-                dir.map_or_else(|| "checkpoint".to_string(), name_of)
-            } else {
-                "checkpoint".to_string()
-            }
-        }
-    }
 }
 
 impl Checkpoint {

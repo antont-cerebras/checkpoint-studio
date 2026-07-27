@@ -172,8 +172,9 @@ pub(crate) fn diff(s: &WebState, q: &Query) -> Reply {
             "against": against,
             "verdict": crate::compare::verdict(&report),
             // The equivalent CLI invocation, so a browser finding can be reproduced (and
-            // extended with --values) in a terminal.
-            "command": crate::compare::reopen_command(std::path::Path::new(against), &s.files),
+            // extended with --values) in a terminal. `null` when the served files span
+            // directories, since then no single path names this side of the comparison.
+            "command": crate::compare::cli_diff_command(std::path::Path::new(against), &s.files),
             "report": report,
         })),
         // A path that doesn't resolve to a checkpoint is a client mistake, not a server

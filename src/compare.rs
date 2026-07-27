@@ -25,13 +25,23 @@ use crate::diff::{CheckpointSummary, DiffReport};
 /// the CLI resolves its own arguments (so `diff` and the interactive screens accept the
 /// same spellings).
 pub(crate) fn summarize(path: &Path) -> Result<CheckpointSummary> {
-    let paths = [path.to_path_buf()];
+    // A leading `~` is expanded by `collect_safetensors_files` (one rule for every path
+    // the program is handed); resolve it here too so an error can name both spellings.
+    let paths = [crate::utils::expand_tilde(&path.to_string_lossy())];
     // `no_health_check = true`: a baseline's index/shard cross-check is not part of a
     // structural diff, and parsing it would only slow the read down.
     let (files, _) = crate::collect_safetensors_files(&paths, false, true)
         .with_context(|| format!("resolving {}", path.display()))?;
     if files.is_empty() {
-        anyhow::bail!("no checkpoint files found at {}", path.display());
+        // Name the resolved path as well when it differs from what was typed (a `~` was
+        // expanded): otherwise "no checkpoint files found at ~/ckpt" leaves the reader
+        // unable to tell whether the tilde was understood.
+        let resolved = paths[0].display().to_string();
+        let typed = path.display().to_string();
+        if resolved == typed {
+            anyhow::bail!("no checkpoint files found at {typed}");
+        }
+        anyhow::bail!("no checkpoint files found at {typed} ({resolved})");
     }
     let model = crate::readers::read_local(&files)
         .with_context(|| format!("reading {}", path.display()))?;
@@ -85,16 +95,21 @@ pub(crate) fn verdict(report: &DiffReport) -> String {
         .replace("tensors: ", "unchanged; ")
 }
 
-/// The path a comparison names, as the reopen (`y`) command spells it.
-pub(crate) fn reopen_command(against: &Path, open: &[PathBuf]) -> String {
-    let open = open
-        .first()
-        .map_or_else(|| ".".to_string(), |p| p.display().to_string());
-    format!(
+/// The `diff OLD NEW` command that reproduces a comparison — the batch equivalent a UI
+/// offers so a finding can be re-run in a terminal (and extended with `--values`).
+///
+/// `open` is the *resolved* file list, which for a sharded checkpoint is every shard. The
+/// command must name the checkpoint, not one of its shards: naming a shard silently
+/// compares something else. [`crate::model::checkpoint_path`] answers that; `None` means
+/// the files span directories, in which case no single path names them and there is no
+/// honest one-line command to offer.
+pub(crate) fn cli_diff_command(against: &Path, open: &[PathBuf]) -> Option<String> {
+    let new = crate::model::checkpoint_path(open)?;
+    Some(format!(
         "checkpoint-studio diff {} {}",
         shell_quote(&against.display().to_string()),
-        shell_quote(&open)
-    )
+        shell_quote(&new.display().to_string())
+    ))
 }
 
 /// Single-quote a path for a copyable shell command when it needs it.
@@ -160,12 +175,48 @@ mod tests {
     }
 
     #[test]
-    fn the_reopen_command_puts_the_baseline_first() {
+    fn the_cli_command_puts_the_baseline_first() {
         // `diff OLD NEW`: the baseline is the first argument, the open checkpoint the
         // second — so pasting the command reproduces the screen's own report.
-        let cmd = reopen_command(Path::new("/a/old"), &[PathBuf::from("/b/new")]);
+        let cmd = cli_diff_command(Path::new("/a/old"), &[PathBuf::from("/b/new")]).unwrap();
         assert_eq!(cmd, "checkpoint-studio diff /a/old /b/new");
-        let quoted = reopen_command(Path::new("/a/needs quoting"), &[PathBuf::from("/b/new")]);
+        let quoted =
+            cli_diff_command(Path::new("/a/needs quoting"), &[PathBuf::from("/b/new")]).unwrap();
         assert!(quoted.contains("'/a/needs quoting'"), "{quoted}");
+    }
+
+    /// The regression this function exists for. `open` is the *resolved* file list, so a
+    /// sharded checkpoint arrives here as every shard — and naming the first one produced
+    /// a command that compared a single shard against the baseline instead of the
+    /// checkpoint. Reported from the web compare screen, which offered
+    /// `diff OLD <ckpt>/codebooks.safetensors` for a directory of shards.
+    #[test]
+    fn the_cli_command_names_a_sharded_checkpoint_not_one_of_its_shards() {
+        let shards = [
+            PathBuf::from("/ckpt/codebooks.safetensors"),
+            PathBuf::from("/ckpt/model-00001-of-00002.safetensors"),
+            PathBuf::from("/ckpt/model-00002-of-00002.safetensors"),
+        ];
+        let cmd = cli_diff_command(Path::new("/base"), &shards).unwrap();
+        assert_eq!(
+            cmd, "checkpoint-studio diff /base /ckpt",
+            "a sharded checkpoint is named by its directory"
+        );
+        assert!(
+            !cmd.contains("codebooks"),
+            "naming a shard would compare something else: {cmd}"
+        );
+    }
+
+    /// Files spanning directories have no single name, so there is no honest one-line
+    /// command — better to offer nothing than a command that means something else.
+    #[test]
+    fn there_is_no_command_when_the_files_span_directories() {
+        let scattered = [
+            PathBuf::from("/a/one.safetensors"),
+            PathBuf::from("/b/two.safetensors"),
+        ];
+        assert!(cli_diff_command(Path::new("/base"), &scattered).is_none());
+        assert!(cli_diff_command(Path::new("/base"), &[]).is_none());
     }
 }

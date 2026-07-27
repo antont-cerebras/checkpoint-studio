@@ -598,3 +598,70 @@ fn the_access_warning_appears_exactly_when_the_server_is_reachable_off_the_machi
         );
     }
 }
+
+/// A path typed into a UI has had no shell, so a leading `~` must be expanded by the
+/// program — reported from the web compare box, where `~/ws/model` said "no checkpoint
+/// files found" for a directory that plainly had them.
+///
+/// Asserted through the failure message rather than by pointing at a real file: the
+/// fixtures are not under `$HOME` on every machine, and a test that quietly skips is
+/// worse than none. The message names the resolved path when it differs from what was
+/// typed, so seeing the expansion in it *is* the proof that expansion ran before
+/// resolution. (`utils::expand_tilde` covers the expansion rule itself.)
+#[test]
+fn a_tilde_path_is_expanded_before_the_checkpoint_is_looked_for() {
+    let home = std::env::var("HOME").expect("HOME is set in the test environment");
+    let Err(err) = crate::compare::summarize(std::path::Path::new("~/no-such-checkpoint-xyz"))
+    else {
+        panic!("a nonexistent path should not resolve to a checkpoint");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(&format!("{home}/no-such-checkpoint-xyz")),
+        "the tilde should have been expanded before the lookup: {msg}"
+    );
+    assert!(
+        msg.contains("~/no-such-checkpoint-xyz"),
+        "and the message should still show what was typed: {msg}"
+    );
+}
+
+/// The command a UI offers must name the *checkpoint*, not one of its shards. Reported
+/// from the web compare screen, which offered
+/// `diff OLD <ckpt>/codebooks.safetensors` for a sharded checkpoint because it took the
+/// first resolved file. Checked here against a real multi-file read, not just the unit
+/// test in `compare`, because the file list this sees is whatever the resolver produced.
+#[test]
+fn the_served_diff_command_names_the_checkpoint_not_a_shard() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.unwrap().path();
+            (p.extension().is_some_and(|x| x == "safetensors")).then_some(p)
+        })
+        .collect();
+    files.sort();
+    assert!(files.len() > 1, "this case needs several shards");
+
+    let model = crate::readers::read_local(&files).expect("the fixtures read");
+    let state = WebState::build(model, &files, &[]);
+    let served = body(handlers::diff(
+        &state,
+        &query("against", &fixture().display().to_string()),
+    ));
+    let command = served["command"]
+        .as_str()
+        .expect("a multi-shard checkpoint in one directory has a one-line command");
+    let named = command.rsplit(' ').next().unwrap();
+    assert_eq!(
+        std::path::Path::new(named.trim_matches('\''))
+            .canonicalize()
+            .unwrap(),
+        dir.canonicalize().unwrap(),
+        "the command should name the directory, not a shard: {command}"
+    );
+    // (The *baseline* here is deliberately a single file, so `.safetensors` appearing
+    // earlier in the command is correct — only the compared side is at issue, which the
+    // path comparison above pins exactly.)
+}

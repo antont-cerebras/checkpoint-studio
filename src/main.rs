@@ -3766,6 +3766,13 @@ fn collect_safetensors_files(
             continue;
         }
 
+        // A leading `~` first: a shell expands it before we ever see an argv path, but a
+        // path typed *inside* the app (the web UI's compare box, the TUI's compare
+        // prompt) has had no shell — and a quoted `'~/ckpt'` on a real command line has
+        // had none either. Doing it here means every path the program is handed obeys the
+        // same rule, whatever door it came in by. See `utils::expand_tilde`.
+        let path = &utils::expand_tilde(&raw);
+
         // Try to expand as glob pattern
         let expanded_paths: Vec<PathBuf> = glob::glob(&path.to_string_lossy()).map_or_else(
             |_| vec![path.clone()],

@@ -192,6 +192,22 @@
       return; // everything else types into the search box
     }
 
+    // A focused text field owns the keyboard from here on. Without this, the global
+    // shortcuts below steal its keys — Backspace navigated *back* instead of deleting a
+    // character in the compare screen's path box. Placed after the search block on
+    // purpose: the search input deliberately gives up ↑/↓/Enter/Esc to the tree, and it
+    // returns above, so this cannot take those away from it.
+    const focused = e.target as HTMLElement | null;
+    if (
+      focused &&
+      (focused.tagName === 'INPUT' || focused.tagName === 'TEXTAREA' || focused.isContentEditable)
+    ) {
+      // Escape still gets you out of the field (and, with nothing focused, the next
+      // Escape leaves the screen) — everything else is text.
+      if (e.key === 'Escape') focused.blur();
+      return;
+    }
+
     // --- global (any screen) ---
     if (e.key === 'Backspace') {
       e.preventDefault(); // don't let the browser navigate back

@@ -6064,20 +6064,18 @@ impl Explorer {
             host.as_ref()
                 .map_or_else(|| shell_quote(s), |h| shell_quote(&format!("{h}:{s}")))
         };
-        match self.files.as_slice() {
-            [] => Vec::new(),
-            [one] => vec![render(&one.to_string_lossy())],
-            many => {
-                let set: BTreeSet<String> = many
+        // One path when one names the checkpoint (the shared rule — see
+        // `model::checkpoint_path`), else every file, which is the only honest spelling
+        // for a glob that spanned directories.
+        crate::model::checkpoint_path(&self.files).map_or_else(
+            || {
+                self.files
                     .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect();
-                common_dir(&set).map_or_else(
-                    || many.iter().map(|p| render(&p.to_string_lossy())).collect(),
-                    |dir| vec![render(&dir)],
-                )
-            }
-        }
+                    .map(|p| render(&p.to_string_lossy()))
+                    .collect()
+            },
+            |one| vec![render(&one.to_string_lossy())],
+        )
     }
 
     /// The program name plus, for an `s3://…` remote source, `--ssh-proxy HOST`
