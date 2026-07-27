@@ -178,15 +178,37 @@ pub(crate) fn file(s: &WebState, q: &Query) -> Reply {
         return err(404, format!("no such file: {rel}"));
     };
     let abs = std::path::Path::new(&s.root).join(&entry.rel_path);
+    // Resolve before reading. The entry came from this checkpoint's own directory walk, so
+    // the *name* is in bounds — but a symlink inside the checkpoint can point anywhere, and
+    // reading through it would serve a file outside the tree the server was pointed at. The
+    // walk records symlinks as leaves, so they are reachable from the browser.
+    let root = std::path::Path::new(&s.root).canonicalize();
+    let real = abs.canonicalize();
+    match (&root, &real) {
+        (Ok(root), Ok(real)) if !real.starts_with(root) => {
+            return err(
+                403,
+                format!("{rel} resolves outside the checkpoint ({})", real.display()),
+            );
+        }
+        _ => {}
+    }
     match std::fs::read(&abs) {
         Ok(bytes) => {
             let truncated = bytes.len() > CAP;
-            let text = String::from_utf8_lossy(&bytes[..bytes.len().min(CAP)]).into_owned();
+            let head = bytes.get(..bytes.len().min(CAP)).unwrap_or(&bytes);
+            // Preview as text, but say when it ISN'T: a lossy conversion of binary is a wall
+            // of U+FFFD, and the client can't tell that from a file that really contains
+            // replacement characters. `text` stays lossy so a mostly-text file with a stray
+            // byte still previews.
+            let binary = std::str::from_utf8(head).is_err();
+            let text = String::from_utf8_lossy(head).into_owned();
             ok(json!({
                 "path": rel,
                 "name": entry.name,
                 "size": entry.apparent(),
                 "truncated": truncated,
+                "binary": binary,
                 "text": text,
             }))
         }
@@ -385,6 +407,48 @@ mod tests_support {
 mod tests {
     use super::tests_support::*;
     use super::*;
+
+    /// The file preview reads `root.join(rel_path)`. The name comes from this checkpoint's own
+    /// walk, so it can't contain `..` — but a SYMLINK inside the checkpoint can point anywhere,
+    /// and the walk records symlinks as browsable leaves. Following one served a file from
+    /// outside the tree the server was pointed at.
+    #[cfg(unix)]
+    #[test]
+    fn the_file_preview_refuses_a_symlink_that_escapes_the_checkpoint() {
+        use std::path::PathBuf;
+        let dir = std::env::temp_dir().join("cs_web_symlink_escape");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ckpt")).unwrap();
+        // A secret next to the checkpoint, and a link to it from inside.
+        std::fs::write(dir.join("outside.txt"), b"not yours").unwrap();
+        std::fs::write(dir.join("ckpt/config.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(dir.join("outside.txt"), dir.join("ckpt/leak.txt")).unwrap();
+        // A real safetensors file so the read produces a checkpoint at all.
+        let shard = dir.join("ckpt/model.safetensors");
+        let header = br#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[0u8; 4]);
+        std::fs::write(&shard, bytes).unwrap();
+
+        let files = vec![shard];
+        let model = crate::readers::read_local(&files).expect("fixture reads");
+        let s = WebState::build(model, &files, &[]);
+
+        // A file genuinely inside the checkpoint previews.
+        let q: Query = std::iter::once(("path".to_string(), "config.json".to_string())).collect();
+        assert_eq!(file(&s, &q).0, 200, "an in-tree file still previews");
+
+        // The symlink is listed (the walk records it) but reading it is refused.
+        let q: Query = std::iter::once(("path".to_string(), "leak.txt".to_string())).collect();
+        let reply = file(&s, &q);
+        assert_eq!(reply.0, 403, "a symlink out of the tree must not be served");
+        let body = String::from_utf8_lossy(&reply.1);
+        assert!(body.contains("outside the checkpoint"), "{body}");
+        assert!(!body.contains("not yours"), "the content leaked: {body}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _: PathBuf = dir; // keep the binding used on all cfgs
+    }
 
     #[test]
     fn every_endpoint_answers_200_with_the_documented_shape() {

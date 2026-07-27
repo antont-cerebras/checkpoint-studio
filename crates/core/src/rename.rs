@@ -624,12 +624,19 @@ pub fn is_writable(path: &Path) -> bool {
 /// update the index. Headers are written first so a rare mid-run I/O error can't
 /// leave an index that points at renames the shards don't yet have.
 pub fn apply(plan: &Plan) -> Result<()> {
-    // Pre-flight: confirm every shard *and* the index can be opened for writing
-    // before rewriting any of them, so a read-only file partway through can't leave
-    // a partially-renamed (inconsistent) checkpoint. Cheap relative to the rewrite,
-    // and turns a mid-run failure into a clean "nothing changed" one.
+    // Pre-flight: confirm every shard *and* the index can be opened for writing before
+    // rewriting any of them, so a read-only file partway through can't leave a
+    // partially-renamed (inconsistent) checkpoint. Cheap relative to the rewrite, and turns a
+    // mid-run failure into a clean "nothing changed" one.
+    //
+    // The handles are KEPT and written through below, rather than reopening each path. Two
+    // opens of the same path are two resolutions of it: between them the name could point
+    // somewhere else, and the second open — not the one we checked — is the one that gets
+    // written. Holding the descriptor means the file we verified is the file we modify. It
+    // also halves the opens, which is what this costs on a 60-shard checkpoint over NFS.
+    let mut handles: Vec<(&Path, fs::File)> = Vec::with_capacity(plan.shards.len());
     for sp in &plan.shards {
-        fs::OpenOptions::new()
+        let f = fs::OpenOptions::new()
             .write(true)
             .open(&sp.path)
             .with_context(|| {
@@ -638,6 +645,7 @@ pub fn apply(plan: &Plan) -> Result<()> {
                     sp.path.display()
                 )
             })?;
+        handles.push((&sp.path, f));
     }
     if let Some((path, _)) = &plan.index {
         fs::OpenOptions::new()
@@ -646,21 +654,17 @@ pub fn apply(plan: &Plan) -> Result<()> {
             .with_context(|| format!("{} is not writable — nothing was renamed", path.display()))?;
     }
 
-    for sp in &plan.shards {
+    for (sp, (path, f)) in plan.shards.iter().zip(&mut handles) {
         // The region after the 8-byte length is exactly `header_n` bytes: the new
         // JSON, space-padded back to that length so the data offsets stay valid.
         let mut buf = sp.new_json.clone();
         buf.resize(sp.header_n as usize, b' ');
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .open(&sp.path)
-            .with_context(|| format!("opening {} for rename", sp.path.display()))?;
         f.seek(SeekFrom::Start(8))
-            .with_context(|| format!("seeking in {}", sp.path.display()))?;
+            .with_context(|| format!("seeking in {}", path.display()))?;
         f.write_all(&buf)
-            .with_context(|| format!("rewriting {} header", sp.path.display()))?;
+            .with_context(|| format!("rewriting {} header", path.display()))?;
         f.flush()
-            .with_context(|| format!("flushing {}", sp.path.display()))?;
+            .with_context(|| format!("flushing {}", path.display()))?;
     }
     if let Some((path, text)) = &plan.index {
         fs::write(path, text).with_context(|| format!("updating {}", path.display()))?;

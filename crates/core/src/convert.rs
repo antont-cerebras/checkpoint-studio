@@ -10,7 +10,7 @@
 //! outer axis in a configurable buffer so peak memory stays bounded regardless
 //! of tensor size.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use hdf5_metno::filters::Filter;
@@ -117,6 +117,11 @@ pub fn convert_hdf5(
     if same_file(input, output) {
         bail!("input and output are the same file: {}", input.display());
     }
+    // Checked here for a clear message, but NOT relied on: `exists` and `create` are two
+    // syscalls on the same path, and a file (or a symlink to one) appearing in between would
+    // be silently truncated by a plain `create`. The exclusive create below is what actually
+    // guarantees we never clobber something — this tool's promise is that it only ever writes
+    // the file you named, and only if it is new.
     if output.exists() {
         bail!("output already exists: {}", output.display());
     }
@@ -127,7 +132,10 @@ pub fn convert_hdf5(
     // source, encode for writing those codecs.
     crate::hdf5_lz4::register();
     crate::hdf5_zstd::register();
-    let dst = hdf5_metno::File::create(output)
+    // `create_excl` is HDF5's `H5F_ACC_EXCL`: it fails if the path exists rather than
+    // truncating it, so the window between the check above and this line cannot cost anyone
+    // a file.
+    let dst = hdf5_metno::File::create_excl(output)
         .with_context(|| format!("creating {}", output.display()))?;
 
     let names = src.member_names().context("listing datasets")?;
@@ -180,9 +188,30 @@ pub fn convert_hdf5(
 /// Whether two paths refer to the same file (by absolute, lexically-normalised
 /// path — `output` need not exist yet).
 fn same_file(a: &Path, b: &Path) -> bool {
-    match (std::path::absolute(a), std::path::absolute(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
+    // Filesystem identity, not string equality. `std::path::absolute` normalises `.` and
+    // `..` LEXICALLY but does not resolve symlinks, so `--output link-to-the-input` compared
+    // unequal and the guard — whose whole job is "never write over the file you are reading"
+    // — did not fire. `canonicalize` resolves the link.
+    //
+    // The output usually does not exist yet, and `canonicalize` needs the path to exist, so
+    // resolve its PARENT and re-join the file name: that is enough to catch a symlinked
+    // directory on the way down, which is the case a lexical compare misses.
+    fn resolve(p: &Path) -> Option<PathBuf> {
+        if let Ok(real) = p.canonicalize() {
+            return Some(real);
+        }
+        let name = p.file_name()?;
+        let parent = p.parent().filter(|d| !d.as_os_str().is_empty())?;
+        Some(parent.canonicalize().ok()?.join(name))
+    }
+    match (resolve(a), resolve(b)) {
+        (Some(a), Some(b)) => a == b,
+        // Neither could be resolved: fall back to the lexical comparison rather than
+        // silently answering "different files".
+        _ => matches!(
+            (std::path::absolute(a), std::path::absolute(b)),
+            (Ok(x), Ok(y)) if x == y
+        ),
     }
 }
 
@@ -327,6 +356,62 @@ fn stream_copy<T: hdf5_metno::H5Type + Clone + Default>(
 mod tests {
     use super::*;
     use hdf5_metno::filters::Filter;
+
+    /// The "never write over the file you're reading" guard compared path SPELLINGS, so a
+    /// symlink pointing at the input looked like a different file. And `create` truncates,
+    /// so the check-then-create window could cost someone a file that appeared in between.
+    #[test]
+    fn the_output_guard_sees_through_symlinks_and_never_truncates() {
+        let dir = std::env::temp_dir().join("cs_convert_identity");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in.hdf5");
+        std::fs::write(&input, b"not really hdf5").unwrap();
+
+        assert!(same_file(&input, &input));
+        assert!(same_file(&input, &dir.join("./in.hdf5")));
+        assert!(!same_file(&input, &dir.join("other.hdf5")));
+
+        // `..` through a real directory. Worth pinning: `std::path::absolute` — what this
+        // used to compare — deliberately does NOT fold `..` on POSIX (folding it changes
+        // meaning when a component is a symlink), so this spelling was NOT caught before.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert!(same_file(&input, &dir.join("sub/../in.hdf5")));
+
+        // The one it missed: a link is the same file as its target.
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.hdf5");
+            std::os::unix::fs::symlink(&input, &link).unwrap();
+            assert!(
+                same_file(&input, &link),
+                "a symlink to the input IS the input"
+            );
+        }
+
+        // And a path that doesn't exist yet still resolves through its parent, so a
+        // symlinked *directory* on the way down is caught too.
+        #[cfg(unix)]
+        {
+            let real_dir = dir.join("real");
+            std::fs::create_dir_all(&real_dir).unwrap();
+            std::fs::write(real_dir.join("x.hdf5"), b"x").unwrap();
+            let link_dir = dir.join("link-dir");
+            std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+            assert!(same_file(
+                &real_dir.join("x.hdf5"),
+                &link_dir.join("x.hdf5")
+            ));
+        }
+
+        // An existing output is refused, and refused by the *create*, not only by the
+        // `exists` check — so nothing is truncated even if the file appears late.
+        let out = dir.join("out.hdf5");
+        std::fs::write(&out, b"precious").unwrap();
+        assert!(hdf5_metno::File::create_excl(&out).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"precious");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn repacks_datasets_and_roundtrips() {
