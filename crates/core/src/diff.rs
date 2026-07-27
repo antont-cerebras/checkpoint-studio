@@ -196,7 +196,8 @@ fn render_change(old: &TensorSig, new: &TensorSig, color: bool) -> (String, Stri
 /// Split a name into a template (each run of digits → a `{}` placeholder) and the
 /// digit-run values, so entries differing only by an index — a layer number, an
 /// expert id — share a template and can be collapsed.
-fn templatize(name: &str) -> (String, Vec<String>) {
+#[must_use]
+pub fn templatize(name: &str) -> (String, Vec<String>) {
     let mut template = String::new();
     let mut indices = Vec::new();
     let mut digits = String::new();

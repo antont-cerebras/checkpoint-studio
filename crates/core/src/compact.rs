@@ -16,9 +16,9 @@
 //! The folding itself is [`crate::diff::tensor_families`] — the same collapsing `diff`
 //! uses for its own summaries, so a family means one thing across the tool.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::diff::{TensorFamily, tensor_families};
+use crate::diff::{TensorFamily, templatize, tensor_families};
 use crate::tree::{Layout, Storage, TensorInfo, TreeBuilder, TreeNode};
 
 /// The tensor tree with uniform index families folded into single subtrees.
@@ -52,6 +52,84 @@ pub struct Varying {
     pub shape: bool,
 }
 
+/// Group tensors into families of **contiguous** index runs, rather than one family per
+/// index template regardless of gaps.
+///
+/// Why: Kimi-K3 alternates three KDA layers then one gated-MLA layer, ninety-three times.
+/// Templating alone puts all 69 KDA layers in one family, whose label then enumerates the
+/// set — `{0-2,4-6,8-10,…,88-90}`, three hundred characters the terminal truncates anyway,
+/// and the *pattern* is invisible. Split on the outermost index's contiguous runs and the
+/// same information reads as `{0-2}`, `{4-6}`, `{8-10}` … where the alternation is the
+/// obvious thing on screen.
+///
+/// Only the outermost index splits. An inner one — the expert id in
+/// `layers.{L}.…experts.{E}.…` — stays merged, because 896 experts present in every layer
+/// is uniformity, not a pattern worth spelling out.
+///
+/// Implemented by partitioning the tensors so that each bucket's outermost index *is*
+/// contiguous and then running the shared [`tensor_families`] over each bucket. The
+/// aggregation (counts, uniform dtype/shape, rolled-up params and bytes) therefore has one
+/// definition, and `diff`'s own summaries — where merging a scattered set is the right
+/// answer — keep the behaviour they had.
+fn contiguous_families(tensors: &[TensorInfo]) -> Vec<TensorFamily> {
+    // Which outermost-index values each template actually has.
+    let mut values: HashMap<String, Vec<u64>> = HashMap::new();
+    for t in tensors {
+        let (template, idx) = templatize(&t.name);
+        if let Some(first) = idx.first().and_then(|v| v.parse::<u64>().ok()) {
+            values.entry(template).or_default().push(first);
+        }
+    }
+    // The contiguous runs of those values, as (start, end) inclusive.
+    let runs: HashMap<String, Vec<(u64, u64)>> = values
+        .into_iter()
+        .map(|(template, mut vs)| {
+            vs.sort_unstable();
+            vs.dedup();
+            let mut out: Vec<(u64, u64)> = Vec::new();
+            for v in vs {
+                match out.last_mut() {
+                    // Extend the current run, including a repeat of its end.
+                    Some(last) if v == last.1 + 1 || v == last.1 => last.1 = v,
+                    _ => out.push((v, v)),
+                }
+            }
+            (template, out)
+        })
+        .collect();
+
+    // Bucket the tensors by (template, which run their outermost index falls in), keeping
+    // first-appearance order so the tree reads in checkpoint order.
+    let mut order: Vec<(String, usize)> = Vec::new();
+    let mut buckets: HashMap<(String, usize), Vec<TensorInfo>> = HashMap::new();
+    for t in tensors {
+        let (template, idx) = templatize(&t.name);
+        let run = idx
+            .first()
+            .and_then(|v| v.parse::<u64>().ok())
+            .and_then(|first| {
+                runs.get(&template)?
+                    .iter()
+                    .position(|&(lo, hi)| first >= lo && first <= hi)
+            })
+            // No index (or an unparseable one): one bucket for the template.
+            .unwrap_or(usize::MAX);
+        let key = (template, run);
+        if !buckets.contains_key(&key) {
+            order.push(key.clone());
+        }
+        buckets.entry(key).or_default().push(t.clone());
+    }
+
+    // One bucket has one contiguous run, so `tensor_families` yields one family from it —
+    // with a label naming just that run.
+    order
+        .iter()
+        .filter_map(|k| buckets.remove(k))
+        .flat_map(|bucket| tensor_families(&bucket))
+        .collect()
+}
+
 /// Fold `tensors` into the compact tree. Pure; no disk.
 ///
 /// `tensors` should be the canonical (deduped, natural-sorted) list, as every other view
@@ -59,7 +137,7 @@ pub struct Varying {
 /// input.
 #[must_use]
 pub fn compact_tree(tensors: &[TensorInfo]) -> CompactTree {
-    let families = tensor_families(tensors);
+    let families = contiguous_families(tensors);
 
     let mut counts = BTreeMap::new();
     let mut varying = BTreeMap::new();
@@ -436,11 +514,39 @@ mod count_tests {
     /// A family whose members disagree about shape must say so. It rendered as `()` —
     /// the *default* shape — which reads as a zero-dimensional tensor rather than
     /// "these differ". Reported from the Kimi-K3 tree: `proj.{0,2}.weight ×2 [BF16, ()]`.
+    /// A NON-contiguous pair splits, so each row shows its own real shape — which is how
+    /// the reported `proj.{0,2}.weight ×2 [BF16, ()]` stops existing: those two are indices
+    /// 0 and 2, not a run, so they were never one family's worth of information.
+    #[test]
+    fn a_non_contiguous_pair_splits_and_keeps_real_shapes() {
+        let tensors = vec![
+            t("mm_projector.proj.0.weight", "BF16", &[7168, 1024]),
+            t("mm_projector.proj.2.weight", "BF16", &[1024, 7168, 2]),
+        ];
+        let c = compact_tree(&tensors);
+        assert_eq!(
+            c.counts.len(),
+            2,
+            "indices 0 and 2 are not a run: {:?}",
+            c.counts.keys()
+        );
+        assert!(
+            c.varying.is_empty(),
+            "a one-member family agrees with itself: {:?}",
+            c.varying
+        );
+        for n in c.counts.values() {
+            assert_eq!(*n, 1, "each split family stands for one tensor");
+        }
+    }
+
+    /// A *contiguous* family whose members disagree about shape still has to say so — that
+    /// is the case `()` was hiding (247,296 packed weights across contiguous experts).
     #[test]
     fn a_varying_shape_says_so_on_the_row() {
         let tensors = vec![
             t("mm_projector.proj.0.weight", "BF16", &[7168, 1024]),
-            t("mm_projector.proj.2.weight", "BF16", &[1024, 7168, 2]),
+            t("mm_projector.proj.1.weight", "BF16", &[1024, 7168, 2]),
         ];
         let mut c = compact_tree(&tensors);
         label_counts(&mut c.tree, &c.counts, &c.varying);
