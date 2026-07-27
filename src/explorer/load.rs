@@ -720,9 +720,12 @@ impl Explorer {
         for file_path in files {
             let as_str = file_path.to_string_lossy();
             if crate::s3::is_uri(&as_str) {
+                // Same reason as the CLI's refusal, from `capability::Location::proxy_note`.
                 anyhow::bail!(
-                    "{as_str}: reading an s3:// checkpoint needs --ssh-proxy <[user@]host> \
-                     (its credentials stay on the remote)"
+                    "{as_str}: {}",
+                    crate::capability::Location::S3
+                        .proxy_note()
+                        .unwrap_or("cannot be read from here")
                 );
             }
         }

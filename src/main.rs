@@ -3783,9 +3783,12 @@ fn collect_safetensors_files(
         // function); a bare `s3://` here has no local credentials to read it with.
         let raw = path.to_string_lossy();
         if s3::is_uri(&raw) {
-            eprintln!(
-                "Warning: {raw}: reading an s3:// checkpoint needs --ssh-proxy <[user@]host>"
-            );
+            // The shared reason, from the capability model — so this refusal and the
+            // loader's (and any UI's) say the same thing.
+            let why = capability::Location::S3
+                .proxy_note()
+                .unwrap_or("cannot be read from here");
+            eprintln!("Warning: {raw}: {why}");
             continue;
         }
         // A Hugging Face reference is a URI, not a path: it must not be globbed, tilde-

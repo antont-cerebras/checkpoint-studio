@@ -109,6 +109,50 @@ impl Location {
     }
 }
 
+/// How a location is reached — the axis that says whether this machine can open it at all.
+///
+/// Distinct from every capability below, which describe what you can *do* once the
+/// checkpoint is open. This is about getting there: an `s3://` prefix is unreadable without
+/// a host that holds the credentials, so the answer to "can I read this at all" is neither
+/// a format nor a feature question. It was enforced by two hand-written strings — one in
+/// `collect_safetensors_files`, one in the loader — which is exactly the kind of thing a
+/// fourth location makes unmaintainable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reach {
+    /// Openable from this machine: a local path, or a public HTTPS endpoint.
+    Direct,
+    /// Only through an SSH proxy that holds the access (`--ssh-proxy`). The data and the
+    /// credentials stay there; only metadata comes back.
+    ViaSshProxy,
+}
+
+impl Location {
+    /// How this location is reached.
+    #[must_use]
+    pub const fn reach(self) -> Reach {
+        match self {
+            // A local path, and the Hub over public HTTPS.
+            Self::Local | Self::Hf => Reach::Direct,
+            // SFTP *is* the proxy; S3 needs one because the credentials live there.
+            Self::Sftp | Self::S3 => Reach::ViaSshProxy,
+        }
+    }
+
+    /// Why this location can't be opened without a proxy, phrased for a user — or `None`
+    /// when it can. One sentence, so the CLI's refusal and a UI's explanation match.
+    #[must_use]
+    pub const fn proxy_note(self) -> Option<&'static str> {
+        match self.reach() {
+            Reach::Direct => None,
+            Reach::ViaSshProxy => Some(
+                "needs --ssh-proxy <[user@]host>: the credentials and data stay on that \
+                 host, and only the checkpoint's metadata is sent back",
+            ),
+        }
+    }
+}
+
 /// What a given (format, location) pair supports. Serializable, so a server can hand the
 /// set to a browser rather than have the client re-derive it from the source's shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -132,6 +176,9 @@ pub struct Capabilities {
     pub object_metadata: bool,
     /// Per-dataset compression codec and stored-vs-logical size — HDF5 only.
     pub codec_info: bool,
+    /// How the source is reached — whether this machine can open it directly at all.
+    /// Carried alongside the capabilities so a frontend gets one answer, not two lookups.
+    pub reach: Reach,
 }
 
 impl Capabilities {
@@ -153,6 +200,7 @@ impl Capabilities {
             browse_files: !local || multi_file,
             object_metadata: matches!(location, Location::S3),
             codec_info: matches!(format, Format::Hdf5),
+            reach: location.reach(),
         }
     }
 
@@ -255,6 +303,32 @@ mod tests {
         // Location-specific extras.
         assert!(st_s3.object_metadata && !st_hf.object_metadata);
         assert!(h5_local.codec_info && !st_local.codec_info);
+    }
+
+    /// Reachability is its own axis: `s3://` is not openable without a proxy however
+    /// capable the format is, and the Hub is openable without one however remote it is.
+    /// Conflating "remote" with "needs a proxy" is what the two hand-written strings did.
+    #[test]
+    fn reach_separates_needing_a_proxy_from_being_remote() {
+        assert_eq!(Location::Local.reach(), Reach::Direct);
+        assert_eq!(
+            Location::Hf.reach(),
+            Reach::Direct,
+            "the Hub is remote but reachable over public HTTPS"
+        );
+        assert_eq!(Location::S3.reach(), Reach::ViaSshProxy);
+        assert_eq!(Location::Sftp.reach(), Reach::ViaSshProxy);
+
+        assert!(Location::Local.proxy_note().is_none());
+        assert!(Location::Hf.proxy_note().is_none(), "no proxy needed");
+        let s3 = Location::S3.proxy_note().expect("a reason");
+        assert!(s3.contains("--ssh-proxy"), "it names the flag: {s3}");
+
+        // And it travels with the capability set rather than needing a second lookup.
+        assert_eq!(
+            Capabilities::of(Format::Safetensors, Location::S3, true).reach,
+            Reach::ViaSshProxy
+        );
     }
 
     /// A single local file has no file tree worth browsing; everything else does.
