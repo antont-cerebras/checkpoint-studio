@@ -16,7 +16,7 @@
 //! The folding itself is [`crate::diff::tensor_families`] — the same collapsing `diff`
 //! uses for its own summaries, so a family means one thing across the tool.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use crate::diff::{TensorFamily, templatize, tensor_families};
 use crate::tree::{Layout, Storage, TensorInfo, TreeBuilder, TreeNode};
@@ -52,82 +52,118 @@ pub struct Varying {
     pub shape: bool,
 }
 
-/// Group tensors into families of **contiguous** index runs, rather than one family per
-/// index template regardless of gaps.
+/// Partition tensors into families by **contiguous runs of like layers**.
 ///
-/// Why: Kimi-K3 alternates three KDA layers then one gated-MLA layer, ninety-three times.
-/// Templating alone puts all 69 KDA layers in one family, whose label then enumerates the
-/// set — `{0-2,4-6,8-10,…,88-90}`, three hundred characters the terminal truncates anyway,
-/// and the *pattern* is invisible. Split on the outermost index's contiguous runs and the
-/// same information reads as `{0-2}`, `{4-6}`, `{8-10}` … where the alternation is the
-/// obvious thing on screen.
+/// The rule this enforces: reading down the tree, layer numbers only ever increase. That
+/// is not a sorting property — it constrains how families are formed. Grouping per tensor
+/// *template* (the obvious approach, and the one this replaces) puts `self_attn.q_proj` in
+/// the 69 layers that have it and `input_layernorm` in all 93, producing `{0-2}` beside
+/// `{0-92}`: overlapping sets, so layer 0 appears twice and no ordering of siblings can
+/// make the numbers monotonic.
 ///
-/// Only the outermost index splits. An inner one — the expert id in
-/// `layers.{L}.…experts.{E}.…` — stays merged, because 896 experts present in every layer
-/// is uniformity, not a pattern worth spelling out.
+/// So the grouping happens at the **layer** level. Each layer index gets a *signature* —
+/// the set of tensor templates it has, which is exactly what distinguishes a KDA layer from
+/// a gated-MLA one — and consecutive layers with an identical signature form a run. Runs
+/// therefore *partition* the index space: `{0-2}`, `{3}`, `{4-6}`, `{7}`, … with every
+/// layer in exactly one group, and Kimi-K3's three-then-one alternation becomes the shape
+/// of the screen instead of a 300-character label.
 ///
-/// Implemented by partitioning the tensors so that each bucket's outermost index *is*
-/// contiguous and then running the shared [`tensor_families`] over each bucket. The
-/// aggregation (counts, uniform dtype/shape, rolled-up params and bytes) therefore has one
-/// definition, and `diff`'s own summaries — where merging a scattered set is the right
-/// answer — keep the behaviour they had.
+/// A consequence worth knowing: a tensor present in every layer (`input_layernorm`) now
+/// appears once per run at `×run-length` rather than once at `×93`. That is the honest
+/// reading — those really are separate layers — and it is what keeps the runs disjoint.
+///
+/// "Layer" means the **outermost** index. An inner one (the expert id in
+/// `layers.{L}.…experts.{E}.…`) is left merged: 896 experts present in every layer is
+/// uniformity, and splitting there would produce 896 rows saying the same thing.
+///
+/// Each bucket is then handed to the shared [`tensor_families`], so the aggregation —
+/// counts, uniform dtype/shape, rolled-up params and bytes — keeps one definition, and
+/// `diff`'s summaries keep the behaviour they had.
 fn contiguous_families(tensors: &[TensorInfo]) -> Vec<TensorFamily> {
-    // Which outermost-index values each template actually has.
-    let mut values: HashMap<String, Vec<u64>> = HashMap::new();
+    use std::collections::{BTreeSet, HashMap};
+
+    // Per index AXIS, what each index value contains. The axis is the template up to and
+    // including its first placeholder (`model.layers.{}`), so a model's layers and a vision
+    // tower's layers are partitioned separately rather than conflated by sharing a number.
+    let mut axes: HashMap<String, BTreeMap<u64, BTreeSet<String>>> = HashMap::new();
     for t in tensors {
         let (template, idx) = templatize(&t.name);
-        if let Some(first) = idx.first().and_then(|v| v.parse::<u64>().ok()) {
-            values.entry(template).or_default().push(first);
-        }
+        let Some(axis) = axis_of(&template) else {
+            continue;
+        };
+        let Some(index) = idx.first().and_then(|v| v.parse::<u64>().ok()) else {
+            continue;
+        };
+        axes.entry(axis)
+            .or_default()
+            .entry(index)
+            .or_default()
+            .insert(template);
     }
-    // The contiguous runs of those values, as (start, end) inclusive.
-    let runs: HashMap<String, Vec<(u64, u64)>> = values
+
+    // Contiguous runs of equal signature, as inclusive (start, end).
+    let runs: HashMap<String, Vec<(u64, u64)>> = axes
         .into_iter()
-        .map(|(template, mut vs)| {
-            vs.sort_unstable();
-            vs.dedup();
+        .map(|(axis, signatures)| {
             let mut out: Vec<(u64, u64)> = Vec::new();
-            for v in vs {
+            let mut current: Option<BTreeSet<String>> = None;
+            for (index, signature) in signatures {
+                let extends = matches!(out.last(), Some(&(_, end)) if index == end + 1)
+                    && current.as_ref() == Some(&signature);
                 match out.last_mut() {
-                    // Extend the current run, including a repeat of its end.
-                    Some(last) if v == last.1 + 1 || v == last.1 => last.1 = v,
-                    _ => out.push((v, v)),
+                    Some(last) if extends => last.1 = index,
+                    _ => {
+                        out.push((index, index));
+                        current = Some(signature);
+                    }
                 }
             }
-            (template, out)
+            (axis, out)
         })
         .collect();
 
-    // Bucket the tensors by (template, which run their outermost index falls in), keeping
-    // first-appearance order so the tree reads in checkpoint order.
+    // Bucket every tensor by (axis, which run its index falls in), in first-appearance
+    // order. A tensor with no index is its own bucket, keyed by its template.
     let mut order: Vec<(String, usize)> = Vec::new();
     let mut buckets: HashMap<(String, usize), Vec<TensorInfo>> = HashMap::new();
     for t in tensors {
         let (template, idx) = templatize(&t.name);
-        let run = idx
-            .first()
-            .and_then(|v| v.parse::<u64>().ok())
-            .and_then(|first| {
-                runs.get(&template)?
-                    .iter()
-                    .position(|&(lo, hi)| first >= lo && first <= hi)
-            })
-            // No index (or an unparseable one): one bucket for the template.
-            .unwrap_or(usize::MAX);
-        let key = (template, run);
+        let key = match (
+            axis_of(&template),
+            idx.first().and_then(|v| v.parse::<u64>().ok()),
+        ) {
+            (Some(axis), Some(index)) => {
+                let run = runs
+                    .get(&axis)
+                    .and_then(|rs| rs.iter().position(|&(lo, hi)| index >= lo && index <= hi))
+                    .unwrap_or(0);
+                (axis, run)
+            }
+            // No index: nothing to partition, so the template is the whole bucket.
+            _ => (template, usize::MAX),
+        };
         if !buckets.contains_key(&key) {
             order.push(key.clone());
         }
         buckets.entry(key).or_default().push(t.clone());
     }
 
-    // One bucket has one contiguous run, so `tensor_families` yields one family from it —
-    // with a label naming just that run.
     order
         .iter()
         .filter_map(|k| buckets.remove(k))
         .flat_map(|bucket| tensor_families(&bucket))
         .collect()
+}
+
+/// The index axis a template belongs to: everything up to and including its first `{}`
+/// placeholder (`model.layers.{}`), or `None` for a template with no index.
+///
+/// Two templates share an axis exactly when they are indexed by the same thing — which is
+/// what makes "layer 3 of the language model" and "layer 3 of the vision tower" different
+/// layers rather than one.
+fn axis_of(template: &str) -> Option<String> {
+    let at = template.find("{}")?;
+    Some(template[..at + 2].to_string())
 }
 
 /// Fold `tensors` into the compact tree. Pure; no disk.
@@ -336,8 +372,9 @@ mod tests {
         );
     }
 
-    /// The reason the view exists: a tensor present in only one layer does NOT fold in
-    /// with its 48 uniform siblings, so it stands out as its own leaf.
+    /// The reason the view exists: the layer that differs is isolated. Layer 2 has an extra
+    /// tensor, so it becomes its own run — `{0-1}`, `{2}`, `{3}` — and the exception is a
+    /// row of its own rather than being averaged into a family spanning all four layers.
     #[test]
     fn an_irregularity_stays_visible_beside_the_folded_stack() {
         let mut tensors = Vec::new();
@@ -352,33 +389,104 @@ mod tests {
         tensors.push(tensor("model.layers.2.mlp.extra_bias", "F32", &[8]));
         let c = compact_tree(&tensors);
 
-        assert_eq!(c.tensor_count, 5);
+        assert_eq!(c.tensor_count, 5, "every tensor is still accounted for");
+        // The uniform pair folds; the odd layer and the layer after it stand alone.
         let names: Vec<&String> = c.counts.keys().collect();
-        assert_eq!(
-            names.len(),
-            2,
-            "the odd one out is its own family: {names:?}"
-        );
-        let odd = c
-            .counts
-            .iter()
-            .find(|&(_, n)| *n == 1)
-            .expect("the single-member family");
         assert!(
-            odd.0.contains("extra_bias"),
-            "the irregularity should be the lone family: {:?}",
-            c.counts
+            names.iter().any(|n| n.contains("{0-1}")),
+            "layers 0 and 1 are alike and fold: {names:?}"
         );
-        // And it names the actual layer rather than a range, which is what makes it read
-        // as an exception.
         assert!(
-            odd.0.contains(".2.") || odd.0.contains("{2}"),
-            "the lone family should name its layer: {}",
-            odd.0
+            names.iter().any(|n| n.contains("extra_bias")),
+            "the odd tensor gets its own family: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("layers.2.")),
+            "layer 2 is named on its own, not inside a range: {names:?}"
         );
     }
 
-    /// A family whose members disagree about dtype is flagged rather than shown with one
+    /// **The rule**: reading down the tree, layer numbers only increase. That is a property
+    /// of how families are formed, not of how siblings are sorted — grouping per tensor
+    /// template produced `{0-2}` beside `{0-92}`, overlapping sets in which layer 0 appears
+    /// twice, and no ordering could have fixed it. This asserts the runs *partition* the
+    /// layer space, which is what makes monotonicity achievable at all.
+    #[test]
+    fn layer_runs_partition_the_layers_so_indices_only_increase() {
+        // Kimi-K3's shape in miniature: three "KDA" layers then one "MLA" layer, twice
+        // over, with two tensors present in every layer.
+        let mut tensors = Vec::new();
+        for layer in 0..8 {
+            tensors.push(tensor(
+                &format!("model.layers.{layer}.input_layernorm.weight"),
+                "BF16",
+                &[8],
+            ));
+            if layer % 4 == 3 {
+                tensors.push(tensor(
+                    &format!("model.layers.{layer}.self_attn.g_proj.weight"),
+                    "BF16",
+                    &[8, 8],
+                ));
+            } else {
+                tensors.push(tensor(
+                    &format!("model.layers.{layer}.self_attn.A_log"),
+                    "F32",
+                    &[4],
+                ));
+            }
+        }
+        let c = compact_tree(&tensors);
+        assert_eq!(c.tensor_count, 16);
+
+        // Every family's layer span, in the order the names sort (which is the order the
+        // tree renders them).
+        let mut spans: Vec<(u64, u64)> = c
+            .counts
+            .keys()
+            .filter_map(|n| layer_span(n))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        spans.sort_unstable();
+        assert!(!spans.is_empty(), "families: {:?}", c.counts.keys());
+
+        // No two runs overlap, and together they cover 0..=7 exactly once — the property
+        // that makes "layer numbers only increase" possible.
+        for pair in spans.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "runs must not overlap: {:?} then {:?} (all: {spans:?})",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(spans.first().map(|s| s.0), Some(0));
+        assert_eq!(spans.last().map(|s| s.1), Some(7));
+        // The 3:1 alternation shows up as runs of three then one.
+        assert!(
+            spans.iter().any(|&(a, b)| b - a == 2),
+            "a three-layer run should exist: {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|&(a, b)| a == b),
+            "a single-layer run should exist: {spans:?}"
+        );
+    }
+
+    /// The layer range a templated family name spans, from its `layers.N` or `layers.{A-B}`.
+    fn layer_span(name: &str) -> Option<(u64, u64)> {
+        let rest = name.split("layers.").nth(1)?;
+        let token: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || matches!(c, '{' | '}' | '-' | ','))
+            .collect();
+        let inner = token.trim_matches(|c| c == '{' || c == '}');
+        let (lo, hi) = inner.split_once('-').unwrap_or((inner, inner));
+        Some((lo.parse().ok()?, hi.parse().ok()?))
+    }
+
+    /// A family whose members disagree about dtype is flagged    /// A family whose members disagree about dtype is flagged rather than shown with one
     /// member's dtype standing in for all of them.
     #[test]
     fn a_family_that_disagrees_about_dtype_is_marked_as_varying() {
