@@ -361,6 +361,12 @@ struct ExploreArgs {
     stats_shards: bool,
 
     #[arg(
+        long = "compact",
+        help = "Open the compact tree: uniform layers / experts folded into one templated subtree each, so only irregularities stand out (the `k` key). Structure at a glance — 31k tensors read as ~20 families"
+    )]
+    compact: bool,
+
+    #[arg(
         long = "sort",
         value_name = "KEY[.DIR]",
         value_parser = viewstate::parse_sort,
@@ -3436,7 +3442,8 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.layout.is_some()
         || args.rename
         || args.diff_against.is_some()
-        || args.sort.is_some();
+        || args.sort.is_some()
+        || args.compact;
     let view = if args.values {
         OpenView::Values
     } else if args.heatmap {
@@ -3491,6 +3498,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.rename
         || args.diff_against.is_some()
         || args.sort.is_some()
+        || args.compact
         || args.exit;
     // `--tensor`/`--metadata` are mutually exclusive (clap enforces it); fold into
     // one target, and the detail-implies-parent flag pairs into 3-state requests.
@@ -3545,6 +3553,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         rename: args.rename,
         diff_against: args.diff_against.clone(),
         sort: args.sort,
+        compact: args.compact,
         rename_rules: args.rename_rule,
     });
 

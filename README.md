@@ -194,6 +194,12 @@ The UI is a Svelte single-page app **embedded in the binary**, so a released
 > `--host 127.0.0.1` to restrict it to your own machine. When the bind is not loopback,
 > the startup banner says so in the terminal and the page carries a strip saying the same.
 
+**Reverse parity — what the browser has that the terminal deliberately doesn't.** The
+terminal now has the compact (family-folded) tree (`k` / `--compact`) and flat-list sorting
+(`o` / `O` / `--sort`). It does **not** have a theme switch: recolouring is browser-idiomatic
+presentation, the terminal already answers to its own colour scheme, and this is left as an
+intentional medium difference rather than a gap.
+
 **What the web UI deliberately does not do.** It is **read-only**: renaming tensors in
 place and repacking an HDF5 codec are offered by the CLI (`convert`) and the TUI (`R` and
 the palette's repack command) but have no web equivalent, because they rewrite checkpoint

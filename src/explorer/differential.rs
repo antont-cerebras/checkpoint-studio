@@ -130,6 +130,24 @@ fn cli_inventory(json: &str) -> BTreeMap<String, Value> {
     out
 }
 
+/// Each tensor leaf's `(full name, display label)`, depth-first — for checking what a
+/// row actually shows against what the data says it should.
+fn leaf_labels(v: &Value, out: &mut Vec<(String, String)>) {
+    if let Some(children) = v.get("children").and_then(Value::as_array) {
+        for c in children {
+            leaf_labels(c, out);
+        }
+    }
+    if v.get("kind").and_then(Value::as_str) == Some("tensor")
+        && let (Some(name), Some(label)) = (
+            v["info"]["name"].as_str(),
+            v.get("label").and_then(Value::as_str),
+        )
+    {
+        out.push((name.to_string(), label.to_string()));
+    }
+}
+
 /// Nothing below means anything if the fixture is empty — a differential test over
 /// two empty collections passes vacuously. Pinned once, so every other case here can
 /// rely on there being something to disagree about.
@@ -827,5 +845,86 @@ fn the_sort_cycles_and_round_trips_through_the_reopen_command() {
     assert_eq!(
         crate::viewstate::parse_sort("size.desc").expect("the emitted spelling parses"),
         (SortKey::Size, SortDir::Desc)
+    );
+}
+
+/// **The compact tree, in both interactive surfaces.** The terminal and the browser must
+/// fold the same checkpoint into the same tree — that is the whole reason the fold lives in
+/// core rather than in each frontend. The one deliberate difference is presentation: the
+/// terminal carries each family's `×N` in the row label (it has no separate count column),
+/// while the browser reads `counts` and styles the multiplier itself.
+#[test]
+fn the_tui_and_the_web_fold_the_same_compact_tree() {
+    let mut ex = explorer();
+    ex.set_compact(true);
+    let tui = serde_json::to_value(&ex.tree_state.tree).unwrap();
+
+    let served = body(handlers::compact(&web(), &query("q", "")));
+
+    // Same shape below the root, once the labels the terminal adds are stripped.
+    // The terminal folds the count into the label; the browser keeps it separate. Null the
+    // labels so the comparison is about the *tree*, and assert the counts separately below.
+    let strip = |v: &Value| -> Value {
+        fn walk(v: &mut Value) {
+            if let Some(items) = v.as_array_mut() {
+                for item in items {
+                    walk(item);
+                }
+                return;
+            }
+            if let Some(children) = v.get_mut("children").and_then(Value::as_array_mut) {
+                for c in children {
+                    walk(c);
+                }
+            }
+            if v.get("kind").and_then(Value::as_str) == Some("tensor")
+                && let Some(obj) = v.as_object_mut()
+            {
+                obj.insert("label".to_string(), Value::Null);
+            }
+        }
+        let mut v = v.clone();
+        walk(&mut v);
+        v
+    };
+    assert_eq!(
+        strip(&tui[0]["children"]),
+        strip(&served["tree"][0]["children"]),
+        "the two surfaces fold the checkpoint differently"
+    );
+
+    // And the terminal's labels really do carry the counts the browser gets separately.
+    let counts = served["counts"].as_object().expect("a counts map");
+    let mut labelled = 0usize;
+    let mut pairs = Vec::new();
+    leaf_labels(&tui[0], &mut pairs);
+    assert!(!pairs.is_empty(), "the compact tree should have families");
+    for (name, label) in pairs {
+        let n = counts[&name].as_u64().expect("a count for every family");
+        assert!(
+            label.ends_with(&format!("×{n}")),
+            "'{label}' should carry the count {n} the browser is sent for '{name}'"
+        );
+        labelled += 1;
+    }
+    assert_eq!(
+        labelled,
+        counts.len(),
+        "every family should appear once in the terminal's tree"
+    );
+}
+
+/// The compact toggle round-trips through `y`, like every other view choice.
+#[test]
+fn the_compact_view_round_trips_through_the_reopen_command() {
+    let mut ex = explorer();
+    let plain = ex.reopen_command(&super::Screen::Tree, false, false);
+    assert!(!plain.contains("--compact"), "{plain}");
+
+    ex.set_compact(true);
+    let folded = ex.reopen_command(&super::Screen::Tree, false, false);
+    assert!(
+        folded.contains("--compact"),
+        "the reopen command should carry the fold: {folded}"
     );
 }

@@ -110,6 +110,22 @@ fn family_as_tensor(f: &TensorFamily) -> TensorInfo {
     }
 }
 
+/// [`compact_tree`], rooted the way every frontend's tree is rooted — so the compact view
+/// has the same header row as the tree view it replaces, counting the *real* tensors above
+/// a body of families. `files` names the root ([`crate::model::root_label`]).
+#[must_use]
+pub fn compact_rooted(tensors: &[TensorInfo], files: &[std::path::PathBuf]) -> CompactTree {
+    let folded = compact_tree(tensors);
+    CompactTree {
+        tree: vec![crate::tree::root_group(
+            crate::model::root_label(files),
+            folded.tree,
+            tensors,
+        )],
+        ..folded
+    }
+}
+
 /// Fold each family's member count into its display label — `down_proj.weight ×48`.
 ///
 /// For a frontend that renders one label per row and has nowhere to put a separate count

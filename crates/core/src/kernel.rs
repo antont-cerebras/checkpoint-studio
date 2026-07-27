@@ -655,15 +655,30 @@ impl Session {
     /// is. A tree assembled in one place cannot disagree with itself.
     #[must_use]
     pub fn build_rooted_tree(&self, files: &[std::path::PathBuf]) -> Vec<TreeNode> {
-        vec![TreeNode::Group {
-            name: crate::model::root_label(files),
-            children: self.build_tree(),
-            expanded: true,
-            tensor_count: self.tensors.len(),
-            params: self.total_parameters,
-            total_size: self.tensors.iter().map(|t| t.size_bytes).sum(),
-            stored_size: self.tensors.iter().map(TensorInfo::on_disk_size).sum(),
-        }]
+        self.rooted(files, self.build_tree())
+    }
+
+    /// The **compact** tree, rooted the same way: uniform layer / expert stacks folded
+    /// into one templated subtree each, with every family's member count folded into its
+    /// row label (`down_proj.weight ×48`) — see [`crate::compact`].
+    ///
+    /// The root still summarises the *real* totals, so the header says 31,251 tensors
+    /// while the body shows the 19 families they fold into.
+    #[must_use]
+    pub fn build_compact_rooted_tree(&self, files: &[std::path::PathBuf]) -> Vec<TreeNode> {
+        let mut c = crate::compact::compact_rooted(&self.tensors, files);
+        crate::compact::label_counts(&mut c.tree, &c.counts);
+        c.tree
+    }
+
+    /// `children` under the single root node that summarises the whole checkpoint — the
+    /// shared wrap, so the plain and compact trees cannot differ in their header.
+    fn rooted(&self, files: &[std::path::PathBuf], children: Vec<TreeNode>) -> Vec<TreeNode> {
+        vec![crate::tree::root_group(
+            crate::model::root_label(files),
+            children,
+            &self.tensors,
+        )]
     }
 
     /// Deduplicate tensors by name (keeping the first occurrence in shard order,

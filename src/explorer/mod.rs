@@ -543,6 +543,8 @@ enum Cmd {
     Search,
     Filter,
     Diff,
+    /// Fold uniform layer / expert stacks (the compact tree).
+    CompactToggle,
     /// Cycle which facet the flat (search / filter) list is ordered by.
     SortCycle,
     /// Reverse the current order.
@@ -666,6 +668,12 @@ const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
         "Tree",
         "Filter tensors… (dtype/shape/size/name/…)",
         '\u{0}',
+    ),
+    (
+        Cmd::CompactToggle,
+        "Tree",
+        "Compact view: fold uniform layers / experts",
+        'k',
     ),
     // Sorting applies to the flat search / filter list only — the tree keeps the
     // checkpoint's own order. `o` cycles the facet, `O` reverses it.
@@ -1226,6 +1234,11 @@ pub(crate) struct Explorer {
     /// Whether a scroll-bar drag is in progress (engine-owned, shared by every
     /// mode's bar).
     scrollbar_drag: bool,
+    /// Show the **compact** tree — uniform layer / expert stacks folded into one
+    /// templated subtree each, so only irregularities stand out (`k`, `--compact`; see
+    /// [`crate::compact`]). A different tree, not a different rendering of one, so
+    /// toggling it rebuilds.
+    compact: bool,
     /// Index/file mismatches, shown as a warning panel. Populated in
     /// [`Self::finalize_load`] from [`Self::index_specs`] once the tensors are
     /// read (plus any remote index health folded in by the loader).
@@ -1327,6 +1340,7 @@ impl Explorer {
             vscrollbar: RefCell::new(None),
             overlay: RefCell::new(None),
             scrollbar_drag: false,
+            compact: false,
             health_reports: Vec::new(),
             index_specs,
             data_view: crate::kernel::DataViewState::default(),
@@ -1462,10 +1476,14 @@ impl Explorer {
     /// root included — comes from the kernel, so the web UI serves the same one
     /// (see [`Session::build_rooted_tree`]).
     fn build_tree(&mut self) {
-        self.tree_state.tree = self
-            .session
-            .as_ref()
-            .map_or_else(Vec::new, |session| session.build_rooted_tree(&self.files));
+        let (compact, files) = (self.compact, self.files.clone());
+        self.tree_state.tree = self.session.as_ref().map_or_else(Vec::new, |session| {
+            if compact {
+                session.build_compact_rooted_tree(&files)
+            } else {
+                session.build_rooted_tree(&files)
+            }
+        });
         self.flatten_tree();
     }
 
@@ -1607,6 +1625,9 @@ impl Explorer {
         let want_diff = self.open.as_ref().and_then(|r| r.diff_against.clone());
         if let Some(sort) = self.open.as_ref().and_then(|r| r.sort) {
             self.tree_state.sort = sort;
+        }
+        if self.open.as_ref().is_some_and(|r| r.compact) {
+            self.set_compact(true);
         }
         if let Some(n) = bins {
             self.data_view.histogram_bins.set(Some(n));
@@ -2130,6 +2151,10 @@ impl Explorer {
         if let Some(sort) = self.open.as_ref().and_then(|r| r.sort) {
             self.tree_state.sort = sort;
         }
+        // Likewise the compact fold, before the tree is built from it.
+        if self.open.as_ref().is_some_and(|r| r.compact) {
+            self.set_compact(true);
+        }
         let want_rename_rules = self
             .open
             .as_ref()
@@ -2613,6 +2638,17 @@ impl Explorer {
         self.flash_copied("screen contents");
     }
 
+    /// Show (or stop showing) the compact tree. It is a *different* tree, so this rebuilds
+    /// — and the selection/scroll can't survive a change of what the rows are. Safe before
+    /// the checkpoint has loaded: the rebuild is a no-op without a session, and loading
+    /// builds the tree again afterwards.
+    fn set_compact(&mut self, on: bool) {
+        self.compact = on;
+        self.build_tree();
+        self.tree_state.selected = 0;
+        self.tree_state.scroll = 0;
+    }
+
     /// Rebuild the flat rows so a sort change takes effect — including a change *back*
     /// to the natural order, which is a rebuild rather than an un-sort.
     fn resort(&mut self) {
@@ -3029,6 +3065,17 @@ impl Explorer {
             Cmd::Search => self.enter_search_mode(),
             Cmd::Filter => self.run_filter_prompt(term),
             Cmd::Diff => return Self::run_diff_prompt(term).map(Nav::Open),
+            Cmd::CompactToggle => {
+                self.set_compact(!self.compact);
+                self.copied_flash = Some((
+                    if self.compact {
+                        "compact view: uniform layers / experts folded".to_string()
+                    } else {
+                        "full tree".to_string()
+                    },
+                    std::time::Instant::now(),
+                ));
+            }
             Cmd::SortCycle => {
                 let key = self.tree_state.cycle_sort();
                 self.resort();
@@ -3108,6 +3155,7 @@ impl Explorer {
                 Cmd::Search
                 | Cmd::Filter
                 | Cmd::Diff
+                | Cmd::CompactToggle
                 | Cmd::ExpandAll
                 | Cmd::CollapseAll
                 | Cmd::Stats
@@ -6195,6 +6243,9 @@ impl Explorer {
         let mut args = state.map_or_else(Vec::new, |s| {
             vec!["--tree-state".to_string(), s.label().to_string()]
         });
+        if self.compact {
+            args.push("--compact".to_string());
+        }
         // The flat list's order, when it isn't the natural one — so `o` / `O` round-trip
         // through `y` like every other view choice.
         let (key, dir) = self.tree_state.sort;

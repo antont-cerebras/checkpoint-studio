@@ -38,7 +38,7 @@ Checkpoint Studio - [FIXTURE] (1/1)                                             
 
 
 ↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · PgUp/PgDn page · Enter open · Tab files · Space/: commands
-e/c expand/collapse all · / search · l legend · h health · s stats · d compare · o/O sort/reverse · t copy tree
-f copy file · n copy name · y copy command · ⌫/\ back/fwd · R rename · q quit
+e/c expand/collapse all · / search · l legend · h health · s stats · d compare · k compact · o/O sort/reverse
+t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · R rename · q quit
  ▸ tests/fixtures
                                                                                                                editable

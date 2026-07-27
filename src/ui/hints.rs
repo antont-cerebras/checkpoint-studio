@@ -581,6 +581,7 @@ pub(crate) fn tree_hint_lines(
         (letter("h"), "health"),
         (letter("s"), "stats"),
         (letter("d"), "compare"),
+        (letter("k"), "compact"),
         (
             vec![
                 Seg::Key("o", hint_key('o')),

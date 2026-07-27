@@ -244,6 +244,26 @@ fn normalize_sep(name: &str) -> Cow<'_, str> {
     }
 }
 
+/// `children` under the single root node that summarises a whole checkpoint —
+/// `▾ <label> (▦ N, P params, S)`.
+///
+/// One definition because every tree a frontend shows is rooted this way: the tensor tree,
+/// the compact (family-folded) tree, and whatever comes next. The totals come from
+/// `tensors` — the *real* tensors — so a folded tree's header still counts the checkpoint
+/// rather than its families.
+#[must_use]
+pub fn root_group(label: String, children: Vec<TreeNode>, tensors: &[TensorInfo]) -> TreeNode {
+    TreeNode::Group {
+        name: label,
+        children,
+        expanded: true,
+        tensor_count: tensors.len(),
+        params: tensors.iter().map(|t| t.num_elements).sum(),
+        total_size: tensors.iter().map(|t| t.size_bytes).sum(),
+        stored_size: tensors.iter().map(TensorInfo::on_disk_size).sum(),
+    }
+}
+
 pub struct TreeBuilder;
 
 impl TreeBuilder {

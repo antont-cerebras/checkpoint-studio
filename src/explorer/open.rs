@@ -303,6 +303,9 @@ pub(crate) struct OpenRequest {
     /// Order the flat search / filter list (`--sort KEY[.DIR]`, the `o` / `O` keys).
     /// Round-trips through `y`.
     pub sort: Option<(crate::viewstate::SortKey, crate::viewstate::SortDir)>,
+    /// Open the compact (family-folded) tree (`--compact`, the `k` key). Round-trips
+    /// through `y`.
+    pub compact: bool,
     /// Render the view once and exit without interactive navigation.
     pub exit_after: bool,
     /// Land in the file browser (`--files`, the `Tab` toggle) once the tree is

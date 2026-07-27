@@ -113,9 +113,9 @@ pub(crate) fn compact(s: &WebState, q: &Query) -> Reply {
             .filter(|t| filter.matches(t))
             .cloned()
             .collect();
-        return ok(crate::compact::compact_tree(&scoped));
+        return ok(crate::compact::compact_rooted(&scoped, &s.files));
     }
-    ok(crate::compact::compact_tree(&s.tensors))
+    ok(crate::compact::compact_rooted(&s.tensors, &s.files))
 }
 
 /// Compact per-family listing: collapse the (optionally `?q=`-filtered) tensors into
