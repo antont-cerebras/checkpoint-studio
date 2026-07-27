@@ -667,7 +667,7 @@ impl Session {
     #[must_use]
     pub fn build_compact_rooted_tree(&self, files: &[std::path::PathBuf]) -> Vec<TreeNode> {
         let mut c = crate::compact::compact_rooted(&self.tensors, files);
-        crate::compact::label_counts(&mut c.tree, &c.counts);
+        crate::compact::label_counts(&mut c.tree, &c.counts, &c.varying);
         c.tree
     }
 

@@ -83,12 +83,41 @@ pub fn compact_tree(tensors: &[TensorInfo]) -> CompactTree {
         })
         .collect();
 
+    let mut tree = TreeBuilder::build_tree(&synthetic);
+    // The builder counted the synthetic tensors — i.e. families. Restate every group's
+    // count in REAL tensors, because `▦` has to mean the same thing on a group as it does
+    // on the root: before this, a folded `language_model` read `▦ 44` under a root reading
+    // `▦ 497220`, which invites the reader to think 497k tensors went missing.
+    recount_groups(&mut tree, &counts);
     CompactTree {
-        tree: TreeBuilder::build_tree(&synthetic),
+        tree,
         counts,
         varying,
         tensor_count: families.iter().map(|f| f.count).sum(),
     }
+}
+
+/// Restate each group's `tensor_count` as the number of real tensors its families stand
+/// for, returning that number so parents can sum it. Sizes and parameter counts are
+/// already real (they come from the family rollups); only the count was of families.
+fn recount_groups(nodes: &mut [TreeNode], counts: &BTreeMap<String, usize>) -> usize {
+    let mut total = 0;
+    for node in nodes {
+        total += match node {
+            TreeNode::Group {
+                children,
+                tensor_count,
+                ..
+            } => {
+                let n = recount_groups(children, counts);
+                *tensor_count = n;
+                n
+            }
+            TreeNode::Tensor { info, .. } => counts.get(&info.name).copied().unwrap_or(1),
+            TreeNode::Metadata { .. } => 0,
+        };
+    }
+    total
 }
 
 /// A family as the one "tensor" that stands for it. `dtype` is `"varies"` and `shape`
@@ -132,10 +161,14 @@ pub fn compact_rooted(tensors: &[TensorInfo], files: &[std::path::PathBuf]) -> C
 /// column: the terminal. The browser reads [`CompactTree::counts`] instead and styles the
 /// multiplier itself. Both show the same fact; only the presentation differs, which is the
 /// kind of difference `shared/parity/README.md` records as deliberate.
-pub fn label_counts(tree: &mut [TreeNode], counts: &BTreeMap<String, usize>) {
+pub fn label_counts(
+    tree: &mut [TreeNode],
+    counts: &BTreeMap<String, usize>,
+    varying: &BTreeMap<String, Varying>,
+) {
     for node in tree {
         match node {
-            TreeNode::Group { children, .. } => label_counts(children, counts),
+            TreeNode::Group { children, .. } => label_counts(children, counts, varying),
             TreeNode::Tensor { info, label } => {
                 let Some(n) = counts.get(&info.name) else {
                     continue;
@@ -152,10 +185,18 @@ pub fn label_counts(tree: &mut [TreeNode], counts: &BTreeMap<String, usize>) {
                 // Idempotent: drop a suffix we already added, so calling this twice (a
                 // rebuild that re-labels an already-labelled tree) can't produce `w ×3 ×3`.
                 let base = base
-                    .rsplit_once(" ×")
-                    .filter(|(_, n)| !n.is_empty() && n.chars().all(char::is_numeric))
+                    .split_once(" ×")
                     .map_or(base.as_str(), |(head, _)| head);
-                *label = Some(format!("{base} ×{n}"));
+                // A family whose members disagree gets told so on the row. Without this the
+                // renderer prints the *default* shape — `()` — which reads as a
+                // zero-dimensional tensor rather than "these differ".
+                let note = match varying.get(&info.name) {
+                    Some(v) if v.dtype && v.shape => " (dtype and shape vary)",
+                    Some(v) if v.shape => " (shape varies)",
+                    Some(_) => "",
+                    None => "",
+                };
+                *label = Some(format!("{base} ×{n}{note}"));
             }
             TreeNode::Metadata { .. } => {}
         }
@@ -300,7 +341,7 @@ mod tests {
             .map(|i| tensor(&format!("model.layers.{i}.mlp.w"), "BF16", &[4, 4]))
             .collect();
         let mut c = compact_tree(&tensors);
-        label_counts(&mut c.tree, &c.counts);
+        label_counts(&mut c.tree, &c.counts, &c.varying);
 
         let first = labels(&c.tree);
         assert_eq!(first.len(), 1, "one family: {first:?}");
@@ -310,7 +351,7 @@ mod tests {
             first[0]
         );
         // Idempotent: running it twice must not produce `w ×3 ×3`.
-        label_counts(&mut c.tree, &c.counts);
+        label_counts(&mut c.tree, &c.counts, &c.varying);
         assert_eq!(labels(&c.tree), first, "labelling twice must not stack");
     }
 
@@ -340,5 +381,118 @@ mod tests {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod count_tests {
+    use super::*;
+
+    fn t(name: &str, dtype: &str, shape: &[usize]) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            dtype: dtype.to_string(),
+            shape: shape.to_vec(),
+            size_bytes: shape.iter().product::<usize>() * 2,
+            num_elements: shape.iter().product(),
+            storage: Storage::Unknown,
+            source_path: "m.safetensors".to_string(),
+            layout: Layout::None,
+        }
+    }
+
+    /// `▦` must mean **real tensors** on every node. It used to count *families* on groups
+    /// while the root counted tensors, so a folded `language_model` read `▦ 44` directly
+    /// under a root reading `▦ 497220` — inviting the reader to conclude that folding had
+    /// lost half a million tensors.
+    #[test]
+    fn group_counts_stay_real_tensor_counts() {
+        let mut tensors = Vec::new();
+        for layer in 0..10 {
+            tensors.push(t(&format!("model.layers.{layer}.mlp.w"), "BF16", &[4, 4]));
+            tensors.push(t(&format!("model.layers.{layer}.attn.w"), "BF16", &[4, 4]));
+        }
+        let c = compact_tree(&tensors);
+        assert_eq!(c.tensor_count, 20);
+        // Two families, but the group above them stands for all twenty tensors.
+        assert_eq!(c.counts.len(), 2, "families: {:?}", c.counts.keys());
+        let counts = group_counts(&c.tree);
+        assert!(
+            counts.iter().any(|&(_, n)| n == 20),
+            "some group should account for all 20 real tensors: {counts:?}"
+        );
+        assert!(
+            !counts.iter().any(|&(_, n)| n == 2),
+            "no group should report the family count as its tensor count: {counts:?}"
+        );
+        // And every group's count is the sum of its children's.
+        assert_eq!(
+            counts.iter().map(|&(_, n)| n).max(),
+            Some(20),
+            "the outermost group covers everything: {counts:?}"
+        );
+    }
+
+    /// A family whose members disagree about shape must say so. It rendered as `()` —
+    /// the *default* shape — which reads as a zero-dimensional tensor rather than
+    /// "these differ". Reported from the Kimi-K3 tree: `proj.{0,2}.weight ×2 [BF16, ()]`.
+    #[test]
+    fn a_varying_shape_says_so_on_the_row() {
+        let tensors = vec![
+            t("mm_projector.proj.0.weight", "BF16", &[7168, 1024]),
+            t("mm_projector.proj.2.weight", "BF16", &[1024, 7168, 2]),
+        ];
+        let mut c = compact_tree(&tensors);
+        label_counts(&mut c.tree, &c.counts, &c.varying);
+
+        let (name, _) = c.counts.iter().next().expect("one family");
+        assert!(
+            c.varying.get(name).is_some_and(|v| v.shape && !v.dtype),
+            "the shapes differ but the dtypes don't: {:?}",
+            c.varying
+        );
+        let label = leaf_label(&c.tree).expect("a labelled leaf");
+        assert!(
+            label.contains("shape varies"),
+            "the row must say the shapes differ rather than printing `()`: {label}"
+        );
+        assert!(label.contains("×2"), "and still carry the count: {label}");
+
+        // Idempotent even with the note appended.
+        let once = label;
+        label_counts(&mut c.tree, &c.counts, &c.varying);
+        assert_eq!(leaf_label(&c.tree).as_deref(), Some(once.as_str()));
+    }
+
+    fn group_counts(nodes: &[TreeNode]) -> Vec<(String, usize)> {
+        let mut out = Vec::new();
+        for n in nodes {
+            if let TreeNode::Group {
+                name,
+                children,
+                tensor_count,
+                ..
+            } = n
+            {
+                out.push((name.clone(), *tensor_count));
+                out.extend(group_counts(children));
+            }
+        }
+        out
+    }
+
+    fn leaf_label(nodes: &[TreeNode]) -> Option<String> {
+        for n in nodes {
+            match n {
+                TreeNode::Group { children, .. } => {
+                    if let Some(l) = leaf_label(children) {
+                        return Some(l);
+                    }
+                }
+                TreeNode::Tensor { label, .. } => return label.clone(),
+                TreeNode::Metadata { .. } => {}
+            }
+        }
+        None
     }
 }
