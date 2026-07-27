@@ -37,6 +37,7 @@ const _: () = assert!(
 
 pub mod check;
 pub mod codec;
+pub mod compact;
 pub mod config;
 pub mod diff;
 pub mod filetree;

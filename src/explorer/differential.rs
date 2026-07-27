@@ -665,3 +665,60 @@ fn the_served_diff_command_names_the_checkpoint_not_a_shard() {
     // earlier in the command is correct — only the compared side is at issue, which the
     // path comparison above pins exactly.)
 }
+
+/// **The compact tree.** It must fold *and* account for everything: a frontend shows
+/// "N tensors in M families", and if the fold silently dropped a tensor that header would
+/// be a lie the view itself can't reveal.
+#[test]
+fn the_compact_tree_accounts_for_every_tensor() {
+    let s = web();
+    let served = body(handlers::compact(&s, &query("q", "")));
+
+    assert_eq!(
+        served["tensor_count"].as_u64().unwrap() as usize,
+        s.tensors.len(),
+        "the fold must account for every tensor in the checkpoint"
+    );
+    // Every family stands for at least one tensor, and the counts sum to the whole.
+    let counts = served["counts"].as_object().expect("a counts map");
+    assert!(!counts.is_empty(), "a non-empty checkpoint has families");
+    let summed: u64 = counts.values().map(|v| v.as_u64().unwrap()).sum();
+    assert_eq!(
+        summed,
+        s.tensors.len() as u64,
+        "the per-family counts must sum to the tensor count"
+    );
+    // A family is never larger than the checkpoint, and never empty.
+    for (name, n) in counts {
+        let n = n.as_u64().unwrap();
+        assert!(
+            n >= 1 && n <= s.tensors.len() as u64,
+            "{name} stands for {n} tensors"
+        );
+    }
+}
+
+/// Folding a *filtered* subset must fold only that subset — otherwise the view would
+/// disagree with the filter bar above it.
+#[test]
+fn the_compact_tree_honours_the_filter() {
+    let s = web();
+    let q = "dtype:F32";
+    let matching = body(handlers::filter(&s, &query("q", q)))["names"]
+        .as_array()
+        .expect("names")
+        .len();
+    assert!(matching > 0, "the fixture should have some F32 tensors");
+
+    let served = body(handlers::compact(&s, &query("q", q)));
+    assert_eq!(
+        served["tensor_count"].as_u64().unwrap() as usize,
+        matching,
+        "the fold should cover exactly the filtered tensors"
+    );
+
+    // And a malformed query is rejected here as it is everywhere else, rather than
+    // silently folding the whole checkpoint.
+    let (status, _) = handlers::compact(&s, &query("q", "dtype:"));
+    assert_eq!(status, 400, "a malformed filter must not fold everything");
+}

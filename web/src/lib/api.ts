@@ -8,6 +8,7 @@ import type {
   SampleDto,
   StatsDto,
   TensorInfo,
+  CompactTree,
   DiffResponse,
   TreeResponse,
 } from './types';
@@ -68,6 +69,8 @@ export const api = {
   /** Structural diff against another checkpoint on the server's filesystem. Rejects
    * with the server's message (a 400) when the path is not a readable checkpoint. */
   diff: (against: string) => getJson<DiffResponse>(`/api/diff?against=${enc(against)}`),
+  /** The compact (family-folded) tree, optionally scoped by the filter query. */
+  compact: (q: string) => getJson<CompactTree>(`/api/compact?q=${enc(q)}`),
   stats: () => getJson<Record<string, unknown>>('/api/stats'),
   health: () => getJson<unknown[]>('/api/health'),
   check: () => getJson<Record<string, unknown> | null>('/api/check'),

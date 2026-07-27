@@ -168,3 +168,20 @@ export interface DiffResponse {
   command: string;
   report: DiffReport;
 }
+
+/** Which of a family's attributes disagree across its members. */
+export interface Varying {
+  dtype: boolean;
+  shape: boolean;
+}
+
+/** `/api/compact`: the tensor tree with uniform layer / expert stacks folded into one
+ * templated subtree each. `tree` is the same `TreeNode` shape the tensor tree uses, so it
+ * flattens with the same `flatten`; a leaf is a *family*, and `counts` says how many real
+ * tensors it stands for (keyed by the leaf's `info.name`, which is the template). */
+export interface CompactTree {
+  tree: TreeNode[];
+  counts: Record<string, number>;
+  varying: Record<string, Varying>;
+  tensor_count: number;
+}

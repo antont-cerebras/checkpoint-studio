@@ -93,6 +93,31 @@ pub(crate) fn filter(s: &WebState, q: &Query) -> Reply {
     }
 }
 
+/// The **compact tree**: the tensor tree with uniform layer / expert stacks folded into
+/// single templated subtrees, so only irregularities stand out
+/// ([`crate::compact::compact_tree`]). Optionally scoped by `?q=` — the same filter
+/// grammar the tree and `/api/filter` use — so you can fold a subset.
+///
+/// This replaced a flat per-family *list* (`/api/schema`, still served): a list destroys
+/// the nesting, and the nesting is what makes an outlier visible next to its siblings.
+pub(crate) fn compact(s: &WebState, q: &Query) -> Reply {
+    let query = q.get("q").map_or("", String::as_str);
+    let filter = match crate::tensorfilter::TensorFilter::parse(query) {
+        Ok(f) => f,
+        Err(e) => return err(400, e.to_string()),
+    };
+    if filter.is_active() {
+        let scoped: Vec<TensorInfo> = s
+            .tensors
+            .iter()
+            .filter(|t| filter.matches(t))
+            .cloned()
+            .collect();
+        return ok(crate::compact::compact_tree(&scoped));
+    }
+    ok(crate::compact::compact_tree(&s.tensors))
+}
+
 /// Compact per-family listing: collapse the (optionally `?q=`-filtered) tensors into
 /// index-templated families (`model.layers.{0-47}.…experts.{0-3}.down_proj.weight`)
 /// with per-family count + uniform dtype/shape + total params/bytes — a "what's in
