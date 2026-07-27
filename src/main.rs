@@ -3345,6 +3345,21 @@ fn run_web(
         let state = std::sync::Arc::new(web::WebState::build(model, &[], &[]).with_exposure(host));
         return web::serve_on(server, state, host);
     }
+    // A Hugging Face repo is a URI, not a path: it must not be globbed or stat'd, and the
+    // source trait already knows how to read one. This is the case the seam removes — the
+    // web entry path needed no per-source branch of its own.
+    if paths.iter().any(|p| hf::is_uri(&p.to_string_lossy())) {
+        let source = source::resolve(paths, None)?;
+        let progress = hf::ReadProgress::default();
+        let (_, model) = source.read(&progress)?;
+        let model =
+            model.ok_or_else(|| anyhow::anyhow!("{}: no model to serve", source.describe()))?;
+        // Pass the paths: the tree's root label comes from them (`model::root_label`), so an
+        // empty list heads the tree "checkpoint" instead of naming the repo.
+        let state =
+            std::sync::Arc::new(web::WebState::build(model, paths, &[]).with_exposure(host));
+        return web::serve(state, host, port);
+    }
     let (files, index_specs) = collect_safetensors_files(paths, recursive, no_health_check)?;
     if files.is_empty() {
         anyhow::bail!("No checkpoint files found in the specified paths.");

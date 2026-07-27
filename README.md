@@ -273,6 +273,12 @@ available — they read tensor bytes, the one thing this never downloads. Same r
 bearer token, so gated and private repos work with the token you already have; `HF_ENDPOINT`
 points at a mirror.
 
+All three frontends take a Hub reference, including the web UI:
+
+```bash
+checkpoint-studio web hf://moonshotai/Kimi-K3 --host 127.0.0.1
+```
+
 ### Remote checkpoints over SSH (`--ssh-proxy`)
 Browse a checkpoint that lives only on a remote host — either behind credentials
 you (rightly) don't want to copy to your laptop (a Cerebras **cstorch** checkpoint

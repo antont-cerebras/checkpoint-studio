@@ -1487,6 +1487,19 @@ impl Explorer {
         self.flatten_tree();
     }
 
+    /// What the open source supports — the one question every feature below asks, instead
+    /// of each re-deriving "is this remote / local / safetensors" for itself.
+    ///
+    /// Resolved from the request rather than the loaded model, so it answers before a read
+    /// finishes (a keypress can arrive first) and during one.
+    fn capabilities(&self) -> crate::capability::Capabilities {
+        let location = crate::source::resolve(&self.files, self.remote_read())
+            .map_or(crate::capability::Location::Local, |s| s.location());
+        let format =
+            crate::capability::Format::of_paths(self.files.iter().filter_map(|p| p.to_str()));
+        crate::capability::Capabilities::of(format, location)
+    }
+
     /// Why a data view is unavailable here, from the shared capability table — so the
     /// terminal and the browser give the same explanation, and each *source* gives its own
     /// (telling someone to copy a Hugging Face repo "down" is not advice).
@@ -3055,7 +3068,11 @@ impl Explorer {
     /// the filesystem), or a remote source we know how to browse — a remote
     /// safetensors dir (SFTP) or an `s3://…` object list. Metadata-only either way.
     fn file_view_available(&self) -> bool {
-        self.remote_read().is_none() || self.remote_browse().is_some()
+        // The capability says whether the source *has* a listing to browse; a remote one
+        // additionally needs a browser we implement (an SFTP dir or an s3 object list), and
+        // that is a fact about this build, not about the source.
+        self.capabilities().browse_files
+            && (self.remote_read().is_none() || self.remote_browse().is_some())
     }
 
     /// Which access badge the bottom-right status line shows: `Editable` when the
@@ -5406,13 +5423,9 @@ impl Explorer {
     /// shards (so every shard *and* the index are renamed consistently). `None`
     /// (command hidden) for a remote source or any non-safetensors format.
     fn rename_target(&self) -> Option<PathBuf> {
-        if self.remote_read().is_some() || self.files.is_empty() {
-            return None;
-        }
-        if !self.files.iter().all(|f| {
-            f.extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"))
-        }) {
+        // "Local safetensors" is exactly `modify_in_place` — the capability that pairs the
+        // format with the location, rather than two checks that can disagree with it.
+        if !self.capabilities().modify_in_place || self.files.is_empty() {
             return None;
         }
         match self.files.as_slice() {

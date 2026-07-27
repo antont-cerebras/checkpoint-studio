@@ -281,13 +281,13 @@ mod tests {
         let Ok(local) = resolve(&paths(&["/m/model.safetensors"]), None) else {
             panic!("a local path resolves");
         };
-        let caps = Capabilities::of(Format::Safetensors, local.location(), true);
+        let caps = Capabilities::of(Format::Safetensors, local.location());
         assert!(caps.read_bytes && caps.modify_in_place);
 
         let Ok(hub) = resolve(&paths(&["hf://owner/name"]), None) else {
             panic!("a repo reference resolves");
         };
-        let caps = Capabilities::of(Format::Safetensors, hub.location(), true);
+        let caps = Capabilities::of(Format::Safetensors, hub.location());
         assert!(!caps.read_bytes, "the Hub serves headers, not weights");
         assert!(
             caps.layout_map,

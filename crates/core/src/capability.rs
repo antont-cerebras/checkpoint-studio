@@ -169,8 +169,12 @@ pub struct Capabilities {
     /// Show the byte-layout map — needs per-tensor byte ranges in the format, and a
     /// readable header, which every location provides.
     pub layout_map: bool,
-    /// Browse the checkpoint's file tree — needs a listing, which every location has
-    /// except a single local file (nothing to list).
+    /// Browse the checkpoint's file tree — needs a listing, which every location has: a
+    /// local checkpoint walks its containing directory (so even a single file has one), an
+    /// SFTP source lists the remote dir, S3 its keys, the Hub its tree.
+    ///
+    /// Whether a *browser* for a given remote is implemented is a separate question about
+    /// this build, not about the source, and stays with the caller.
     pub browse_files: bool,
     /// Per-object storage metadata (`ETag`, checksums, storage class) — S3 only.
     pub object_metadata: bool,
@@ -182,10 +186,9 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// Derive the set from the pair. `multi_file` distinguishes a single local file (which
-    /// has no file tree worth browsing) from a directory of shards.
+    /// Derive the set from the pair.
     #[must_use]
-    pub const fn of(format: Format, location: Location, multi_file: bool) -> Self {
+    pub const fn of(format: Format, location: Location) -> Self {
         let local = location.is_local();
         Self {
             // Only the local readers open tensor data today. The Hub could serve it by
@@ -197,7 +200,10 @@ impl Capabilities {
             modify_in_place: local && matches!(format, Format::Safetensors),
             repack: local && matches!(format, Format::Hdf5),
             layout_map: format.has_byte_ranges(),
-            browse_files: !local || multi_file,
+            // Every location has something to list — see the field's note. This row was
+            // briefly `!local || multi_file`, which broke the file browser for a
+            // single-file local checkpoint; the existing badge/navigation tests caught it.
+            browse_files: true,
             object_metadata: matches!(location, Location::S3),
             codec_info: matches!(format, Format::Hdf5),
             reach: location.reach(),
@@ -242,7 +248,7 @@ impl Checkpoint {
     /// What this checkpoint supports — the one question a feature should ask.
     #[must_use]
     pub fn capabilities(&self) -> Capabilities {
-        Capabilities::of(self.format(), self.location(), self.shards.len() > 1)
+        Capabilities::of(self.format(), self.location())
     }
 }
 
@@ -280,10 +286,10 @@ mod tests {
     /// which is the point — none of these follow from the format or the location alone.
     #[test]
     fn capabilities_depend_on_both_axes() {
-        let st_local = Capabilities::of(Format::Safetensors, Location::Local, true);
-        let st_hf = Capabilities::of(Format::Safetensors, Location::Hf, true);
-        let h5_local = Capabilities::of(Format::Hdf5, Location::Local, false);
-        let st_s3 = Capabilities::of(Format::Safetensors, Location::S3, true);
+        let st_local = Capabilities::of(Format::Safetensors, Location::Local);
+        let st_hf = Capabilities::of(Format::Safetensors, Location::Hf);
+        let h5_local = Capabilities::of(Format::Hdf5, Location::Local);
+        let st_s3 = Capabilities::of(Format::Safetensors, Location::S3);
 
         // Renaming in place needs safetensors AND local — neither half suffices.
         assert!(st_local.modify_in_place);
@@ -326,21 +332,22 @@ mod tests {
 
         // And it travels with the capability set rather than needing a second lookup.
         assert_eq!(
-            Capabilities::of(Format::Safetensors, Location::S3, true).reach,
+            Capabilities::of(Format::Safetensors, Location::S3).reach,
             Reach::ViaSshProxy
         );
     }
 
-    /// A single local file has no file tree worth browsing; everything else does.
+    /// Every location has a listing, so browsing is always offered — a local checkpoint
+    /// browses its containing directory, which is why even a single file has one. Pinned
+    /// because getting this wrong removed the file browser from the commonest case there is.
     #[test]
-    fn browsing_needs_something_to_list() {
-        assert!(
-            !Capabilities::of(Format::Safetensors, Location::Local, false).browse_files,
-            "one local file is not a directory"
-        );
-        assert!(Capabilities::of(Format::Safetensors, Location::Local, true).browse_files);
-        // A remote source always has a listing (the SFTP dir, the S3 keys, the Hub tree).
-        assert!(Capabilities::of(Format::Safetensors, Location::Hf, false).browse_files);
+    fn browsing_is_available_for_every_location() {
+        for location in [Location::Local, Location::Sftp, Location::S3, Location::Hf] {
+            assert!(
+                Capabilities::of(Format::Safetensors, location).browse_files,
+                "{location:?} has a listing to browse"
+            );
+        }
     }
 
     /// The unavailability message names the actual reason, and each remote kind explains
