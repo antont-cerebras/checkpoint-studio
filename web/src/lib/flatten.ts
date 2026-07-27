@@ -17,6 +17,30 @@ export function nodeId(node: TreeNode, parentId: string): string {
   return `m:${node.info.name}`;
 }
 
+/**
+ * The ids of the groups the *server* sent expanded — the initial fold state.
+ *
+ * Every `TreeNode.Group` carries an `expanded` flag that the Rust flattener honors, so
+ * it is what the terminal UI opens with (root plus, for example, a `model` group whose
+ * only sibling chain collapses into it). This client owns fold state after load, but it
+ * has to *start* from the same place, or the same checkpoint shows a different first
+ * screen in the two UIs — which is exactly what it used to do: the seed was just the
+ * root, so `model` came up collapsed here and expanded in the terminal.
+ */
+export function expandedIds(tree: TreeNode[]): Set<string> {
+  const ids = new Set<string>();
+  const walk = (nodes: TreeNode[], parentId: string) => {
+    for (const node of nodes) {
+      if (node.kind !== 'group') continue;
+      const id = nodeId(node, parentId);
+      if (node.expanded) ids.add(id);
+      walk(node.children, id);
+    }
+  };
+  walk(tree, '');
+  return ids;
+}
+
 /** Flatten the tree to visible rows, honoring `expanded` (a set of group ids). */
 export function flatten(tree: TreeNode[], expanded: Set<string>): Row[] {
   const out: Row[] = [];

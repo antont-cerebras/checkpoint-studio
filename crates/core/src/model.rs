@@ -226,6 +226,39 @@ pub struct Checkpoint {
     pub s3: Option<S3Meta>,
 }
 
+/// A concise display name for a checkpoint made of `files`: the file's own name for a
+/// single file; the shared parent directory's name when every file sits in one
+/// directory; `"checkpoint"` when neither applies (no files, or a glob spanning
+/// directories).
+///
+/// Shared because every frontend puts this string at the top of its tree, and each had
+/// derived it separately — the TUI from the file list, the web from
+/// [`Checkpoint::root`]'s basename. Those disagree on the commonest case there is: open
+/// one `model.safetensors` and the terminal called the root `model.safetensors` while
+/// the browser called it by the *containing directory*. Deriving a display name twice
+/// is how that happens, so it is derived once, here.
+#[must_use]
+pub fn root_label(files: &[std::path::PathBuf]) -> String {
+    fn name_of(p: &std::path::Path) -> String {
+        p.file_name().map_or_else(
+            || "checkpoint".to_string(),
+            |s| s.to_string_lossy().into_owned(),
+        )
+    }
+    match files.split_first() {
+        None => "checkpoint".to_string(),
+        Some((only, [])) => name_of(only),
+        Some((first, _)) => {
+            let dir = first.parent();
+            if dir.is_some() && files.iter().all(|f| f.parent() == dir) {
+                dir.map_or_else(|| "checkpoint".to_string(), name_of)
+            } else {
+                "checkpoint".to_string()
+            }
+        }
+    }
+}
+
 impl Checkpoint {
     /// Every tensor across all shards, in shard order (the flattened primary
     /// tensor list the tree / stats / diff consume).
@@ -281,6 +314,42 @@ impl Checkpoint {
 mod tests {
     use super::*;
     use crate::tree::{Layout, Storage};
+
+    /// Every branch of the root label, because both frontends now put its output at
+    /// the top of their tree and a wrong answer is visible on the first screen.
+    #[test]
+    fn the_root_label_names_a_file_a_directory_or_neither() {
+        use std::path::PathBuf;
+
+        assert_eq!(root_label(&[]), "checkpoint", "no files");
+        assert_eq!(
+            root_label(&[PathBuf::from("/m/model.safetensors")]),
+            "model.safetensors",
+            "a single file is named by the file — not by its directory"
+        );
+        assert_eq!(
+            root_label(&[
+                PathBuf::from("/m/model-00001-of-00002.safetensors"),
+                PathBuf::from("/m/model-00002-of-00002.safetensors"),
+            ]),
+            "m",
+            "shards sharing a directory are named by that directory"
+        );
+        assert_eq!(
+            root_label(&[
+                PathBuf::from("/a/one.safetensors"),
+                PathBuf::from("/b/two.safetensors"),
+            ]),
+            "checkpoint",
+            "files spanning directories have no shared name"
+        );
+        // A relative single file still resolves to its own name, since that is how
+        // the CLI is normally invoked (`checkpoint-studio model.safetensors`).
+        assert_eq!(
+            root_label(&[PathBuf::from("model.safetensors")]),
+            "model.safetensors"
+        );
+    }
 
     fn sample() -> Checkpoint {
         Checkpoint {

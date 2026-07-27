@@ -559,6 +559,29 @@ impl Session {
         }
     }
 
+    /// [`Self::build_tree`] wrapped in the single root node that summarises the whole
+    /// checkpoint — `▾ <label> (▦ N, P params, S)` — so the tree reads top-down from one
+    /// place instead of from a separate footer. `files` names the root (see
+    /// [`crate::model::root_label`]).
+    ///
+    /// This is the *whole* tree a frontend shows, root included. It exists because the
+    /// TUI and the web server each used to wrap the forest themselves, each with its own
+    /// copy of the seven-field root and its own idea of the label — and they disagreed
+    /// about that label for a single-file checkpoint, which is the commonest case there
+    /// is. A tree assembled in one place cannot disagree with itself.
+    #[must_use]
+    pub fn build_rooted_tree(&self, files: &[std::path::PathBuf]) -> Vec<TreeNode> {
+        vec![TreeNode::Group {
+            name: crate::model::root_label(files),
+            children: self.build_tree(),
+            expanded: true,
+            tensor_count: self.tensors.len(),
+            params: self.total_parameters,
+            total_size: self.tensors.iter().map(|t| t.size_bytes).sum(),
+            stored_size: self.tensors.iter().map(TensorInfo::on_disk_size).sum(),
+        }]
+    }
+
     /// Deduplicate tensors by name (keeping the first occurrence in shard order,
     /// so a name in two shards is resolved to the first) and natural-sort them —
     /// the canonical order the tree / stats / diff all consume.

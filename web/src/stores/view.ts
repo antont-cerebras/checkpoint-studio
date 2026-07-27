@@ -10,7 +10,7 @@
 
 import { derived, get, writable } from 'svelte/store';
 import { api } from '../lib/api';
-import { flatten, nodeId, type Row } from '../lib/flatten';
+import { expandedIds, flatten, nodeId, type Row } from '../lib/flatten';
 import {
   DV_KEYS,
   hashFor,
@@ -185,13 +185,13 @@ export function clearFilter(): void {
   filterQuery.set('');
 }
 
-// Expand the synthetic root node once the tree first loads, so its children show.
+// Seed the fold state from the tree the server sent, so the first screen matches the
+// terminal UI's (see `expandedIds`). After this the client owns folding.
 let seededExpand = false;
 treeData.subscribe((t) => {
   if (t && !seededExpand) {
     seededExpand = true;
-    const first = t.tree[0];
-    if (first) expanded.set(new Set([nodeId(first, '')]));
+    expanded.set(expandedIds(t.tree));
   }
 });
 

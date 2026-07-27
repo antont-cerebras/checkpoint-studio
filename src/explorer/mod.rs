@@ -40,6 +40,13 @@ use open::{EXPORT_CHOICES, ExportChoice, MENU_PREVIEW_LINES};
 
 // Per-view caches + the background stats scan (see `cache.rs`).
 mod cache;
+/// Cross-interface differential tests (test-only): the same question asked of the
+/// CLI export, the TUI screen and the web handler, asserting the answers agree.
+/// Lives under `explorer` because it needs this module's internals (`tensors`,
+/// `load_quiet`, the export builders); the web side it compares against is
+/// `pub(crate)` and reachable from anywhere.
+#[cfg(test)]
+mod differential;
 mod export;
 mod load;
 mod render;
@@ -1385,51 +1392,21 @@ impl Explorer {
     // Reading + loading (a second `impl Explorer` block in `load.rs`): readers,
     // shard headers local or remote, the stats scan, and the derived view state.
 
+    /// Rebuild the tensor tree from the loaded data. The whole tree — the summarising
+    /// root included — comes from the kernel, so the web UI serves the same one
+    /// (see [`Session::build_rooted_tree`]).
     fn build_tree(&mut self) {
-        let children = if self.metadata().is_empty() {
-            TreeBuilder::build_tree(self.tensors())
-        } else {
-            TreeBuilder::build_tree_mixed(self.tensors(), self.metadata())
-        };
-        // Everything hangs off a single root node summarising the whole
-        // checkpoint (tensor count, parameters and size), so the tree reads
-        // top-down from one place instead of from a separate footer.
-        let total_size = self.tensors().iter().map(|t| t.size_bytes).sum();
-        let stored_size = self.tensors().iter().map(TensorInfo::on_disk_size).sum();
-        let root = TreeNode::Group {
-            name: self.root_label(),
-            children,
-            expanded: true,
-            tensor_count: self.tensors().len(),
-            params: self.total_parameters(),
-            total_size,
-            stored_size,
-        };
-        self.tree_state.tree = vec![root];
+        self.tree_state.tree = self
+            .session
+            .as_ref()
+            .map_or_else(Vec::new, |session| session.build_rooted_tree(&self.files));
         self.flatten_tree();
     }
 
-    /// A concise name for the checkpoint root: the file name for a single file,
-    /// otherwise the shared parent directory's name (or "checkpoint").
+    /// A concise name for the checkpoint root — the shared rule, so the web UI's
+    /// tree header cannot say something else (see [`crate::model::root_label`]).
     fn root_label(&self) -> String {
-        let basename = |p: &Path| {
-            p.file_name().map_or_else(
-                || "checkpoint".to_string(),
-                |s| s.to_string_lossy().into_owned(),
-            )
-        };
-        match self.files.split_first() {
-            None => "checkpoint".to_string(),
-            Some((first, [])) => basename(first),
-            Some((first, _)) => {
-                let dir = first.parent();
-                if dir.is_some() && self.files.iter().all(|f| f.parent() == dir) {
-                    dir.map_or_else(|| "checkpoint".to_string(), basename)
-                } else {
-                    "checkpoint".to_string()
-                }
-            }
-        }
+        crate::model::root_label(&self.files)
     }
 
     /// Re-flatten the tree (fold-aware) and, if searching, refresh the filtered
@@ -5829,13 +5806,6 @@ impl Explorer {
     /// The checkpoint's `config.json`, when present — from the session.
     fn config(&self) -> Option<&crate::config::ModelConfig> {
         self.session.as_ref().and_then(|s| s.config())
-    }
-
-    /// Total element (parameter) count across the canonical tensors.
-    fn total_parameters(&self) -> usize {
-        self.session
-            .as_ref()
-            .map_or(0, checkpoint_studio_core::kernel::Session::total_parameters)
     }
 
     fn disk_usage(&self) -> Option<crate::stats::DiskUsage> {

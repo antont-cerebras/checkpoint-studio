@@ -15,14 +15,19 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { expandedIds, flatten } from './flatten';
 import { humanCount, humanSize, percent } from './format';
 import { searchTree } from './search';
 import type { TreeNode } from './types';
+
+/** `[depth, kind, name, hasChildren]` — one tree row, as both flatteners see it. */
+type RowProjection = [number, string, string, boolean];
 
 interface Fixture {
   size: [number, string][];
   count: [number, string][];
   percent: [number, number, string][];
+  tree: { nodes: TreeNode[]; rows: RowProjection[] };
   search: { names: string[]; matches: [string, string[]][] };
 }
 
@@ -99,5 +104,32 @@ describe('the search matcher matches the same names as the TUI', () => {
     const { rows, total } = searchTree(many, 'weight');
     expect(rows).toHaveLength(1000);
     expect(total).toBe(1500);
+  });
+});
+
+describe('the tree flattens to the same rows as the Rust flattener', () => {
+  // The structural half of "the web UI looks like the TUI": the same rows, in the same
+  // order, at the same depths, with the same expand affordance — starting from the fold
+  // state the server sent. The rendered *text* of a row is deliberately not contracted
+  // (see shared/parity/README.md); the row list is.
+  it('produces the fixture rows', () => {
+    const { nodes, rows } = fixture.tree;
+    const got: RowProjection[] = flatten(nodes, expandedIds(nodes)).map((r) => [
+      r.depth,
+      r.node.kind,
+      r.node.kind === 'group' ? r.node.name : r.node.info.name,
+      r.hasChildren,
+    ]);
+    expect(got, HINT).toEqual(rows);
+  });
+
+  it('honors the served fold state rather than expanding only the root', () => {
+    // Pinned because the seed used to be `new Set([rootId])`, which opened the browser
+    // on a different first screen than the terminal for the very same checkpoint.
+    const { nodes } = fixture.tree;
+    const ids = expandedIds(nodes);
+    expect(ids.size, 'the fixture should have an expanded group to find').toBeGreaterThan(0);
+    const deepest = Math.max(...flatten(nodes, ids).map((r) => r.depth));
+    expect(deepest, 'a group the server sent expanded must contribute deeper rows').toBeGreaterThan(0);
   });
 });

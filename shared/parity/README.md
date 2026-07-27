@@ -32,6 +32,22 @@ cd web && npm test
 | parameter counts (`30.9B`) | `utils::format_parameters` | `format.ts: humanCount` |
 | zero fraction (`0%` / `1.0e-7%` / `12.3%`) | `utils::format_percent` | `format.ts: percent` |
 | which tensors a search query matches | `SkimMatcherV2` (smart case) | `search.ts: searchTree` |
+| the tree's **rows** — order, depth, kind, expandability | `TreeBuilder::flatten_tree` | `flatten.ts: flatten` + `expandedIds` |
+
+The tree rows are the structural half of "the web UI looks like the TUI". The fixture
+carries the tree as the server sends it (**rooted**, via `Session::build_rooted_tree` —
+the same call both frontends make) plus the rows Rust flattens it into; the TypeScript
+must flatten the same tree into the same rows. Two things this pins that used to be
+wrong:
+
+- **The initial fold state comes from the data.** Each group carries its own `expanded`
+  flag, which the Rust flattener honors. The browser used to ignore it and seed only the
+  root, so the same checkpoint opened with `model` expanded in the terminal and collapsed
+  in the browser. `expandedIds` reads the flags now; the client owns folding only *after*
+  load.
+- **The fixture is rooted on purpose.** In the bare forest `model` sits at depth 0, so a
+  client seeding only the top level would still produce the right rows — the test would
+  have passed while the bug was live. Rooted, it fails (verified by mutation).
 
 Two subtleties the fixture deliberately samples:
 

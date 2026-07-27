@@ -26,6 +26,10 @@
 
 use std::path::PathBuf;
 
+use checkpoint_studio_core::kernel::Session;
+use checkpoint_studio_core::tree::{
+    Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode,
+};
 use checkpoint_studio_core::utils::{format_parameters, format_percent, format_size};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -131,6 +135,71 @@ const QUERIES: &[&str] = &[
     "wieght", // a transposition: subsequence matching must NOT match it
 ];
 
+/// A synthetic checkpoint for the tree-row contract: a top-level tensor, a `model`
+/// group with a nested `layers.0` group, and one metadata entry — enough to exercise
+/// grouping, depth, the single-child chain the builder collapses, and a non-tensor row.
+///
+/// Hand-built rather than read from `tests/fixtures/`: a `TensorInfo` carries the
+/// **absolute** path it was loaded from, which would make the committed fixture differ
+/// per machine.
+///
+/// Returned **rooted** — through [`Session::build_rooted_tree`], the very call both
+/// frontends make — so the fixture is the tree a browser is actually served, summarising
+/// root and all. That matters for more than realism: with the bare forest, `model` sits
+/// at depth 0, and a client that seeded its fold state from only the top level would
+/// still produce the right rows. Rooted, `model` is nested, so the fixture can tell the
+/// difference.
+fn sample_tree() -> Vec<TreeNode> {
+    let tensor = |name: &str, dtype: &str, shape: &[usize], size: usize| TensorInfo {
+        name: name.to_string(),
+        dtype: dtype.to_string(),
+        shape: shape.to_vec(),
+        size_bytes: size,
+        num_elements: shape.iter().product(),
+        storage: Storage::Unknown,
+        source_path: "model.safetensors".to_string(),
+        layout: Layout::None,
+    };
+    let tensors = vec![
+        tensor("lm_head.weight", "I32", &[2, 4], 32),
+        tensor("model.embed_tokens.weight", "F16", &[6, 4], 48),
+        tensor(
+            "model.layers.0.mlp.down_proj.weight",
+            "U16",
+            &[3, 4, 5],
+            120,
+        ),
+        tensor(
+            "model.layers.0.self_attn.q_proj.weight",
+            "BF16",
+            &[4, 4],
+            32,
+        ),
+        tensor("model.norm.weight", "F32", &[4], 16),
+    ];
+    let metadata = vec![MetadataInfo {
+        name: "format".to_string(),
+        value: "pt".to_string(),
+        value_type: "string".to_string(),
+    }];
+    Session::from_parts(tensors, metadata, None)
+        .build_rooted_tree(&[PathBuf::from("/models/tiny/model.safetensors")])
+}
+
+/// One tree row, projected to what both flatteners must agree on: how deep it sits,
+/// what kind of row it is, its name, and whether it can be expanded. Deliberately not
+/// the rendered text — that differs by medium (see the README) — but the row list
+/// itself is what "the web UI looks like the TUI" means.
+fn row_projection(node: &TreeNode, depth: usize) -> Value {
+    let kind = match node {
+        TreeNode::Group { .. } => "group",
+        TreeNode::Tensor { .. } => "tensor",
+        TreeNode::Metadata { .. } => "metadata",
+    };
+    let has_children = matches!(node, TreeNode::Group { children, .. } if !children.is_empty());
+    json!([depth, kind, node.name(), has_children])
+}
+
 fn build() -> Value {
     let matcher = SkimMatcherV2::default();
     json!({
@@ -147,6 +216,17 @@ fn build() -> Value {
                 json!([zeros, count, format_percent(fraction, zeros == 0)])
             })
             .collect::<Vec<_>>(),
+        // The tree the two UIs flatten into rows. `tree` is the served hierarchy;
+        // `rows` is what the Rust flattener makes of it, honouring each group's own
+        // `expanded` flag — the initial fold state. `web/src/lib/parity.test.ts`
+        // flattens the same `tree` and must produce the same `rows`.
+        "tree": {
+            "nodes": sample_tree(),
+            "rows": TreeBuilder::flatten_tree(&sample_tree())
+                .iter()
+                .map(|(node, depth)| row_projection(node, *depth))
+                .collect::<Vec<_>>(),
+        },
         "search": {
             "names": NAMES,
             // Which names each query matches. Only the SET is a contract: the two

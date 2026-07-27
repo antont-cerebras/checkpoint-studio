@@ -56,22 +56,12 @@ fn require_local(t: &TensorInfo) -> Option<Reply> {
 // ---- metadata / derived-view routes (served from precomputed state) ----
 
 pub(crate) fn tree(s: &WebState) -> Reply {
-    // Wrap the forest in a single root node summarising the whole checkpoint, the
-    // way the TUI's tree does (`▾ <name> (▦ N, P params, S)`), with the metadata
-    // group (when present) among its children.
-    let root = crate::tree::TreeNode::Group {
-        name: basename(&s.root).to_string(),
-        children: s.tree.clone(),
-        expanded: true,
-        tensor_count: s.tensors.len(),
-        params: s.tensors.iter().map(|t| t.num_elements).sum(),
-        total_size: s.tensors.iter().map(|t| t.size_bytes).sum(),
-        stored_size: s.tensors.iter().map(TensorInfo::on_disk_size).sum(),
-    };
     ok(json!({
         "root": s.root,
         "tensor_count": s.tensors.len(),
-        "tree": [root],
+        // Already rooted by `Session::build_rooted_tree` — the same tree, with the same
+        // summarising root and label, that the TUI renders.
+        "tree": s.tree,
     }))
 }
 

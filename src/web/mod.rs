@@ -83,7 +83,9 @@ impl WebState {
         let tensors: Vec<tree::TensorInfo> = session.tensors().to_vec();
         let metadata: Vec<tree::MetadataInfo> = session.metadata().to_vec();
         let config = session.config().cloned();
-        let tree = session.build_tree();
+        // The whole tree, summarising root included — the same call the TUI makes, so
+        // the two surfaces cannot disagree about the tree or its label.
+        let tree = session.build_rooted_tree(files);
         // The S3 section too, for an `s3://` model — the same projection the TUI uses,
         // so the browser's stats screen isn't missing a section the terminal shows.
         let checkpoint_stats = session
