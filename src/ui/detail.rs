@@ -299,7 +299,7 @@ pub(super) fn computing_gauge(stats: StatsView) -> Option<(f64, Line<'static>)> 
             ));
             Some((frac, label))
         }
-        _ => None,
+        StatsView::Pending | StatsView::Computing { .. } | StatsView::Ready(_) => None,
     }
 }
 

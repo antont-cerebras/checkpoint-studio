@@ -857,7 +857,11 @@ fn main() -> Result<()> {
                         std::process::exit(2);
                     }
                 };
-            let (old, new) = (&srcs[0], &srcs[1]);
+            // `diff` takes exactly two sources; the arg parser guarantees the pair.
+            let [old, new] = srcs.as_slice() else {
+                eprintln!("checkpoint-studio diff: expected exactly two checkpoints");
+                std::process::exit(2);
+            };
             let remote = remote.map(|(host, venv)| remote::RemoteRead::new(host, venv));
             let filter = match build_tensor_filter(
                 &name,
@@ -1030,7 +1034,10 @@ fn run_check(
             );
             return 2;
         }
-        let src = paths[0].to_string_lossy().to_string();
+        let src = paths
+            .first()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
         (|| -> Result<check::CheckReport> {
             let mut password: Option<String> = None;
             let session = r.open_with(&mut password)?;
@@ -1241,9 +1248,6 @@ fn build_name_map(map: &[String], map_from: Option<&Path>) -> Result<diff::NameM
     diff::NameMap::from_pairs(pairs)
 }
 
-/// Braille spinner frames (matches the interactive stats scan).
-const DIFF_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
 /// Shared state between the value-comparison workers and the spinner thread.
 struct CompareState {
     /// Tensors currently being compared (one entry per in-flight worker).
@@ -1368,7 +1372,7 @@ fn compare_progress_block(
     width: usize,
     height: usize,
 ) -> Vec<String> {
-    let spin = DIFF_SPINNER[frame % DIFF_SPINNER.len()];
+    let spin = progress::spinner_frame(frame);
     let mut lines = vec![format!(
         "{spin} comparing tensors ({done}/{total}, {} in flight):",
         names.len()
@@ -1376,7 +1380,7 @@ fn compare_progress_block(
     let indent = "    ";
     let max_rows = height.saturating_sub(2).max(1); // keep the block on screen
     let shown = names.len().min(max_rows);
-    for name in &names[..shown] {
+    for name in names.get(..shown).unwrap_or(names) {
         let budget = width.saturating_sub(indent.chars().count());
         lines.push(format!("{indent}{}", truncate_tail(name, budget)));
     }
@@ -2853,8 +2857,9 @@ fn print_repack_sample(rr: &remote::RepackResult, red: &str, dim: &str, reset: &
     // Both grids highlight the differing cells (red), so the eye lands on the same
     // positions in old and new.
     let render = |a: &[Vec<u32>], b: &[Vec<u32>]| {
-        for (i, row) in a.iter().take(rows).enumerate() {
-            let brow = &b[i];
+        // Old and new grids have the same shape (checked by the caller), so walk them
+        // together instead of indexing the second by the first's position.
+        for (i, (row, brow)) in a.iter().zip(b).take(rows).enumerate() {
             let cells: String = row
                 .iter()
                 .enumerate()
@@ -2927,10 +2932,14 @@ fn print_repack_aux(
 /// dims equal and `2 ≤ fold ≤ 16` (so `bits = 16/fold ≥ 1`). Returns the fold, or
 /// `None` if the shapes aren't a fold pair. The bit-width is derived separately.
 fn detect_fold(old: &[usize], new: &[usize]) -> Option<usize> {
-    if old.is_empty() || old.len() != new.len() || old[1..] != new[1..] {
+    // A fold pair is `(E, inner…)` ↔ `(ceil(E/fold), inner…)`: same rank, same inner dims.
+    let (Some((&e, old_inner)), Some((&w, new_inner))) = (old.split_first(), new.split_first())
+    else {
+        return None;
+    };
+    if old_inner != new_inner {
         return None;
     }
-    let (e, w) = (old[0], new[0]);
     if w == 0 || e <= w {
         return None;
     }
@@ -3525,8 +3534,13 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
                 .unwrap_or_else(|| "~/venv".to_string());
             // `--print-model` dumps the structure; the per-object S3 metadata would
             // add a HEAD per object for data it doesn't print.
-            remote::RemoteRead::new(host.clone(), venv)
-                .read_checkpoint(&files[0].to_string_lossy(), remote::ObjectMeta::Skip)?
+            remote::RemoteRead::new(host.clone(), venv).read_checkpoint(
+                &files
+                    .first()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                remote::ObjectMeta::Skip,
+            )?
         } else {
             readers::read_local(&files)?
         };
@@ -3794,7 +3808,7 @@ fn collect_safetensors_files(
                             "Warning: {} file(s) listed in {} were not found on disk (e.g. {}).",
                             missing.len(),
                             index_path.display(),
-                            missing[0],
+                            missing.first().map_or("", String::as_str),
                         );
                     }
                     if !found_from_index {

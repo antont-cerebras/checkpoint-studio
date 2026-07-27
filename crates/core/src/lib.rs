@@ -6,18 +6,6 @@
 //! dependency. Frontends (the interactive terminal, and future web-server / MCP
 //! bins) drive it and render its serializable outputs.
 
-// Denied HERE rather than workspace-wide, because this crate is the one that parses files
-// it did not write: safetensors and GGUF headers, HDF5 metadata, `.npy` descriptors, and the
-// JSON a remote script prints. An out-of-range index in that code is a crash on someone
-// else's checkpoint; in the binary's render layer it is an index into a `Vec` the same
-// function just built, and a `_` arm is usually over a foreign key/colour enum.
-//
-// All 143 `indexing_slicing` sites and all 31 `wildcard_enum_match_arm` sites in this crate
-// are converted. The binary still has 73 and 49 respectively, allowed at the workspace level
-// until that pass is done — so this crate's guarantee holds now instead of after the whole
-// tree is finished. (`[lints] workspace = true` in Cargo.toml cannot be combined with a
-// per-crate `[lints.clippy]` table, which is why these live here.)
-#![deny(clippy::indexing_slicing, clippy::wildcard_enum_match_arm)]
 // An unwrap in a test IS the assertion — the panic is the failure report, and rewriting
 // hundreds of them into `?` would make the tests harder to read for no gain. So
 // `unwrap_used`/`expect_used` (denied for product code in Cargo.toml) are allowed in test

@@ -66,7 +66,9 @@ impl UI {
             let mut trailer_text = match r.status() {
                 Status::Pass => format!("— {}", r.summary().unwrap_or(r.note)),
                 Status::Na => "— n/a for this checkpoint".to_string(),
-                _ => format!("— {}  ({})", r.note, count_phrase(r.errors(), r.warnings())),
+                Status::Warn | Status::Fail => {
+                    format!("— {}  ({})", r.note, count_phrase(r.errors(), r.warnings()))
+                }
             };
             // The value scan carries its wall-clock time (like the CLI bar).
             if let Some(d) = r.elapsed() {
@@ -132,7 +134,7 @@ impl UI {
             let (mark, mc, trailer) = match state {
                 // The count lives in the footer bar — don't repeat it here.
                 CheckPopup::Scanning { frame, .. } => (
-                    CHECK_SPINNER[frame % CHECK_SPINNER.len()].to_string(),
+                    crate::progress::spinner_frame(frame).to_string(),
                     palette::ACCENT,
                     sty("— scanning…".into(), Style::default().fg(palette::DIM)),
                 ),
@@ -227,9 +229,6 @@ pub(crate) enum CheckPopup {
         frame: usize,
     },
 }
-
-/// Braille spinner frames for the in-progress "Value scan" row.
-const CHECK_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// One check row: `  <mark> <title padded>  <trailer>`, all on the panel `bg`.
 fn check_row(

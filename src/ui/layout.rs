@@ -143,11 +143,18 @@ impl UI {
         let mut body: Vec<Line> = Vec::with_capacity(body_rows);
         for r in scroll..(scroll + body_rows).min(total_rows) {
             // Advance to the band containing global row `r`.
-            while seg + 1 < starts.len() && r >= starts[seg] + rows[seg] {
+            while seg + 1 < starts.len()
+                && let (Some(&start), Some(&height)) = (starts.get(seg), rows.get(seg))
+                && r >= start + height
+            {
                 seg += 1;
             }
-            let s = &map.segments[seg];
-            let row_in = r - starts[seg];
+            // `starts`, `rows` and `segments` are parallel and `seg` is bounded by the loop
+            // above, so all three resolve; `else break` states that rather than assuming it.
+            let (Some(s), Some(&start)) = (map.segments.get(seg), starts.get(seg)) else {
+                break;
+            };
+            let row_in = r - start;
             let first = row_in == 0;
             let selected_row = seg == selected && first;
             let rule = if r == 0 {
@@ -329,7 +336,7 @@ fn band_rows(map: &crate::safelayout::LayoutMap, body_rows: usize) -> Vec<usize>
                 // rows to show them (a label row + one per entry) even when its
                 // byte share is tiny — as it is for a multi-GB file.
                 SegmentKind::Header => proportional.max(1 + map.metadata.len()),
-                _ => proportional.max(1),
+                SegmentKind::Tensor { .. } | SegmentKind::Gap => proportional.max(1),
             }
         })
         .collect()

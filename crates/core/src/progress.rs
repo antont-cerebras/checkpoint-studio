@@ -352,6 +352,18 @@ fn sweep_pos(frame: usize, width: usize, win: usize) -> usize {
 
 /// Spinner frames for a running bar.
 const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The Braille spinner glyph for animation step `frame`.
+///
+/// One definition for every spinner in the app: the load bars here, the stats scan, the
+/// health check, the diff progress line and the detail screen each had their own copy of the
+/// same ten characters, so a change to the animation meant finding five tables. The `%` is
+/// the bound, and a table that had somehow been emptied shows a dot rather than panicking
+/// mid-frame.
+#[must_use]
+pub fn spinner_frame(frame: usize) -> char {
+    FRAMES.get(frame % FRAMES.len()).copied().unwrap_or('·')
+}
 // Bold cyan spinner, bold green ✓, bold red ✗; dimmed labels so the coloured mark and
 // the timer stand out.
 const RUN: &str = "\x1b[1;36m";
@@ -401,7 +413,6 @@ fn render_line(v: &BarView, frame: usize, cols: usize) -> String {
         OK => (DONE, '✓'),
         ERR => (FAIL, '✗'),
         ABORTED => (DIM, '⊘'), // cut short, not a failure — dim, not red
-        // `% FRAMES.len()` is the bound; a missing frame would mean an empty table.
         _ => (
             RUN,
             FRAMES.get(frame % FRAMES.len()).copied().unwrap_or('*'),

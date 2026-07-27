@@ -48,7 +48,7 @@ impl UI {
         // range, flagged as such.
         let (rmin, rmax) = match stats {
             StatsView::Ready(s) => (s.min, s.max),
-            _ => (sample.min, sample.max),
+            StatsView::Pending | StatsView::Computing { .. } => (sample.min, sample.max),
         };
         let lo = fmt_value(rmin, integer);
         let hi = fmt_value(rmax, integer);
@@ -86,13 +86,15 @@ impl UI {
         // background = the lower row's; a trailing odd row keeps the default bg.
         let mut r = 0;
         while r < sample.values.len() {
-            let top = &sample.values[r];
+            let Some(top) = sample.values.get(r) else {
+                break;
+            };
             let bottom = sample.values.get(r + 1);
             let mut spans: Vec<Span> = Vec::with_capacity(top.len());
             for (c, &tv) in top.iter().enumerate() {
                 let mut style = Style::default().fg(heat_color(norm(tv)));
-                if let Some(below) = bottom {
-                    style = style.bg(heat_color(norm(below[c])));
+                if let Some(&b) = bottom.and_then(|row| row.get(c)) {
+                    style = style.bg(heat_color(norm(b)));
                 }
                 spans.push(Span::styled("▀", style));
             }
@@ -190,7 +192,10 @@ impl UI {
         // mode), so the dotted separator can be drawn there.
         let gap = |idx: &[usize]| -> Option<usize> {
             edges
-                .then(|| idx.windows(2).position(|w| w[1] != w[0] + 1))
+                .then(|| {
+                    idx.windows(2)
+                        .position(|w| matches!(*w, [a, b] if b != a + 1))
+                })
                 .flatten()
         };
         let row_gap = gap(&sample.rows);
@@ -228,8 +233,8 @@ impl UI {
                 } else {
                     &mut bot
                 };
-                for (k, ch) in label.chars().enumerate() {
-                    buf[start + k] = ch;
+                for (slot, ch) in buf.iter_mut().skip(start).zip(label.chars()) {
+                    *slot = ch;
                 }
                 rank += 1;
             }
@@ -237,8 +242,10 @@ impl UI {
                 let pos = right_edge(g) + cw - 1;
                 if pos < hwidth {
                     for buf in [&mut top, &mut bot] {
-                        if buf[pos] == ' ' {
-                            buf[pos] = '⋯';
+                        if let Some(slot) = buf.get_mut(pos)
+                            && *slot == ' '
+                        {
+                            *slot = '⋯';
                         }
                     }
                 }
@@ -276,7 +283,7 @@ impl UI {
             let mut spans: Vec<Span> = Vec::new();
             // Dimmed row index.
             spans.push(Span::styled(
-                format!("{:>lw$}", sample.rows[i]),
+                format!("{:>lw$}", sample.rows.get(i).copied().unwrap_or(0)),
                 bg_style(dim),
             ));
             let mut vcol = 0usize;
@@ -295,8 +302,10 @@ impl UI {
                         exact.map_or_else(|| format!("{:>cw$}", v as i64), |s| format!("{s:>cw$}"))
                     }
                     NumBase::Decimal => format!("{v:>cw$.3e}"),
-                    _ => {
-                        let rb = sample.raw[i][j];
+                    NumBase::Hex | NumBase::Octal | NumBase::Binary => {
+                        let Some(&rb) = sample.raw.get(i).and_then(|r| r.get(j)) else {
+                            continue;
+                        };
                         let d = base.digits(rb.width as u32);
                         let body = match base {
                             NumBase::Hex => format!("{:0d$x}", rb.bits),
@@ -554,7 +563,10 @@ fn edge_desc(idx: &[usize], total: usize) -> String {
     if n >= total {
         return format!("all {n}");
     }
-    match idx.windows(2).position(|w| w[1] != w[0] + 1) {
+    match idx
+        .windows(2)
+        .position(|w| matches!(*w, [a, b] if b != a + 1))
+    {
         Some(g) => format!("first {} & last {}", g + 1, n - (g + 1)),
         None if idx.first() == Some(&0) => format!("first {n}"),
         None => format!("last {n}"),
@@ -649,15 +661,23 @@ pub(super) fn render_histogram(
 
     let accent = Style::default().fg(palette::ACCENT);
     let bold = Style::default().add_modifier(Modifier::BOLD);
-    for i in 0..shown {
-        let frac = hist.counts[i] as f64 / max_count as f64;
+    // Five parallel per-bin vectors: zip them so "one entry per bin" is structural.
+    let rows = hist
+        .counts
+        .iter()
+        .zip(&labels)
+        .zip(&counts)
+        .zip(&pcts)
+        .take(shown);
+    for (((&count, label), count_text), pct) in rows {
+        let frac = count as f64 / max_count as f64;
         lines.push(Line::from(vec![
-            Span::raw(format!("{:>label_w$} ", labels[i])),
+            Span::raw(format!("{label:>label_w$} ")),
             dim_span("│"),
             Span::styled(bar(frac, bar_w), accent),
-            Span::styled(format!(" {:>count_w$} ", counts[i]), bold),
+            Span::styled(format!(" {count_text:>count_w$} "), bold),
             dim_span("("),
-            Span::raw(pcts[i].clone()),
+            Span::raw(pct.clone()),
             dim_span(")"),
         ]));
     }

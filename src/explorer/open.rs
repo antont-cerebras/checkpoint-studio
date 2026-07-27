@@ -182,14 +182,14 @@ impl OpenTarget {
     pub(crate) fn tensor(&self) -> Option<&str> {
         match self {
             Self::Tensor(n) => Some(n),
-            _ => None,
+            Self::SoleTensor | Self::Metadata(_) => None,
         }
     }
     /// The metadata entry name, if `--metadata` named one.
     pub(crate) fn metadata(&self) -> Option<&str> {
         match self {
             Self::Metadata(n) => Some(n),
-            _ => None,
+            Self::SoleTensor | Self::Tensor(_) => None,
         }
     }
 }
@@ -212,7 +212,7 @@ impl HistogramReq {
     pub(crate) fn bins(&self) -> Option<usize> {
         match self {
             Self::Bins(n) => Some(*n),
-            _ => None,
+            Self::Off | Self::Auto => None,
         }
     }
 }

@@ -155,23 +155,19 @@ expect_used = "deny"
 # codebase already runs on: make the compiler enforce the invariant instead of writing a
 # comment that says it holds.
 #
-# `indexing_slicing` and `wildcard_enum_match_arm` are DENIED IN THE CORE CRATE ONLY, and
-# allowed here for the binary — see the note at the bottom of this block for why, and
-# `crates/core/Cargo.toml` for where they are enforced.
-#
 # `indexing_slicing` is the substantive one. `v[i]` is a panic branch the type system can't
 # see, and a length check plus an index are two operations that drift apart independently —
 # which is exactly how three of the crashes fixed this week happened (the region gather
 # reading past an empty segment, `decode_prim` on a short tail, GGUF's unbounded string
 # length). Core code uses `get`/`get_mut`/`first`/`chunks_exact` and handles the `None`.
-indexing_slicing = "allow"
+indexing_slicing = "deny"
 # A `From` that can panic is a `TryFrom` wearing the wrong trait: the caller has no way to
 # see the failure coming.
 fallible_impl_from = "deny"
 # `..` where the fields could be named, so a new field is a decision rather than a default.
 unneeded_field_pattern = "deny"
 # See `indexing_slicing` above: enforced in the core crate, pending in the binary.
-wildcard_enum_match_arm = "allow"
+wildcard_enum_match_arm = "deny"
 # A bool parameter is read at the call site as a bare `true`, with no field name to say what
 # it means. `struct_excessive_bools` stays allowed (see above) because a struct literal names
 # its fields; a call does not.

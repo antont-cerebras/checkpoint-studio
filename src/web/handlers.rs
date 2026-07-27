@@ -343,7 +343,10 @@ fn lookup<'a>(s: &'a WebState, q: &Query) -> Result<&'a TensorInfo, Reply> {
         .tensor_index
         .get(name)
         .ok_or_else(|| err(404, format!("unknown tensor: {name}")))?;
-    Ok(&s.tensors[*idx])
+    // The index came from `tensor_index`, which is built from `tensors` itself.
+    s.tensors
+        .get(*idx)
+        .ok_or_else(|| err(500, format!("tensor index out of range for {name}")))
 }
 
 fn view_of(q: &Query) -> Result<ViewDtype, Reply> {

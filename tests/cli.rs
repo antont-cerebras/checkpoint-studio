@@ -161,7 +161,7 @@ fn dtype_size(dt: Dtype) -> usize {
         Dtype::F16 | Dtype::BF16 | Dtype::I16 | Dtype::U16 => 2,
         Dtype::F32 | Dtype::I32 | Dtype::U32 => 4,
         Dtype::F64 | Dtype::I64 | Dtype::U64 => 8,
-        _ => 4,
+        Dtype::F8_E5M2 | Dtype::F8_E4M3 | _ => 4,
     }
 }
 

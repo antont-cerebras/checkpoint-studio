@@ -29,8 +29,6 @@ pub(super) struct CachedReader {
     pub(super) reader: Box<dyn crate::sample::TensorReader>,
 }
 
-/// A spinner cycled while a statistics scan runs (Braille dots).
-pub(super) const STATS_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// A statistics scan running on a worker thread for a data view's current
 /// `(tensor, view)`. The view stays fully interactive while it runs; the main
 /// loop polls [`Self::handle`], caches the result when it lands, and animates the
@@ -123,7 +121,7 @@ pub(super) fn scan_stats_view<'a>(
     }
     spin.set(spin.get().wrapping_add(1));
     StatsView::Computing {
-        spinner: STATS_SPINNER[spin.get() % STATS_SPINNER.len()],
+        spinner: crate::progress::spinner_frame(spin.get()),
         elapsed: job.started.elapsed(),
         progress: job.progress(),
     }

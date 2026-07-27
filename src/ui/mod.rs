@@ -185,7 +185,7 @@ impl StatsView<'_> {
     pub(crate) fn value_range(&self) -> Option<(f64, f64)> {
         match self {
             StatsView::Ready(s) => Some((s.min, s.max)),
-            _ => None,
+            StatsView::Pending | StatsView::Computing { .. } => None,
         }
     }
 }

@@ -273,24 +273,31 @@ impl UI {
                 // block. Any non-zero share shows at least a one-cell sliver.
                 let cells = crate::stats::composition_cells(comp, crate::stats::BAR_W);
                 let mut line = vec![plain(format!("  {:<LBL$}  ", "Composition"))];
-                for (i, &n) in cells.iter().enumerate() {
+                // Three parallel triples (cells, shades, colours) — zipped.
+                for ((&n, &shade), &colour) in cells
+                    .iter()
+                    .zip(crate::stats::SHADES.iter())
+                    .zip(colors.iter())
+                {
                     if n > 0 {
                         line.push(sty(
-                            crate::stats::SHADES[i].to_string().repeat(n),
-                            Style::default().fg(colors[i]),
+                            shade.to_string().repeat(n),
+                            Style::default().fg(colour),
                         ));
                     }
                 }
                 line.push(plain("   ".into()));
-                for i in 0..3 {
+                let key = crate::stats::SHADES
+                    .iter()
+                    .zip(colors.iter())
+                    .zip(names.iter())
+                    .zip(comp.iter());
+                for (i, (((&shade, &colour), name), &share)) in key.enumerate() {
                     if i > 0 {
                         line.push(dim(" · ".into()));
                     }
-                    line.push(sty(
-                        format!("{} ", crate::stats::SHADES[i]),
-                        Style::default().fg(colors[i]),
-                    ));
-                    line.push(plain(format!("{} {}", names[i], pct(comp[i]))));
+                    line.push(sty(format!("{shade} "), Style::default().fg(colour)));
+                    line.push(plain(format!("{name} {}", pct(share))));
                 }
                 lines.push(Line::from(line));
             }

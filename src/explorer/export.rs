@@ -123,6 +123,11 @@ impl Explorer {
         serde_json::to_string_pretty(&serde_json::Value::Array(items)).unwrap_or_default()
     }
 
+    // One `_` arm here is over crossterm's `KeyCode` / `MouseEventKind` / `Event`: foreign,
+    // wide (a dozen-plus variants, several data-carrying), and listing them all would break
+    // on every crossterm release. `wildcard_enum_match_arm` is for a `_` that hides OUR own
+    // new variants, so it is allowed for this function.
+    #[allow(clippy::wildcard_enum_match_arm)]
     /// The `t` shortcut: open a modal menu to pick which export variant to copy
     /// (tree / tensor list × text / JSON × plain / verbose — every CLI
     /// `--print-*` combination), then copy that. `↑`/`↓` (or `1`–`8`) move,
@@ -141,7 +146,9 @@ impl Explorer {
         let mut layout_hint: Option<char> = None;
         loop {
             if sel != previewed {
-                preview = self.export_preview(EXPORT_CHOICES[sel]);
+                if let Some(&choice) = EXPORT_CHOICES.get(sel) {
+                    preview = self.export_preview(choice);
+                }
                 previewed = sel;
             }
             let hint = layout_hint;
@@ -173,6 +180,10 @@ impl Explorer {
                         continue;
                     }
                     layout_hint = None;
+                    // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
+                    // variants, several of them data-carrying); a handler that listed them all would break on
+                    // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+                    #[allow(clippy::wildcard_enum_match_arm)]
                     match key.code {
                         KeyCode::Up => sel = if sel == 0 { last } else { sel - 1 },
                         KeyCode::Down => sel = if sel == last { 0 } else { sel + 1 },
@@ -182,12 +193,16 @@ impl Explorer {
                         KeyCode::Char(d @ '1'..='9') => {
                             let i = d as usize - '1' as usize;
                             if i <= last {
-                                self.copy_export(term, EXPORT_CHOICES[i]);
+                                if let Some(&choice) = EXPORT_CHOICES.get(i) {
+                                    self.copy_export(term, choice);
+                                }
                                 return;
                             }
                         }
                         KeyCode::Enter => {
-                            self.copy_export(term, EXPORT_CHOICES[sel]);
+                            if let Some(&choice) = EXPORT_CHOICES.get(sel) {
+                                self.copy_export(term, choice);
+                            }
                             return;
                         }
                         KeyCode::Esc | KeyCode::Char('q') => return,
@@ -204,9 +219,15 @@ impl Explorer {
                         }
                     }
                     // Click a row to copy it; a click off the list cancels.
+                    // crossterm's `KeyCode` / `MouseEventKind` / `Event` are foreign and wide (a dozen-plus
+                    // variants, several of them data-carrying); a handler that listed them all would break on
+                    // every crossterm release. The lint is for a `_` that hides OUR OWN new variants.
+                    #[allow(clippy::wildcard_enum_match_arm)]
                     MouseEventKind::Down(_) => match hit(m.column, m.row) {
                         Some(i) => {
-                            self.copy_export(term, EXPORT_CHOICES[i]);
+                            if let Some(&choice) = EXPORT_CHOICES.get(i) {
+                                self.copy_export(term, choice);
+                            }
                             return;
                         }
                         None => return,

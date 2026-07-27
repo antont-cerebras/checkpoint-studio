@@ -99,7 +99,6 @@ impl Explorer {
         view: ViewDtype,
         render: impl Fn(&mut ratatui::Frame, StatsView<'_>),
     ) -> ScanOutcome {
-        const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         if self.cached_stats(tensor, view).is_some() {
             return ScanOutcome::Completed;
         }
@@ -127,7 +126,7 @@ impl Explorer {
             // small tensors (which return before the first frame).
             if started.elapsed() >= std::time::Duration::from_millis(120) {
                 let sv = StatsView::Computing {
-                    spinner: SPINNER[frame % SPINNER.len()],
+                    spinner: crate::progress::spinner_frame(frame),
                     elapsed: started.elapsed(),
                     progress: (total > 0)
                         .then(|| (done.load(Ordering::Relaxed) as f64 / total as f64).min(1.0)),
@@ -292,7 +291,7 @@ impl Explorer {
             // Animate through the live terminal when one is up (the interactive
             // session); headless `--plain` uses `load_quiet` and never gets here.
             if let Some(term) = self.terminal.as_mut() {
-                let spinner = STATS_SPINNER[frame % STATS_SPINNER.len()];
+                let spinner = crate::progress::spinner_frame(frame);
                 let elapsed = started.elapsed();
                 let _ = term.draw(|f| UI::render_loading(f, &label, total, spinner, elapsed));
             }
