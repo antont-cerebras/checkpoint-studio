@@ -54,6 +54,17 @@ Two checkers, two mechanisms, same directory:
 - ty — `[tool.ty.environment] extra-paths = ["typings"]` in `pyproject.toml`; ty has no
   stub-path concept, so the stubs go on the module search path instead.
 
+Ruff lints these files too (`typings` is in pyright's `include`, and ruff's `select = ["ALL"]`
+turns on flake8-pyi, which exists for exactly this kind of hand-written stub). Two
+consequences worth knowing before you edit one:
+
+- **Notes go in `#` comments, not docstrings.** A docstring in a stub is a lint (PYI021):
+  stubs carry types, and prose about *why a stub exists* is a note to the next editor.
+- **Names are not ours to fix.** boto3's keyword arguments really are PascalCase
+  (`Bucket`, `Key`, `MaxKeys`) and torch really does have parameters that shadow builtins,
+  so `N801`/`N802`/`N803`/`A002`/`A003` are turned off for `typings/**/*.pyi` alone. A stub
+  that renamed them would describe a library that doesn't exist.
+
 ## Checking a stub against reality
 
     ssh <proxy> 'source ~/venv/bin/activate && python3 -c "

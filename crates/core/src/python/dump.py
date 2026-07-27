@@ -70,11 +70,12 @@ def probe_s3(src: str) -> dict[str, Any]:
                 if len(sample) < 12: sample.append([rel, sz])
             if resp.get("IsTruncated"): tok = resp.get("NextContinuationToken")
             else: break
+    except Exception as e:
+        return {"s3_probe_error": "%r" % (e,)}
+    else:
         return {"s3_probe": {"prefix": prefix, "total": total, "empty": empty,
                              "bytes": nbytes, "metadata_key": meta_key,
                              "metadata_empty": meta_empty, "sample": sample}}
-    except Exception as e:
-        return {"s3_probe_error": "%r" % (e,)}
 try:
     import cerebras.pytorch as cstorch
 except Exception as e:
@@ -140,8 +141,11 @@ if WANT_S3:
         denied_flag = threading.Event()
 
         def describe(k: str) -> tuple[dict[str, Any] | None, str | None, bool]:
-            """`(object, warning, tags_denied)` for one key. Never raises: a failed
-            HEAD drops the object with a warning, missing tags drop just the tags."""
+            """`(object, warning, tags_denied)` for one key.
+
+            Never raises: a failed HEAD drops the object with a warning, missing tags
+            drop just the tags.
+            """
             try:
                 h = cli.head_object(Bucket=bucket, Key=k, ChecksumMode="ENABLED")
             except Exception as e:

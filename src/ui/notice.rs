@@ -7,6 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
+use super::Overlay;
 use super::UI;
 use super::palette;
 // Only the (hdf5-gated) conversion progress screen draws a gauge.
@@ -16,6 +17,20 @@ use super::popup::{Backdrop, render_popup_box, render_titled_bar};
 use super::theme::{dim_span, key_span};
 
 impl UI {
+    /// Composite an [`Overlay`] as a frame's last layer — the one place that maps
+    /// each variant to its renderer. Three callers used to carry their own copy of
+    /// this three-arm match (the engine's draw loop and the detail / data plain
+    /// renderers), so a new variant meant finding all three; now it means adding an
+    /// arm here and the compiler points at nothing else.
+    pub(crate) fn render_overlay(frame: &mut Frame, overlay: Option<&Overlay>) {
+        match overlay {
+            Some(Overlay::Legend(l)) => Self::render_legend_band(frame, *l),
+            Some(Overlay::Command(c)) => Self::render_command_band(frame, c),
+            Some(Overlay::Notice(m)) => Self::render_notice_box(frame, m),
+            None => {}
+        }
+    }
+
     /// Composite the copied-CLI-command pop-up over the live frame — a full-width
     /// [`render_titled_bar`] (label + copied confirmation ride the top border) with
     /// the wrapped command flush at column 0 so it stays cleanly selectable, then a

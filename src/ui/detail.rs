@@ -159,12 +159,7 @@ impl UI {
 
         // A pop-up overlay composites last, over the live frame, so the detail
         // (including a running scan's progress) keeps animating behind it.
-        match overlay {
-            Some(Overlay::Legend(l)) => Self::render_legend_band(frame, *l),
-            Some(Overlay::Command(c)) => Self::render_command_band(frame, c),
-            Some(Overlay::Notice(m)) => Self::render_notice_box(frame, m),
-            None => {}
-        }
+        Self::render_overlay(frame, overlay);
         (regions, links)
     }
 

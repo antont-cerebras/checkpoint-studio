@@ -103,7 +103,7 @@ class FakeS3Client:
             "ChecksumSHA256": "sum-%s" % key,
         }
 
-    def get_object_tagging(self, **kw: Any) -> dict[str, Any]:
+    def get_object_tagging(self, **_kw: Any) -> dict[str, Any]:
         self.taggings += 1
         if self.deny_tags:
             raise RuntimeError("no s3:GetObjectTagging")
@@ -167,9 +167,11 @@ def run_script(
     *,
     tweak: Callable[[str], str] | None = None,
 ) -> list[str]:
-    """Exec one script with `params` substituted and `modules` stubbed; return its
-    stdout lines. Mirrors `remote.rs::with_params`, so the substitution under test is
-    the same one that ships."""
+    """Exec one script with `params` substituted and `modules` stubbed.
+
+    Returns its stdout lines. Mirrors `remote.rs::with_params`, so the substitution
+    under test is the same one that ships.
+    """
     path = SCRIPTS / name
     text = path.read_text()
     if tweak:
@@ -198,7 +200,7 @@ def run_script(
 
 
 def meta(lines: list[str]) -> dict[str, Any]:
-    """The last sentinel-tagged JSON line — the result the Rust side parses."""
+    """Return the last sentinel-tagged JSON line — the result the Rust side parses."""
     payload = [line for line in lines if line.startswith(SENTINEL)]
     assert payload, "no sentinel line in:\n%s" % "\n".join(lines)
     return json.loads(payload[-1][len(SENTINEL) :])
@@ -283,8 +285,10 @@ class DumpScript(unittest.TestCase):
 
 
 class DumpScriptS3Phase(unittest.TestCase):
-    """`want_s3`: the per-object metadata pass, which is where the parallelism and the
-    tag early-stop live."""
+    """`want_s3`: the per-object metadata pass.
+
+    That pass is where the parallelism and the tag early-stop live.
+    """
 
     def objects(self) -> dict[str, int]:
         return {"ckpt/__METADATA__": 99, "ckpt/a.weight": 64, "ckpt/b.weight": 64}
@@ -379,9 +383,12 @@ class ListObjectsScript(unittest.TestCase):
 
 
 class ParamSubstitution(unittest.TestCase):
-    """`remote.rs` injects parameters through one JSON slot. A URI carrying a quote or a
-    backslash must not be able to break out of it — the scripts are built by string
-    substitution, so this is the one place an injection could happen."""
+    """`remote.rs` injects parameters through one JSON slot.
+
+    A URI carrying a quote or a backslash must not be able to break out of it — the
+    scripts are built by string substitution, so this is the one place an injection
+    could happen.
+    """
 
     def test_a_hostile_uri_survives_the_json_slot(self) -> None:
         nasty = 's3://bucket/it\'s "quoted" \\ and #hashed'

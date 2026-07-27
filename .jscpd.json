@@ -1,7 +1,7 @@
 {
   "//": [
     "Copy-paste detection (jscpd, token-based Rabin-Karp). Run it with:",
-    "    npx jscpd@4 --config .jscpd.json",
+    "    npx jscpd@5.0.12 --config .jscpd.json      (or `npm run dup` from web/)",
     "CI runs the same command, so the `threshold` below is a real gate: duplication cannot",
     "grow past it. Lower it when a refactor brings the number down; raising it needs a reason",
     "in the commit, the same rule the coverage floor follows.",
@@ -15,11 +15,14 @@
     "Tests are excluded: a test's whole job is to spell the case out, and near-identical",
     "fixtures are usually clearer than a parameterised helper.",
     "",
-    "The threshold sits just above the measurement (0.78% at the time of writing), not at a",
-    "round number: 1.0 would have allowed ~125 lines of new duplication before firing, which",
-    "is not a ratchet."
+    "The threshold sits just above the measurement, not at a round number: 1.0 would have",
+    "allowed ~125 lines of new duplication before firing, which is not a ratchet. It has been",
+    "lowered twice as duplication came down — 0.8 (at 0.78%), then 0.75 (at 0.69%, once the",
+    "engine took over the screens' overlay slot). At ~57.6k lines scanned, 0.06pp of headroom",
+    "is ~35 duplicated lines: enough that a legitimate near-miss doesn't trip it, tight enough",
+    "that one pasted block does."
   ],
-  "threshold": 0.8,
+  "threshold": 0.75,
   "minLines": 10,
   "minTokens": 60,
   "format": ["rust"],

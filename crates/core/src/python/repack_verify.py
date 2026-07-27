@@ -61,16 +61,19 @@ mask = np.uint16((1 << BITS) - 1)
 # can stream it ourselves with progress, rather than cstorch's one-shot read.
 class Loc(NamedTuple):
     """Where an object lives in S3 (thread-safe client + bucket + key)."""
+
     client: Any
     bucket: str
     key: str
 class Head(NamedTuple):
     """What a HEAD tells us about a weight object."""
+
     size: int
     compressed: bool
     numpy: bool        # stored with `__NUMPY__` metadata, so we can stream it
 class Aux(NamedTuple):
     """A numpy-float-stored sibling (codebook / qscale)."""
+
     compressed: bool
     dtype: Any         # numpy dtype
     shape: list[int]
@@ -101,7 +104,7 @@ def download_raw(loc: Loc, on: Callable[[int], object]) -> bytearray:
         buf += c
         on(len(buf))
     return buf
-def decode_u16(buf: bytearray, compressed: bool) -> np.ndarray[Any, Any]:
+def decode_u16(buf: bytearray, *, compressed: bool) -> np.ndarray[Any, Any]:
     if compressed:
         return np.frombuffer(zstandard.decompress(bytes(buf)), dtype=np.uint16)
     return np.frombuffer(buf, dtype=np.uint16)     # raw 16-bit words, zero-copy
@@ -229,7 +232,7 @@ def work(idx: int) -> None:
                 stat("bytes\t%s\t%d\t%d" % (nname, osz, nsz))
                 tb = osz + nsz
                 comparing()
-                ao = decode_u16(ra, ocomp); bo = decode_u16(rb, ncomp)
+                ao = decode_u16(ra, compressed=ocomp); bo = decode_u16(rb, compressed=ncomp)
             else:
                 ao = to_u16(da); bo = to_u16(db)   # not numpy-stored: no byte progress
                 tb = int(ao.nbytes) + int(bo.nbytes)
@@ -269,7 +272,7 @@ def work(idx: int) -> None:
             differing += cnt
             if cnt:
                 m = int(ad.max())
-                if m > maxdelta: maxdelta = m
+                maxdelta = max(maxdelta, m)
                 big += int(np.count_nonzero(ad > 1))   # differ by more than ±1
             if first is None and cnt:
                 p = np.argwhere(ne)[0]; e = int(p[0]); col = n0 + int(p[1])
@@ -315,7 +318,7 @@ def work(idx: int) -> None:
                 vals = d if bool(fin.all()) else d[fin]
                 if vals.size:
                     m = float(vals.max())
-                    if m > fmax: fmax = m
+                    fmax = max(fmax, m)
                     fsum += float(vals.sum(dtype=np.float64)); fcount += int(vals.size)
             res["fallback"] = {"dtype": label,
                                "elements": int(ao.size),

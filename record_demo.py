@@ -28,8 +28,11 @@ import struct
 import tempfile
 import termios
 import time
+from pathlib import Path
 
 COLS, ROWS = 100, 30
+# Where the recording lands (asciinema v2 "cast" format).
+CAST = Path("/tmp/demo.cast")
 
 # A minimal rcfile for a clean `$ ` prompt (bash inherits it via --rcfile). We
 # also start bash with --noediting so readline doesn't emit its bracketed-paste
@@ -99,12 +102,12 @@ send("exit\r"); feed(1.0)
 with contextlib.suppress(OSError):
     os.close(fd)
 os.waitpid(pid, 0)
-os.unlink(rc.name)
+Path(rc.name).unlink()
 
 header = {"version": 2, "width": COLS, "height": ROWS,
           "env": {"TERM": "xterm-256color", "SHELL": "/bin/bash"}}
-with open("/tmp/demo.cast", "w") as f:
+with CAST.open("w") as f:
     f.write(json.dumps(header) + "\n")
     f.writelines(json.dumps(ev) + "\n" for ev in events)
 print(f"cast: {len(events)} events, {events[-1][0] if events else 0:.1f}s, "
-      f"{os.path.getsize('/tmp/demo.cast')} bytes")
+      f"{CAST.stat().st_size} bytes")

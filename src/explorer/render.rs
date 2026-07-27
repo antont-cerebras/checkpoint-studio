@@ -162,12 +162,7 @@ impl Explorer {
             Representation::Heatmap => UI::render_heatmap(frame, tensor, sample, stats),
             Representation::Values => UI::render_values(frame, tensor, sample, stats, stripe, base),
         };
-        match overlay {
-            Some(Overlay::Legend(l)) => UI::render_legend_band(frame, *l),
-            Some(Overlay::Command(c)) => UI::render_command_band(frame, c),
-            Some(Overlay::Notice(m)) => UI::render_notice_box(frame, m),
-            None => {}
-        }
+        UI::render_overlay(frame, overlay);
         let badges = self.screen_badges(HelpCtx::Data);
         UI::render_badge_bar(frame, &badges, self.hovered_badge.get());
         self.links.borrow_mut().clear(); // data view shows no linkable names

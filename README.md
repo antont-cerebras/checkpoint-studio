@@ -211,6 +211,23 @@ over `crates/core/src` and `src`, and fails if duplication rises above the `thre
 refactor earns it, and raising it needs a reason in the commit — the same rule the coverage
 floor follows. Tests are excluded, because a test's job is to spell its case out.
 
+**The Python side** (the scripts that run on the ssh proxy, plus the `typings/` stubs that
+let a type checker see them) is gated by three tools, all **version-pinned** in CI:
+
+```bash
+python3 -m venv ~/.venvs/ckpt-tools           # any interpreter; the tools ship wheels
+~/.venvs/ckpt-tools/bin/pip install "ruff==0.16.0" "pyright==1.1.409" "ty==0.0.63" "numpy<2"
+ruff check .                                   # config in pyproject.toml
+pyright                                        # strict; config in pyrightconfig.json
+ty check crates/core/src/python crates/core/tests/python gen_demo.py record_demo.py
+python3 -m unittest discover -s crates/core/tests/python -t crates/core/tests/python
+```
+
+Ruff runs with `select = ["ALL"]` — every rule it ships, minus a list of opt-outs that each
+carry their reason in `pyproject.toml`. That is why the versions are pinned: with the whole
+rule set at deny, a new ruff release would otherwise add rules to a red build on a commit
+that changed nothing. Upgrading is a deliberate commit where the new findings get triaged.
+
 ### Remote checkpoints over SSH (`--ssh-proxy`)
 Browse a checkpoint that lives only on a remote host — either behind credentials
 you (rightly) don't want to copy to your laptop (a Cerebras **cstorch** checkpoint

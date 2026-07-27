@@ -23,7 +23,6 @@ use anyhow::Result;
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -35,9 +34,7 @@ use crate::tree::{TensorInfo, TreeNode};
 use crate::ui::{Legend, Overlay, StatsView, UI};
 
 // The mode framework and the vocabulary these screens share with the driver.
-use super::{
-    Explorer, HelpCtx, Mode, ModeSpec, Nav, Outcome, PaletteResult, PopupBackdrop, Screen,
-};
+use super::{Explorer, HelpCtx, Mode, Nav, Outcome, PaletteResult, PopupBackdrop, Screen};
 
 // Input handling and scroll tuning, shared with the parent's own loops.
 use super::{
@@ -86,11 +83,8 @@ impl FilesMode {
 }
 
 impl Mode for FilesMode {
-    fn spec(&self) -> ModeSpec {
-        ModeSpec {
-            id: HelpCtx::Files,
-            ctrlc_quits_immediately: false,
-        }
+    fn help_ctx(&self) -> HelpCtx {
+        HelpCtx::Files
     }
 
     fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
@@ -324,11 +318,8 @@ impl LayoutMode {
 }
 
 impl Mode for LayoutMode {
-    fn spec(&self) -> ModeSpec {
-        ModeSpec {
-            id: HelpCtx::Layout,
-            ctrlc_quits_immediately: false,
-        }
+    fn help_ctx(&self) -> HelpCtx {
+        HelpCtx::Layout
     }
 
     fn on_enter(
@@ -576,11 +567,8 @@ impl TreeMode {
 }
 
 impl Mode for TreeMode {
-    fn spec(&self) -> ModeSpec {
-        ModeSpec {
-            id: HelpCtx::Tree,
-            ctrlc_quits_immediately: false,
-        }
+    fn help_ctx(&self) -> HelpCtx {
+        HelpCtx::Tree
     }
 
     // While searching, typed letters edit the query — skip the wrong-layout hint,
@@ -1074,11 +1062,8 @@ impl RenameMode2 {
 }
 
 impl Mode for RenameMode2 {
-    fn spec(&self) -> ModeSpec {
-        ModeSpec {
-            id: HelpCtx::Rename,
-            ctrlc_quits_immediately: true,
-        }
+    fn help_ctx(&self) -> HelpCtx {
+        HelpCtx::Rename
     }
 
     // The name fields take arbitrary text; skip the wrong-layout hint. Space / `:`
@@ -1504,7 +1489,6 @@ pub(super) struct DetailMode {
     pub(super) warm: bool,
     pub(super) scan: Option<ScanJob>,
     pub(super) spin: Cell<usize>,
-    pub(super) overlay: Option<Overlay>,
 }
 
 impl DetailMode {
@@ -1525,7 +1509,6 @@ impl DetailMode {
             warm: false,
             scan: None,
             spin: Cell::new(0),
-            overlay: None,
         }
     }
 
@@ -1633,24 +1616,12 @@ fn paint_detail_background(
 }
 
 impl Mode for DetailMode {
-    fn spec(&self) -> ModeSpec {
-        ModeSpec {
-            id: HelpCtx::Detail,
-            ctrlc_quits_immediately: true,
-        }
+    fn help_ctx(&self) -> HelpCtx {
+        HelpCtx::Detail
     }
 
-    fn set_background_paused(&self, paused: bool) {
-        if let Some(job) = &self.scan {
-            job.pause.store(paused, Ordering::Relaxed);
-        }
-    }
-
-    fn overlay(&self) -> Option<&Overlay> {
-        self.overlay.as_ref()
-    }
-    fn dismiss_overlay(&mut self) -> bool {
-        self.overlay.take().is_some()
+    fn scan_job(&self) -> Option<&ScanJob> {
+        self.scan.as_ref()
     }
 
     fn on_enter(
@@ -1729,7 +1700,7 @@ impl Mode for DetailMode {
             stats_view,
             hist.as_ref(),
             None,
-            self.overlay.as_ref(),
+            None, // the engine composites any floating overlay — see `Explorer::overlay`
         );
         if let Some((what, _)) = &ex.copied_flash {
             UI::render_copied_flash(f, what);
@@ -1792,7 +1763,7 @@ impl Mode for DetailMode {
                 KeyCode::Char('m' | 'v' | 'h' | 's' | 'S' | 'b' | 'B')
             )
         {
-            self.overlay = Some(Overlay::Notice(
+            ex.show_overlay(Overlay::Notice(
                 "Read remotely with --ssh-proxy: only the structure is here. Data views \
                  (heatmap, values, histogram, statistics) need the file locally — copy the \
                  checkpoint down to preview its values."
@@ -1948,7 +1919,7 @@ impl Mode for DetailMode {
             }
             // `y` (copy the reopen command) is handled by the engine — see
             // `Explorer::do_copy_command` — so every mode does it identically.
-            KeyCode::Char('l') => self.overlay = Some(Overlay::Legend(Legend::Detail)),
+            KeyCode::Char('l') => ex.show_overlay(Overlay::Legend(Legend::Detail)),
             KeyCode::Backspace => return Ok(Outcome::Leave(Nav::Back)),
             KeyCode::Char('\\') => return Ok(Outcome::Leave(Nav::Forward)),
             // Any other key goes back to the tree.
@@ -1976,7 +1947,6 @@ pub(super) struct StatsMode {
     /// The last render's maximum scroll (render is `&self`), so the key / wheel
     /// handlers can clamp downward scrolling to the content.
     pub(super) scroll_max: Cell<usize>,
-    pub(super) overlay: Option<Overlay>,
 }
 
 impl StatsMode {
@@ -1985,7 +1955,6 @@ impl StatsMode {
             shards_expanded,
             scroll,
             scroll_max: Cell::new(0),
-            overlay: None,
         }
     }
 
@@ -2014,18 +1983,8 @@ impl StatsMode {
 }
 
 impl Mode for StatsMode {
-    fn spec(&self) -> ModeSpec {
-        ModeSpec {
-            id: HelpCtx::Stats,
-            ctrlc_quits_immediately: true,
-        }
-    }
-
-    fn overlay(&self) -> Option<&Overlay> {
-        self.overlay.as_ref()
-    }
-    fn dismiss_overlay(&mut self) -> bool {
-        self.overlay.take().is_some()
+    fn help_ctx(&self) -> HelpCtx {
+        HelpCtx::Stats
     }
 
     fn on_enter(
@@ -2114,7 +2073,7 @@ impl Mode for StatsMode {
                     std::time::Instant::now(),
                 ));
             }
-            KeyCode::Char('l') => self.overlay = Some(Overlay::Legend(Legend::Stats)),
+            KeyCode::Char('l') => ex.show_overlay(Overlay::Legend(Legend::Stats)),
             KeyCode::Char('q') => return Ok(Outcome::Leave(Nav::Quit)),
             KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::Down => self.scroll = (self.scroll + 1).min(self.scroll_max.get()),
@@ -2177,7 +2136,6 @@ pub(super) struct DataMode {
     pub(super) interaction: Interaction,
     pub(super) scan: Option<ScanJob>,
     pub(super) spin: Cell<usize>,
-    pub(super) overlay: Option<Overlay>,
     pub(super) slices: Cell<usize>,
     pub(super) overridable: Cell<bool>,
 }
@@ -2196,7 +2154,6 @@ impl DataMode {
             interaction,
             scan: None,
             spin: Cell::new(0),
-            overlay: None,
             slices: Cell::new(1),
             overridable: Cell::new(false),
         }
@@ -2214,24 +2171,12 @@ impl DataMode {
 }
 
 impl Mode for DataMode {
-    fn spec(&self) -> ModeSpec {
-        ModeSpec {
-            id: HelpCtx::Data,
-            ctrlc_quits_immediately: true,
-        }
+    fn help_ctx(&self) -> HelpCtx {
+        HelpCtx::Data
     }
 
-    fn set_background_paused(&self, paused: bool) {
-        if let Some(job) = &self.scan {
-            job.pause.store(paused, Ordering::Relaxed);
-        }
-    }
-
-    fn overlay(&self) -> Option<&Overlay> {
-        self.overlay.as_ref()
-    }
-    fn dismiss_overlay(&mut self) -> bool {
-        self.overlay.take().is_some()
+    fn scan_job(&self) -> Option<&ScanJob> {
+        self.scan.as_ref()
     }
 
     fn on_enter(
@@ -2273,7 +2218,7 @@ impl Mode for DataMode {
             stats_view,
             stripe,
             base,
-            self.overlay.as_ref(),
+            None, // the engine composites any floating overlay — see `Explorer::overlay`
         ) {
             Ok((slices, overridable, clamped)) => {
                 self.slices.set(slices);
@@ -2520,7 +2465,7 @@ impl Mode for DataMode {
             }
             // `y` (copy the reopen command) is engine-owned — see `do_copy_command`.
             KeyCode::Char('l') => {
-                self.overlay = Some(Overlay::Legend(match self.repr {
+                ex.show_overlay(Overlay::Legend(match self.repr {
                     Representation::Heatmap => Legend::Heatmap,
                     Representation::Values => Legend::Values,
                 }));
@@ -3205,15 +3150,14 @@ mod tests {
         draw_mode("the searching tree", &mode, &ex);
 
         // The tree's `l` legend is drawn and dismissed within the key handler rather
-        // than being carried as a mode overlay (only the detail-family modes composite
-        // one), so the tree reports none — pinned so the two mechanisms don't get
-        // confused for each other.
+        // than being floated in the engine's overlay slot (only the detail-family
+        // screens ask for that), so nothing is left behind for the driver to dismiss
+        // — pinned so the two mechanisms don't get confused for each other.
         mode.handle_key(&mut ex, &mut term, code(KeyCode::Esc))
             .unwrap();
-        assert!(mode.overlay().is_none());
         assert!(
-            !mode.dismiss_overlay(),
-            "the tree carries no overlay to dismiss"
+            ex.overlay.borrow().is_none(),
+            "the tree leaves no floating overlay behind"
         );
     }
 
@@ -3269,6 +3213,49 @@ mod tests {
         stats.handle_key(&mut ex, &mut term, key('f')).unwrap();
         stats.pre_draw(&mut ex, &mut term);
         draw_mode("the stats screen with shards", &stats, &ex);
+    }
+
+    /// The engine-owned overlay slot, end to end: a screen asks for one from its key
+    /// handler, the engine composites it over the frame, and dismissing it clears the
+    /// slot. Worth pinning because the engine is now the *only* painter — the screens
+    /// used to also paint their own copy from `render_frame`, so this path had a
+    /// belt-and-braces second renderer covering for it.
+    #[test]
+    fn the_engine_floats_and_dismisses_a_screens_overlay() {
+        let (mut ex, mut term) = loaded();
+        let tensor = first_tensor(&ex);
+        let mut detail = DetailMode::new(tensor, 0, StatsStart::OnDemand, Interaction::Interactive);
+        detail.on_enter(&mut ex, &mut term).unwrap();
+        assert!(ex.overlay.borrow().is_none(), "nothing floats on entry");
+
+        // `l` asks for the detail legend; the screen's own frame must NOT paint it.
+        detail.handle_key(&mut ex, &mut term, key('l')).unwrap();
+        assert!(
+            matches!(
+                ex.overlay.borrow().as_ref(),
+                Some(Overlay::Legend(Legend::Detail))
+            ),
+            "`l` should ask the engine to float the detail legend"
+        );
+        let body = crate::tui::headless_render(120, 40, |f| detail.render_frame(&ex, f)).unwrap();
+        let composited = crate::tui::headless_render(120, 40, |f| {
+            detail.render_frame(&ex, f);
+            ex.render_overlay(f);
+        })
+        .unwrap();
+        assert_ne!(
+            body, composited,
+            "the engine's composite must add the legend the screen leaves out"
+        );
+
+        ex.dismiss_overlay();
+        assert!(ex.overlay.borrow().is_none(), "dismiss clears the slot");
+        let after = crate::tui::headless_render(120, 40, |f| {
+            detail.render_frame(&ex, f);
+            ex.render_overlay(f);
+        })
+        .unwrap();
+        assert_eq!(body, after, "a dismissed overlay composites nothing");
     }
 
     /// Clicks, wheel and drag through the modes' own handlers. A mouse event the driver

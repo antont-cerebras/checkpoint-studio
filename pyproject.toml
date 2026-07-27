@@ -17,34 +17,22 @@ line-length = 100
 extend-exclude = ["target", "web"]
 
 [tool.ruff.lint]
-select = [
-  "E",   # pycodestyle errors
-  "F",   # pyflakes — undefined names, unused imports (the class that breaks a run)
-  "W",   # pycodestyle warnings
-  "B",   # flake8-bugbear — likely bugs (mutable defaults, broad raise, loop vars)
-  "C4",  # comprehensions
-  "SIM", # simplifications
-  "UP",  # pyupgrade, bounded by target-version above
-  "RET", # return-path consistency
-  "PIE", # misc lints
-  "ANN", # every function must be type-annotated (see ANN401 below)
-  "RUF", # ruff's own
-  # Added in the strictness pass. Each was measured to be clean (or one autofix away)
-  # on this tree, so they are here to catch regressions rather than to log debt:
-  "I",     # import sorting — deterministic, autofixable
-  "S",     # bandit: shell injection, `exec`, hardcoded temp paths, weak randomness
-  "PERF",  # obvious performance mistakes (needless list building, try-except in loops)
-  "FURB",  # modernizations refurb would suggest
-  "PLE",   # pylint errors — real bugs, not style
-  "PLW",   # pylint warnings
-  "DTZ",   # naive datetimes (the S3 timestamps are tz-aware; keep it that way)
-  "LOG",   # logging misuse
-  "ICN",   # conventional import aliases
-  "TID",   # tidy imports (no relative-import surprises across the ssh boundary)
-  "ASYNC", # async pitfalls, in case any of this ever grows an event loop
-  "C90",   # mccabe complexity, capped below
-]
+# Every rule ruff ships, minus the opt-outs below — the Python counterpart of the Rust
+# side's `clippy::all + pedantic + nursery + cargo` at deny. `ALL` rather than a list of
+# families is deliberate: it makes a new ruff release's rules arrive as opt-*out*. The
+# version is pinned in CI, so an upgrade is a step where new findings get triaged, not a
+# surprise that reds the build overnight.
+#
+# Switching this on (ruff 0.16, which has ~970 rules) found 38 of ruff's linter families
+# already clean on this tree — those are now held that way for free. Everything below is
+# either a rule ruff itself says conflicts with another, or a deliberate decision with the
+# reason attached. Nothing here is "too noisy to look at": each was read.
+select = ["ALL"]
 ignore = [
+  # --- pairs ruff itself reports as mutually exclusive ---------------------------
+  "D203", # blank line *before* a class docstring — conflicts with D211, which wins
+  "D213", # summary on the *second* line — conflicts with D212, which wins
+  # --- style, on scripts written to a deliberately compact shape ------------------
   # These are scripts, not a library: they're written in a deliberately compact style
   # (`emit(...); sys.exit(0)`) and cross an ssh boundary as a single payload. Line
   # length and one-statement-per-line would mean reformatting ~150 lines of code that
@@ -52,6 +40,8 @@ ignore = [
   "E501",  # line too long
   "E701",  # multiple statements on one line (colon)
   "E702",  # multiple statements on one line (semicolon)
+  "COM812", # missing trailing comma — ruff's docs flag COM as formatter-conflicting
+  "COM819", # ditto, prohibited trailing comma
   # printf-style `%` formatting is used throughout and is fine — `%r` for repr in
   # error paths is the idiom here. Rewriting 41 sites in cluster code buys nothing.
   "UP031",
@@ -61,6 +51,50 @@ ignore = [
   "ANN401",
   # `×` in comments is intentional (matches the Rust docs' style).
   "RUF003",
+  # --- what these programs *are* --------------------------------------------------
+  # stdout is the protocol: every remote script's entire output is the JSON line it
+  # prints, which the Rust side parses. `print` is the interface, not a leftover debug.
+  "T201",
+  "T203",
+  # The remote scripts are execed by absolute path on the proxy and the stub trees are
+  # resolved by path too — none of these directories is an importable package, and
+  # adding `__init__.py` to make a linter happy would change how they load.
+  "INP001",
+  # No license headers in this repo (it carries a top-level LICENSE instead).
+  "CPY001",
+  # The Python tests use `unittest`, on purpose: the harness runs on machines where we
+  # can't count on pytest being installed. PT009 would have us rewrite 35 assertions
+  # into a framework we deliberately don't depend on.
+  "PT009",
+  # `raise RuntimeError("...")` reads better than assigning the message to a name
+  # first, and these messages are read by a human staring at a failed cluster job.
+  "EM101",
+  "EM102",
+  "TRY003",
+  # --- docstring *presence* (the formatting rules, D2xx/D4xx, stay on) ------------
+  # Same call as the Rust side's `missing_errors_doc` / `missing_panics_doc`: 59 sites
+  # of prose, on code that is already densely commented, where the comment usually
+  # explains *why* rather than restating the signature. Worse, in a `.pyi` stub a
+  # docstring is itself a lint (PYI021) — so D1xx and PYI021 cannot both be satisfied.
+  "D100", "D101", "D102", "D103", "D104", "D105", "D107",
+  # --- overlapping ceilings -------------------------------------------------------
+  # `value_diff.work` / `repack_verify.work` are the chunked compare loops, and are
+  # already held by one ceiling (C901, max-complexity 15 below, with a documented
+  # per-file exemption). Three more counters over the same two functions would not
+  # tell us anything the first one doesn't.
+  "PLR0912", # too many branches
+  "PLR0915", # too many statements
+  "PLR0913", # too many arguments
+  # Comparisons against small integers in dtype / rank / bit-width code, where `3` and
+  # `4` are the domain (3-bit and 4-bit packing), not magic numbers wanting a name.
+  "PLR2004",
+  # --- policy, not correctness ----------------------------------------------------
+  # A TODO is a note to ourselves; making one fail the build just moves it out of the
+  # code and into someone's memory, which is worse.
+  "FIX", "TD",
+  # pydoclint's rules are all preview-only in 0.16, so selecting them here would be a
+  # no-op that silently activates on a future upgrade. Revisit when they stabilise.
+  "DOC",
 ]
 
 [tool.ruff.lint.mccabe]
@@ -85,11 +119,24 @@ max-complexity = 15
   # would mean threading a dozen locals through helpers on code that runs on a cluster
   # we cannot step through. The complexity ceiling still applies to everything else.
   "C901",
+  # The fast path's whole purpose is to reach into cstorch's `DeferredObject` for the S3
+  # coordinates (`._reader`, `._key`) that its public API doesn't expose, and to memoize
+  # the patch with a private marker. That access is the feature — see remote.rs — so
+  # flagging it here would only teach us to stop reading the warning.
+  "SLF001",
+  # `E`, `W`, `N` are the experts / weight / row dimensions of the arrays being compared.
+  # Single capitals are the notation this arithmetic is written in everywhere else.
+  "N806",
 ]
 # The test harness deliberately does the things bandit flags: `exec` is how it runs the
 # scripts under test, `assert` is how a test asserts, and a temp path is where a fixture
 # goes. Flagging them here would be noise, not security.
 "crates/core/tests/python/*.py" = ["S101", "S102", "S301", "S108"]
+# A stub's job is to restate someone else's API *exactly*: boto3's keyword arguments are
+# PascalCase (`Bucket`, `Key`, `MaxKeys`), torch has a class that isn't CapWords and
+# parameters that shadow builtins. Renaming any of them would make the stub describe a
+# library that doesn't exist. See typings/README.md.
+"typings/**/*.pyi" = ["N801", "N802", "N803", "A002", "A003"]
 # The demo recorders shell out to the terminal recorder and write to a fixed temp path;
 # that is what they are for.
 "{gen_demo,record_demo}.py" = ["S101", "S311", "S603", "S606", "S607", "S110", "S108"]

@@ -11,14 +11,14 @@ Stdlib only (no numpy) — writes valid `.safetensors` files into /tmp/ckpt-demo
 """
 
 import json
-import os
 import random
 import struct
 from collections.abc import Sequence
+from pathlib import Path
 
 random.seed(7)
-OUT = "/tmp/ckpt-demo"
-os.makedirs(OUT, exist_ok=True)
+OUT = Path("/tmp/ckpt-demo")
+OUT.mkdir(parents=True, exist_ok=True)
 
 DT_SIZE = {"F32": 4, "F16": 2, "BF16": 2, "U16": 2, "U8": 1, "I8": 1}
 
@@ -48,14 +48,14 @@ def write_safetensors(
     if metadata:
         header["__metadata__"] = metadata
     hb = json.dumps(header).encode()
-    with open(path, "wb") as f:
+    with Path(path).open("wb") as f:
         f.write(struct.pack("<Q", len(hb)))
         f.write(hb)
         f.write(bytes(blob))
 
 
 def f32(shape: Sequence[int]) -> bytes:
-    """A real-valued F32 tensor (standard-normal) so the data views look alive."""
+    """Build a real-valued F32 tensor (standard-normal) so the data views look alive."""
     return struct.pack("<%df" % numel(shape), *[random.gauss(0.0, 1.0) for _ in range(numel(shape))])
 
 

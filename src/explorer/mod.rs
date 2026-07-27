@@ -354,15 +354,32 @@ enum Nav {
     Quit,
 }
 
-/// The declarative facets of an interactive mode that the generic
-/// [`Explorer::run_mode`] driver needs — the small, per-mode data that used to be
-/// scattered across each hand-rolled `run_*` loop.
-struct ModeSpec {
-    /// Help / badge / hover context for this screen.
-    id: HelpCtx,
-    /// Ctrl-C quits the process immediately (detail / data / rename) vs returning
-    /// `Nav::Quit` to the navigator (tree / files / layout).
-    ctrlc_quits_immediately: bool,
+/// What Ctrl-C does on a screen. The leaf screens (detail / data / statistics /
+/// rename) quit the process where they stand; the navigable ones (tree / files /
+/// layout) hand a [`Nav::Quit`] back to the navigator so it can unwind its history.
+///
+/// Which of the two applies is a property of *which screen you are on*, so it is
+/// derived from [`HelpCtx`] below rather than restated per mode: this used to be a
+/// `ModeSpec { id, ctrlc_quits_immediately: bool }` that all seven [`Mode::help_ctx`]
+/// impls filled in by hand, and the boolean was set consistently with the screen
+/// every time — two facts where there is only one.
+enum CtrlC {
+    /// Quit the process from here (`quit_immediately`).
+    QuitProcess,
+    /// Leave with [`Nav::Quit`]; the navigator decides what that means.
+    LeaveToNavigator,
+}
+
+// An inherent impl on a `crate::ui` type from the explorer — legal (same crate), and
+// the right home: what Ctrl-C means is engine policy, not part of the help context.
+impl HelpCtx {
+    /// What Ctrl-C means on this screen — see [`CtrlC`].
+    const fn ctrlc(self) -> CtrlC {
+        match self {
+            Self::Detail | Self::Data | Self::Stats | Self::Rename => CtrlC::QuitProcess,
+            Self::Tree | Self::Files | Self::Layout => CtrlC::LeaveToNavigator,
+        }
+    }
 }
 
 /// The result of a mode handling a key (or `on_enter`): stay in the loop, or leave
@@ -416,7 +433,9 @@ const SCAN_TICK: std::time::Duration = std::time::Duration::from_millis(80);
 /// bubbles, footer-chip / link / badge clicks, Ctrl-C, and the wrong-keyboard-layout
 /// hint — so a mode physically cannot diverge from the others on those.
 trait Mode {
-    fn spec(&self) -> ModeSpec;
+    /// Which screen this is. The driver derives everything else it needs from it —
+    /// the footer / badge / hover context, and what Ctrl-C does ([`HelpCtx::ctrlc`]).
+    fn help_ctx(&self) -> HelpCtx;
     /// Whether typed letters are field input here (rename, tree-in-search), so the
     /// driver skips the wrong-layout hint and badge-click actions.
     fn accepts_text(&self, _ex: &Explorer) -> bool {
@@ -446,16 +465,19 @@ trait Mode {
     fn tick_background(&mut self, _ex: &mut Explorer) -> Bg {
         Bg::Idle
     }
-    /// Pause / resume a running background scan while input is pending, so a
-    /// keypress's own file read isn't stuck behind the scan's block. No-op by default.
-    fn set_background_paused(&self, _paused: bool) {}
-    /// The in-frame overlay (legend / copied-command / notice), if one is up.
-    fn overlay(&self) -> Option<&Overlay> {
+    /// This screen's background statistics scan, if it has one (detail / data). The
+    /// driver pauses and resumes it through [`Self::set_background_paused`], so a
+    /// screen only has to say where its job lives.
+    fn scan_job(&self) -> Option<&ScanJob> {
         None
     }
-    /// Dismiss any in-frame overlay; returns whether one was showing.
-    fn dismiss_overlay(&mut self) -> bool {
-        false
+    /// Pause / resume a running background scan while input is pending, so a
+    /// keypress's own file read isn't stuck behind the scan's block. Derived from
+    /// [`Self::scan_job`]; a screen without a scan gets the no-op for free.
+    fn set_background_paused(&self, paused: bool) {
+        if let Some(job) = self.scan_job() {
+            job.set_paused(paused);
+        }
     }
     /// Open the command palette (Space / `:`) and dispatch the choice.
     fn open_palette(
@@ -1118,6 +1140,17 @@ pub(crate) struct Explorer {
     /// drag-scrubbed by the `run_mode` engine, so every mode gets a bar the same
     /// way — see [`crate::ui::VScrollbar`].
     vscrollbar: RefCell<Option<crate::ui::VScrollbar>>,
+    /// A floating [`Overlay`] (legend / copied command / notice) to composite over
+    /// the next frame. Engine-owned for the same reason as `vscrollbar`: a screen
+    /// *asks* for one from its key handler ([`Self::show_overlay`]) and the
+    /// `run_mode` engine draws it as the frame's last layer, then swallows the next
+    /// key or click to dismiss it. Three screens used to each carry this field and
+    /// re-implement the show / dismiss pair; the dismissal rule is engine policy,
+    /// so it lives with the engine.
+    ///
+    /// Written only from key handlers, never from a render — the engine holds a
+    /// shared borrow while compositing.
+    overlay: RefCell<Option<Overlay>>,
     /// Whether a scroll-bar drag is in progress (engine-owned, shared by every
     /// mode's bar).
     scrollbar_drag: bool,
@@ -1220,6 +1253,7 @@ impl Explorer {
             clickable: RefCell::new(Vec::new()),
             links: RefCell::new(Vec::new()),
             vscrollbar: RefCell::new(None),
+            overlay: RefCell::new(None),
             scrollbar_drag: false,
             health_reports: Vec::new(),
             index_specs,
@@ -2478,13 +2512,24 @@ impl Explorer {
         ));
     }
 
-    /// The generic interactive driver: run one [`Mode`] until it returns a [`Nav`].
-    /// Owns the live terminal (taken into a local for the loop, like the old
-    /// detail/data screens) and all the shared plumbing — the input-drain gate, the
-    /// draw (frame + overlay + hover), the copied-flash lifecycle, footer-chip / link
-    /// / badge clicks, hover, Ctrl-C, the wrong-layout hint, and the command palette
-    /// — so a mode only supplies its content (`render_frame` / `handle_key` /
-    /// `handle_mouse` / `open_palette`). Replaces the six hand-rolled `run_*` loops.
+    /// Float `overlay` over the next frame; the [`Self::run_mode`] driver composites
+    /// it as the frame's last layer and swallows the next key or click to dismiss it.
+    /// Called from a screen's key handler — see the `overlay` field.
+    fn show_overlay(&self, overlay: Overlay) {
+        *self.overlay.borrow_mut() = Some(overlay);
+    }
+
+    /// Dismiss any floating overlay.
+    fn dismiss_overlay(&self) {
+        self.overlay.borrow_mut().take();
+    }
+
+    /// Composite the floating overlay, if any, as a frame's last layer. Scopes the
+    /// borrow to this call so a render can never see the slot locked.
+    fn render_overlay(&self, f: &mut ratatui::Frame) {
+        UI::render_overlay(f, self.overlay.borrow().as_ref());
+    }
+
     /// Copy the command that reopens the current view (the `y` action) and float a
     /// borderless [`render_command_band`](UI::render_command_band) with it — the same
     /// for every mode (the command is `reopen_command(mode.residual())`), so the
@@ -2499,6 +2544,13 @@ impl Explorer {
         });
     }
 
+    /// The tensor called `name`, cloned — the resolution the tensor-data screens need
+    /// before they can be built. `None` when the checkpoint has no such tensor, which is
+    /// the caller's cue to go somewhere else rather than open an empty screen.
+    fn tensor_named(&self, name: &str) -> Option<TensorInfo> {
+        self.tensors().iter().find(|t| t.name == name).cloned()
+    }
+
     /// Run `f` with the terminal borrowed out of `self`, putting it back afterwards.
     /// `None` when there is no live terminal (headless), so `f` never ran.
     ///
@@ -2507,13 +2559,6 @@ impl Explorer {
     /// Doing that in one place means the five callers no longer each restate the invariant
     /// that it is present, and a caller that returns early part-way through can't leave the
     /// terminal stranded, which would silently blank every later draw.
-    /// The tensor called `name`, cloned — the resolution the tensor-data screens need
-    /// before they can be built. `None` when the checkpoint has no such tensor, which is
-    /// the caller's cue to go somewhere else rather than open an empty screen.
-    fn tensor_named(&self, name: &str) -> Option<TensorInfo> {
-        self.tensors().iter().find(|t| t.name == name).cloned()
-    }
-
     fn with_terminal<T>(
         &mut self,
         f: impl FnOnce(&mut Self, &mut crate::tui::LiveTerminal) -> T,
@@ -2524,6 +2569,13 @@ impl Explorer {
         Some(out)
     }
 
+    /// The generic interactive driver: run one [`Mode`] until it returns a [`Nav`].
+    /// Owns the live terminal (taken into a local for the loop, like the old
+    /// detail/data screens) and all the shared plumbing — the input-drain gate, the
+    /// draw (frame + overlay + hover), the copied-flash lifecycle, footer-chip / link
+    /// / badge clicks, hover, Ctrl-C, the wrong-layout hint, and the command palette
+    /// — so a mode only supplies its content (`render_frame` / `handle_key` /
+    /// `handle_mouse` / `open_palette`). Replaces the six hand-rolled `run_*` loops.
     fn run_mode(&mut self, mode: &mut dyn Mode) -> Result<Nav> {
         self.with_terminal(|ex, term| ex.drive_mode(mode, term))
             .unwrap_or_else(|| Err(anyhow::anyhow!("no live terminal to run a screen on")))
@@ -2537,7 +2589,7 @@ impl Explorer {
         mode: &mut dyn Mode,
         term: &mut crate::tui::LiveTerminal,
     ) -> Result<Nav> {
-        let spec = mode.spec();
+        let ctx = mode.help_ctx();
         match mode.on_enter(self, term) {
             Ok(Outcome::Leave(nav)) => return Ok(nav),
             Ok(Outcome::Stay) => {}
@@ -2577,13 +2629,7 @@ impl Explorer {
                     if let Some(sb) = *self.vscrollbar.borrow() {
                         UI::render_vscrollbar(f, &sb);
                     }
-                    if let Some(o) = mode.overlay() {
-                        match o {
-                            Overlay::Legend(l) => UI::render_legend_band(f, *l),
-                            Overlay::Command(c) => UI::render_command_band(f, c),
-                            Overlay::Notice(m) => UI::render_notice_box(f, m),
-                        }
-                    }
+                    self.render_overlay(f);
                     if let Some(c) = hint {
                         UI::render_notice(f, &layout_hint_msg(c));
                     }
@@ -2620,12 +2666,12 @@ impl Explorer {
 
             // A floating overlay (detail/data legend/command/notice) swallows the
             // next input: any key or click closes it; Ctrl-C still quits.
-            if mode.overlay().is_some() {
+            if self.overlay.borrow().is_some() {
                 #[allow(clippy::wildcard_enum_match_arm)]
                 // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                 match &ev {
                     Event::Key(k) if is_ctrl_c(k) => {
-                        if spec.ctrlc_quits_immediately {
+                        if matches!(ctx.ctrlc(), CtrlC::QuitProcess) {
                             quit_immediately();
                         } else {
                             break Nav::Quit;
@@ -2635,16 +2681,16 @@ impl Explorer {
                         if let Some(c) = wrong_layout_char(k) {
                             layout_hint = Some(c);
                         } else {
-                            mode.dismiss_overlay();
+                            self.dismiss_overlay();
                         }
                     }
                     Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved) => {
                         if let Ok(sz) = term.size() {
-                            self.update_hovers(spec.id, sz.width, sz.height, m.column, m.row);
+                            self.update_hovers(ctx, sz.width, sz.height, m.column, m.row);
                         }
                     }
                     Event::Mouse(m) if matches!(m.kind, MouseEventKind::Down(_)) => {
-                        mode.dismiss_overlay();
+                        self.dismiss_overlay();
                     }
                     _ => {}
                 }
@@ -2660,7 +2706,7 @@ impl Explorer {
                 Event::Key(k) => k,
                 #[allow(clippy::wildcard_enum_match_arm)]
                 // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
-                Event::Mouse(m) => match self.route_mouse(term, mode, &spec, m)? {
+                Event::Mouse(m) => match self.route_mouse(term, mode, ctx, m)? {
                     MouseOutcome::Leave(nav) => break nav,
                     MouseOutcome::SynthKey(k) => k,
                     MouseOutcome::Redraw | MouseOutcome::Ignored => continue,
@@ -2669,7 +2715,7 @@ impl Explorer {
             };
 
             if is_ctrl_c(&key) {
-                if spec.ctrlc_quits_immediately {
+                if matches!(ctx.ctrlc(), CtrlC::QuitProcess) {
                     quit_immediately();
                 } else {
                     break Nav::Quit;
@@ -2748,7 +2794,7 @@ impl Explorer {
         &mut self,
         term: &mut crate::tui::LiveTerminal,
         mode: &mut dyn Mode,
-        spec: &ModeSpec,
+        ctx: HelpCtx,
         m: MouseEvent,
     ) -> Result<MouseOutcome> {
         let (col, row) = (m.column, m.row);
@@ -2757,7 +2803,7 @@ impl Explorer {
         match m.kind {
             MouseEventKind::Moved => {
                 if let Ok(sz) = term.size() {
-                    self.update_hovers(spec.id, sz.width, sz.height, col, row);
+                    self.update_hovers(ctx, sz.width, sz.height, col, row);
                 }
                 Ok(MouseOutcome::Redraw)
             }
@@ -2771,7 +2817,7 @@ impl Explorer {
                 // field input here.
                 if !mode.accepts_text(self)
                     && let Ok(sz) = term.size()
-                    && let Some(k) = self.badge_action_at(spec.id, sz.width, sz.height, col, row)
+                    && let Some(k) = self.badge_action_at(ctx, sz.width, sz.height, col, row)
                 {
                     return Ok(MouseOutcome::SynthKey(k));
                 }

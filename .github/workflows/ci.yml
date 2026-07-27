@@ -220,6 +220,13 @@ jobs:
       # annotations that pyright's inference accepted, and ruff enforces that the
       # annotations exist in the first place.
       - name: Install tools
+        # Pinned, deliberately. ruff's config is `select = ["ALL"]`, so a new ruff
+        # release adds rules to a gate that is already at deny: unpinned, an upstream
+        # release could red the build on a commit that changed nothing. Pinned, an
+        # upgrade becomes a commit where the new findings are read and either fixed or
+        # ignored-with-a-reason. Same argument for the two type checkers — ty is pre-1.0
+        # and its diagnostics still move. Bump these on purpose.
+        #
         # `coverage[toml]` because the config lives in pyproject.toml and 3.9 has no
         # tomllib.
         #
@@ -228,7 +235,13 @@ jobs:
         # see typings/README.md) numpy is small and ships precise inline types, so it is
         # installed rather than stubbed. `<2` matches the 1.x line the proxy's cstorch
         # venv is built on, so we check against the types the scripts actually meet.
-        run: pip install ruff pyright ty "numpy<2" "coverage[toml]"
+        run: |
+          pip install \
+            "ruff==0.16.0" \
+            "pyright==1.1.409" \
+            "ty==0.0.63" \
+            "numpy<2" \
+            "coverage[toml]"
 
       - name: Lint (ruff)
         run: ruff check .

@@ -89,6 +89,7 @@ for _n in ("float16","float32","float64","bfloat16","uint8","int8","int16","uint
     if _t is not None: NP2T[_n] = _t
 class Obj(NamedTuple):
     """One tensor's backing S3 object: where it lives plus how to decode it."""
+
     client: Any        # boto3 S3 client (thread-safe)
     bucket: str
     key: str
@@ -204,7 +205,7 @@ def work(idx: int) -> int:
                 if bool(np.any(fdm)):
                     dd = np.abs(av[fdm] - bv[fdm])
                     m = float(dd.max())
-                    if m > max_abs: max_abs = m
+                    max_abs = max(max_abs, m)
                     sum_abs += float(dd.sum())
                 nfm += int(np.count_nonzero(dmask & ~bothfin))
             if WANT_HIST and oc is not None and nc is not None:

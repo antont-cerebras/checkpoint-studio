@@ -55,6 +55,14 @@ impl ScanJob {
         (self.total > 0)
             .then(|| (self.done.load(Ordering::Relaxed) as f64 / self.total as f64).min(1.0))
     }
+
+    /// Ask the worker to wait between blocks (releasing the file lock so a
+    /// foreground read runs uncontended), or to resume where it left off. The
+    /// `Relaxed` ordering is right because the flag is advisory: the worker checks
+    /// it at a block boundary and nothing else is ordered against it.
+    pub(super) fn set_paused(&self, paused: bool) {
+        self.pause.store(paused, Ordering::Relaxed);
+    }
 }
 
 impl Drop for ScanJob {

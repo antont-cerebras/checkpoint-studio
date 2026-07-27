@@ -1,16 +1,16 @@
-"""`torch` — the handful of names the compare scripts use.
-
-Extracted from `value_diff.py` / `repack_verify.py`: two dtypes, three functions, and the
-tensor methods those scripts call. A tensor's element type isn't tracked (torch's own
-stubs don't either), so operations return `Tensor` and the numeric edges are `Any`.
-"""
+# `torch` — the handful of names the compare scripts use.
+#
+# Extracted from `value_diff.py` / `repack_verify.py`: two dtypes, three functions, and the
+# tensor methods those scripts call. A tensor's element type isn't tracked (torch's own
+# stubs don't either), so operations return `Tensor` and the numeric edges are `Any`.
+#
+# (Notes here are comments rather than docstrings: PYI021 — a stub carries types, and this
+# prose is for whoever edits the stub.)
 
 from typing import Any
 
-class dtype:
-    """A torch dtype object (`torch.float64`, …). Compared by identity, printed by `str`."""
-
-    def __str__(self) -> str: ...
+# A torch dtype object (`torch.float64`, …). Compared by identity, printed by `str`.
+class dtype: ...
 
 float64: dtype
 float32: dtype
@@ -22,17 +22,13 @@ int16: dtype
 int8: dtype
 uint8: dtype
 
-class Size(tuple[int, ...]):
-    """`Tensor.shape` — a tuple of dimensions."""
+# `Tensor.shape` — a tuple of dimensions.
+class Size(tuple[int, ...]): ...
 
+# Only the surface the scripts touch: `element_size()` is what `dump.py` reads for the
+# stored width; `to()` casts (the scripts cast to float64 before comparing); `numpy()`
+# hands the buffer to numpy; `reshape`/`view`/`contiguous` reshape without copying data.
 class Tensor:
-    """Only the surface the scripts touch.
-
-    `element_size()` is what `dump.py` reads for the stored width; `to()` casts (the
-    scripts cast to float64 before comparing); `numpy()` hands the buffer to numpy;
-    `reshape`/`view`/`contiguous` reshape without copying data.
-    """
-
     dtype: dtype
     shape: Size
     def element_size(self) -> int: ...
