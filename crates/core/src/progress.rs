@@ -8,8 +8,8 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,8 @@ pub struct LoadProgress {
     phase: AtomicU8,
     /// Which step of the read is running (0 = unknown) — see [`Stage`].
     stage: AtomicU8,
+    /// Replaces the bar's static label while the read runs — see [`LoadProgress::set_item`].
+    item: RwLock<Option<String>>,
 }
 
 /// What a [`LoadProgress`] count measures — shown after the `done/total` on the
@@ -210,6 +212,28 @@ impl LoadProgress {
         }
     }
 
+    /// Name the thing currently being worked on, replacing the bar's static label.
+    ///
+    /// One bar over a whole run needs to say *where* the run is, and a fixed label
+    /// can't. Comparing a 16B checkpoint's tensor values used to open one bar per
+    /// tensor — thousands of them, scrolling for screens, none of which you could read
+    /// while they moved. A single bar filling over the total, relabelled as it goes,
+    /// says the same thing in one line.
+    ///
+    /// Truncation happens at draw time rather than here, because the replacement
+    /// arrives after the terminal width has already been measured.
+    pub fn set_item(&self, item: &str) {
+        if let Ok(mut slot) = self.item.write() {
+            *slot = Some(item.to_string());
+        }
+    }
+
+    /// The current item, if one has been set.
+    #[must_use]
+    pub fn item(&self) -> Option<String> {
+        self.item.read().ok().and_then(|slot| slot.clone())
+    }
+
     /// Mark one more unit complete.
     pub fn advance(&self) {
         self.done.fetch_add(1, Ordering::Relaxed);
@@ -324,6 +348,42 @@ fn truncate_middle(s: &str, max: usize) -> String {
     let h: String = s.chars().take(head).collect();
     let t: String = s.chars().skip(n - tail).collect();
     format!("{h}…{t}")
+}
+
+/// Fit a live item label into `max` columns, keeping its `[k/n]` counter and the *end* of
+/// the name.
+///
+/// [`truncate_middle`] is right for a path or URI, where both ends carry meaning. A tensor
+/// name is the opposite: `model.layers.26.mlp.experts.3.down_proj.weight` shares its head
+/// with every other tensor in the checkpoint, and everything that tells them apart is at
+/// the end. Middle-truncating one on a narrow terminal left `[377/377] …oj.weight`, which
+/// names nothing.
+fn fit_item(item: &str, max: usize) -> String {
+    // Below this the name is a stub like `…oj.weight`, which no tensor is identified by.
+    const MIN_NAME: usize = 15;
+    if item.chars().count() <= max {
+        return item.to_string();
+    }
+    // Keep a leading `[k/n] ` counter verbatim — it is short, fixed-width, and says how far
+    // along the run is, which no part of the name can.
+    let (prefix, rest) = item
+        .strip_prefix('[')
+        .and_then(|r| r.find("] "))
+        .map_or(("", item), |at| item.split_at(at + 3));
+    let mut prefix = prefix;
+    let mut room = max.saturating_sub(prefix.chars().count());
+    // On a narrow terminal the counter costs more than it is worth: how far along the run
+    // is also shows in the bar's fill, while *which tensor* shows nowhere else.
+    if room < MIN_NAME {
+        prefix = "";
+        room = max;
+    }
+    if room <= 1 {
+        return truncate_middle(item, max);
+    }
+    let n = rest.chars().count();
+    let tail: String = rest.chars().skip(n.saturating_sub(room - 1)).collect();
+    format!("{prefix}…{tail}")
 }
 
 /// Width of the drawn `━━━━━━` progress bar, in columns.
@@ -584,8 +644,11 @@ fn spawn(
                 // A `[███░░░] done/total` bar once the total is known (e.g. after a
                 // remote dir is listed); until then just the spinner + timer.
                 let (done, total) = prog.snapshot();
+                // A live item (the tensor being compared right now) replaces the static
+                // label. Truncated here rather than up front because it arrives later.
+                let item = prog.item().map(|i| fit_item(&i, budget));
                 let view = BarView {
-                    label,
+                    label: item.as_deref().unwrap_or(label),
                     state: st,
                     ms: if st == RUNNING {
                         start.elapsed().as_millis() as u64
@@ -614,6 +677,72 @@ fn spawn(
 
 #[cfg(test)]
 mod tests {
+
+    /// The rule that makes one bar readable: keep the counter and the end of the name.
+    mod item_labels {
+        use super::super::{LoadProgress, fit_item};
+
+        const NAME: &str = "model.layers.26.mlp.experts.3.down_proj.weight";
+
+        #[test]
+        fn a_short_item_is_left_alone() {
+            assert_eq!(fit_item("[1/9] w", 40), "[1/9] w");
+        }
+
+        #[test]
+        fn the_counter_survives_and_the_name_keeps_its_tail() {
+            let out = fit_item(&format!("[377/377] {NAME}"), 30);
+            assert!(out.starts_with("[377/377] "), "counter kept: {out}");
+            assert!(out.ends_with("down_proj.weight"), "tail kept: {out}");
+            assert!(out.chars().count() <= 30, "fits: {out}");
+        }
+
+        /// The regression: middle truncation kept the head, which every tensor shares,
+        /// and threw away the part that identifies one.
+        #[test]
+        fn it_does_not_degenerate_to_a_meaningless_suffix() {
+            let out = fit_item(&format!("[377/377] {NAME}"), 20);
+            assert_ne!(out, "[377/377] …oj.weight");
+            assert!(
+                out.contains("proj.weight") || out.contains("down_pro"),
+                "{out}"
+            );
+        }
+
+        #[test]
+        fn an_item_with_no_counter_still_keeps_its_tail() {
+            let out = fit_item(NAME, 20);
+            assert!(out.starts_with('…'), "{out}");
+            assert!(out.ends_with("down_proj.weight"), "{out}");
+        }
+
+        #[test]
+        fn an_absurdly_narrow_terminal_still_produces_something() {
+            for max in 0..6 {
+                let out = fit_item(&format!("[377/377] {NAME}"), max);
+                assert!(out.chars().count() <= max.max(1), "max {max}: {out}");
+            }
+        }
+
+        #[test]
+        fn a_multibyte_name_is_cut_on_character_boundaries() {
+            // Slicing by bytes here would panic; the counter makes the prefix split a
+            // byte index, so this pins that the rest is walked by chars.
+            let out = fit_item("[1/2] модель.слой.вес", 12);
+            assert!(out.chars().count() <= 12, "{out}");
+        }
+
+        #[test]
+        fn the_item_replaces_the_static_label_only_once_set() {
+            let p = LoadProgress::new();
+            assert_eq!(p.item(), None);
+            p.set_item("[1/2] w");
+            assert_eq!(p.item().as_deref(), Some("[1/2] w"));
+            p.set_item("[2/2] b");
+            assert_eq!(p.item().as_deref(), Some("[2/2] b"), "latest wins");
+        }
+    }
+
     use super::{
         ABORTED, BAR_COLS, BarView, DIM, ERR, LoadProgress, OK, Phase, RESET, RUN, RUNNING, Stage,
         Unit, filled_cols, fit_stage, render_line, sweep_pos, truncate_middle,

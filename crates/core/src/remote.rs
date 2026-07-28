@@ -321,9 +321,11 @@ pub enum CompareStatus {
 }
 
 /// A live event streamed from a remote value comparison (`--values` or
-/// `--verify-repack`), driving the standard per-tensor progress bars: it reports
-/// each side's S3 download size + byte progress so the bars fill for real, not just
-/// spin, then a per-tensor outcome as each one lands.
+/// `--verify-repack`), driving the run's single progress bar: it reports each side's S3
+/// download size + byte progress so the bar fills for real rather than just spinning,
+/// names the tensor in flight, and reports each outcome as it lands. The consumer
+/// (`ValueBar` in `main.rs`) aggregates these into one line — there is one bar for the
+/// whole run, not one per tensor.
 #[derive(Debug)]
 pub enum RepackEvent<'a> {
     /// A checkpoint is loading (`"old"` / `"new"`).

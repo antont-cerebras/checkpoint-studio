@@ -1453,59 +1453,101 @@ fn erase_block(prev_lines: usize) {
 /// sides, settling to ✓ (compared / equivalent) or ✗ (error) as each lands. The
 /// comparison itself stays on the proxy — only the byte counts cross ssh. Names
 /// not among the pairs we asked for are ignored.
-fn drive_bars(
-    bars: &progress::Bars,
-    index: &HashMap<&str, usize>,
-    finished: &std::cell::RefCell<Vec<bool>>,
-    ev: remote::RepackEvent,
-) {
-    use crate::remote::RepackEvent as E;
-    match ev {
-        // Loading a checkpoint / starting a tensor needs no bar change — the bar
-        // sweeps (total unknown) until the byte sizes arrive, then fills as they
-        // stream in.
-        E::Loading(_) | E::Start { .. } => {}
-        // Bytes all read; the proxy now decodes + compares the tensor. Flag it so
-        // the (now full) byte bar shows `· comparing…` with its still-running timer
-        // instead of looking stuck.
-        E::Comparing(name) => {
-            if let Some(&i) = index.get(name)
-                && let Some(p) = bars.progress(i)
-            {
-                p.set_phase(progress::Phase::Comparing);
+/// One aggregate progress bar for a whole remote value compare / repack verify.
+///
+/// A bar per tensor is unreadable at checkpoint scale: a 16B `MoE` has thousands, so
+/// `diff --values` scrolled for screens and nothing on them stayed still long enough to
+/// read. This is one bar filling over the *total* bytes both sides will stream, relabelled
+/// with the tensor currently being read — so the line says how far along the run is and
+/// where it is, in the space one bar takes.
+///
+/// The per-tensor byte events are cumulative *per tensor*, so summing the latest value
+/// seen for each is what gives a total that only ever moves forward. Adding the deltas
+/// would drift: a retried tensor re-reports from zero.
+struct ValueBar {
+    bars: progress::Bars,
+    /// Latest cumulative bytes per tensor, keyed by name.
+    seen: HashMap<String, u64>,
+    /// Tensors finished, for the `k/n` note.
+    done: usize,
+    total_tensors: usize,
+    /// Whether any tensor reported an error, so the bar can end as `✓` or `✗`.
+    failed: bool,
+}
+
+impl ValueBar {
+    /// Start the bar. `total_bytes` is what both sides add up to; `total_tensors` is the
+    /// pair count, used for the `k/n tensors` note.
+    fn start(label: &str, total_bytes: u64, total_tensors: usize) -> Self {
+        let bars = progress::Bars::start(std::slice::from_ref(&label.to_string()));
+        if let Some(p) = bars.progress(0) {
+            p.set_unit(progress::Unit::Bytes);
+            // Zero would render as a finished bar; leave the total unset so it sweeps
+            // until the first size arrives.
+            if total_bytes > 0 {
+                p.set_total(total_bytes as usize);
             }
         }
-        E::Size {
-            name,
-            old_bytes,
-            new_bytes,
-        } => {
-            if let Some(&i) = index.get(name)
-                && let Some(p) = bars.progress(i)
-            {
-                p.set_unit(progress::Unit::Bytes);
-                p.set_total((old_bytes + new_bytes) as usize);
-            }
+        Self {
+            bars,
+            seen: HashMap::new(),
+            done: 0,
+            total_tensors,
+            failed: false,
         }
-        E::Bytes {
-            name,
-            old_done,
-            new_done,
-        } => {
-            if let Some(&i) = index.get(name)
-                && let Some(p) = bars.progress(i)
-            {
-                p.set_done((old_done + new_done) as usize);
+    }
+
+    /// Fold one event into the bar.
+    fn on(&mut self, ev: remote::RepackEvent<'_>) {
+        use crate::remote::RepackEvent as E;
+        let Some(p) = self.bars.progress(0) else {
+            return;
+        };
+        match ev {
+            // Nothing to show yet: the checkpoints are still opening.
+            E::Loading(_) | E::Size { .. } => {}
+            E::Start { name, .. } => {
+                p.set_item(&self.item_label(name));
             }
-        }
-        E::Done { name, status } => {
-            if let Some(&i) = index.get(name) {
-                bars.finish(i, status != remote::CompareStatus::Error);
-                if let Some(f) = finished.borrow_mut().get_mut(i) {
-                    *f = true;
+            E::Bytes {
+                name,
+                old_done,
+                new_done,
+            } => {
+                self.seen.insert(name.to_string(), old_done + new_done);
+                p.set_done(self.seen.values().sum::<u64>() as usize);
+            }
+            // The whole run is never "done reading" until the end, so a per-tensor
+            // compare phase would flicker the note on and off; name the tensor instead.
+            E::Comparing(name) => {
+                p.set_item(&format!("{} · comparing", self.item_label(name)));
+            }
+            E::Done { name, status } => {
+                self.done += 1;
+                if status == remote::CompareStatus::Error {
+                    self.failed = true;
                 }
+                // A tensor that never reported bytes still counted toward the total, so
+                // credit it here or the bar can never fill.
+                self.seen.entry(name.to_string()).or_insert(0);
+                p.set_item(&self.item_label(name));
             }
         }
+    }
+
+    /// `[k/n] tensor.name` — the position in the run, then where it is.
+    fn item_label(&self, name: &str) -> String {
+        format!(
+            "[{}/{}] {name}",
+            (self.done + 1).min(self.total_tensors.max(1)),
+            self.total_tensors
+        )
+    }
+
+    /// Close the bar and wait for its final frame.
+    fn finish(self) {
+        self.bars.finish(0, !self.failed);
+        self.bars.join();
     }
 }
 
@@ -2585,27 +2627,19 @@ fn fetch_remote_repack(
             pairs.len().clamp(1, 4),
         );
     }
-    // One standard progress bar per read tensor (weight + sibling codebook/qscale),
-    // labelled by the *new* name, each filling over its (old + new) S3 byte size as
-    // the proxy streams the two sides.
-    let bars = progress::Bars::start(bar_labels);
-    let index: HashMap<&str, usize> = bar_labels
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), i))
-        .collect();
-    let finished = std::cell::RefCell::new(vec![false; bar_labels.len()]);
+    // One bar for the whole verify, relabelled with the tensor being read — a bar per
+    // tensor is thousands of them at checkpoint scale (see `ValueBar`).
+    let bar = std::cell::RefCell::new(ValueBar::start(
+        &format!("verifying repack on {}", r.host),
+        0,
+        bar_labels.len(),
+    ));
     let out = r.verify_repack(&session, old_uri, new_uri, pairs, bits, auto_sparse, |ev| {
-        drive_bars(&bars, &index, &finished, ev);
+        bar.borrow_mut().on(ev);
     });
-    // Settle any bar that never got a Done (a fatal mid-run error) so the animation
-    // thread sees every bar finished and `join` returns.
-    for (i, done) in finished.borrow().iter().enumerate() {
-        if !done {
-            bars.finish(i, false);
-        }
-    }
-    bars.join();
+    // Settle the bar (even on a fatal mid-run error) so the animation thread sees it
+    // finished and `join` returns.
+    bar.into_inner().finish();
     let (map, stats) = out?;
     if let Some(s) = stats {
         let elapsed = std::time::Duration::from_secs_f64(s.elapsed_s.max(0.0));
@@ -3070,25 +3104,19 @@ fn fetch_remote_value_diff(
         utils::format_size(total_bytes as usize),
         vopts.jobs.max(1),
     );
-    // One standard progress bar per compared tensor, each filling over its
-    // (old + new) S3 byte size as the proxy streams the two sides (the values are
-    // still compared on the proxy — only the byte counts and result cross ssh).
-    let bars = progress::Bars::start(&pairs.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>());
-    let index: HashMap<&str, usize> = pairs
-        .iter()
-        .enumerate()
-        .map(|(i, (_, n))| (n.as_str(), i))
-        .collect();
-    let finished = std::cell::RefCell::new(vec![false; pairs.len()]);
+    // One bar for the whole compare, filling over the total both sides will stream and
+    // relabelled with the tensor being read (the values are still compared on the proxy —
+    // only the byte counts and result cross ssh). A bar per tensor is thousands of them on
+    // a real checkpoint, which is screens of output nobody can read; see `ValueBar`.
+    let bar = std::cell::RefCell::new(ValueBar::start(
+        &format!("comparing values on {}", r.host),
+        total_bytes,
+        pairs.len(),
+    ));
     let out = r.value_diff(&session, old_uri, new_uri, pairs, vopts, |ev| {
-        drive_bars(&bars, &index, &finished, ev);
+        bar.borrow_mut().on(ev);
     });
-    for (i, done) in finished.borrow().iter().enumerate() {
-        if !done {
-            bars.finish(i, false);
-        }
-    }
-    bars.join();
+    bar.into_inner().finish();
     let (map, stats) = out?;
     // I/O + timing from the proxy: bytes read from S3 and the throughput, so a long
     // comparison's performance is visible (on stderr, keeping stdout's diff clean).
@@ -4031,6 +4059,166 @@ mod tests {
         assert_eq!(split_scp("./model.safetensors"), None);
         assert_eq!(split_scp("s3://bucket/key"), None);
         assert_eq!(split_scp("dir/a:b"), None); // colon after a slash → local
+    }
+
+    /// One bar over a whole run, so the numbers it shows have to be right: the label names
+    /// where the run is, and the fill is every tensor's bytes added up.
+    mod value_bar {
+        use super::super::{ValueBar, remote::CompareStatus, remote::RepackEvent as E};
+
+        /// A `ValueBar` with no terminal attached still folds every event, so these test
+        /// the arithmetic rather than the drawing (which `progress.rs` covers).
+        fn bar(total_bytes: u64, tensors: usize) -> ValueBar {
+            ValueBar::start("comparing", total_bytes, tensors)
+        }
+
+        #[test]
+        fn the_label_names_the_tensor_and_its_position_in_the_run() {
+            let mut b = bar(100, 3);
+            b.on(E::Start {
+                done: 0,
+                total: 3,
+                name: "model.layers.0.mlp.down_proj.weight",
+            });
+            let p = b.bars.progress(0).expect("one bar");
+            assert_eq!(
+                p.item().as_deref(),
+                Some("[1/3] model.layers.0.mlp.down_proj.weight")
+            );
+        }
+
+        #[test]
+        fn the_position_advances_as_tensors_finish() {
+            let mut b = bar(100, 3);
+            b.on(E::Done {
+                name: "a",
+                status: CompareStatus::Identical,
+            });
+            b.on(E::Start {
+                done: 1,
+                total: 3,
+                name: "b",
+            });
+            let p = b.bars.progress(0).expect("one bar");
+            assert_eq!(p.item().as_deref(), Some("[2/3] b"));
+        }
+
+        #[test]
+        fn the_position_never_runs_past_the_total() {
+            // The last tensor's Done makes `done` equal the total; `[4/3]` would be a
+            // visible lie on the final frame.
+            let mut b = bar(100, 3);
+            for name in ["a", "b", "c"] {
+                b.on(E::Done {
+                    name,
+                    status: CompareStatus::Identical,
+                });
+            }
+            let p = b.bars.progress(0).expect("one bar");
+            assert_eq!(p.item().as_deref(), Some("[3/3] c"));
+        }
+
+        /// The reason the bar keeps the latest value per tensor instead of summing
+        /// deltas: the events are cumulative *per tensor*, and several tensors are in
+        /// flight at once under `--jobs`.
+        #[test]
+        fn bytes_are_summed_across_tensors_in_flight() {
+            let mut b = bar(400, 2);
+            let p = b.bars.progress(0).expect("one bar");
+            b.on(E::Bytes {
+                name: "a",
+                old_done: 50,
+                new_done: 50,
+            });
+            assert_eq!(p.snapshot().0, 100);
+            // A second tensor's progress adds to the first, not replaces it.
+            b.on(E::Bytes {
+                name: "b",
+                old_done: 25,
+                new_done: 25,
+            });
+            assert_eq!(p.snapshot().0, 150);
+            // And `a` reporting again *replaces* a's contribution rather than adding.
+            b.on(E::Bytes {
+                name: "a",
+                old_done: 100,
+                new_done: 100,
+            });
+            assert_eq!(
+                p.snapshot().0,
+                250,
+                "cumulative per tensor, not a delta sum"
+            );
+        }
+
+        #[test]
+        fn a_restarted_tensor_does_not_inflate_the_total() {
+            // A retry re-reports from zero. Summing deltas would leave the bar past its
+            // total and showing more bytes read than exist.
+            let mut b = bar(200, 1);
+            let p = b.bars.progress(0).expect("one bar");
+            b.on(E::Bytes {
+                name: "a",
+                old_done: 90,
+                new_done: 90,
+            });
+            b.on(E::Bytes {
+                name: "a",
+                old_done: 0,
+                new_done: 0,
+            });
+            assert_eq!(p.snapshot().0, 0);
+        }
+
+        #[test]
+        fn a_tensor_that_reported_no_bytes_still_counts_when_it_finishes() {
+            // A skipped or cached tensor never emits Bytes; without crediting it on Done
+            // the bar could never reach its total.
+            let mut b = bar(0, 1);
+            b.on(E::Done {
+                name: "a",
+                status: CompareStatus::Identical,
+            });
+            assert!(b.seen.contains_key("a"));
+        }
+
+        #[test]
+        fn an_error_makes_the_bar_finish_as_a_failure() {
+            let mut b = bar(10, 1);
+            assert!(!b.failed);
+            b.on(E::Done {
+                name: "a",
+                status: CompareStatus::Error,
+            });
+            assert!(b.failed, "one failed tensor must not report a clean run");
+        }
+
+        #[test]
+        fn comparing_says_so_without_losing_the_tensor_name() {
+            let mut b = bar(10, 1);
+            b.on(E::Comparing("w"));
+            let p = b.bars.progress(0).expect("one bar");
+            let item = p.item().unwrap_or_default();
+            assert!(item.contains('w'), "keeps the name: {item}");
+            assert!(
+                item.contains("comparing"),
+                "and says what it is doing: {item}"
+            );
+        }
+
+        #[test]
+        fn events_before_any_tensor_leave_the_bar_alone() {
+            let mut b = bar(10, 1);
+            b.on(E::Loading("old"));
+            b.on(E::Size {
+                name: "w",
+                old_bytes: 5,
+                new_bytes: 5,
+            });
+            let p = b.bars.progress(0).expect("one bar");
+            assert_eq!(p.item(), None, "nothing to name yet");
+            assert_eq!(p.snapshot().0, 0);
+        }
     }
 
     #[test]
