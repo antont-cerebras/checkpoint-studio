@@ -4,10 +4,11 @@
     back,
     navigate,
     activateSelection,
-    setAllExpanded,
+    toggleAllExpanded,
     startSearch,
     setTab,
     paletteOpen,
+    compact,
     type Screen,
   } from '../stores/view';
 
@@ -26,10 +27,11 @@
     { keys: 'Enter', label: 'open', act: activateSelection },
     { keys: 'Tab', label: 'files', act: () => navigate({ kind: 'files' }) },
     { keys: 'Space/:', label: 'commands', act: () => paletteOpen.set(true) },
-    { keys: 'e/c', label: 'expand/collapse all', act: () => setAllExpanded(true) },
+    { keys: 'e', label: 'expand/collapse all', act: toggleAllExpanded },
     { keys: '/', label: 'search', act: startSearch },
     { keys: 'h', label: 'health', act: () => navigate({ kind: 'health' }) },
     { keys: 's', label: 'stats', act: () => navigate({ kind: 'stats' }) },
+    { keys: 'k', label: 'compact', act: () => compact.update((v) => !v) },
     { keys: '⇧L', label: 'layout', act: () => navigate({ kind: 'layout' }) },
   ];
 

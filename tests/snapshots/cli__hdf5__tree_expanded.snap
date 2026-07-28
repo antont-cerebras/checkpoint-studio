@@ -38,7 +38,7 @@ Checkpoint Studio - [FIXTURE] (1/1)                                             
         · input_layernorm.weight [F32, (4), 16 B → 19 B (⇩ gzip)]
         · self_attn.q_proj.weight [I32, (4, 4), 64 B → 41 B (⇩ gzip)]
 ↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · PgUp/PgDn page · Enter open · Tab files · Space/: commands
-e/c expand/collapse all · / search · l legend · h health · s stats · d compare · k compact · o/O sort/reverse
-t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · r repack · q quit
+e expand/collapse all · / search · l legend · h health · s stats · d compare · k compact · o/O sort/reverse
+c copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · r repack · q quit
  ▸ tests/fixtures
                                                                                                               read-only

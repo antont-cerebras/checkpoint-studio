@@ -244,8 +244,9 @@ pub(crate) fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str>
         (Tree, PageUp | PageDown) => "Scroll the tree by one screenful.",
         (Tree, KeyCode::Enter) => "Open the selected tensor, or expand / collapse a group.",
         (Tree, Char(' ' | ':')) => "Open the command palette — search and run any command.",
-        (Tree, Char('e' | 'E')) => "Expand every group in the tree.",
-        (Tree, Char('c' | 'C')) => "Collapse every group in the tree.",
+        (Tree, Char('e' | 'E')) => {
+            "Expand every group in the tree — or collapse them all once everything is open."
+        }
         (Tree, Char('/')) => "Search: filter tensors by name as you type.",
         (Tree, Char('h')) => "Run the checkpoint health checks and show the report.",
         (Tree, Char('s')) => {
@@ -568,14 +569,7 @@ pub(crate) fn tree_hint_lines(
         (vec![Seg::Key("Enter", KeyEvent::new(Enter, plain))], "open"),
         (vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))], "files"),
         (palette_keys(), "commands"),
-        (
-            vec![
-                Seg::Key("e", hint_key('e')),
-                Seg::Sep("/"),
-                Seg::Key("c", hint_key('c')),
-            ],
-            "expand/collapse all",
-        ),
+        (letter("e"), "expand/collapse all"),
         (letter("/"), "search"),
         (letter("l"), "legend"),
         (letter("h"), "health"),
@@ -590,6 +584,7 @@ pub(crate) fn tree_hint_lines(
             ],
             "sort/reverse",
         ),
+        (letter("c"), "copy screen"),
         (letter("t"), "copy tree"),
         (letter("f"), "copy file"),
         (letter("n"), "copy name"),

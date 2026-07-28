@@ -352,6 +352,30 @@ export function toggle(id: string): void {
   });
 }
 
+/**
+ * Expand every group, or collapse them all when everything is already open.
+ *
+ * The TUI's `e`, which is one key rather than the `e`/`c` pair both UIs used to have —
+ * `c` is copy-screen on every screen, and taking it here cost the tree that.
+ */
+export function toggleAllExpanded(): void {
+  setAllExpanded(anyCollapsed());
+}
+
+/** Whether any group in the tree on screen is still folded. */
+function anyCollapsed(): boolean {
+  const open = get(expanded);
+  const nodes = get(compact) ? get(compactTree)?.tree : get(treeData)?.tree;
+  if (!nodes) return true;
+  const walk = (nodes: TreeNode[], parentId: string): boolean =>
+    nodes.some((n) => {
+      if (n.kind !== 'group') return false;
+      const id = nodeId(n, parentId);
+      return !open.has(id) || walk(n.children, id);
+    });
+  return walk(nodes, '');
+}
+
 export function setAllExpanded(on: boolean): void {
   if (!on) {
     expanded.set(new Set());

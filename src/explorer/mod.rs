@@ -549,6 +549,11 @@ enum Cmd {
     SortCycle,
     /// Reverse the current order.
     SortFlip,
+    /// Expand every group, or collapse every group when they are all already open.
+    ///
+    /// One key rather than a pair: `c` used to collapse, which cost the tree the
+    /// `c` = copy-screen binding every other screen has.
+    ExpandToggle,
     ExpandAll,
     CollapseAll,
     ViewFiles,
@@ -684,17 +689,20 @@ const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
         'o',
     ),
     (Cmd::SortFlip, "Tree", "Reverse the sort order", 'O'),
-    (Cmd::ExpandAll, "Tree", "Expand all groups", 'e'),
-    (Cmd::CollapseAll, "Tree", "Collapse all groups", 'c'),
+    (
+        Cmd::ExpandToggle,
+        "Tree",
+        "Expand / collapse all groups",
+        'e',
+    ),
+    (Cmd::ExpandAll, "Tree", "Expand all groups", '\u{0}'),
+    (Cmd::CollapseAll, "Tree", "Collapse all groups", '\u{0}'),
     (Cmd::ViewFiles, "View", "File browser", '\t'),
     (Cmd::Diff, "View", "Compare with another checkpoint…", 'd'),
     (Cmd::Stats, "View", "Checkpoint stats", 's'),
     (Cmd::Health, "View", "Health report", 'h'),
     (Cmd::Legend, "View", "Legend", 'l'),
-    // `c` now expands/collapses (mirrors the web); copy-screen keeps the palette
-    // (and the tree's purpose-built `t` copy) but gives up its tree hotkey. The
-    // blank sentinel makes it palette-only (no footer chip; see `key_label`).
-    (Cmd::CopyScreen, "Copy", "Screen text", '\u{0}'),
+    (Cmd::CopyScreen, "Copy", "Screen text", 'c'),
     (Cmd::CopyTree, "Copy", "Tree / tensor list…", 't'),
     (Cmd::CopyPath, "Copy", "File path", 'f'),
     (Cmd::CopyName, "Copy", "Tensor name", 'n'),
@@ -3116,6 +3124,12 @@ impl Explorer {
                 self.resort();
                 self.flash_sort(self.tree_state.sort.0);
             }
+            // Collapse only when there is nothing left to open, so the first press
+            // always reveals more — the direction a user expects from one key.
+            Cmd::ExpandToggle => {
+                let expand = self.tree_state.any_collapsed();
+                self.tree_state.set_all_expanded(expand);
+            }
             Cmd::ExpandAll => self.tree_state.set_all_expanded(true),
             Cmd::CollapseAll => self.tree_state.set_all_expanded(false),
             Cmd::ViewFiles => {
@@ -3186,6 +3200,7 @@ impl Explorer {
                 | Cmd::Filter
                 | Cmd::Diff
                 | Cmd::CompactToggle
+                | Cmd::ExpandToggle
                 | Cmd::ExpandAll
                 | Cmd::CollapseAll
                 | Cmd::Stats
@@ -7605,12 +7620,20 @@ mod tests {
         assert_eq!(tree_command_for_key('/'), Some(Cmd::Search));
         assert_eq!(tree_command_for_key('q'), Some(Cmd::Quit));
         assert_eq!(tree_command_for_key('z'), None); // unbound
-        // Expand/collapse-all take either case (mirrors the web); `c` no longer
-        // triggers copy-screen on the tree (it's palette-only now).
-        assert_eq!(tree_command_for_key('e'), Some(Cmd::ExpandAll));
-        assert_eq!(tree_command_for_key('E'), Some(Cmd::ExpandAll));
-        assert_eq!(tree_command_for_key('c'), Some(Cmd::CollapseAll));
-        assert_eq!(tree_command_for_key('C'), Some(Cmd::CollapseAll));
+        // One key folds and unfolds, in either case, so `c` keeps the copy-screen
+        // meaning it has on every other screen. Binding it to collapse-all was the
+        // mistake this pins shut.
+        assert_eq!(tree_command_for_key('e'), Some(Cmd::ExpandToggle));
+        assert_eq!(tree_command_for_key('E'), Some(Cmd::ExpandToggle));
+        assert_eq!(tree_command_for_key('c'), Some(Cmd::CopyScreen));
+        assert_eq!(tree_command_for_key('C'), Some(Cmd::CopyScreen));
+        // Both directions stay individually addressable from the palette, keyless.
+        assert!(
+            TREE_COMMANDS
+                .iter()
+                .any(|(cmd, _, _, key)| *cmd == Cmd::CollapseAll && *key == '\u{0}'),
+            "collapse-all is palette-only, not unbound-and-unreachable"
+        );
         // Copy-screen stays reachable via the palette even without a hotkey.
         assert!(
             TREE_COMMANDS
@@ -7732,7 +7755,7 @@ mod tests {
                 continue; // gated off in this context (e.g. Repack needs HDF5)
             }
             if key_label(c).is_empty() {
-                continue; // palette-only (e.g. copy-screen since `c` now collapses)
+                continue; // palette-only (expand-all / collapse-all: `e` toggles both)
             }
             let want = if c == '\t' {
                 KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)

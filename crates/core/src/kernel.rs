@@ -290,6 +290,13 @@ impl TreeState {
         self.reflatten();
     }
 
+    /// Whether any group is still folded — what the single expand/collapse key asks
+    /// to decide which direction it goes.
+    #[must_use]
+    pub fn any_collapsed(&self) -> bool {
+        TreeBuilder::any_collapsed(&self.tree)
+    }
+
     /// Expand or collapse every group, then reset the cursor to the top since the
     /// visible rows change wholesale.
     pub fn set_all_expanded(&mut self, expanded: bool) {

@@ -17,7 +17,7 @@
     enterChild,
     selectSibling,
     activateSelection,
-    setAllExpanded,
+    toggleAllExpanded,
     startSearch,
     exitSearch,
     setTab,
@@ -237,13 +237,11 @@
   function treeKey(e: KeyboardEvent) {
     switch (e.key) {
       case 'ArrowDown':
-      case 'j':
         e.preventDefault();
         if (e.shiftKey) selectSibling(true);
         else moveSelection(1);
         break;
       case 'ArrowUp':
-      case 'k':
         e.preventDefault();
         if (e.shiftKey) selectSibling(false);
         else moveSelection(-1);
@@ -272,15 +270,15 @@
         e.preventDefault();
         navigate({ kind: 'files' });
         break;
-      // Accept lower- and upper-case: the footer shows plain `e`/`c`/`l`, so a
-      // Shift requirement would just read as "the feature is broken".
+      // Accept lower- and upper-case: the footer shows plain `e`/`l`, so a Shift
+      // requirement would just read as "the feature is broken".
       case 'e':
       case 'E':
-        setAllExpanded(true);
+        toggleAllExpanded();
         break;
-      case 'c':
-      case 'C':
-        setAllExpanded(false);
+      case 'k':
+      case 'K':
+        compact.update((v) => !v);
         break;
       case '/':
         e.preventDefault();

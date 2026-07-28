@@ -2877,23 +2877,37 @@ mod tests {
     }
 
     #[test]
-    fn the_tree_folds_and_unfolds_with_e_and_c() {
+    fn one_key_folds_and_unfolds_the_whole_tree() {
         let (mut ex, mut term) = loaded();
         let mut mode = TreeMode::new();
-        mode.handle_key(&mut ex, &mut term, key('c')).unwrap();
-        let collapsed = ex.tree_state.flattened.len();
+        // A checkpoint opens partly folded, so the first press opens everything —
+        // never closes it. That direction is the point of a single key.
+        let opening = ex.tree_state.flattened.len();
         mode.handle_key(&mut ex, &mut term, key('e')).unwrap();
         let expanded = ex.tree_state.flattened.len();
         assert!(
-            expanded > collapsed,
-            "expand-all must reveal rows: {collapsed} → {expanded}"
+            expanded > opening,
+            "the first press must reveal rows: {opening} → {expanded}"
         );
-        // Either case works for both (the TUI accepts `E`/`C` too — see the parity note
-        // in the key map).
-        mode.handle_key(&mut ex, &mut term, key('C')).unwrap();
-        assert_eq!(ex.tree_state.flattened.len(), collapsed);
+        // Now that nothing is left to open, the same key closes.
+        mode.handle_key(&mut ex, &mut term, key('e')).unwrap();
+        let collapsed = ex.tree_state.flattened.len();
+        assert!(
+            collapsed < expanded,
+            "the second press must fold: {expanded} → {collapsed}"
+        );
+        // And back, in either case.
         mode.handle_key(&mut ex, &mut term, key('E')).unwrap();
         assert_eq!(ex.tree_state.flattened.len(), expanded);
+
+        // `c` copies the screen — it does not fold anything. Reusing it for
+        // collapse-all cost the tree the copy every other screen has.
+        mode.handle_key(&mut ex, &mut term, key('c')).unwrap();
+        assert_eq!(
+            ex.tree_state.flattened.len(),
+            expanded,
+            "`c` must not change the fold state"
+        );
     }
 
     #[test]

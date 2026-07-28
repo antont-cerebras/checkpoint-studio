@@ -492,6 +492,20 @@ impl TreeBuilder {
         false
     }
 
+    /// Whether any group anywhere in the tree is still folded.
+    ///
+    /// What makes one key able to both expand and collapse: while anything is closed
+    /// the key opens, and only once everything is open does it close.
+    #[must_use]
+    pub fn any_collapsed(nodes: &[TreeNode]) -> bool {
+        nodes.iter().any(|node| match node {
+            TreeNode::Group {
+                expanded, children, ..
+            } => !*expanded || Self::any_collapsed(children),
+            TreeNode::Tensor { .. } | TreeNode::Metadata { .. } => false,
+        })
+    }
+
     /// Recursively set the `expanded` flag on every group in the tree.
     pub fn set_all_expanded(nodes: &mut [TreeNode], expanded: bool) {
         for node in nodes {
