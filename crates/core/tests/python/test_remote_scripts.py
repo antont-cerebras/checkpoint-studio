@@ -412,5 +412,143 @@ class ParamSubstitution(unittest.TestCase):
             self.assertEqual(slots, expected, "%s has %d slots" % (path.name, slots))
 
 
+class CstorchFastPrelude(unittest.TestCase):
+    """The S3 fast-path prelude that stops cstorch re-HEADing one object per tensor.
+
+    1155 HEADs of the same key, 4.97s of a 7.3s open — see the module's own docstring.
+
+    It runs on every `cstorch.load` script, and it is written to fail *silently* if
+    cstorch's internals move, so a mistake here is invisible: the read stays correct and
+    quietly slow. That makes its branches worth testing more than most.
+    """
+
+    @staticmethod
+    def _run(s3_module: types.ModuleType | None) -> None:
+        """Exec the real prelude text with `cerebras…s3_storage` stubbed (or absent)."""
+        names = [
+            "cerebras",
+            "cerebras.appliance",
+            "cerebras.appliance.storage",
+            "cerebras.appliance.storage.s3_storage",
+        ]
+        saved = {k: sys.modules.get(k) for k in names}
+        try:
+            if s3_module is None:
+                # Present but empty, so `from … import S3Reader` raises ImportError and
+                # the prelude takes its give-up path. Deterministic in a way that merely
+                # deleting the keys is not: that would depend on cstorch being absent
+                # from the machine, which is true here and not a property of the test.
+                for k in names:
+                    sys.modules[k] = FakeModule(k)
+            else:
+                for k in names[:-1]:
+                    sys.modules.setdefault(k, FakeModule(k))
+                sys.modules[names[-1]] = s3_module
+            # Compile under the script's real path, like `run_script` does: coverage.py
+            # attributes executed lines by filename, so a bare name lands on a phantom
+            # module and the file still reports 0%.
+            script = SCRIPTS / "cstorch_fast.py"
+            exec(compile(script.read_text(), str(script), "exec"), {"__name__": "__main__"})
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    @staticmethod
+    def _module_with(reader: type) -> types.ModuleType:
+        return FakeModule("cerebras.appliance.storage.s3_storage", S3Reader=reader)
+
+    def test_it_memoizes_stats_per_reader_path(self) -> None:
+        calls = []
+
+        class S3Reader:
+            def __init__(self, path: str) -> None:
+                self.path = path
+
+            @property
+            def stats(self) -> str:
+                calls.append(self.path)
+                return "stat:" + self.path
+
+        self._run(self._module_with(S3Reader))
+
+        a, b = S3Reader("s3://b/one"), S3Reader("s3://b/two")
+        # Repeated access on the same path must hit the real getter exactly once — that
+        # is the entire point, since each real call is an HTTPS round trip.
+        self.assertEqual([a.stats, a.stats, a.stats], ["stat:s3://b/one"] * 3)
+        self.assertEqual(calls, ["s3://b/one"])
+        # A different path is a different entry, not a stale hit from the first.
+        self.assertEqual(b.stats, "stat:s3://b/two")
+        self.assertEqual(calls, ["s3://b/one", "s3://b/two"])
+        # A second reader on the same path shares the memo (the key is the path).
+        self.assertEqual(S3Reader("s3://b/one").stats, "stat:s3://b/one")
+        self.assertEqual(len(calls), 2)
+
+    def test_a_reader_without_a_path_is_cached_per_instance(self) -> None:
+        # The key falls back to `id(self)`, so two pathless readers must not collide.
+        calls = []
+
+        class S3Reader:
+            @property
+            def stats(self) -> int:
+                calls.append(1)
+                return len(calls)
+
+        self._run(self._module_with(S3Reader))
+        x, y = S3Reader(), S3Reader()
+        self.assertEqual((x.stats, x.stats), (1, 1), "memoized per instance")
+        self.assertEqual(y.stats, 2, "a different instance is not a cache hit")
+
+    def test_it_marks_the_class_so_a_second_splice_does_not_double_wrap(self) -> None:
+        # The prelude is prepended to every script, and a session may exec more than one.
+        # Wrapping the wrapper would memoize the memo and never see a real refresh.
+        calls = []
+
+        class S3Reader:
+            def __init__(self) -> None:
+                self.path = "p"
+
+            @property
+            def stats(self) -> int:
+                calls.append(1)
+                return 1
+
+        mod = self._module_with(S3Reader)
+        self._run(mod)
+        first = S3Reader.stats
+        self._run(mod)
+        self.assertIs(S3Reader.stats, first, "the second run is a no-op")
+        self.assertTrue(getattr(S3Reader, "_ckpt_studio_memoized", False))
+
+    def test_it_leaves_an_unrecognised_shape_alone(self) -> None:
+        # Best-effort by design: if `stats` is not a property whose getter we can call,
+        # the correct-but-slow original has to survive untouched.
+        class PlainAttr:
+            stats = "not a property"
+
+        def discard(*_: object) -> None:
+            """Ignore every assignment — this property is a setter with no getter."""
+
+        class NoGetter:
+            # `fget is None`, so there is nothing for the prelude to memoize.
+            stats = property(None, discard)
+
+        class Missing:
+            pass
+
+        for cls, name in ((PlainAttr, "plain"), (NoGetter, "setter-only"), (Missing, "absent")):
+            before = getattr(cls, "stats", "<absent>")
+            self._run(self._module_with(cls))
+            self.assertEqual(getattr(cls, "stats", "<absent>"), before, "%s was patched" % name)
+            self.assertFalse(getattr(cls, "_ckpt_studio_memoized", False), name)
+
+    def test_it_is_a_no_op_when_cstorch_is_not_installed(self) -> None:
+        # Every local run takes this path, and it must not raise: the prelude is spliced
+        # into scripts that would otherwise work.
+        self._run(None)
+
+
 if __name__ == "__main__":
     unittest.main()
