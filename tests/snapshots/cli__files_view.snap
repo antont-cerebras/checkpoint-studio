@@ -39,6 +39,6 @@ File browser - tests/fixtures                                                   
 
 
 
-↑/↓ navigate · ←/→ collapse/expand · PgUp/PgDn page · Enter open/preview · Tab tensor tree · Space/: commands · l legend
-f copy path · c copy screen · y copy command · ⌫/\ back/fwd · q quit
+↑/↓ navigate · ←/→ collapse/expand · PgUp/PgDn page · Enter open/preview · Tab tensor tree · t its tensors
+Space/: commands · l legend · f copy path · c copy screen · y copy command · ⌫/\ back/fwd · q quit
  ▪ tests/fixtures                                                                                              editable

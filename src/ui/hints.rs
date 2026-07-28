@@ -780,6 +780,7 @@ pub(crate) fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>)
             vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))],
             "tensor tree",
         ),
+        (letter("t"), "its tensors"),
         (palette_keys(), "commands"),
         (letter("l"), "legend"),
         (letter("f"), "copy path"),

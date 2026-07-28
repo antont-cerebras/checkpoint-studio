@@ -576,6 +576,7 @@ enum Cmd {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FileCmd {
     TensorTree,
+    FilterTensors,
     Legend,
     CopyPath,
     CopyScreen,
@@ -716,6 +717,7 @@ const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
 /// of [`TREE_COMMANDS`]. `\t` (`Tab`) toggles back to the tensor tree.
 const FILE_COMMANDS: &[(FileCmd, &str, &str, char)] = &[
     (FileCmd::TensorTree, "View", "Tensor tree", '\t'),
+    (FileCmd::FilterTensors, "View", "Tensors in this file", 't'),
     (FileCmd::Legend, "View", "Legend", 'l'),
     (FileCmd::CopyPath, "Copy", "File path", 'f'),
     (FileCmd::CopyScreen, "Copy", "Screen text", 'c'),
@@ -3706,6 +3708,51 @@ impl Explorer {
         Ok((text, truncated))
     }
 
+    /// `t` in the file browser: narrow the tensor tree to the selected shard's tensors
+    /// and go there.
+    ///
+    /// Expressed as the filter query `shard:NAME` rather than as a mode of its own, so it
+    /// is the same state `--filter` sets: the title shows the query and the match count,
+    /// the filter bar can edit or clear it, `y` reproduces it, and the browser's filter
+    /// box says the same thing. A cross-link that invented its own kind of narrowing
+    /// would be a second thing to explain and a second thing to round-trip.
+    fn filter_tree_to_selected_file(&mut self) -> Option<Nav> {
+        let row = self.file_state.rows.get(self.file_state.selected)?;
+        if row.file_kind() != Some(crate::filetree::FileKind::Checkpoint) {
+            self.copied_flash = Some((
+                format!("{} holds no tensors to filter to", row.name),
+                std::time::Instant::now(),
+            ));
+            return None;
+        }
+        let query = format!("shard:{}", row.name);
+        match crate::tensorfilter::TensorFilter::parse(&query) {
+            Ok(filter) => {
+                self.set_tensor_filter(filter);
+                self.refresh_filter();
+                Some(Nav::Open(Screen::Tree))
+            }
+            // Only a name with the grammar's own punctuation in it can land here; say so
+            // rather than doing nothing and looking broken.
+            Err(e) => {
+                self.copied_flash = Some((
+                    format!("can't filter to {}: {e}", row.name),
+                    std::time::Instant::now(),
+                ));
+                None
+            }
+        }
+    }
+
+    /// The `source_path` of the tensor the tree has selected, if it has one selected —
+    /// what the file browser highlights on the way in.
+    fn selected_tensor_source(&self) -> Option<String> {
+        match self.tree_state.visible().get(self.tree_state.selected) {
+            Some((TreeNode::Tensor { info, .. }, _)) => Some(info.source_path.clone()),
+            _ => None,
+        }
+    }
+
     /// The file browser's legend (glyphs + what `Enter` does), floated like a
     /// preview.
     fn show_files_legend(&self, term: &mut crate::tui::LiveTerminal) {
@@ -3737,6 +3784,14 @@ impl Explorer {
             Line::from(Span::raw(
                 "tensors  what the model reads out of this file, and its share of the parameters"
                     .to_string(),
+            )),
+            Line::default(),
+            Line::from(Span::raw(
+                "t        narrow the tensor tree to this file's tensors (a shard: filter)"
+                    .to_string(),
+            )),
+            Line::from(crate::ui::dim_span(
+                "         Tab back here lands on the file the selected tensor lives in",
             )),
             Line::from(Span::raw(format!(
                 "{}        hardlinked: one copy of the bytes under N names, so the size is shared",
@@ -3914,6 +3969,11 @@ impl Explorer {
     ) -> Option<Nav> {
         match cmd {
             FileCmd::TensorTree => return Some(Nav::Back),
+            FileCmd::FilterTensors => {
+                if let Some(nav) = self.filter_tree_to_selected_file() {
+                    return Some(nav);
+                }
+            }
             FileCmd::Legend => self.show_files_legend(term),
             FileCmd::CopyPath => self.copy_file_path(),
             FileCmd::CopyScreen => self.copy_files_screen(),
@@ -6365,6 +6425,13 @@ impl Explorer {
         });
         if self.compact {
             args.push("--compact".to_string());
+        }
+        // The active filter. Set by `--filter`, by the filter bar, and now by the file
+        // browser's `t` — a narrowed tree that reopens unnarrowed isn't the same view.
+        let query = self.tree_state.filter_query();
+        if !query.is_empty() {
+            args.push("--filter".to_string());
+            args.push(shell_quote(query));
         }
         // The flat list's order, when it isn't the natural one — so `o` / `O` round-trip
         // through `y` like every other view choice.
