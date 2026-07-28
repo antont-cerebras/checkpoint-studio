@@ -32,10 +32,35 @@ export type TreeNode =
   | { kind: 'tensor'; info: TensorInfo; label: string | null }
   | { kind: 'metadata'; info: MetadataInfo };
 
+/** What the source supports — `crate::capability::Capabilities`, served so the client asks
+ * one question instead of re-deriving availability from the source's shape. That
+ * re-derivation is the bug the Rust module exists to prevent, and it is just as wrong here:
+ * a Hub repo and an ssh-proxied directory both lack byte access for different reasons. */
+export interface Capabilities {
+  /** Tensor bytes are reachable — the heatmap, value grid, histogram and whole-tensor
+   * scan. False for every non-local source today. */
+  read_bytes: boolean;
+  modify_in_place: boolean;
+  repack: boolean;
+  layout_map: boolean;
+  browse_files: boolean;
+  object_metadata: boolean;
+  codec_info: boolean;
+  reread_header: boolean;
+  reach: 'direct' | 'via_ssh_proxy';
+}
+
 export interface TreeResponse {
   root: string;
   tensor_count: number;
   tree: TreeNode[];
+  /** What this source can do — see [[Capabilities]]. */
+  capabilities: Capabilities;
+  format: string;
+  location: string;
+  /** Why the data views are unavailable, or null when they aren't. The server's own
+   * sentence, so the disabled pane says what a 400 from it would have said. */
+  data_view_note: string | null;
   /** `source_path`s of tensors on disk that `model.safetensors.index.json` doesn't
    * list. Sent with the tree because that's where they're marked, and keyed on
    * `source_path` so the test here is the same one the TUI makes. */

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tree, cachedStats, unindexed } from '../stores/server';
+  import { tree, cachedStats, unindexed, caps, dataViewNote } from '../stores/server';
   import { setTab, navigate, type DataTab } from '../stores/view';
   import type { StatsDto, TensorInfo, TreeNode } from '../lib/types';
   import { humanCount, humanSize, num, percent } from '../lib/format';
@@ -40,7 +40,13 @@
   // link when the tensor actually HAS a byte-range layout (safetensors) — for
   // cstorch (no byte ranges) / HDF5 (chunked) that map doesn't exist, so the link
   // would go nowhere.
-  $: isS3 = info?.source_path.startsWith('s3://') ?? false;
+  // The source's own answer, not a guess from the path's shape — the same reason the Rust
+  // side asks `capabilities` instead of testing for a prefix.
+  $: isS3 = $tree?.location === 's3';
+  // Whether the data views can work at all here. A remote source carries only the
+  // structure, so offering a heatmap that 400s teaches the user nothing: the tabs are
+  // disabled and the server's own sentence says why.
+  $: canReadBytes = $caps?.read_bytes ?? false;
   $: isExtra = info !== null && info !== undefined && $unindexed.has(info.source_path);
   $: hasByteLayout = info ? offsets(info.layout) != null : false;
 
@@ -51,18 +57,24 @@
     statsPromise = cachedStats(tensor);
   }
 
-  const tabs: { id: DataTab; label: string }[] = [
-    { id: 'info', label: 'Info' },
-    { id: 'heatmap', label: 'Heatmap' },
-    { id: 'values', label: 'Values' },
-    { id: 'histogram', label: 'Histogram' },
+  // The three that read tensor bytes are gated on that capability; Info never is.
+  const tabs: { id: DataTab; label: string; needsBytes: boolean }[] = [
+    { id: 'info', label: 'Info', needsBytes: false },
+    { id: 'heatmap', label: 'Heatmap', needsBytes: true },
+    { id: 'values', label: 'Values', needsBytes: true },
+    { id: 'histogram', label: 'Histogram', needsBytes: true },
   ];
 </script>
 
 <div class="detail">
   <div class="tabbar">
     {#each tabs as t (t.id)}
-      <button class:active={tab === t.id} on:click={() => setTab(t.id)}>{t.label}</button>
+      <button
+        class:active={tab === t.id}
+        disabled={t.needsBytes && !canReadBytes}
+        title={t.needsBytes && !canReadBytes ? ($dataViewNote ?? '') : undefined}
+        on:click={() => setTab(t.id)}>{t.label}</button
+      >
     {/each}
   </div>
 
@@ -102,7 +114,10 @@
 
       <div class="statsblock">
         <h3>Statistics</h3>
-        {#if !statsPromise}
+        {#if !canReadBytes}
+          <!-- The server's sentence, not a second wording of it. -->
+          <p class="dim note">{$dataViewNote ?? ''}</p>
+        {:else if !statsPromise}
           <button on:click={scan}>Scan tensor</button>
           <span class="dim">reads the whole tensor's values</span>
         {:else}
@@ -188,6 +203,15 @@
   }
   .statsblock table {
     margin: 0;
+  }
+  .tabbar button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  .note {
+    max-width: 70ch;
+    margin: 4px 0 0;
+    line-height: 1.5;
   }
   /* The same vivid red the terminal marks an unindexed tensor with. */
   .extra {

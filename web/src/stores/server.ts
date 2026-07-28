@@ -42,6 +42,13 @@ export async function loadCompact(q: string): Promise<CompactTree | null> {
 }
 export const treeError = writable<string | null>(null);
 
+/** What the source supports, as the server derived it — the one question a feature asks
+ * before offering itself. Null until the tree lands. */
+export const caps = derived(tree, ($t) => $t?.capabilities ?? null);
+
+/** Why the data views are unavailable, or null when they are. The server's wording. */
+export const dataViewNote = derived(tree, ($t) => $t?.data_view_note ?? null);
+
 /** Tensors on disk but not listed in the index, by `source_path` — a Set, because the
  * tree tests it once per visible row. Marked with the same glyph and vivid red the
  * terminal uses (see `palette::UNINDEXED`); a loader following only the index will not

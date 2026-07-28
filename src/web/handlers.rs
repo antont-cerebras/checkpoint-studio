@@ -69,6 +69,11 @@ pub(crate) fn tree(s: &WebState) -> Reply {
         "capabilities": s.checkpoint.capabilities(),
         "format": s.checkpoint.format(),
         "location": s.checkpoint.location(),
+        // Why a data view is unavailable, or `null` when it isn't — from the one function
+        // that words it, so the pane the client disables says what the 400 would have.
+        "data_view_note": crate::capability::Capabilities::data_view_note(
+            s.checkpoint.location(),
+        ),
         // `null` unless the server is reachable off this machine — the client shows it as
         // a banner. Carried on the tree because that is the first thing the UI fetches.
         "access_warning": s.access_warning,
@@ -713,7 +718,33 @@ mod contract {
         has_keys(
             "TreeResponse",
             &tree,
-            &["root", "tensor_count", "tree", "unindexed"],
+            &[
+                "root",
+                "tensor_count",
+                "tree",
+                "unindexed",
+                "capabilities",
+                "format",
+                "location",
+                "data_view_note",
+            ],
+        );
+        // The capability set the client gates its data views on — every row, since a
+        // missing one reads as `undefined` and so as "not allowed".
+        has_keys(
+            "Capabilities",
+            &tree["capabilities"],
+            &[
+                "read_bytes",
+                "modify_in_place",
+                "repack",
+                "layout_map",
+                "browse_files",
+                "object_metadata",
+                "codec_info",
+                "reread_header",
+                "reach",
+            ],
         );
         // A list, even when empty — the client turns it straight into a Set.
         assert!(tree["unindexed"].is_array(), "unindexed is a list");

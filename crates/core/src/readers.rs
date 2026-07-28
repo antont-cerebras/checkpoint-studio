@@ -521,7 +521,7 @@ mod tests {
         // A truncated download or an interrupted conversion: fifteen good shards and one
         // that won't parse. Refusing all of them tells you less than showing the fifteen
         // and naming the sixteenth — which is what this used to do.
-        let dir = std::env::temp_dir().join("ce_readers_partial_test");
+        let dir = std::env::temp_dir().join(format!("ce_readers_partial_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let good = dir.join("model-00001-of-00002.safetensors");
