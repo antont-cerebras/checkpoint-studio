@@ -6998,6 +6998,14 @@ fn layout_to_text(map: &crate::safelayout::LayoutMap) -> String {
 
 /// Build a sidecar preview's lines: JSON syntax-highlighted (falling back to
 /// plain text when it doesn't parse), any other text plain.
+///
+/// **Markdown is plain text here, and a rendered document in the browser.** A model
+/// card is prose with tables, links and code — the file where this would help most —
+/// but the web ecosystem has real answers for it (`marked` + `DOMPurify` + Shiki, see
+/// `web/src/lib/md.ts`) and the terminal does not. Writing one by hand for the TUI
+/// would mean a second implementation that disagreed with the browser's on every
+/// document neither of us thought to test, so the deliberate choice is a gap rather
+/// than a divergence. `checkpoint-studio web` renders READMEs; this shows them raw.
 fn preview_lines(text: &str, kind: crate::filetree::FileKind) -> Vec<Line<'static>> {
     if kind == crate::filetree::FileKind::Json
         && let Some(lines) = crate::ui::highlight_json_lines(text)

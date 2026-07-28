@@ -577,6 +577,17 @@ again (or `Backspace`) returns to the tensor tree; launch straight into it with
 - a **JSON** sidecar opens a scrollable, syntax-highlighted preview; other
   **text** files (`.txt`, `.md`, `.py`, `README`, …) preview as plain scrollable
   text.
+
+  **Markdown is a rendered document in the web UI only.** `checkpoint-studio web`
+  renders a README or model card properly — headings, tables, clickable links,
+  and syntax-highlighted code blocks — with the model's `---` frontmatter lifted
+  out as a field list, and a *source* toggle for the highlighted raw file. The
+  terminal has no equivalent library, and hand-writing one would just disagree
+  with it, so the TUI shows markdown as plain text on purpose.
+
+  A card comes from a checkpoint someone else built, so the rendered HTML is
+  sanitized before it is shown: scripts, event handlers, `javascript:` URLs and
+  `<style>` blocks don't survive, and links open in a new tab with `noopener`.
 - anything else shows a short info pop-up (no preview).
 
 The file view has the same command palette (`Space` / `:`), `l` legend, `c` /
