@@ -625,15 +625,6 @@ pub struct HeaderInputs<'a> {
     pub index: &'a [crate::model::IndexEntry],
     /// Checkpoint files the read skipped past because their headers wouldn't parse.
     pub unreadable: &'a [crate::model::UnreadableShard],
-    /// What the source can do — [`crate::capability::Capabilities::reread_header`] decides
-    /// whether the header text can be read back for the repeated-key check.
-    ///
-    /// Asked rather than inferred from a path's shape, which is the whole point of that
-    /// module: a Hub shard's `ShardHeader.path` is a bare repo-relative name, so a
-    /// "does this look remote" test calls it local and the check goes looking for it in the
-    /// working directory. `None` when no source was supplied (a unit test) — the
-    /// pessimistic reading, so nothing is attempted.
-    pub caps: Option<crate::capability::Capabilities>,
 }
 
 impl<'a> From<&'a crate::model::Checkpoint> for HeaderInputs<'a> {
@@ -642,7 +633,6 @@ impl<'a> From<&'a crate::model::Checkpoint> for HeaderInputs<'a> {
             shards: &cp.shards,
             index: &cp.index,
             unreadable: &cp.unreadable,
-            caps: Some(cp.capabilities()),
         }
     }
 }
@@ -747,10 +737,10 @@ fn is_safetensors_dtype(dtype: &str) -> bool {
 /// for a remote read (whose listing doesn't keep it), which reads as "not known" and is
 /// skipped rather than reported as misaligned.
 ///
-/// A remote read merges its shards as it goes and keeps no individual headers, so over
-/// `--ssh-proxy` only the index-based invariants above can run. That is a fact about the
-/// read, not about the checkpoint, so the note says which parts applied instead of a bare
-/// pass implying all of them did.
+/// Every invariant here reads off the model, so they apply to a local checkpoint, an
+/// `--ssh-proxy` one and a Hub repo alike — each reader records what its own parse saw,
+/// and nothing re-reads a file. The only per-source difference left is `header_len`, which
+/// non-safetensors formats don't have.
 fn check_headers(
     tensors: &[TensorInfo],
     metadata: &[MetadataInfo],
@@ -760,10 +750,6 @@ fn check_headers(
     const TITLE: &str = "Header consistency";
     const NOTE: &str =
         "every header read, data 8-byte aligned, no tensor in two shards, index total right";
-    /// What can be said when the per-shard headers weren't kept — a remote read.
-    const INDEX_ONLY_NOTE: &str = "every header read, index total right (no per-shard \
-                                   headers from a remote read: alignment and repeated \
-                                   keys not checked)";
 
     // A file the read couldn't parse at all. First, because it's the loudest thing the
     // header check can say: the tensors it would have contributed are missing from
@@ -849,40 +835,21 @@ fn check_headers(
         }
     }
 
-    // --- a name the raw header declares twice ---
+    // --- a name the header declares twice ---
     //
-    // Only where the header text can be read back — `sh.tensors` went through
-    // `serde_json`, which already folded the repeats away (see `stheader::duplicate_keys`).
-    // The capability answers that; a path's shape does not (see `HeaderInputs::caps`).
-    let can_reread = headers.caps.is_some_and(|c| c.reread_header);
+    // Read off the model, where the parse recorded it. Nothing is re-read: the JSON map
+    // keeps the last of two identical keys, so this can only be known while parsing — and
+    // knowing it there is what makes it work for a remote or Hub shard as well as a local
+    // one. (It used to re-open the file, which is why it was local-only.)
     for sh in &safetensors {
-        if !can_reread || sh.header_len == 0 {
-            continue;
-        }
-        match read_header_json(&sh.path, sh.header_len) {
-            Ok(json) => match crate::stheader::duplicate_keys(&json) {
-                Ok(dupes) => {
-                    for key in dupes {
-                        findings.push(Finding::error(
-                            Some(key.clone()),
-                            format!(
-                                "{}: declared twice in the header — every reader keeps only the last, silently discarding the other's dtype, shape and byte span",
-                                short(&sh.path)
-                            ),
-                        ));
-                    }
-                }
-                // A header that won't re-parse is a finding, not a dead check: the file
-                // opened (we have its tensors), so something else is wrong with it.
-                Err(e) => findings.push(Finding::error(
-                    Some(short(&sh.path)),
-                    format!("header did not re-parse as JSON: {e}"),
-                )),
-            },
-            Err(e) => findings.push(Finding::warning(
-                Some(short(&sh.path)),
-                format!("could not re-read the header to check for repeated keys: {e}"),
-            )),
+        for key in &sh.duplicate_keys {
+            findings.push(Finding::error(
+                Some(key.clone()),
+                format!(
+                    "{}: declared twice in the header — every reader keeps only the last, silently discarding the other's dtype, shape and byte span",
+                    short(&sh.path)
+                ),
+            ));
         }
     }
 
@@ -955,14 +922,7 @@ fn check_headers(
     }
 
     findings.sort_by(sort_key);
-    // Say which invariants actually applied: a pass that silently covered half of them
-    // claims more than it checked.
-    let note = if safetensors.iter().all(|s| s.header_len == 0) && !headers.index.is_empty() {
-        INDEX_ONLY_NOTE
-    } else {
-        NOTE
-    };
-    CheckResult::done(ID, TITLE, note, findings)
+    CheckResult::done(ID, TITLE, NOTE, findings)
 }
 
 /// safetensors byte-layout integrity: every tensor's byte span matches its
@@ -1075,21 +1035,6 @@ fn check_byte_ranges(tensors: &[TensorInfo]) -> CheckResult {
     }
     findings.sort_by(sort_key);
     CheckResult::done(ID, TITLE, NOTE, findings)
-}
-
-/// The raw JSON header of a safetensors file — bytes `8..header_len`, where
-/// `header_len` is the blob start the reader recorded. Bounded by that recorded length,
-/// so a corrupt length prefix can't make this allocate wildly: the value came from a
-/// successful open, which already put it under `stheader::header_len`'s ceiling.
-fn read_header_json(path: &str, header_len: u64) -> Result<Vec<u8>, String> {
-    use std::io::{Read, Seek};
-    let json_len = usize::try_from(header_len.saturating_sub(8)).map_err(|e| e.to_string())?;
-    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    f.seek(std::io::SeekFrom::Start(8))
-        .map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; json_len];
-    f.read_exact(&mut buf).map_err(|e| e.to_string())?;
-    Ok(buf)
 }
 
 /// Read a safetensors file's `(data_blob_start, file_size)`: 8-byte little-endian
@@ -1988,43 +1933,6 @@ mod tests {
         }
     }
 
-    /// A **real** safetensors file whose data blob starts at `header_len` (`8 + the JSON
-    /// length`), with `body` padded out with spaces to fit — returned as the
-    /// `ShardHeader` a reader would have produced for it.
-    ///
-    /// Real, because the checks that read the header text (repeated keys) must have
-    /// something to read: a missing file is itself a finding, which is correct in
-    /// production — the checkpoint opened moments earlier — and would otherwise make
-    /// every test here warn.
-    fn shard_file(
-        dir: &std::path::Path,
-        name: &str,
-        header_len: u64,
-        body: &str,
-    ) -> crate::model::ShardHeader {
-        use std::io::Write;
-        let json_len = usize::try_from(header_len - 8).expect("a sane header length");
-        assert!(
-            body.len() <= json_len,
-            "{name}: body longer than the header"
-        );
-        let mut json = body.as_bytes().to_vec();
-        json.resize(json_len, b' '); // trailing space is valid JSON
-        let path = dir.join(name);
-        let mut f = std::fs::File::create(&path).expect("the temp file");
-        f.write_all(&(json.len() as u64).to_le_bytes())
-            .expect("length prefix");
-        f.write_all(&json).expect("header");
-        f.write_all(&[0u8; 16]).expect("a little data");
-        crate::model::ShardHeader {
-            path: path.to_string_lossy().into_owned(),
-            total_len: 8 + json_len as u64 + 16,
-            header_len,
-            tensors: Vec::new(),
-            metadata: Vec::new(),
-        }
-    }
-
     /// A shard header with no recorded blob start, so the checks that read the header
     /// text skip it — for the invariants that only need the parsed metadata/tensors.
     fn shard(path: &str, header_len: u64, metadata: &[(&str, &str)]) -> crate::model::ShardHeader {
@@ -2033,6 +1941,7 @@ mod tests {
             total_len: 4096,
             header_len,
             tensors: Vec::new(),
+            duplicate_keys: Vec::new(),
             metadata: metadata
                 .iter()
                 .map(|(k, v)| MetadataInfo {
@@ -2045,45 +1954,36 @@ mod tests {
     }
 
     #[test]
-    fn header_check_flags_a_misaligned_data_blob_and_a_repeated_key() {
-        // Real files: this check reads the header text back, which is the only way a
-        // repeated key can be seen at all.
-        // Per-process, so a second concurrent run of this binary can't race the same
-        // path — these tests write real files, unlike most here.
-        let dir = std::env::temp_dir().join(format!("cs_check_headers_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let one = r#"{"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#;
-        // A local safetensors source — the pair whose `reread_header` is true.
-        let local = Some(crate::capability::Capabilities::of(
-            crate::capability::Format::Safetensors,
-            crate::capability::Location::Local,
-        ));
+    fn header_check_flags_a_misaligned_data_blob() {
+        // No files: every invariant reads off the model now, which is what makes them
+        // work for a source whose bytes this process can't open.
+        let one = |header_len: u64| {
+            [crate::model::ShardHeader {
+                path: "/c/a.safetensors".into(),
+                total_len: 4096,
+                header_len,
+                tensors: Vec::new(),
+                metadata: Vec::new(),
+                duplicate_keys: Vec::new(),
+            }]
+        };
+        let run = |shards: &[crate::model::ShardHeader]| {
+            check_headers(
+                &[ti("w", "F32", &[4])],
+                &[],
+                HeaderInputs {
+                    shards,
+                    ..Default::default()
+                },
+            )
+        };
 
         // The reference serializer pads the header so the blob starts 8-byte aligned.
         // Nothing breaks without it — which is why it needs saying.
-        let aligned = [shard_file(&dir, "aligned.safetensors", 128, one)];
-        let r = check_headers(
-            &[ti("w", "F32", &[4])],
-            &[],
-            HeaderInputs {
-                shards: &aligned,
-                caps: local,
-                ..Default::default()
-            },
-        );
+        let r = run(&one(128));
         assert_eq!(r.status(), Status::Pass, "{:?}", r.findings());
 
-        let skewed = [shard_file(&dir, "skewed.safetensors", 130, one)];
-        let r = check_headers(
-            &[ti("w", "F32", &[4])],
-            &[],
-            HeaderInputs {
-                shards: &skewed,
-                caps: local,
-                ..Default::default()
-            },
-        );
+        let r = run(&one(130));
         assert_eq!(r.status(), Status::Warn, "{:?}", r.findings());
         assert!(
             r.findings()[0]
@@ -2093,92 +1993,52 @@ mod tests {
             r.findings()
         );
 
-        // A key the header declares twice. Parsing keeps the last and drops the first
-        // without a word, so the file says one thing and means another.
-        let twice = r#"{"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]},"w":{"dtype":"F16","shape":[8],"data_offsets":[0,16]}}"#;
-        let dupe = [shard_file(&dir, "dupe.safetensors", 136, twice)];
-        let r = check_headers(
-            &[ti("w", "F16", &[8])],
-            &[],
-            HeaderInputs {
-                shards: &dupe,
-                caps: local,
-                ..Default::default()
-            },
-        );
-        assert_eq!(r.status(), Status::Fail, "{:?}", r.findings());
-        assert!(
-            r.findings()
-                .iter()
-                .any(|f| f.subject.as_deref() == Some("w")
-                    && f.message.contains("declared twice in the header")),
-            "{:?}",
-            r.findings()
-        );
-
-        // A shard whose reader didn't record the length is unknown, not misaligned, and
-        // isn't re-read: `header_len == 0` is another format or a remote listing, and a
-        // safetensors blob can never start at 0.
-        let unknown = [shard("/nowhere/a.safetensors", 0, &[])];
-        let r = check_headers(
-            &[ti("w", "F32", &[4])],
-            &[],
-            HeaderInputs {
-                shards: &unknown,
-                caps: local,
-                ..Default::default()
-            },
-        );
+        // A shard whose reader didn't record the length is unknown, not misaligned:
+        // `header_len == 0` is another format, and a safetensors blob never starts at 0.
+        let r = run(&one(0));
         assert_eq!(r.status(), Status::Pass, "{:?}", r.findings());
+    }
 
-        // A shard that vanished between the read and the check IS worth saying — the
-        // checkpoint opened moments ago, so something moved.
-        let gone = [shard_file(&dir, "gone.safetensors", 128, one)];
-        std::fs::remove_file(&gone[0].path).expect("remove it");
-        let r = check_headers(
-            &[ti("w", "F32", &[4])],
-            &[],
-            HeaderInputs {
-                shards: &gone,
-                caps: local,
-                ..Default::default()
-            },
-        );
-        assert_eq!(r.status(), Status::Warn);
-        assert!(
-            r.findings()[0]
-                .message
-                .contains("could not re-read the header"),
-            "{:?}",
-            r.findings()
-        );
-
-        // The gate itself: a source whose header text ISN'T here is not looked for. A Hub
-        // shard's path is a bare repo-relative name, so the old "does this look remote"
-        // test called it local and every shard warned that it couldn't be re-read.
-        let hub = [crate::model::ShardHeader {
-            path: "model-00001-of-00002.safetensors".into(),
-            ..shard_file(&dir, "onhub.safetensors", 136, twice)
-        }];
-        let r = check_headers(
-            &[ti("w", "F16", &[8])],
-            &[],
-            HeaderInputs {
-                shards: &hub,
-                caps: Some(crate::capability::Capabilities::of(
-                    crate::capability::Format::Safetensors,
-                    crate::capability::Location::Hf,
-                )),
-                ..Default::default()
-            },
-        );
-        assert!(
-            r.findings().is_empty(),
-            "nothing is read, and nothing is claimed: {:?}",
-            r.findings()
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn the_header_invariants_do_not_depend_on_where_the_shards_live() {
+        // The point of carrying `duplicate_keys`, `header_len` and per-shard metadata on
+        // the model: a remote shard's header text can never be read again, so anything
+        // derived *afterwards* is local-only by construction. Derived at parse time, the
+        // same three findings come out of a shard whose path is scp form or a Hub-relative
+        // name — neither of which is a file this process could open.
+        for path in [
+            "/local/ckpt/model-00001.safetensors",
+            "lab@host:/remote/ckpt/model-00001.safetensors",
+            "model-00001.safetensors", // as a Hub read records it
+        ] {
+            let shards = [crate::model::ShardHeader {
+                path: path.into(),
+                total_len: 4096,
+                header_len: 130, // 2 past an 8-byte boundary
+                tensors: vec![ti("w", "F32", &[4])],
+                metadata: vec![MetadataInfo {
+                    name: "total_params".into(),
+                    value: "7".into(),
+                    value_type: "number".into(),
+                }],
+                duplicate_keys: vec!["w".into()],
+            }];
+            let r = check_headers(
+                &[ti("w", "F32", &[4])],
+                &shards[0].metadata,
+                HeaderInputs {
+                    shards: &shards,
+                    ..Default::default()
+                },
+            );
+            let said = |needle: &str| r.findings().iter().any(|f| f.message.contains(needle));
+            assert!(said("past an 8-byte boundary"), "alignment, for {path}");
+            assert!(
+                said("declared twice in the header"),
+                "repeated key, for {path}"
+            );
+            assert!(said("not a string"), "metadata type, for {path}");
+        }
     }
 
     #[test]

@@ -262,13 +262,14 @@ fn read_shard_header(file_path: &Path) -> Result<Option<ShardHeader>> {
             let mut header_buf = vec![0u8; n];
             file.read_exact(&mut header_buf)
                 .with_context(|| format!("Failed to read header: {}", file_path.display()))?;
-            let (tensors, metadata) = crate::stheader::parse_header(&header_buf, &source_path)?;
+            let parsed = crate::stheader::parse_header(&header_buf, &source_path)?;
             Ok(Some(ShardHeader {
                 path: source_path,
                 total_len,
                 header_len: 8 + n as u64,
-                tensors,
-                metadata,
+                tensors: parsed.tensors,
+                metadata: parsed.metadata,
+                duplicate_keys: parsed.duplicate_keys,
             }))
         }
         Some("gguf") => {
@@ -340,6 +341,8 @@ fn shard(
         header_len: 0,
         tensors,
         metadata,
+        // Only a safetensors header is JSON with keys that could repeat.
+        duplicate_keys: Vec::new(),
     }
 }
 

@@ -742,7 +742,6 @@ mod contract {
                 "browse_files",
                 "object_metadata",
                 "codec_info",
-                "reread_header",
                 "reach",
             ],
         );

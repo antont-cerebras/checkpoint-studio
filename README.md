@@ -1267,9 +1267,8 @@ The **structural** checks read only headers, so they're cheap and work over
     tensor list that is deduplicated by name.
   - **no name declared twice in one header**. Parsing keeps the last of two
     identical JSON keys, so the first declaration — its dtype, shape and byte span
-    — is discarded silently. Seen by re-reading the header text, so it needs the
-    file within reach (a local checkpoint; a Hub or `--ssh-proxy` one reports the
-    rest of this check and skips this part).
+    — is discarded silently. Recorded by the parse that read the header, which is the
+    only moment it exists, so it is known for a remote and Hub shard too.
   - the **shards agree about `__metadata__`** (one `format` per checkpoint; two
     answers means mixed provenance), and its values are **strings**, as the format
     defines.
@@ -1277,11 +1276,11 @@ The **structural** checks read only headers, so they're cheap and work over
     below; the file that was skipped is named here, because its tensors are absent
     from everything else.
 
-  Over `--ssh-proxy` the index-based parts run (the `total_size` claim, which found a
-  real 9.5 MiB overstatement in a production 1.0T checkpoint) and the ones needing the
-  **per-shard headers** — alignment, repeated keys, two shards claiming one tensor,
-  metadata agreement — do not: a remote read merges the shards as it goes and doesn't
-  keep their individual headers. The row says so rather than passing silently.
+  **All of it applies to every source.** Each reader records what its own parse saw —
+  the header length, the repeated keys, each shard's own metadata — so a checkpoint read
+  over `--ssh-proxy` or from the Hub is checked exactly as a local one is, and nothing
+  re-reads a file to do it. (The `total_size` check found a real 9.5 MiB overstatement in
+  a production 1.0T checkpoint read over ssh.)
 - **HDF5 integrity** — the `.hdf5` equivalent (HDF5 stores chunked, filtered
   datasets rather than a flat blob): each dataset's chunk shape matches its
   tensor rank, the stored chunk count doesn't exceed the chunk grid, and its

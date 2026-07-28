@@ -197,6 +197,15 @@ pub struct ShardHeader {
     pub header_len: u64,
     pub tensors: Vec<TensorInfo>,
     pub metadata: Vec<MetadataInfo>,
+    /// Top-level keys this file's header declares **more than once**, from the parse that
+    /// read it — see [`crate::stheader::ParsedHeader::duplicate_keys`].
+    ///
+    /// Carried on the model rather than re-derived, because it can only be seen *while*
+    /// parsing: the JSON map keeps the last of two identical keys, so by the time anything
+    /// holds a tensor list the first declaration is gone. Recording it here is what makes
+    /// the check work for a remote or Hub shard, whose text nothing can read again.
+    #[serde(default)]
+    pub duplicate_keys: Vec<String>,
 }
 
 /// A checkpoint's `model.safetensors.index.json` (the pieces the health check
@@ -464,6 +473,7 @@ mod tests {
                     value: "pt".into(),
                     value_type: "string".into(),
                 }],
+                duplicate_keys: Vec::new(),
             }],
             config: Some(ModelConfig {
                 model_type: Some("qwen3_moe".into()),

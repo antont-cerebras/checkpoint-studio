@@ -375,6 +375,7 @@ impl Explorer {
         let mut s3_meta: Option<crate::remote::S3Meta> = None;
         let mut unreadable: Vec<crate::model::UnreadableShard> = Vec::new();
         let mut index: Vec<crate::model::IndexEntry> = Vec::new();
+        let mut shards: Vec<crate::model::ShardHeader> = Vec::new();
         for file_path in &self.files {
             let as_str = file_path.to_string_lossy().into_owned();
             let bars = crate::progress::Bars::start(std::slice::from_ref(&as_str));
@@ -407,6 +408,7 @@ impl Explorer {
             // them — the same account a local read keeps.
             unreadable.extend(rc.unreadable);
             index.extend(rc.index);
+            shards.extend(rc.shards);
             if let Some(s3) = rc.s3 {
                 s3_meta = Some(s3); // one `s3://` source per run
             }
@@ -434,29 +436,38 @@ impl Explorer {
             }
             None => (String::new(), crate::model::Source::Local),
         };
-        let mut order: Vec<String> = Vec::new();
-        let mut by_src: HashMap<String, Vec<TensorInfo>> = HashMap::new();
-        for t in &tensors {
-            if !by_src.contains_key(&t.source_path) {
-                order.push(t.source_path.clone());
+        // The headers the read kept, in shard order — the same shape a local read produces,
+        // so the header checks, the layout map's file lengths and the per-shard metadata
+        // are all there. An `s3://` cstorch source has no per-file headers, so there (and
+        // only there) they're grouped back out of the tensors by `source_path`, with the
+        // metadata on the first group.
+        let mut shards: Vec<crate::model::ShardHeader> = if shards.is_empty() {
+            let mut order: Vec<String> = Vec::new();
+            let mut by_src: HashMap<String, Vec<TensorInfo>> = HashMap::new();
+            for t in &tensors {
+                if !by_src.contains_key(&t.source_path) {
+                    order.push(t.source_path.clone());
+                }
+                by_src
+                    .entry(t.source_path.clone())
+                    .or_default()
+                    .push(t.clone());
             }
-            by_src
-                .entry(t.source_path.clone())
-                .or_default()
-                .push(t.clone());
-        }
-        let mut shards: Vec<crate::model::ShardHeader> = order
-            .iter()
-            .enumerate()
-            .map(|(i, src)| crate::model::ShardHeader {
-                path: src.clone(),
-                total_len: 0,
-                header_len: 0,
-                tensors: by_src.remove(src).unwrap_or_default(),
-                // All `__metadata__` on the first shard (it isn't keyed per file).
-                metadata: if i == 0 { metadata.clone() } else { Vec::new() },
-            })
-            .collect();
+            order
+                .iter()
+                .enumerate()
+                .map(|(i, src)| crate::model::ShardHeader {
+                    path: src.clone(),
+                    total_len: 0,
+                    header_len: 0,
+                    tensors: by_src.remove(src).unwrap_or_default(),
+                    metadata: if i == 0 { metadata.clone() } else { Vec::new() },
+                    duplicate_keys: Vec::new(),
+                })
+                .collect()
+        } else {
+            shards
+        };
         if shards.is_empty() && !metadata.is_empty() {
             shards.push(crate::model::ShardHeader {
                 path: root.clone(),
@@ -464,6 +475,7 @@ impl Explorer {
                 header_len: 0,
                 tensors: Vec::new(),
                 metadata: metadata.clone(),
+                duplicate_keys: Vec::new(),
             });
         }
         // The same listing the web server shows, from the same numbers (see

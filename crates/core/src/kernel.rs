@@ -922,6 +922,7 @@ mod tests {
                     value: "pt".into(),
                     value_type: "string".into(),
                 }],
+                duplicate_keys: Vec::new(),
             }],
             config: None,
             index: vec![],

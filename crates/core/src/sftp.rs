@@ -27,7 +27,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use ssh2::{CheckResult, KnownHostFileKind, Session};
 
 use crate::filetree::DirEntry;
-use crate::tree::{MetadataInfo, TensorInfo};
 use std::fmt::Write as _;
 
 /// What one pass over a remote directory (one `readdir`, one index read) yields:
@@ -75,8 +74,9 @@ enum IsSymlink {
 pub enum ShardOutcome {
     Parsed {
         index: usize,
-        tensors: Vec<TensorInfo>,
-        metadata: Vec<MetadataInfo>,
+        /// The shard as read — the same shape a local read produces, so a remote
+        /// checkpoint's model is not a reconstruction of one.
+        header: crate::model::ShardHeader,
     },
     Unreadable {
         index: usize,
@@ -491,15 +491,21 @@ impl RemoteSession {
             let (Some(file), Some(display)) = (files.get(idx), displays.get(idx)) else {
                 break;
             };
+            // `read_header_sized` costs one `stat` on the handle it already opened, so the
+            // whole-file length comes back with the header for free — no data is read.
             out.push(
-                match read_header(&sftp, file)
-                    .and_then(|header| crate::stheader::parse_header(&header, display))
-                {
-                    Ok((tensors, metadata)) => ShardOutcome::Parsed {
-                        index: idx,
-                        tensors,
-                        metadata,
-                    },
+                match read_header_sized(&sftp, file).and_then(|(total_len, header)| {
+                    let parsed = crate::stheader::parse_header(&header, display)?;
+                    Ok(crate::model::ShardHeader {
+                        path: display.clone(),
+                        total_len,
+                        header_len: 8 + header.len() as u64,
+                        tensors: parsed.tensors,
+                        metadata: parsed.metadata,
+                        duplicate_keys: parsed.duplicate_keys,
+                    })
+                }) {
+                    Ok(header) => ShardOutcome::Parsed { index: idx, header },
                     Err(e) => ShardOutcome::Unreadable {
                         index: idx,
                         // The display form, so what's reported names the file the way the
@@ -822,20 +828,6 @@ fn open_readonly(sftp: &ssh2::Sftp, path: &str) -> Result<ssh2::File> {
         ssh2::OpenType::File,
     )
     .with_context(|| format!("opening {path}"))
-}
-
-/// Read a shard's safetensors header over SFTP — the 8-byte little-endian length
-/// then that many JSON bytes — without touching the tensor data that follows.
-fn read_header(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<u8>> {
-    let mut f = open_readonly(sftp, path)?;
-    let mut len_buf = [0u8; 8];
-    f.read_exact(&mut len_buf)
-        .with_context(|| format!("reading header length of {path}"))?;
-    let n = crate::stheader::header_len(u64::from_le_bytes(len_buf), path)?;
-    let mut header = vec![0u8; n];
-    f.read_exact(&mut header)
-        .with_context(|| format!("reading header of {path}"))?;
-    Ok(header)
 }
 
 /// Parse one `stat -L -c '%s\t%b\t%B\t%h\t%F\t%n'` line into `(path, RemoteStat)`:

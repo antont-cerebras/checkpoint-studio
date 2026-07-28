@@ -342,13 +342,14 @@ fn fetch_header(agent: &ureq::Agent, repo: &RepoRef, file: &HubFile) -> Result<S
     // it from the working directory and reported `No such file or directory` instead of
     // saying the weights aren't here. The `hf://…` prefix makes it unmistakably remote.
     let source = format!("{}/{}", repo.spec(), file.path);
-    let (tensors, metadata) = crate::stheader::parse_header(&json, &source)?;
+    let parsed = crate::stheader::parse_header(&json, &source)?;
     Ok(ShardHeader {
         path: file.path.clone(),
         total_len: file.size,
         header_len: 8 + len as u64,
-        tensors,
-        metadata,
+        tensors: parsed.tensors,
+        metadata: parsed.metadata,
+        duplicate_keys: parsed.duplicate_keys,
     })
 }
 
@@ -702,6 +703,7 @@ mod tests {
             header_len: 0,
             tensors: Vec::new(),
             metadata: vec![meta("format", "pt")],
+            duplicate_keys: Vec::new(),
         };
         let (tensors, metadata) = flatten(&[shard("a"), shard("b"), shard("c")]);
         assert!(tensors.is_empty());
