@@ -3,6 +3,7 @@
 
 import { derived, writable } from 'svelte/store';
 import { api } from '../lib/api';
+import type { Progress } from '../lib/progress';
 import type {
   CompactTree,
   HistogramDto,
@@ -98,14 +99,25 @@ function collectNames(t: TreeResponse | null, want: 'tensor' | 'shard'): Set<str
   return set;
 }
 
+/** How far the tensor tree's download has got, while it is in flight; null before it
+ * starts and after it lands. Drives the loading bar — the terminal shows a gauge and an
+ * elapsed timer for the same wait, and this is the browser's half of that. */
+export const treeProgress = writable<Progress | null>(null);
+
 let treeStarted = false;
 export async function ensureTree(): Promise<void> {
   if (treeStarted) return;
   treeStarted = true;
+  const startedAt = performance.now();
+  treeProgress.set({ received: 0, total: null, startedAt });
   try {
-    tree.set(await api.tree());
+    tree.set(
+      await api.tree((received, total) => treeProgress.set({ received, total, startedAt })),
+    );
   } catch (e) {
     treeError.set(e instanceof Error ? e.message : String(e));
+  } finally {
+    treeProgress.set(null);
   }
   // Warm the whole-checkpoint stats in the background (~8 KB, precomputed
   // server-side) so opening the Stats screen is instant rather than showing a
