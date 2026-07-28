@@ -4,6 +4,7 @@ expression: "plain(&[\"--layout\", FIXTURE])"
 ---
 Layout - [FIXTURE]                                                                                            [×]
 888 B · 7 tensors · header 616 B · 1 metadata
+U16 120 B · F16 48 B · BF16 32 B · F32 32 B · I32 32 B · U8 8 B
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 0x000000000000 ┬ █  header (8 B length + JSON metadata)  616 B
                │ █  † format  pt
@@ -39,6 +40,5 @@ Layout - [FIXTURE]                                                              
                │ █
                │ █
 0x000000000370 ┴ ▒  model.scale.u8  U8 (8)  8 B
-
 ↑/↓ select · PgUp/PgDn page · ↵ in tree · Tab tensor tree · Space/: commands · l legend · c copy screen · y copy command
 ⌫/\ back/fwd · q quit

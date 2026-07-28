@@ -4,7 +4,7 @@
   import { api } from '../lib/api';
   import type { LayoutMap, Segment, TreeNode } from '../lib/types';
   import { humanSize } from '../lib/format';
-  import { gapSummary } from '../lib/layout';
+  import { gapSummary, dtypeVar, dtypeTally } from '../lib/layout';
   import { cssVar } from '../lib/color';
   import { theme } from '../stores/theme';
   import Spinner from './Spinner.svelte';
@@ -23,6 +23,7 @@
   $: shards = collect($tree?.tree ?? []);
   $: wanted = $screen.kind === 'layout' ? $screen.file : undefined;
   $: gaps = map ? gapSummary(map) : { count: 0, bytes: 0 };
+  $: tally = map ? dtypeTally(map) : [];
   $: if (shards.length && !shards.includes(selected)) selected = shards[0] ?? '';
   $: if (wanted && shards.includes(wanted)) selected = wanted;
   $: if (selected) void load(selected);
@@ -67,7 +68,11 @@
     for (const s of m.segments) {
       const y = (s.start / total) * h;
       const sh = Math.max(0.5, ((s.end - s.start) / total) * h);
-      ctx.fillStyle = cssVar(segVar(s.kind.kind));
+      // A tensor band is coloured by its dtype family; the header and gap keep their own
+      // colours so the structure still reads at a glance.
+      ctx.fillStyle = cssVar(
+        s.kind.kind === 'tensor' ? dtypeVar(s.kind.dtype) : segVar(s.kind.kind),
+      );
       ctx.fillRect(0, y, W, sh);
     }
   }
@@ -133,9 +138,17 @@
         ></canvas>
       </div>
       <div class="side">
+        <!-- One swatch per dtype present, in the colours the bands actually use. A single
+         "tensor" swatch was wrong once the bands became dtype-coloured: it claimed every
+         tensor was one colour while the strip showed several. -->
         <div class="legend">
           <span><i style="background:var(--dtype)"></i> header</span>
-          <span><i style="background:var(--accent)"></i> tensor</span>
+          {#each tally as d (d.dtype)}
+            <span
+              ><i style="background:var({dtypeVar(d.dtype)})"></i> {d.dtype}
+              {humanSize(d.bytes)}</span
+            >
+          {/each}
           <span><i style="background:var(--danger)"></i> gap</span>
           <span class="hover mono">{hover}</span>
         </div>
