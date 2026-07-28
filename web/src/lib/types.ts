@@ -46,7 +46,6 @@ export interface Capabilities {
   browse_files: boolean;
   object_metadata: boolean;
   codec_info: boolean;
-  reread_header: boolean;
   reach: 'direct' | 'via_ssh_proxy';
 }
 

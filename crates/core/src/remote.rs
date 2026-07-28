@@ -54,6 +54,10 @@ pub struct RemoteCheckpoint {
     /// tensors are absent. Empty for a healthy checkpoint; see
     /// [`crate::model::UnreadableShard`].
     pub unreadable: Vec<crate::model::UnreadableShard>,
+    /// The per-shard headers **as read**, in shard order — the same shape a local read
+    /// produces, so a remote checkpoint's model is not a reconstruction of one. Empty for
+    /// an `s3://` cstorch source, which has no per-file headers to keep.
+    pub shards: Vec<crate::model::ShardHeader>,
     /// The underlying S3 objects' metadata — `Some` only for an `s3://` source
     /// (fetched best-effort by the remote script); `None` for a local/SFTP read.
     pub s3: Option<S3Meta>,
@@ -374,16 +378,53 @@ pub enum RepackEvent<'a> {
 /// just mean fewer readers and the work-stealing counter still covers every shard.
 const MAX_SHARD_SESSIONS: usize = 12;
 
-/// Per-shard header parse output, tagged with the shard's index so results from
-/// several parallel readers can be merged back into a deterministic order.
-type ShardParse = (usize, Vec<TensorInfo>, Vec<MetadataInfo>);
+/// Reconstruct shard headers by grouping tensors on `source_path` — the fallback for a
+/// source with no per-file headers to keep (an `s3://` cstorch checkpoint, described by one
+/// dump rather than by 64 files). Lossy on purpose and only where there is nothing to lose:
+/// `total_len` / `header_len` are unknown and the metadata isn't keyed per file, so it all
+/// goes on the first group.
+fn group_tensors_into_shards(
+    tensors: Vec<TensorInfo>,
+    metadata: &mut Vec<MetadataInfo>,
+) -> Vec<crate::model::ShardHeader> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<TensorInfo>> = HashMap::new();
+    for t in tensors {
+        let p = t.source_path.clone();
+        if !groups.contains_key(&p) {
+            order.push(p.clone());
+        }
+        groups.entry(p).or_default().push(t);
+    }
+    order
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| crate::model::ShardHeader {
+            tensors: groups.remove(&p).unwrap_or_default(),
+            metadata: if i == 0 {
+                std::mem::take(metadata)
+            } else {
+                Vec::new()
+            },
+            path: p,
+            total_len: 0,
+            header_len: 0,
+            duplicate_keys: Vec::new(),
+        })
+        .collect()
+}
 
-/// Split the workers' per-shard outcomes into what parsed and what didn't.
+/// One shard as read, tagged with its index so results from several parallel readers merge
+/// back into a deterministic order.
+type ShardParse = (usize, crate::model::ShardHeader);
+
+/// Split the workers' per-shard outcomes into the shards that read and the ones that
+/// didn't, both in a deterministic order.
 ///
 /// A bad shard is reported, not propagated — fifteen good shards are worth showing,
-/// exactly as for a local directory (see `readers::read_local`). The failures are sorted
-/// by path so two reads of the same broken directory report the same list regardless of
-/// which worker happened to claim which shard.
+/// exactly as for a local directory (see `readers::read_local`). Both lists are sorted so
+/// two reads of the same directory produce the same model regardless of which worker
+/// happened to claim which shard.
 fn partition_outcomes(
     outcomes: Vec<crate::sftp::ShardOutcome>,
 ) -> (Vec<ShardParse>, Vec<crate::model::UnreadableShard>) {
@@ -391,16 +432,13 @@ fn partition_outcomes(
     let mut unreadable = Vec::new();
     for outcome in outcomes {
         match outcome {
-            crate::sftp::ShardOutcome::Parsed {
-                index,
-                tensors,
-                metadata,
-            } => parsed.push((index, tensors, metadata)),
+            crate::sftp::ShardOutcome::Parsed { index, header } => parsed.push((index, header)),
             crate::sftp::ShardOutcome::Unreadable { path, error, .. } => {
                 unreadable.push(crate::model::UnreadableShard { path, error });
             }
         }
     }
+    parsed.sort_by_key(|(index, _)| *index);
     unreadable.sort_by(|a, b| a.path.cmp(&b.path));
     (parsed, unreadable)
 }
@@ -502,6 +540,7 @@ impl RemoteRead {
             config,
             rc.index,
             rc.unreadable,
+            rc.shards,
             rc.s3,
             &disk_shards,
         ))
@@ -589,8 +628,9 @@ impl RemoteRead {
             Ok(RemoteCheckpoint {
                 index: Vec::new(), // a cstorch checkpoint has no safetensors index
                 // One dump script reads the whole checkpoint; a failure there isn't
-                // attributable to one object.
+                // attributable to one object, and there are no per-file headers to keep.
                 unreadable: Vec::new(),
+                shards: Vec::new(),
                 tensors,
                 metadata,
                 disk: None,
@@ -683,7 +723,7 @@ impl RemoteRead {
             outcomes.extend(part?);
         }
         let (all, unreadable) = partition_outcomes(outcomes);
-        let (tensors, metadata) = merge_shards(all);
+        let (tensors, metadata) = merge_shards(&all);
         if tensors.is_empty() {
             // Nothing read: the reason is the answer, not "0 tensors".
             if let Some(first) = unreadable.first() {
@@ -776,6 +816,8 @@ impl RemoteRead {
             // The same index the health check just used, now on the model too.
             index,
             unreadable,
+            // The headers as read — not grouped back out of the flattened list.
+            shards: all.into_iter().map(|(_, header)| header).collect(),
             s3: None, // a safetensors dir/file has no S3 object metadata
         })
     }
@@ -1794,10 +1836,11 @@ fn assemble_remote_checkpoint(
     config: Option<crate::config::ModelConfig>,
     index: Vec<crate::model::IndexEntry>,
     unreadable: Vec<crate::model::UnreadableShard>,
+    shards: Vec<crate::model::ShardHeader>,
     s3: Option<S3Meta>,
     disk_shards: &[ShardDisk],
 ) -> crate::model::Checkpoint {
-    use crate::model::{Checkpoint, ShardHeader, Source};
+    use crate::model::{Checkpoint, Source};
     let source = if src.starts_with("s3://") {
         Source::S3 {
             uri: src.to_string(),
@@ -1808,30 +1851,14 @@ fn assemble_remote_checkpoint(
             root: src.to_string(),
         }
     };
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<TensorInfo>> = HashMap::new();
-    for t in tensors {
-        let p = t.source_path.clone();
-        if !groups.contains_key(&p) {
-            order.push(p.clone());
-        }
-        groups.entry(p).or_default().push(t);
-    }
-    let shards: Vec<ShardHeader> = order
-        .into_iter()
-        .enumerate()
-        .map(|(i, p)| ShardHeader {
-            tensors: groups.remove(&p).unwrap_or_default(),
-            metadata: if i == 0 {
-                std::mem::take(&mut metadata)
-            } else {
-                Vec::new()
-            },
-            path: p,
-            total_len: 0,
-            header_len: 0,
-        })
-        .collect();
+    // The shards as read. An `s3://` cstorch checkpoint has no per-file headers to keep —
+    // one dump script describes the whole thing — so there it still groups the tensors by
+    // `source_path`, with the metadata on the first group.
+    let shards = if shards.is_empty() {
+        group_tensors_into_shards(tensors, &mut metadata)
+    } else {
+        shards
+    };
     Checkpoint {
         source,
         root: src.to_string(),
@@ -1874,22 +1901,26 @@ pub(crate) fn map_dtype(torch: &str) -> String {
     .to_string()
 }
 
-/// Merge per-shard parse results into one checkpoint: order by shard index (so the
-/// result is deterministic regardless of which parallel reader finished first),
-/// then flatten, keeping the first occurrence of each tensor / metadata name.
-fn merge_shards(mut shards: Vec<ShardParse>) -> (Vec<TensorInfo>, Vec<MetadataInfo>) {
-    shards.sort_by_key(|(idx, _, _)| *idx);
+/// Flatten the per-shard headers into the canonical tensor / metadata lists, keeping the
+/// first occurrence of each name.
+///
+/// The flattening is **derived**, not destructive: the headers themselves travel on
+/// [`RemoteCheckpoint::shards`], so what the flattening loses — which shard held what,
+/// each shard's own metadata, a name two shards both claim — is still on the model for
+/// `check` to read. It used to be the only output, and everything per-shard had to be
+/// guessed back from `source_path` afterwards.
+fn merge_shards(shards: &[ShardParse]) -> (Vec<TensorInfo>, Vec<MetadataInfo>) {
     let (mut tensors, mut metadata) = (Vec::new(), Vec::new());
     let (mut seen_t, mut seen_m) = (HashSet::new(), HashSet::new());
-    for (_, ts, ms) in shards {
-        for t in ts {
+    for (_, header) in shards {
+        for t in &header.tensors {
             if seen_t.insert(t.name.clone()) {
-                tensors.push(t);
+                tensors.push(t.clone());
             }
         }
-        for m in ms {
+        for m in &header.metadata {
             if seen_m.insert(m.name.clone()) {
-                metadata.push(m);
+                metadata.push(m.clone());
             }
         }
     }
@@ -2598,8 +2629,14 @@ mod tests {
             },
             ShardOutcome::Parsed {
                 index: 0,
-                tensors: vec![tensor("a")],
-                metadata: vec![meta("format")],
+                header: crate::model::ShardHeader {
+                    path: "host:/ckpt/shard-0.safetensors".into(),
+                    total_len: 4096,
+                    header_len: 128,
+                    tensors: vec![tensor("a")],
+                    metadata: vec![meta("format")],
+                    duplicate_keys: Vec::new(),
+                },
             },
             ShardOutcome::Unreadable {
                 index: 1,
@@ -2610,6 +2647,10 @@ mod tests {
         let (parsed, unreadable) = partition_outcomes(outcomes);
         assert_eq!(parsed.len(), 1, "the shard that read is kept");
         assert_eq!(parsed[0].0, 0, "with its index, for the merge order");
+        // …and it is the header as read, not a reconstruction: the lengths a local read
+        // records are here too, which is what makes the header checks work over ssh.
+        assert_eq!(parsed[0].1.header_len, 128);
+        assert_eq!(parsed[0].1.total_len, 4096);
         assert_eq!(
             unreadable
                 .iter()
@@ -2626,8 +2667,14 @@ mod tests {
         // Nothing to report when every shard read.
         let (parsed, unreadable) = partition_outcomes(vec![ShardOutcome::Parsed {
             index: 0,
-            tensors: vec![tensor("a")],
-            metadata: Vec::new(),
+            header: crate::model::ShardHeader {
+                path: "host:/ckpt/shard-0.safetensors".into(),
+                total_len: 4096,
+                header_len: 128,
+                tensors: vec![tensor("a")],
+                metadata: Vec::new(),
+                duplicate_keys: Vec::new(),
+            },
         }]);
         assert_eq!(parsed.len(), 1);
         assert!(unreadable.is_empty());
@@ -2644,6 +2691,7 @@ mod tests {
             None,
             Vec::new(), // a cstorch checkpoint has no safetensors index
             Vec::new(), // and nothing it couldn't read
+            Vec::new(), // and no per-file headers — the tensors group into shards here
             None,       // no object metadata was requested for this read
             &[],        // and no directory listing, so there is nothing to browse
         );
@@ -2679,6 +2727,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(), // no per-file headers, so the tensors group into shards here
             None,
             &[],
         );
@@ -2784,19 +2833,37 @@ mod tests {
     }
 
     #[test]
-    fn merge_shards_orders_by_index_and_dedups_first_seen() {
-        // Deliberately out of order (as parallel readers may finish): shard 2 then
-        // 0 then 1. `b` appears in shards 0 and 2 → the shard-0 copy wins.
+    fn merge_shards_flattens_in_shard_order_and_keeps_the_headers() {
+        // `partition_outcomes` has already put these in shard order; `b` appears in shards
+        // 0 and 2, and the shard-0 copy wins.
+        let hdr =
+            |path: &str, ts: Vec<TensorInfo>, ms: Vec<MetadataInfo>| crate::model::ShardHeader {
+                path: path.into(),
+                total_len: 4096,
+                header_len: 128,
+                tensors: ts,
+                metadata: ms,
+                duplicate_keys: Vec::new(),
+            };
         let parts = vec![
-            (2, vec![tensor("c")], vec![meta("fmt")]),
-            (0, vec![tensor("a"), tensor("b")], vec![meta("fmt")]),
-            (1, vec![tensor("b")], vec![]),
+            (
+                0,
+                hdr("s0", vec![tensor("a"), tensor("b")], vec![meta("fmt")]),
+            ),
+            (1, hdr("s1", vec![tensor("b")], vec![])),
+            (2, hdr("s2", vec![tensor("c")], vec![meta("fmt")])),
         ];
-        let (t, m) = merge_shards(parts);
+        let (t, m) = merge_shards(&parts);
         let names: Vec<&str> = t.iter().map(|x| x.name.as_str()).collect();
         assert_eq!(names, ["a", "b", "c"]); // shard order, `b` deduped
         assert_eq!(m.len(), 1); // duplicate `fmt` metadata collapsed
         assert_eq!(m[0].name, "fmt");
+
+        // The flattening is derived, not destructive: `parts` still says which shard held
+        // what — including the `b` the merged list dropped, which is how `check` can see
+        // two shards claiming one tensor.
+        assert_eq!(parts[1].1.tensors[0].name, "b");
+        assert_eq!(parts.len(), 3);
     }
 }
 
