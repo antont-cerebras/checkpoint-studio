@@ -50,6 +50,10 @@ pub struct RemoteCheckpoint {
     /// and it can only do that if the index reached [`crate::model::Checkpoint`]. Empty
     /// for `s3://` (a cstorch checkpoint has no such index) and for a single file.
     pub index: Vec<crate::model::IndexEntry>,
+    /// Shards whose headers wouldn't read — the read carried on without them, so their
+    /// tensors are absent. Empty for a healthy checkpoint; see
+    /// [`crate::model::UnreadableShard`].
+    pub unreadable: Vec<crate::model::UnreadableShard>,
     /// The underlying S3 objects' metadata — `Some` only for an `s3://` source
     /// (fetched best-effort by the remote script); `None` for a local/SFTP read.
     pub s3: Option<S3Meta>,
@@ -374,6 +378,33 @@ const MAX_SHARD_SESSIONS: usize = 12;
 /// several parallel readers can be merged back into a deterministic order.
 type ShardParse = (usize, Vec<TensorInfo>, Vec<MetadataInfo>);
 
+/// Split the workers' per-shard outcomes into what parsed and what didn't.
+///
+/// A bad shard is reported, not propagated — fifteen good shards are worth showing,
+/// exactly as for a local directory (see `readers::read_local`). The failures are sorted
+/// by path so two reads of the same broken directory report the same list regardless of
+/// which worker happened to claim which shard.
+fn partition_outcomes(
+    outcomes: Vec<crate::sftp::ShardOutcome>,
+) -> (Vec<ShardParse>, Vec<crate::model::UnreadableShard>) {
+    let mut parsed = Vec::new();
+    let mut unreadable = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            crate::sftp::ShardOutcome::Parsed {
+                index,
+                tensors,
+                metadata,
+            } => parsed.push((index, tensors, metadata)),
+            crate::sftp::ShardOutcome::Unreadable { path, error, .. } => {
+                unreadable.push(crate::model::UnreadableShard { path, error });
+            }
+        }
+    }
+    unreadable.sort_by(|a, b| a.path.cmp(&b.path));
+    (parsed, unreadable)
+}
+
 /// Whether a tensor's `source_path` refers to a remote (`--ssh-proxy`) source — an
 /// `s3://…` URI or an scp-style `[user@]host:path` — for which data views aren't
 /// available locally. The scp test (a `:` before any `/`, with a non-empty host to
@@ -470,6 +501,7 @@ impl RemoteRead {
             rc.metadata,
             config,
             rc.index,
+            rc.unreadable,
             rc.s3,
             &disk_shards,
         ))
@@ -556,6 +588,9 @@ impl RemoteRead {
             };
             Ok(RemoteCheckpoint {
                 index: Vec::new(), // a cstorch checkpoint has no safetensors index
+                // One dump script reads the whole checkpoint; a failure there isn't
+                // attributable to one object.
+                unreadable: Vec::new(),
                 tensors,
                 metadata,
                 disk: None,
@@ -614,7 +649,7 @@ impl RemoteRead {
 
         let workers = files.len().min(MAX_SHARD_SESSIONS);
         let next = AtomicUsize::new(0);
-        let parts: Vec<Result<Vec<ShardParse>>> = std::thread::scope(|s| {
+        let parts: Vec<Result<Vec<crate::sftp::ShardOutcome>>> = std::thread::scope(|s| {
             let (files, displays, next) = (&files, &displays, &next);
             let mut handles = Vec::with_capacity(workers);
             // The already-open session reads straight away.
@@ -638,12 +673,29 @@ impl RemoteRead {
                 .collect()
         });
 
-        let mut all: Vec<ShardParse> = Vec::new();
+        // Split the workers' outcomes: the shards that parsed, and the ones that didn't.
+        // A bad shard is reported, not propagated — fifteen good shards are worth showing,
+        // exactly as for a local directory (see `readers::read_local`). An `Err` here is a
+        // worker that couldn't open its channel at all, which is still fatal.
+        let mut outcomes = Vec::new();
         for part in parts {
-            all.extend(part?);
+            outcomes.extend(part?);
         }
+        let (all, unreadable) = partition_outcomes(outcomes);
         let (tensors, metadata) = merge_shards(all);
         if tensors.is_empty() {
+            // Nothing read: the reason is the answer, not "0 tensors".
+            if let Some(first) = unreadable.first() {
+                bail!(
+                    "{}{}",
+                    first.error,
+                    if unreadable.len() > 1 {
+                        format!(" (and {} more file(s) unreadable)", unreadable.len() - 1)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
             bail!(
                 "no tensors in the safetensors headers at {}",
                 self.source_path(path)
@@ -722,6 +774,7 @@ impl RemoteRead {
             health,
             // The same index the health check just used, now on the model too.
             index,
+            unreadable,
             s3: None, // a safetensors dir/file has no S3 object metadata
         })
     }
@@ -1739,6 +1792,7 @@ fn assemble_remote_checkpoint(
     mut metadata: Vec<MetadataInfo>,
     config: Option<crate::config::ModelConfig>,
     index: Vec<crate::model::IndexEntry>,
+    unreadable: Vec<crate::model::UnreadableShard>,
     s3: Option<S3Meta>,
     disk_shards: &[ShardDisk],
 ) -> crate::model::Checkpoint {
@@ -1785,6 +1839,7 @@ fn assemble_remote_checkpoint(
         config,
         index,
         s3,
+        unreadable,
     }
 }
 
@@ -2528,6 +2583,56 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_remote_shard_is_kept_aside_not_propagated() {
+        use crate::sftp::ShardOutcome;
+        // What the work-stealing readers hand back when one shard of three is torn. The
+        // order is whatever the workers finished in, which is exactly why the failures
+        // come out sorted: two reads of the same broken directory must report the same
+        // list.
+        let outcomes = vec![
+            ShardOutcome::Unreadable {
+                index: 2,
+                path: "host:/ckpt/shard-2.safetensors".into(),
+                error: "Failed to parse SafeTensors header: expected value".into(),
+            },
+            ShardOutcome::Parsed {
+                index: 0,
+                tensors: vec![tensor("a")],
+                metadata: vec![meta("format")],
+            },
+            ShardOutcome::Unreadable {
+                index: 1,
+                path: "host:/ckpt/shard-1.safetensors".into(),
+                error: "failed to fill whole buffer".into(),
+            },
+        ];
+        let (parsed, unreadable) = partition_outcomes(outcomes);
+        assert_eq!(parsed.len(), 1, "the shard that read is kept");
+        assert_eq!(parsed[0].0, 0, "with its index, for the merge order");
+        assert_eq!(
+            unreadable
+                .iter()
+                .map(|u| u.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "host:/ckpt/shard-1.safetensors",
+                "host:/ckpt/shard-2.safetensors"
+            ],
+            "and the failures come out in path order, not worker order"
+        );
+        assert!(unreadable[0].error.contains("whole buffer"));
+
+        // Nothing to report when every shard read.
+        let (parsed, unreadable) = partition_outcomes(vec![ShardOutcome::Parsed {
+            index: 0,
+            tensors: vec![tensor("a")],
+            metadata: Vec::new(),
+        }]);
+        assert_eq!(parsed.len(), 1);
+        assert!(unreadable.is_empty());
+    }
+
+    #[test]
     fn assembles_s3_checkpoint_into_one_shard() {
         let ts = vec![tensor("a"), tensor("b")]; // both carry source_path "h:/p"
         let ck = assemble_remote_checkpoint(
@@ -2537,6 +2642,7 @@ mod tests {
             vec![meta("format")],
             None,
             Vec::new(), // a cstorch checkpoint has no safetensors index
+            Vec::new(), // and nothing it couldn't read
             None,       // no object metadata was requested for this read
             &[],        // and no directory listing, so there is nothing to browse
         );
@@ -2570,6 +2676,7 @@ mod tests {
             ts,
             vec![meta("format")],
             None,
+            Vec::new(),
             Vec::new(),
             None,
             &[],

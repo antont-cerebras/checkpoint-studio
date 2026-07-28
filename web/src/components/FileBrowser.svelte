@@ -50,6 +50,13 @@
     return node.kind === 'file' && node.links > 1 ? node.links : 0;
   }
 
+  /** Why this file's header wouldn't parse. The loudest fact about a row when it's set:
+      the read carried on without the file, so its tensors are missing from the tree, the
+      stats and the parameter count. */
+  function readError(node: FileNode): string {
+    return node.kind === 'file' ? (node.read_error ?? '') : '';
+  }
+
   function activate(node: FileNode) {
     if (node.kind === 'dir') {
       expanded = toggleDir(expanded, node.path);
@@ -96,7 +103,9 @@
           {/if}
         </span>
         <span class="note dim">
-          {#if node.kind === 'dir'}{node.files} {node.files === 1
+          {#if readError(node)}<span class="broken" title={readError(node)}
+              >✗ unreadable — see check</span
+            >{:else if node.kind === 'dir'}{node.files} {node.files === 1
               ? 'file'
               : 'files'}{node.hardlinked
               ? ` · ${node.hardlinked} hardlinked`
@@ -204,6 +213,10 @@
      — one signal, whichever UI you're in. */
   .note .extra {
     color: var(--unindexed);
+  }
+  /* A file that didn't read is wrong, not merely unusual — the app's error colour. */
+  .note .broken {
+    color: var(--danger);
   }
   .err {
     color: var(--danger);

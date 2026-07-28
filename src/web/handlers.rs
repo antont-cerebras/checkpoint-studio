@@ -803,6 +803,7 @@ mod contract {
                 "size_share",
                 "index",
                 "links",
+                "read_error",
             ],
         );
         // The fixture's own shard is attributed, so `ShardTensors` is on the wire too

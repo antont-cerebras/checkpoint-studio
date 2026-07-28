@@ -1111,6 +1111,7 @@ fn run_check(
                 // lengths, so the alignment half of the check reads n/a.
                 check::HeaderInputs {
                     index: &rc.index,
+                    unreadable: &rc.unreadable,
                     ..Default::default()
                 },
                 false,

@@ -373,6 +373,7 @@ impl Explorer {
         let mut disk_shards: Vec<crate::stats::ShardDisk> = Vec::new();
         let mut health: Vec<crate::health::HealthReport> = Vec::new();
         let mut s3_meta: Option<crate::remote::S3Meta> = None;
+        let mut unreadable: Vec<crate::model::UnreadableShard> = Vec::new();
         for file_path in &self.files {
             let as_str = file_path.to_string_lossy().into_owned();
             let bars = crate::progress::Bars::start(std::slice::from_ref(&as_str));
@@ -401,6 +402,9 @@ impl Explorer {
             // source (built by the reader, which has both halves) and the
             // index-vs-files report for a remote safetensors directory.
             health.extend(rc.health);
+            // Shards the read skipped, so the browser marks their rows and `check` names
+            // them — the same account a local read keeps.
+            unreadable.extend(rc.unreadable);
             if let Some(s3) = rc.s3 {
                 s3_meta = Some(s3); // one `s3://` source per run
             }
@@ -472,6 +476,7 @@ impl Explorer {
             config: config.clone(),
             index: Vec::new(),
             s3: s3_meta.clone(),
+            unreadable,
         };
 
         if let Some(rc) = self.remote.as_mut() {

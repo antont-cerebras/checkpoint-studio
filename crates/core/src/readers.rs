@@ -32,11 +32,38 @@ pub fn read_local(files: &[PathBuf]) -> Result<Checkpoint> {
     entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
     // Per checkpoint file: its parsed header (header-only; never the tensor data).
+    //
+    // One unreadable file does not sink the read. A truncated download or an interrupted
+    // conversion leaves fifteen good shards and one bad one, and showing the fifteen with
+    // the sixteenth named beats showing nothing at all — which is what propagating here
+    // used to do. The failures ride along on the model so `check` can call them errors
+    // and the file browser can mark their rows.
     let mut shards = Vec::new();
+    let mut unreadable = Vec::new();
     for file_path in files {
-        if let Some(shard) = read_shard_header(file_path)? {
-            shards.push(shard);
+        match read_shard_header(file_path) {
+            Ok(Some(shard)) => shards.push(shard),
+            Ok(None) => {} // not a checkpoint file — nothing to read
+            Err(e) => unreadable.push(crate::model::UnreadableShard {
+                path: file_path.to_string_lossy().into_owned(),
+                error: format!("{e:#}"),
+            }),
         }
+    }
+    // …but if nothing read, the error IS the answer: there is no checkpoint to show, and
+    // a caller told "0 tensors" learns less than one told why.
+    if shards.is_empty()
+        && let Some(first) = unreadable.first()
+    {
+        anyhow::bail!(
+            "{}{}",
+            first.error,
+            if unreadable.len() > 1 {
+                format!(" (and {} more file(s) unreadable)", unreadable.len() - 1)
+            } else {
+                String::new()
+            }
+        );
     }
 
     let config = crate::config::load_local(files);
@@ -50,6 +77,7 @@ pub fn read_local(files: &[PathBuf]) -> Result<Checkpoint> {
         config,
         index,
         s3: None,
+        unreadable,
     })
 }
 
@@ -486,6 +514,45 @@ mod tests {
         bytes.extend_from_slice(header.as_bytes());
         bytes.extend_from_slice(&[0u8; 16]);
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn read_local_keeps_the_good_shards_and_names_the_bad_one() {
+        // A truncated download or an interrupted conversion: fifteen good shards and one
+        // that won't parse. Refusing all of them tells you less than showing the fifteen
+        // and naming the sixteenth — which is what this used to do.
+        let dir = std::env::temp_dir().join("ce_readers_partial_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("model-00001-of-00002.safetensors");
+        let bad = dir.join("model-00002-of-00002.safetensors");
+        write_st(&good);
+        // A plausible length prefix over bytes that are not JSON.
+        let mut junk = 12u64.to_le_bytes().to_vec();
+        junk.extend_from_slice(b"not json at ");
+        std::fs::write(&bad, junk).unwrap();
+
+        let cp = read_local(&[good, bad.clone()]).expect("the good shard is enough");
+        assert_eq!(cp.shards.len(), 1, "the readable shard is there");
+        assert_eq!(cp.shards[0].tensors.len(), 1);
+        assert_eq!(cp.unreadable.len(), 1, "and the other is accounted for");
+        assert!(
+            cp.unreadable[0]
+                .path
+                .ends_with("model-00002-of-00002.safetensors")
+        );
+        assert!(
+            cp.unreadable[0].error.contains("SafeTensors header"),
+            "with the reason: {}",
+            cp.unreadable[0].error
+        );
+
+        // Nothing readable is still an error: a caller told "0 tensors" learns less than
+        // one told why, and there is no checkpoint to show either way.
+        let err = read_local(&[bad]).expect_err("one bad file, nothing to show");
+        assert!(format!("{err:#}").contains("SafeTensors header"), "{err:#}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

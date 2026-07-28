@@ -242,6 +242,22 @@ impl IndexEntry {
     }
 }
 
+/// A checkpoint file whose header could not be read, and why.
+///
+/// A directory read keeps going past one of these: fifteen good shards are worth showing,
+/// and refusing all of them because the sixteenth is a truncated download tells you less
+/// than showing the fifteen and naming the sixteenth. The tensors it would have
+/// contributed are simply absent — which is exactly what `check` reports as an error and
+/// the file browser marks on its row.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UnreadableShard {
+    /// The file's path, as the reader saw it.
+    pub path: String,
+    /// The reader's message chain, flattened (`{:#}`) — e.g. `Failed to parse
+    /// SafeTensors header: …: expected value at line 1 column 1`.
+    pub error: String,
+}
+
 /// The one serializable checkpoint model. Read once; everything derives from it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Checkpoint {
@@ -260,6 +276,10 @@ pub struct Checkpoint {
     pub index: Vec<IndexEntry>,
     /// S3 object metadata — `Some` only for an `s3://` source.
     pub s3: Option<S3Meta>,
+    /// Checkpoint files whose headers wouldn't parse. Empty for a healthy checkpoint;
+    /// non-empty means what you're looking at is *part* of one — see [`UnreadableShard`].
+    #[serde(default)]
+    pub unreadable: Vec<UnreadableShard>,
 }
 
 /// The single path that denotes a checkpoint made of `files`: the file itself when there
@@ -460,6 +480,7 @@ mod tests {
                 total_size: None,
             }],
             s3: None,
+            unreadable: Vec::new(),
         }
     }
 

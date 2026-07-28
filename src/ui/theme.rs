@@ -15,6 +15,10 @@ pub(crate) const UNINDEXED_MARK: &str = "✚";
 /// reachable from elsewhere on the filesystem, so its size is shared, not its own.
 pub(crate) const HARDLINK_MARK: &str = "⧉";
 
+/// Marks a checkpoint file whose header wouldn't parse — the read carried on without it,
+/// so its tensors are absent from everything else.
+pub(crate) const UNREADABLE_MARK: &str = "✗";
+
 /// Storage tag for a tensor stored uncompressed on disk. Shared by the tree row,
 /// the detail screen and the legend so the wording stays consistent.
 pub(super) const UNCOMPRESSED_TAG: &str = "(uncompressed)";
@@ -83,6 +87,13 @@ pub(crate) fn dim_span(text: impl Into<String>) -> Span<'static> {
 /// definition is what keeps the colour from drifting across four screens.
 pub(crate) fn unindexed_span(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(palette::UNINDEXED))
+}
+
+/// The colour something missing or wrong is drawn in — an unreadable shard's mark on a
+/// file row and in the legend that explains it. A function rather than a re-exported
+/// constant so `palette` stays private to `ui`.
+pub(crate) fn error_color() -> Color {
+    palette::ERROR
 }
 
 /// A bold green span — a "✓ copied" style confirmation, matching the copy

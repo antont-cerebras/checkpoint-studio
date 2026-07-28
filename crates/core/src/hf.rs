@@ -440,6 +440,9 @@ pub fn read_checkpoint(repo: &RepoRef, progress: &ReadProgress) -> Result<Checkp
         config,
         index,
         s3: None,
+        // A Hub read downloads each shard's header individually and propagates a failure
+        // (a partial download is a retry, not a checkpoint to browse around).
+        unreadable: Vec::new(),
     })
 }
 

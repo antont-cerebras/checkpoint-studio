@@ -623,6 +623,8 @@ pub fn count_phrase(errors: usize, warnings: usize) -> String {
 pub struct HeaderInputs<'a> {
     pub shards: &'a [crate::model::ShardHeader],
     pub index: &'a [crate::model::IndexEntry],
+    /// Checkpoint files the read skipped past because their headers wouldn't parse.
+    pub unreadable: &'a [crate::model::UnreadableShard],
 }
 
 impl<'a> From<&'a crate::model::Checkpoint> for HeaderInputs<'a> {
@@ -630,6 +632,7 @@ impl<'a> From<&'a crate::model::Checkpoint> for HeaderInputs<'a> {
         Self {
             shards: &cp.shards,
             index: &cp.index,
+            unreadable: &cp.unreadable,
         }
     }
 }
@@ -717,6 +720,9 @@ fn is_safetensors_dtype(dtype: &str) -> bool {
 /// - **The index's `total_size` matches the tensors.** It is written once by whatever
 ///   produced the checkpoint and not recomputed when a shard is re-quantised, so a stale
 ///   value is common and a loader that pre-allocates from it gets it wrong.
+/// - **Every checkpoint file's header actually read.** A directory read carries on past
+///   one that doesn't (see [`crate::model::UnreadableShard`]), so this is where the file
+///   that was skipped gets named — its tensors are absent from everything else.
 /// - **No tensor is claimed by two shards.** Which value loads then depends on read
 ///   order. This is the *only* place it can be caught: every consumer downstream reads
 ///   the session's canonical list, which is deduped by name, so the second claimant is
@@ -738,17 +744,35 @@ fn check_headers(
     const ID: &str = "headers";
     const TITLE: &str = "Header consistency";
     const NOTE: &str =
-        "data 8-byte aligned, index total right, no tensor in two shards, metadata text";
+        "every header read, data 8-byte aligned, no tensor in two shards, index total right";
+
+    // A file the read couldn't parse at all. First, because it's the loudest thing the
+    // header check can say: the tensors it would have contributed are missing from
+    // everything — the tree, the stats, the parameter count — and the read carried on so
+    // you could see the rest.
+    let mut findings = Vec::new();
+    for bad in headers.unreadable {
+        findings.push(Finding::error(
+            Some(bad.path.rsplit('/').next().unwrap_or(&bad.path).to_string()),
+            format!(
+                "header unreadable, so its tensors are missing from this checkpoint: {}",
+                bad.error
+            ),
+        ));
+    }
 
     let safetensors: Vec<&crate::model::ShardHeader> = headers
         .shards
         .iter()
         .filter(|s| s.path.ends_with(".safetensors"))
         .collect();
-    if safetensors.is_empty() && headers.index.is_empty() && metadata.is_empty() {
+    if findings.is_empty()
+        && safetensors.is_empty()
+        && headers.index.is_empty()
+        && metadata.is_empty()
+    {
         return CheckResult::na(ID, TITLE, NOTE);
     }
-    let mut findings = Vec::new();
     let short = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
 
     // --- the data blob's alignment, per shard ---

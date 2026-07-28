@@ -907,6 +907,7 @@ mod tests {
             config: None,
             index: vec![],
             s3: None,
+            unreadable: Vec::new(),
         }
     }
 
@@ -959,6 +960,7 @@ mod tests {
                     size_share: 1.0,
                     index: None,
                     links: 1,
+                    read_error: None,
                 },
             }],
             ..Default::default()
