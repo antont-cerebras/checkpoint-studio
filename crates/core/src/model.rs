@@ -207,6 +207,14 @@ pub struct IndexEntry {
     pub path: String,
     /// tensor name → shard file basename.
     pub weight_map: std::collections::BTreeMap<String, String>,
+    /// The index's own `metadata.total_size` — the byte total it *claims* the
+    /// checkpoint's tensors come to. `None` when the index omits it (it's optional).
+    ///
+    /// Kept because it is a claim that can be wrong, and often is: it's written once by
+    /// whatever produced the checkpoint and not recomputed when a shard is re-quantised
+    /// or a tensor dropped. Loaders that pre-allocate from it then get it wrong.
+    #[serde(default)]
+    pub total_size: Option<u64>,
 }
 
 impl IndexEntry {
@@ -226,6 +234,10 @@ impl IndexEntry {
                 .iter()
                 .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect(),
+            total_size: v
+                .get("metadata")
+                .and_then(|m| m.get("total_size"))
+                .and_then(serde_json::Value::as_u64),
         })
     }
 }
@@ -445,6 +457,7 @@ mod tests {
                     "model-00001-of-00002.safetensors".to_string(),
                 ))
                 .collect(),
+                total_size: None,
             }],
             s3: None,
         }

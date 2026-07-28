@@ -1169,6 +1169,7 @@ mod tests {
                     "model-00001.safetensors".to_string(),
                 ))
                 .collect(),
+                total_size: None,
             };
             let mut root = two_shard_tree();
             root.attribute_index(std::slice::from_ref(&index));
@@ -1203,6 +1204,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            total_size: None,
         };
         let mut root = two_shard_tree();
         root.attribute_index(std::slice::from_ref(&index));

@@ -21,14 +21,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How serious a finding is. `Error` always fails the run; `Warning` fails only
 /// under `--strict`. Ordered so `Error > Warning` for sorting/severity.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum Severity {
     Warning,
     Error,
 }
 
 /// A single problem a check turned up.
-#[derive(Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Finding {
     pub severity: Severity,
     /// The tensor / file the finding concerns, when it's about one thing.
@@ -224,7 +224,7 @@ impl CheckReport {
 }
 
 /// Whether a check passed, warned, failed, or didn't apply.
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Status {
     Pass,
     Warn,
@@ -612,6 +612,28 @@ pub fn count_phrase(errors: usize, warnings: usize) -> String {
     }
 }
 
+/// What [`check_headers`] reads: the per-shard headers as they were parsed, and the
+/// index(es) the checkpoint declares.
+///
+/// Bundled into one argument because they travel together, both come off
+/// [`crate::model::Checkpoint`], and [`run`] already takes nine. Default is empty — a
+/// caller without a model (a unit test, a source whose reader keeps neither) gets an
+/// `n/a` check rather than a wrong one.
+#[derive(Default, Clone, Copy)]
+pub struct HeaderInputs<'a> {
+    pub shards: &'a [crate::model::ShardHeader],
+    pub index: &'a [crate::model::IndexEntry],
+}
+
+impl<'a> From<&'a crate::model::Checkpoint> for HeaderInputs<'a> {
+    fn from(cp: &'a crate::model::Checkpoint) -> Self {
+        Self {
+            shards: &cp.shards,
+            index: &cp.index,
+        }
+    }
+}
+
 // ---- the checks -----------------------------------------------------------
 
 /// Run every applicable check against an already-loaded checkpoint. Structural
@@ -626,6 +648,7 @@ pub fn run(
     health: &[HealthReport],
     config: Option<&crate::config::ModelConfig>,
     filter: &NameFilter,
+    headers: HeaderInputs<'_>,
     values: bool,
     jobs: usize,
 ) -> CheckReport {
@@ -637,6 +660,7 @@ pub fn run(
     let mut results = vec![
         check_layers(tensors),
         check_shapes_dtypes(tensors),
+        check_headers(tensors, metadata, headers),
         check_config(tensors, config),
         check_files(tensors, files, health),
         check_s3_metadata(tensors, health),
@@ -662,6 +686,232 @@ pub fn run(
         storage,
         results,
     }
+}
+
+/// The dtypes a safetensors header may declare (the format's own set, plus the `F8_*`
+/// variants torch writes — `F8_E4M3FN`, `F8_E5M2FNUZ` and friends, which are the same
+/// two widths under longer names).
+///
+/// A validation list of its own rather than "whatever our readers happen to support":
+/// the question here is whether the *file* conforms, and an unrecognised dtype is
+/// exactly what silently degrades everywhere downstream — `DtypeClass::of` buckets it as
+/// `Other`, the heatmap can't read it, and nothing says why.
+const SAFETENSORS_DTYPES: &[&str] = &[
+    "BOOL", "U8", "I8", "I16", "U16", "F16", "BF16", "I32", "U32", "F32", "F64", "I64", "U64",
+];
+
+/// Whether `dtype` is one a safetensors header may legitimately declare.
+fn is_safetensors_dtype(dtype: &str) -> bool {
+    SAFETENSORS_DTYPES.contains(&dtype)
+        || dtype.starts_with("F8_E4M3")
+        || dtype.starts_with("F8_E5M2")
+}
+
+/// Header consistency — the invariants a safetensors header carries beyond its byte
+/// spans (which [`check_byte_ranges`] owns).
+///
+/// - **The data blob starts on an 8-byte boundary.** The reference serializer pads the
+///   JSON header with spaces to make `8 + header_len` a multiple of 8. Nothing breaks
+///   without it, which is why it goes unnoticed — but every zero-copy reader that maps
+///   the blob into aligned types has to fall back to copying, and some refuse outright.
+/// - **The index's `total_size` matches the tensors.** It is written once by whatever
+///   produced the checkpoint and not recomputed when a shard is re-quantised, so a stale
+///   value is common and a loader that pre-allocates from it gets it wrong.
+/// - **No tensor is claimed by two shards.** Which value loads then depends on read
+///   order. This is the *only* place it can be caught: every consumer downstream reads
+///   the session's canonical list, which is deduped by name, so the second claimant is
+///   already gone by then. (A duplicate *within* one file is collapsed even earlier —
+///   `serde_json` keeps the last of two identical JSON keys — so it can't be seen from
+///   the parsed header at all, only from a duplicate-preserving pass over the raw text.)
+/// - **The shards agree about `__metadata__`.** One `format` per checkpoint; two
+///   different answers means the shards came from different tools or different runs.
+/// - **`__metadata__` values are strings.** The spec makes it a string→string map.
+///
+/// Only applies to safetensors; the per-shard `header_len` is 0 for other formats and
+/// for a remote read (whose listing doesn't keep it), which reads as "not known" and is
+/// skipped rather than reported as misaligned.
+fn check_headers(
+    tensors: &[TensorInfo],
+    metadata: &[MetadataInfo],
+    headers: HeaderInputs<'_>,
+) -> CheckResult {
+    const ID: &str = "headers";
+    const TITLE: &str = "Header consistency";
+    const NOTE: &str =
+        "data 8-byte aligned, index total right, no tensor in two shards, metadata text";
+
+    let safetensors: Vec<&crate::model::ShardHeader> = headers
+        .shards
+        .iter()
+        .filter(|s| s.path.ends_with(".safetensors"))
+        .collect();
+    if safetensors.is_empty() && headers.index.is_empty() && metadata.is_empty() {
+        return CheckResult::na(ID, TITLE, NOTE);
+    }
+    let mut findings = Vec::new();
+    let short = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
+
+    // --- the data blob's alignment, per shard ---
+    for sh in &safetensors {
+        // 0 means "the reader didn't record it" (another format, or a remote listing),
+        // not "the blob starts at 0" — a safetensors blob never can.
+        if sh.header_len == 0 {
+            continue;
+        }
+        let off = sh.header_len % 8;
+        if off != 0 {
+            findings.push(Finding::warning(
+                Some(short(&sh.path)),
+                format!(
+                    "tensor data starts at byte {} — {off} past an 8-byte boundary, so a zero-copy reader must copy instead of mapping it",
+                    sh.header_len
+                ),
+            ));
+        }
+    }
+
+    // --- the index's declared byte total ---
+    for idx in headers.index {
+        let Some(declared) = idx.total_size else {
+            continue; // the field is optional; absent is not wrong
+        };
+        if idx.weight_map.is_empty() {
+            continue; // nothing to sum against (a remote listing keeps only the paths)
+        }
+        // Sum only the tensors THIS index names. `total_size` describes what the index
+        // declares, not what the directory holds — a quantised checkpoint ships
+        // codebooks and scales the index never mentions, and counting those made a
+        // perfectly good index look 717 MiB short. (It's a real checkpoint that said so.)
+        let declared_bytes: u64 = tensors
+            .iter()
+            .filter(|t| idx.weight_map.contains_key(&t.name))
+            .map(|t| t.size_bytes as u64)
+            .sum();
+        if declared != declared_bytes {
+            findings.push(Finding::error(
+                Some(short(&idx.path)),
+                format!(
+                    "index declares total_size {} but the {} tensors it lists come to {} ({} {})",
+                    format_size(declared as usize),
+                    idx.weight_map.len(),
+                    format_size(declared_bytes as usize),
+                    format_size(declared.abs_diff(declared_bytes) as usize),
+                    if declared > declared_bytes {
+                        "over"
+                    } else {
+                        "short"
+                    },
+                ),
+            ));
+        }
+    }
+
+    // --- a name the raw header declares twice ---
+    //
+    // Local only: it needs the header text, and a remote read doesn't keep it. Reading
+    // it is the point — `sh.tensors` went through `serde_json`, which already folded the
+    // repeats away (see `stheader::duplicate_keys`).
+    for sh in &safetensors {
+        if sh.header_len == 0 || crate::remote::is_remote_source(&sh.path) {
+            continue;
+        }
+        match read_header_json(&sh.path, sh.header_len) {
+            Ok(json) => match crate::stheader::duplicate_keys(&json) {
+                Ok(dupes) => {
+                    for key in dupes {
+                        findings.push(Finding::error(
+                            Some(key.clone()),
+                            format!(
+                                "{}: declared twice in the header — every reader keeps only the last, silently discarding the other's dtype, shape and byte span",
+                                short(&sh.path)
+                            ),
+                        ));
+                    }
+                }
+                // A header that won't re-parse is a finding, not a dead check: the file
+                // opened (we have its tensors), so something else is wrong with it.
+                Err(e) => findings.push(Finding::error(
+                    Some(short(&sh.path)),
+                    format!("header did not re-parse as JSON: {e}"),
+                )),
+            },
+            Err(e) => findings.push(Finding::warning(
+                Some(short(&sh.path)),
+                format!("could not re-read the header to check for repeated keys: {e}"),
+            )),
+        }
+    }
+
+    // --- the same tensor claimed by two shards ---
+    //
+    // This is the one place it CAN be seen. Everything downstream reads the session's
+    // canonical tensor list, which is deduped by name on the way in, so by then the
+    // second claimant is simply gone — `check_shapes_dtypes`' duplicate-name branch can
+    // never fire for it. `headers.shards` is the per-shard parse, before that.
+    let mut claimants: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for sh in &safetensors {
+        for tensor in &sh.tensors {
+            claimants
+                .entry(&tensor.name)
+                .or_default()
+                .push(short(&sh.path));
+        }
+    }
+    for (name, mut files) in claimants {
+        if files.len() > 1 {
+            files.sort();
+            findings.push(Finding::error(
+                Some(name.to_string()),
+                format!(
+                    "claimed by {} shards ({}) — which value loads depends on read order",
+                    files.len(),
+                    files.join(", "),
+                ),
+            ));
+        }
+    }
+
+    // --- do the shards tell the same story about themselves? ---
+    let mut values: BTreeMap<&str, BTreeMap<&str, Vec<String>>> = BTreeMap::new();
+    for sh in &safetensors {
+        for m in &sh.metadata {
+            values
+                .entry(&m.name)
+                .or_default()
+                .entry(&m.value)
+                .or_default()
+                .push(short(&sh.path));
+        }
+    }
+    for (key, by_value) in values {
+        if by_value.len() > 1 {
+            let spread = by_value
+                .iter()
+                .map(|(v, files)| format!("{v:?} in {}", files.len()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            findings.push(Finding::warning(
+                Some(key.to_string()),
+                format!("shards disagree: {spread} — mixed provenance?"),
+            ));
+        }
+    }
+
+    // --- and is the metadata text, as the spec says? ---
+    for m in metadata {
+        if m.value_type != "string" {
+            findings.push(Finding::warning(
+                Some(m.name.clone()),
+                format!(
+                    "__metadata__ value is a JSON {}, not a string — the format defines it as text",
+                    m.value_type
+                ),
+            ));
+        }
+    }
+
+    findings.sort_by(sort_key);
+    CheckResult::done(ID, TITLE, NOTE, findings)
 }
 
 /// safetensors byte-layout integrity: every tensor's byte span matches its
@@ -774,6 +1024,21 @@ fn check_byte_ranges(tensors: &[TensorInfo]) -> CheckResult {
     }
     findings.sort_by(sort_key);
     CheckResult::done(ID, TITLE, NOTE, findings)
+}
+
+/// The raw JSON header of a safetensors file — bytes `8..header_len`, where
+/// `header_len` is the blob start the reader recorded. Bounded by that recorded length,
+/// so a corrupt length prefix can't make this allocate wildly: the value came from a
+/// successful open, which already put it under `stheader::header_len`'s ceiling.
+fn read_header_json(path: &str, header_len: u64) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek};
+    let json_len = usize::try_from(header_len.saturating_sub(8)).map_err(|e| e.to_string())?;
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    f.seek(std::io::SeekFrom::Start(8))
+        .map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; json_len];
+    f.read_exact(&mut buf).map_err(|e| e.to_string())?;
+    Ok(buf)
 }
 
 /// Read a safetensors file's `(data_blob_start, file_size)`: 8-byte little-endian
@@ -980,7 +1245,8 @@ fn check_layers(tensors: &[TensorInfo]) -> CheckResult {
 fn check_shapes_dtypes(tensors: &[TensorInfo]) -> CheckResult {
     const ID: &str = "shapes_dtypes";
     const TITLE: &str = "Shape / dtype sanity";
-    const NOTE: &str = "no duplicate names, no empty tensors, dtype uniform within each role";
+    const NOTE: &str =
+        "no duplicate names, no empty tensors, dtypes defined and uniform within each role";
 
     if tensors.is_empty() {
         return CheckResult::na(ID, TITLE, NOTE);
@@ -1007,6 +1273,28 @@ fn check_shapes_dtypes(tensors: &[TensorInfo]) -> CheckResult {
             findings.push(Finding::warning(
                 Some(t.name.clone()),
                 format!("zero-element tensor, shape {}", format_shape(&t.shape)),
+            ));
+        }
+    }
+
+    // A dtype the safetensors format doesn't define. Everything downstream degrades
+    // quietly on one — it classifies as `Other`, the data views can't decode it, and the
+    // byte-span check can't tell whether the span is right — so it is worth naming here
+    // rather than inferring from three other symptoms. Only for safetensors files: GGUF
+    // and HDF5 name their types differently and legitimately.
+    for t in tensors {
+        if t.source_path.ends_with(".safetensors") && !is_safetensors_dtype(&t.dtype) {
+            findings.push(Finding::warning(
+                Some(t.name.clone()),
+                format!(
+                    "dtype {:?} is not one safetensors defines{}",
+                    t.dtype,
+                    if t.dtype == "?" {
+                        " (the header entry had no dtype at all)"
+                    } else {
+                        ""
+                    }
+                ),
             ));
         }
     }
@@ -1647,6 +1935,394 @@ mod tests {
             source_path: "mem.safetensors".into(),
             layout: Layout::None,
         }
+    }
+
+    /// A **real** safetensors file whose data blob starts at `header_len` (`8 + the JSON
+    /// length`), with `body` padded out with spaces to fit — returned as the
+    /// `ShardHeader` a reader would have produced for it.
+    ///
+    /// Real, because the checks that read the header text (repeated keys) must have
+    /// something to read: a missing file is itself a finding, which is correct in
+    /// production — the checkpoint opened moments earlier — and would otherwise make
+    /// every test here warn.
+    fn shard_file(
+        dir: &std::path::Path,
+        name: &str,
+        header_len: u64,
+        body: &str,
+    ) -> crate::model::ShardHeader {
+        use std::io::Write;
+        let json_len = usize::try_from(header_len - 8).expect("a sane header length");
+        assert!(
+            body.len() <= json_len,
+            "{name}: body longer than the header"
+        );
+        let mut json = body.as_bytes().to_vec();
+        json.resize(json_len, b' '); // trailing space is valid JSON
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).expect("the temp file");
+        f.write_all(&(json.len() as u64).to_le_bytes())
+            .expect("length prefix");
+        f.write_all(&json).expect("header");
+        f.write_all(&[0u8; 16]).expect("a little data");
+        crate::model::ShardHeader {
+            path: path.to_string_lossy().into_owned(),
+            total_len: 8 + json_len as u64 + 16,
+            header_len,
+            tensors: Vec::new(),
+            metadata: Vec::new(),
+        }
+    }
+
+    /// A shard header with no recorded blob start, so the checks that read the header
+    /// text skip it — for the invariants that only need the parsed metadata/tensors.
+    fn shard(path: &str, header_len: u64, metadata: &[(&str, &str)]) -> crate::model::ShardHeader {
+        crate::model::ShardHeader {
+            path: path.into(),
+            total_len: 4096,
+            header_len,
+            tensors: Vec::new(),
+            metadata: metadata
+                .iter()
+                .map(|(k, v)| MetadataInfo {
+                    name: (*k).into(),
+                    value: (*v).into(),
+                    value_type: "string".into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn header_check_flags_a_misaligned_data_blob_and_a_repeated_key() {
+        // Real files: this check reads the header text back, which is the only way a
+        // repeated key can be seen at all.
+        let dir = std::env::temp_dir().join("cs_check_headers_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let one = r#"{"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#;
+
+        // The reference serializer pads the header so the blob starts 8-byte aligned.
+        // Nothing breaks without it — which is why it needs saying.
+        let aligned = [shard_file(&dir, "aligned.safetensors", 128, one)];
+        let r = check_headers(
+            &[ti("w", "F32", &[4])],
+            &[],
+            HeaderInputs {
+                shards: &aligned,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.status(), Status::Pass, "{:?}", r.findings());
+
+        let skewed = [shard_file(&dir, "skewed.safetensors", 130, one)];
+        let r = check_headers(
+            &[ti("w", "F32", &[4])],
+            &[],
+            HeaderInputs {
+                shards: &skewed,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.status(), Status::Warn, "{:?}", r.findings());
+        assert!(
+            r.findings()[0]
+                .message
+                .contains("2 past an 8-byte boundary"),
+            "{:?}",
+            r.findings()
+        );
+
+        // A key the header declares twice. Parsing keeps the last and drops the first
+        // without a word, so the file says one thing and means another.
+        let twice = r#"{"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]},"w":{"dtype":"F16","shape":[8],"data_offsets":[0,16]}}"#;
+        let dupe = [shard_file(&dir, "dupe.safetensors", 136, twice)];
+        let r = check_headers(
+            &[ti("w", "F16", &[8])],
+            &[],
+            HeaderInputs {
+                shards: &dupe,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.status(), Status::Fail, "{:?}", r.findings());
+        assert!(
+            r.findings()
+                .iter()
+                .any(|f| f.subject.as_deref() == Some("w")
+                    && f.message.contains("declared twice in the header")),
+            "{:?}",
+            r.findings()
+        );
+
+        // A shard whose reader didn't record the length is unknown, not misaligned, and
+        // isn't re-read: `header_len == 0` is another format or a remote listing, and a
+        // safetensors blob can never start at 0.
+        let unknown = [shard("/nowhere/a.safetensors", 0, &[])];
+        let r = check_headers(
+            &[ti("w", "F32", &[4])],
+            &[],
+            HeaderInputs {
+                shards: &unknown,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.status(), Status::Pass, "{:?}", r.findings());
+
+        // A shard that vanished between the read and the check IS worth saying — the
+        // checkpoint opened moments ago, so something moved.
+        let gone = [shard_file(&dir, "gone.safetensors", 128, one)];
+        std::fs::remove_file(&gone[0].path).expect("remove it");
+        let r = check_headers(
+            &[ti("w", "F32", &[4])],
+            &[],
+            HeaderInputs {
+                shards: &gone,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.status(), Status::Warn);
+        assert!(
+            r.findings()[0]
+                .message
+                .contains("could not re-read the header"),
+            "{:?}",
+            r.findings()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_check_catches_a_stale_index_total() {
+        // An index that lists `a` and `b` — but not the extra `codebook`, the way a
+        // quantised checkpoint's index doesn't list its codebooks.
+        let idx = |total: Option<u64>| crate::model::IndexEntry {
+            path: "/c/model.safetensors.index.json".into(),
+            weight_map: ["a", "b"]
+                .into_iter()
+                .map(|n| (n.to_string(), "s.safetensors".to_string()))
+                .collect(),
+            total_size: total,
+        };
+        // `ti` sizes every tensor at 4 bytes per element: two 4-element tensors = 32 B.
+        let tensors = [
+            ti("a", "F32", &[4]),
+            ti("b", "F32", &[4]),
+            // Present on disk, absent from the index — and so absent from its total.
+            ti("codebook", "F32", &[64]),
+        ];
+
+        let right = [idx(Some(32))];
+        assert_eq!(
+            check_headers(
+                &tensors,
+                &[],
+                HeaderInputs {
+                    index: &right,
+                    ..Default::default()
+                }
+            )
+            .status(),
+            Status::Pass
+        );
+
+        // Stale: a shard was re-quantised and nobody recomputed the field.
+        let stale = [idx(Some(64))];
+        let r = check_headers(
+            &tensors,
+            &[],
+            HeaderInputs {
+                index: &stale,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            r.status(),
+            Status::Fail,
+            "a loader pre-allocating from it is wrong"
+        );
+        assert!(
+            r.findings()[0].message.contains("over"),
+            "{:?}",
+            r.findings()
+        );
+
+        // Counting the unlisted extras would have made this index look 256 B short —
+        // the false positive a real checkpoint caught. 32 B is the listed pair only.
+        assert!(
+            check_headers(
+                &tensors,
+                &[],
+                HeaderInputs {
+                    index: &right,
+                    ..Default::default()
+                }
+            )
+            .findings()
+            .is_empty(),
+            "an unlisted extra is not the index's business"
+        );
+
+        // Absent is not wrong — the field is optional.
+        let absent = [idx(None)];
+        assert_eq!(
+            check_headers(
+                &tensors,
+                &[],
+                HeaderInputs {
+                    index: &absent,
+                    ..Default::default()
+                }
+            )
+            .status(),
+            Status::Pass
+        );
+    }
+
+    #[test]
+    fn header_check_catches_a_tensor_two_shards_both_claim() {
+        // Two shards both holding `w`. A loader takes whichever it reads last, so the
+        // checkpoint means two different things depending on read order.
+        let mut a = shard("/c/a.safetensors", 0, &[]);
+        let mut b = shard("/c/b.safetensors", 0, &[]);
+        a.tensors = vec![ti("w", "F32", &[4]), ti("only-in-a", "F32", &[4])];
+        b.tensors = vec![ti("w", "F32", &[4])];
+        let shards = [a, b];
+
+        let r = check_headers(
+            &[ti("w", "F32", &[4])],
+            &[],
+            HeaderInputs {
+                shards: &shards,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.status(), Status::Fail, "{:?}", r.findings());
+        let dupe = r
+            .findings()
+            .iter()
+            .find(|f| f.subject.as_deref() == Some("w"))
+            .expect("the contested name is the subject");
+        assert!(
+            dupe.message.contains("claimed by 2 shards")
+                && dupe.message.contains("a.safetensors, b.safetensors"),
+            "{:?}",
+            dupe.message
+        );
+        assert!(
+            !r.findings()
+                .iter()
+                .any(|f| f.subject.as_deref() == Some("only-in-a")),
+            "a name in one shard is fine"
+        );
+
+        // And the reason this check has to read the shards: by the time anything else
+        // sees the tensors they are deduped, so the duplicate is already gone.
+        let deduped = [ti("w", "F32", &[4]), ti("only-in-a", "F32", &[4])];
+        assert!(
+            !check_shapes_dtypes(&deduped)
+                .findings()
+                .iter()
+                .any(|f| f.message.contains("duplicate")),
+            "the canonical list cannot show it"
+        );
+    }
+
+    #[test]
+    fn header_check_notices_shards_that_disagree_about_themselves() {
+        // Two shards of one checkpoint, each claiming a different `format` — the
+        // signature of shards written by different tools. The *flattened* metadata can't
+        // show this (it dedups by name), which is why the check reads the shards.
+        // `header_len` 0 so the header-text checks skip these: what's under test is the
+        // parsed metadata, and a synthetic path has no file to re-read.
+        let shards = [
+            shard("/c/a.safetensors", 0, &[("format", "pt")]),
+            shard("/c/b.safetensors", 0, &[("format", "np")]),
+        ];
+        let r = check_headers(
+            &[ti("w", "F32", &[4])],
+            &[],
+            HeaderInputs {
+                shards: &shards,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.status(), Status::Warn);
+        assert!(
+            r.findings()[0].message.contains("shards disagree"),
+            "{:?}",
+            r.findings()
+        );
+
+        // Agreeing shards say nothing.
+        let agree = [
+            shard("/c/a.safetensors", 0, &[("format", "pt")]),
+            shard("/c/b.safetensors", 0, &[("format", "pt")]),
+        ];
+        assert_eq!(
+            check_headers(
+                &[ti("w", "F32", &[4])],
+                &[],
+                HeaderInputs {
+                    shards: &agree,
+                    ..Default::default()
+                }
+            )
+            .status(),
+            Status::Pass
+        );
+    }
+
+    #[test]
+    fn header_check_flags_metadata_that_is_not_text() {
+        // The format defines `__metadata__` as a string→string map.
+        let meta = [MetadataInfo {
+            name: "total_params".into(),
+            value: "30900000000".into(),
+            value_type: "number".into(),
+        }];
+        let r = check_headers(&[ti("w", "F32", &[4])], &meta, HeaderInputs::default());
+        assert_eq!(r.status(), Status::Warn);
+        assert!(
+            r.findings()[0].message.contains("JSON number"),
+            "{:?}",
+            r.findings()
+        );
+    }
+
+    #[test]
+    fn an_undefined_safetensors_dtype_is_named() {
+        // Everything downstream degrades quietly on one, so it's worth saying once.
+        let r = check_shapes_dtypes(&[ti("w", "F32", &[4]), ti("odd", "FP16", &[4])]);
+        assert!(
+            r.findings()
+                .iter()
+                .any(|f| f.message.contains("not one safetensors defines")
+                    && f.subject.as_deref() == Some("odd")),
+            "{:?}",
+            r.findings()
+        );
+        // The real names pass, including the torch `F8_*` variants.
+        for dtype in ["BF16", "U8", "BOOL", "F8_E4M3FN", "F8_E5M2"] {
+            let r = check_shapes_dtypes(&[ti("w", dtype, &[4])]);
+            assert!(
+                !r.findings()
+                    .iter()
+                    .any(|f| f.message.contains("safetensors defines")),
+                "{dtype} is a real dtype: {:?}",
+                r.findings()
+            );
+        }
+        // A header entry with no dtype at all parses as "?" — say so plainly.
+        let r = check_shapes_dtypes(&[ti("w", "?", &[4])]);
+        assert!(
+            r.findings()
+                .iter()
+                .any(|f| f.message.contains("no dtype at all")),
+            "{:?}",
+            r.findings()
+        );
     }
 
     /// A minimal chunked HDF5 tensor.

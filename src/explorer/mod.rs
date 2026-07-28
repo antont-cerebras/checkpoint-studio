@@ -1815,6 +1815,7 @@ impl Explorer {
                     &self.health_reports,
                     self.config(),
                     &crate::filter::NameFilter::default(),
+                    self.header_inputs(),
                     false,
                     1,
                 )
@@ -5949,6 +5950,7 @@ impl Explorer {
                 &self.health_reports,
                 self.config(),
                 &crate::filter::NameFilter::default(),
+                self.header_inputs(),
                 false,
                 1,
             );
@@ -6132,6 +6134,14 @@ impl Explorer {
     }
 
     /// The cached checkpoint model (owned by the kernel session), when loaded.
+    /// The shard headers + index the header-consistency check reads, from the model this
+    /// explorer loaded. Empty before a model exists, which reads as `n/a`.
+    fn header_inputs(&self) -> crate::check::HeaderInputs<'_> {
+        self.checkpoint()
+            .map(crate::check::HeaderInputs::from)
+            .unwrap_or_default()
+    }
+
     fn checkpoint(&self) -> Option<&crate::model::Checkpoint> {
         self.session.as_ref().and_then(|s| s.model())
     }

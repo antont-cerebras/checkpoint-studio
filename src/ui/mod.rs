@@ -415,6 +415,7 @@ mod small_terminal {
             &[],
             None,
             &crate::filter::NameFilter::parse(&[]).expect("empty filter"),
+            crate::check::HeaderInputs::default(),
             false,
             1,
         );
