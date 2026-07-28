@@ -20,9 +20,9 @@ const _: () = assert!(
 // them at the crate root so the (still bin-side) `explorer`/`ui` keep resolving
 // their `crate::tree::…` / `crate::stats::…` paths unchanged during the refactor.
 pub use checkpoint_studio_core::{
-    capability, check, codec, compact, config, diff, filetree, filter, gguf, health, hf, kernel,
-    model, npy, progress, readers, remote, rename, repack, s3, safelayout, sample, sftp, stats,
-    stheader, tensorfilter, tree, utils, viewstate,
+    arch, capability, check, codec, compact, config, diff, filetree, filter, gguf, health, hf,
+    kernel, model, npy, progress, readers, remote, rename, repack, s3, safelayout, sample, sftp,
+    stats, stheader, tensorfilter, tree, utils, viewstate,
 };
 #[cfg(feature = "hdf5")]
 pub use checkpoint_studio_core::{convert, hdf5, hdf5_lz4, hdf5_zstd};
@@ -362,6 +362,12 @@ struct ExploreArgs {
         help = "Like --stats, but with the on-disk per-shard breakdown expanded (the view's `f` toggle)"
     )]
     stats_shards: bool,
+
+    #[arg(
+        long = "print-arch",
+        help = "Print the architecture inferred from the tensors alone — layers, experts, vocabulary, quantization, and the stored-vs-logical parameter counts — with the evidence for each, and what a model card lists that tensors cannot supply"
+    )]
+    print_arch: bool,
 
     #[arg(
         long = "compact",
@@ -3612,6 +3618,38 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
     // `--print-model`: dump the whole central serializable model as JSON and exit
     // — a CLI frontend reading the kernel's model directly (the "serializable into
     // JSON" contract). Local only for now; the remote reader fills the model next.
+    // `--print-arch`: the inferred architecture summary. Reads the structure only, so it
+    // works for a Hugging Face repo as readily as a local checkpoint.
+    if args.print_arch {
+        let source = source::resolve(&args.paths, None)?;
+        let ((tensors, _, _, _, _), _) = source.read(&hf::ReadProgress::default())?;
+        let inferred = arch::infer(&tensors, None);
+        match args.format {
+            explorer::TreeFormat::Json => {
+                println!("{}", serde_json::to_string_pretty(&inferred)?);
+            }
+            explorer::TreeFormat::Text => {
+                let width = inferred
+                    .facts
+                    .iter()
+                    .map(|(l, _)| l.len())
+                    .max()
+                    .unwrap_or(0);
+                for (label, fact) in &inferred.facts {
+                    println!("{label:width$}  {}", fact.value);
+                    println!("{:width$}    ← {}", "", fact.from);
+                }
+                if !inferred.not_in_tensors.is_empty() {
+                    println!("\nNot inferable from tensors:");
+                    for (label, why) in &inferred.not_in_tensors {
+                        println!("  {label} — {why}");
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
     if args.print_model {
         let model = if let Some(host) = args.ssh_proxy.as_ref() {
             let venv = args
