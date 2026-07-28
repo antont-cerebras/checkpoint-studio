@@ -958,6 +958,7 @@ mod tests {
                     shard: None,
                     size_share: 1.0,
                     index: None,
+                    links: 1,
                 },
             }],
             ..Default::default()

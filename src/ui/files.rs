@@ -18,8 +18,8 @@ use super::palette;
 use super::popup::render_scroll_popup;
 use super::scroll::VScrollbar;
 use super::text::truncate_keep_end;
-use super::theme::UNINDEXED_MARK;
 use super::theme::tree_span;
+use super::theme::{HARDLINK_MARK, UNINDEXED_MARK};
 
 /// Footer rows below the file-browser list: a one-line status bar (the selected
 /// entry's path / size, or a copy confirmation).
@@ -316,13 +316,26 @@ fn file_row_line(
     // The marker, the name (truncated from the left, so a shard's number survives)
     // and the trailing note, per row kind — the columns after them are shared.
     let (marker, marker_color, name_color, name, note) = match row.kind {
-        FileRowKind::Dir { expanded, files } => (
+        FileRowKind::Dir {
+            expanded,
+            files,
+            hardlinked,
+        } => (
             if expanded { "▾" } else { "▸" },
             palette::ACCENT,
             palette::ACCENT,
             // The `/` is part of the name's width, hence one cell less to fill.
             format!("{}/", truncate_keep_end(&row.name, room.saturating_sub(1))),
-            format!("{files} {}", if files == 1 { "file" } else { "files" }),
+            // How much of the directory shares its bytes — the question a listing that
+            // adds up to 57 GiB actually raises. Omitted at zero, which is every
+            // ordinary checkpoint and every remote source (no local `st_nlink`).
+            match hardlinked {
+                0 => format!("{files} {}", if files == 1 { "file" } else { "files" }),
+                n => format!(
+                    "{files} {} · {n} hardlinked",
+                    if files == 1 { "file" } else { "files" }
+                ),
+            },
         ),
         FileRowKind::File { kind, shard, .. } => {
             // A checkpoint gets the tensor glyph (it opens into the tree) and the
@@ -345,6 +358,16 @@ fn file_row_line(
                 shard.map(|sh| sh.note()).unwrap_or_default(),
             )
         }
+    };
+
+    // Hardlinked: the same bytes under more than one name, so this row's size is
+    // shared rather than its own — deleting this name frees nothing, and the sizes down
+    // the column sum to more than the checkpoint occupies. `1` is an ordinary file, and
+    // is also what every remote backend reports, so nothing shows there.
+    let note = match (row.links(), note.is_empty()) {
+        (0 | 1, _) => note,
+        (n, true) => format!("{HARDLINK_MARK} {n} names"),
+        (n, false) => format!("{note} · {HARDLINK_MARK} {n} names"),
     };
 
     let indent = "  ".repeat(row.depth);
@@ -408,6 +431,7 @@ mod tests {
                 kind: FileRowKind::Dir {
                     expanded: true,
                     files: 2,
+                    hardlinked: 0,
                 },
             },
             FileRow {
@@ -420,6 +444,7 @@ mod tests {
                     shard: None,
                     size_share: 1.0,
                     index: None,
+                    links: 1,
                 },
             },
             FileRow {
@@ -432,6 +457,7 @@ mod tests {
                     shard: None,
                     size_share: 0.1,
                     index: None,
+                    links: 1,
                 },
             },
         ];
@@ -456,7 +482,7 @@ mod tests {
     #[test]
     fn a_shard_row_says_what_it_holds() {
         use crate::filetree::{FileKind, FileRow, FileRowKind, ShardTensors};
-        let row = |name: &str, shard: Option<ShardTensors>, index| FileRow {
+        let row = |name: &str, shard: Option<ShardTensors>, index, links| FileRow {
             depth: 0,
             name: name.into(),
             path: format!("/ckpt/{name}").into(),
@@ -466,6 +492,7 @@ mod tests {
                 shard,
                 size_share: 1.0,
                 index,
+                links,
             },
         };
         let rows = vec![
@@ -477,6 +504,7 @@ mod tests {
                     params_share: 0.0641,
                 }),
                 Some(IndexMembership::Listed),
+                2, // hardlinked — the real checkpoint's shards are
             ),
             row(
                 "codebooks.safetensors",
@@ -486,10 +514,11 @@ mod tests {
                     params_share: 0.0001,
                 }),
                 Some(IndexMembership::Unlisted),
+                1,
             ),
             // Unattributed (a shard of some other checkpoint, or an unmatched tree):
             // the row keeps its old shape rather than claiming zero tensors.
-            row("stranger.safetensors", None, None),
+            row("stranger.safetensors", None, None, 1),
         ];
         let badges = status_badges(AccessBadge::ReadOnly, None, false);
         let out = crate::tui::headless_render(110, 12, |f| {
@@ -527,6 +556,16 @@ mod tests {
             marked.contains(UNINDEXED_MARK),
             "with the same mark the tensor tree uses:\n{out}"
         );
+
+        // Hardlinked bytes: only the shard whose inode has two names says so, and it
+        // says how many — an ordinary file adds nothing.
+        let shared: Vec<&str> = out.lines().filter(|l| l.contains(HARDLINK_MARK)).collect();
+        assert_eq!(shared.len(), 1, "one hardlinked row:\n{out}");
+        assert!(
+            shared[0].contains("model-00001-of-00016.safetensors")
+                && shared[0].contains(&format!("{HARDLINK_MARK} 2 names")),
+            "…named, with its link count:\n{out}"
+        );
     }
 
     /// Rows of wildly different name lengths and sizes, for the column assertions.
@@ -552,6 +591,7 @@ mod tests {
                 shard: None,
                 size_share,
                 index: Some(IndexMembership::Listed),
+                links: 1,
             },
         })
         .collect()

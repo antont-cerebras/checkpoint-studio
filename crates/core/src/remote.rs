@@ -44,6 +44,12 @@ pub struct RemoteCheckpoint {
     pub metadata: Vec<MetadataInfo>,
     pub disk: Option<DiskUsage>,
     pub health: Vec<crate::health::HealthReport>,
+    /// The `model.safetensors.index.json` this read already parsed, when the directory
+    /// has a usable one. Carried so a remote checkpoint's *model* says what it declares,
+    /// not just its health report: the file browser marks a shard the index doesn't name,
+    /// and it can only do that if the index reached [`crate::model::Checkpoint`]. Empty
+    /// for `s3://` (a cstorch checkpoint has no such index) and for a single file.
+    pub index: Vec<crate::model::IndexEntry>,
     /// The underlying S3 objects' metadata — `Some` only for an `s3://` source
     /// (fetched best-effort by the remote script); `None` for a local/SFTP read.
     pub s3: Option<S3Meta>,
@@ -463,6 +469,7 @@ impl RemoteRead {
             rc.tensors,
             rc.metadata,
             config,
+            rc.index,
             rc.s3,
             &disk_shards,
         ))
@@ -548,6 +555,7 @@ impl RemoteRead {
                 Vec::new()
             };
             Ok(RemoteCheckpoint {
+                index: Vec::new(), // a cstorch checkpoint has no safetensors index
                 tensors,
                 metadata,
                 disk: None,
@@ -649,10 +657,11 @@ impl RemoteRead {
             .ok()
             .map(|rows| {
                 rows.into_iter()
-                    .map(|(p, apparent, allocated)| ShardDisk {
+                    .map(|(p, st)| ShardDisk {
                         name: crate::stats::shard_name(&p),
-                        apparent,
-                        allocated,
+                        apparent: st.apparent(),
+                        allocated: st.allocated(),
+                        links: st.links(),
                     })
                     .collect::<Vec<_>>()
             })
@@ -665,6 +674,22 @@ impl RemoteRead {
         // index (references shards that aren't there, or lists tensors a shard
         // doesn't hold) surfaces in the tree's health popup and `⚠ health` badge,
         // just as for a local checkpoint.
+        // The index as a *model* fact, not only as an input to the health check: the file
+        // browser marks a shard the index doesn't name, and both frontends read that off
+        // `Checkpoint::index`. Built from the map this pass already parsed — no re-read,
+        // and no second notion of what the index says.
+        let index: Vec<crate::model::IndexEntry> = index_path
+            .as_ref()
+            .map(|path| crate::model::IndexEntry {
+                path: self.source_path(path),
+                weight_map: weight_map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+
         let health = index_path.map_or_else(Vec::new, |index_path| {
             let mut present_by_file: HashMap<String, BTreeSet<String>> = HashMap::new();
             for t in &tensors {
@@ -692,6 +717,8 @@ impl RemoteRead {
             metadata,
             disk,
             health,
+            // The same index the health check just used, now on the model too.
+            index,
             s3: None, // a safetensors dir/file has no S3 object metadata
         })
     }
@@ -1669,7 +1696,7 @@ pub fn remote_file_entries(
     s3: Option<&S3Meta>,
     disk_shards: &[ShardDisk],
 ) -> Vec<crate::model::FileEntry> {
-    let entry = |name: &str, apparent: u64, allocated: u64| crate::model::FileEntry {
+    let entry = |name: &str, apparent: u64, allocated: u64, links: u64| crate::model::FileEntry {
         rel_path: name.to_string(),
         name: name.rsplit('/').next().unwrap_or(name).to_string(),
         // Flat: the keys carry their own `/`, and the file tree builder folds them into
@@ -1682,7 +1709,7 @@ pub fn remote_file_entries(
             apparent,
             allocated,
             kind: crate::filetree::FileKind::of(name),
-            links: 1,
+            links,
         },
     };
     if let Some(meta) = s3 {
@@ -1691,21 +1718,24 @@ pub fn remote_file_entries(
         return meta
             .objects
             .iter()
-            .map(|o| entry(&o.key, o.size, o.size))
+            // An object has no inode, so it has exactly one name.
+            .map(|o| entry(&o.key, o.size, o.size, 1))
             .collect();
     }
     disk_shards
         .iter()
-        .map(|d| entry(&d.name, d.apparent, d.allocated))
+        .map(|d| entry(&d.name, d.apparent, d.allocated, d.links))
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)] // one flat assembly of the model's own fields
 fn assemble_remote_checkpoint(
     host: &str,
     src: &str,
     tensors: Vec<TensorInfo>,
     mut metadata: Vec<MetadataInfo>,
     config: Option<crate::config::ModelConfig>,
+    index: Vec<crate::model::IndexEntry>,
     s3: Option<S3Meta>,
     disk_shards: &[ShardDisk],
 ) -> crate::model::Checkpoint {
@@ -1750,7 +1780,7 @@ fn assemble_remote_checkpoint(
         files: remote_file_entries(s3.as_ref(), disk_shards),
         shards,
         config,
-        index: Vec::new(),
+        index,
         s3,
     }
 }
@@ -2475,6 +2505,7 @@ mod tests {
             name: "model-00001-of-00002.safetensors".into(),
             apparent: 1000,
             allocated: 1024,
+            links: 1,
         }];
         let files = remote_file_entries(None, &shards);
         assert_eq!(files.len(), 1);
@@ -2502,8 +2533,9 @@ mod tests {
             ts,
             vec![meta("format")],
             None,
-            None, // no object metadata was requested for this read
-            &[],  // and no directory listing, so there is nothing to browse
+            Vec::new(), // a cstorch checkpoint has no safetensors index
+            None,       // no object metadata was requested for this read
+            &[],        // and no directory listing, so there is nothing to browse
         );
         assert!(matches!(ck.source, crate::model::Source::S3 { .. }));
         assert_eq!(ck.root, "s3://bucket/ckpt");
@@ -2529,8 +2561,16 @@ mod tests {
             mk("b", "host:/ckpt/shard-1.safetensors"),
             mk("c", "host:/ckpt/shard-0.safetensors"),
         ];
-        let ck =
-            assemble_remote_checkpoint("host", "/ckpt", ts, vec![meta("format")], None, None, &[]);
+        let ck = assemble_remote_checkpoint(
+            "host",
+            "/ckpt",
+            ts,
+            vec![meta("format")],
+            None,
+            Vec::new(),
+            None,
+            &[],
+        );
         assert!(matches!(ck.source, crate::model::Source::Sftp { .. }));
         assert_eq!(ck.shards.len(), 2);
         assert_eq!(ck.shards[0].path, "host:/ckpt/shard-0.safetensors");

@@ -3428,6 +3428,9 @@ impl Explorer {
                             crate::filetree::DirEntry::File {
                                 name: fe.name.clone(),
                                 size: fe.apparent(),
+                                // The cached walk already recorded `st_nlink`, so the
+                                // browser gets it without a second stat.
+                                links: fe.node.links(),
                             }
                         };
                         listing.entry(parent).or_default().push(entry);
@@ -3461,6 +3464,10 @@ impl Explorer {
                 let objects = self
                     .with_remote_session(|s| r.list_s3(s, uri))
                     .map_err(|e| format!("{e:#}"))?;
+                let objects: Vec<crate::filetree::ObjectEntry> = objects
+                    .into_iter()
+                    .map(|(key, size)| crate::filetree::ObjectEntry::object(key, size))
+                    .collect();
                 Ok(crate::filetree::build_from_keys(
                     &s3_root_label(uri),
                     &objects,
@@ -3728,6 +3735,10 @@ impl Explorer {
                 "tensors  what the model reads out of this file, and its share of the parameters"
                     .to_string(),
             )),
+            Line::from(Span::raw(format!(
+                "{}        hardlinked: one copy of the bytes under N names, so the size is shared",
+                crate::ui::HARDLINK_MARK
+            ))),
             Line::from(vec![
                 crate::ui::unindexed_span(format!("{}       ", crate::ui::UNINDEXED_MARK)),
                 Span::raw(

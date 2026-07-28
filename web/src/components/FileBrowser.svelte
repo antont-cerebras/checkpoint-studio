@@ -43,6 +43,13 @@
     return node.kind === 'file' && node.index === 'unlisted';
   }
 
+  /** Names this file's bytes have, when there's more than one. Hardlinked files share
+      their bytes, so deleting this name frees nothing and the sizes down the column
+      sum to more than the checkpoint occupies. 0 when the question doesn't arise. */
+  function sharedNames(node: FileNode): number {
+    return node.kind === 'file' && node.links > 1 ? node.links : 0;
+  }
+
   function activate(node: FileNode) {
     if (node.kind === 'dir') {
       expanded = toggleDir(expanded, node.path);
@@ -89,10 +96,19 @@
           {/if}
         </span>
         <span class="note dim">
-          {#if node.kind === 'dir'}{node.files} {node.files === 1 ? 'file' : 'files'}
+          {#if node.kind === 'dir'}{node.files} {node.files === 1
+              ? 'file'
+              : 'files'}{node.hardlinked
+              ? ` · ${node.hardlinked} hardlinked`
+              : ''}
           {:else}{shardSuffix(node)}{#if unlisted(node)}<span class="extra"
                 title="on disk but not listed in model.safetensors.index.json"
                 >{shardSuffix(node) ? ' · ' : ''}✚ not in the index</span
+              >{/if}{#if sharedNames(node)}<span
+                title="hardlinked: one copy of the bytes under {sharedNames(
+                  node,
+                )} names, so this size is shared"
+                >{shardSuffix(node) || unlisted(node) ? ' · ' : ''}⧉ {sharedNames(node)} names</span
               >{/if}{/if}
         </span>
       </div>
@@ -179,9 +195,9 @@
   }
   /* Fixed, though it's the last column: a note whose width varied would change how
      much slack the name gets, and the columns before it would wander per row. Wide
-     enough for the longest form — the shard note plus the index mark. */
+     enough for the longest form — the shard note, the index mark and the link count. */
   .note {
-    flex: 0 0 50ch;
+    flex: 0 0 64ch;
     font-size: 12px;
   }
   /* The same vivid red the terminal marks an unindexed file with (palette::UNINDEXED)

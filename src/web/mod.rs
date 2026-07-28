@@ -128,10 +128,16 @@ impl WebState {
             node.attribute_index(&checkpoint.index);
             dto::WebFileNode::from_node(&node, Path::new(&root))
         } else {
-            let objects: Vec<(String, u64)> = checkpoint
+            // The model's file listing, which carries each entry's link count for an
+            // `--ssh-proxy` read (an S3 object reports one name — no inode to share).
+            let objects: Vec<filetree::ObjectEntry> = checkpoint
                 .files
                 .iter()
-                .map(|f| (f.rel_path.clone(), f.apparent()))
+                .map(|f| filetree::ObjectEntry {
+                    key: f.rel_path.clone(),
+                    size: f.apparent(),
+                    links: f.node.links(),
+                })
                 .collect();
             let label = root
                 .trim_end_matches('/')

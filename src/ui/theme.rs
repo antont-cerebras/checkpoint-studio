@@ -11,6 +11,10 @@ use super::palette;
 /// shown in [`palette::UNINDEXED`] in the tree, detail screen and legends.
 pub(crate) const UNINDEXED_MARK: &str = "✚";
 
+/// Marks a file whose bytes have more than one name (`st_nlink > 1`) — the same copy
+/// reachable from elsewhere on the filesystem, so its size is shared, not its own.
+pub(crate) const HARDLINK_MARK: &str = "⧉";
+
 /// Storage tag for a tensor stored uncompressed on disk. Shared by the tree row,
 /// the detail screen and the legend so the wording stays consistent.
 pub(super) const UNCOMPRESSED_TAG: &str = "(uncompressed)";

@@ -47,6 +47,20 @@ pub struct ShardListing {
     pub actual: BTreeSet<String>,
 }
 
+/// Paths per `stat` exec (see [`RemoteSession::stat_paths`]). Comfortably inside any
+/// `ARG_MAX` — a few hundred long paths is tens of kilobytes of command line — while
+/// keeping a normal checkpoint directory to a single round trip.
+const STAT_BATCH: usize = 400;
+
+/// Whether a walked entry was a symlink — which decides whether the batched `stat -L`
+/// should also replace its size, or only add its link count. A named pair rather than a
+/// bare `bool` at a call site where `true` would say nothing about which is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsSymlink {
+    Yes,
+    No,
+}
+
 /// One directory's entries — the file browser's view of a remote directory (see
 /// [`RemoteSession::walk_dir`]). Uses the shared [`crate::filetree::DirEntry`] sum
 /// type, so the remote listing and the local walk feed the browser the same shape.
@@ -66,6 +80,10 @@ pub enum RemoteStat {
         apparent: u64,
         /// On-disk allocation (`st_blocks × block-size`) of the target, in bytes.
         allocated: u64,
+        /// `st_nlink` of the target: `>1` when the same bytes are reachable under
+        /// another name. SFTP's own `readdir` stat has no such field, so this is the
+        /// only way to know it remotely — see [`RemoteSession::stat_paths`].
+        links: u64,
     },
     Directory,
 }
@@ -89,6 +107,15 @@ impl RemoteStat {
         match self {
             Self::File { allocated, .. } => *allocated,
             Self::Directory => 0,
+        }
+    }
+    /// Names the target's bytes have (`1` for a directory, and for anything a `stat`
+    /// couldn't report).
+    #[must_use]
+    pub fn links(&self) -> u64 {
+        match self {
+            Self::File { links, .. } => *links,
+            Self::Directory => 1,
         }
     }
 }
@@ -266,8 +293,9 @@ impl RemoteSession {
         let sftp = self.session.sftp().context("opening the SFTP subsystem")?;
         let root = root.trim_end_matches('/').to_string();
         let mut map: HashMap<String, DirListing> = HashMap::new();
-        // Symlinks to resolve after the walk, in one batch: (dir, row index, full).
-        let mut links: Vec<(String, usize, String)> = Vec::new();
+        // Every file row, to stat after the walk in one batch: (dir, row index, full,
+        // whether it's a symlink whose size needs replacing).
+        let mut files: Vec<(String, usize, String, IsSymlink)> = Vec::new();
         let mut stack = vec![(root.clone(), 0usize)];
         while let Some((dir, depth)) = stack.pop() {
             if depth >= max_depth {
@@ -295,42 +323,53 @@ impl RemoteSession {
                 // stat). It stays a leaf, so it's never descended.
                 let is_symlink = st.perm.is_some_and(|m| m & 0o170_000 == 0o120_000);
                 if is_symlink {
-                    links.push((dir.clone(), rows.len(), full));
+                    files.push((dir.clone(), rows.len(), full, IsSymlink::Yes));
                     // Pushed as a File leaf with a fallback size; the follow-up
                     // `stat -L` below replaces the size with the target's.
                     rows.push(DirEntry::File {
                         name,
                         size: st.size.unwrap_or(0),
+                        links: 1, // until the batch `stat` reports `%h`
                     });
                 } else {
                     let is_dir = st.is_dir();
                     if is_dir && depth + 1 < max_depth {
-                        stack.push((full, depth + 1));
+                        stack.push((full.clone(), depth + 1));
                     }
-                    rows.push(if is_dir {
-                        DirEntry::Directory { name }
+                    if is_dir {
+                        rows.push(DirEntry::Directory { name });
                     } else {
-                        DirEntry::File {
+                        // `readdir` gives the size but never `st_nlink`, so a plain
+                        // file joins the batch too — for its link count only.
+                        files.push((dir.clone(), rows.len(), full, IsSymlink::No));
+                        rows.push(DirEntry::File {
                             name,
                             size: st.size.unwrap_or(0),
-                        }
-                    });
+                            links: 1,
+                        });
+                    }
                 }
             }
             map.insert(dir, rows);
         }
-        // Follow every symlink in one `stat -L` and replace its fallback size with
-        // the target's (a symlinked dir stays a size-0 leaf — never descended).
-        if !links.is_empty() {
-            let paths: Vec<String> = links.iter().map(|(_, _, p)| p.clone()).collect();
+        // One batched `stat -L` over every file: it follows symlinks (so a linked
+        // shard's size becomes its target's) and reports `st_nlink`, which `readdir`
+        // never carries — the only way the remote browser can say a file's bytes are
+        // shared. Best-effort throughout: a path that doesn't resolve keeps its
+        // `readdir` size and one name.
+        if !files.is_empty() {
+            let paths: Vec<String> = files.iter().map(|(_, _, p, _)| p.clone()).collect();
             let resolved = self.stat_paths(&paths);
-            for (dir, idx, full) in &links {
+            for (dir, idx, full, symlink) in &files {
                 if let Some(st) = resolved.get(full)
                     && let Some(rows) = map.get_mut(dir)
-                    && let Some(DirEntry::File { size, .. }) = rows.get_mut(*idx)
+                    && let Some(DirEntry::File { size, links, .. }) = rows.get_mut(*idx)
                 {
-                    // A symlinked dir stays a size-0 leaf (never descended).
-                    *size = if st.is_dir() { 0 } else { st.apparent() };
+                    if *symlink == IsSymlink::Yes {
+                        // A symlinked dir stays a size-0 leaf (never descended).
+                        *size = if st.is_dir() { 0 } else { st.apparent() };
+                    }
+                    *links = st.links();
                 }
             }
         }
@@ -348,22 +387,26 @@ impl RemoteSession {
     #[must_use]
     pub fn stat_paths(&self, paths: &[String]) -> HashMap<String, RemoteStat> {
         let mut out = HashMap::new();
-        if paths.is_empty() {
-            return out;
+        // One exec per chunk. A whole directory walk can be thousands of paths, and
+        // they all become arguments to one command line — past `ARG_MAX` the remote
+        // shell rejects the lot, so every path would come back "unresolved" and every
+        // size would silently read 0. Chunking keeps the common case at one exec.
+        for chunk in paths.chunks(STAT_BATCH) {
+            let args = chunk.iter().fold(String::new(), |mut acc, p| {
+                let _ = write!(acc, " {}", shell_single_quote(p));
+                acc
+            });
+            // `-L` follows links; `%s` size · `%b` blocks · `%B` block-size · `%h`
+            // link count · `%F` type · `%n` the path as given (tab-separated so a
+            // spaced type like "regular file" stays one field, and a path with spaces
+            // is the whole last field).
+            let command = format!("stat -L -c '%s\t%b\t%B\t%h\t%F\t%n' --{args}");
+            let _ = self.exec_capture(&command, "", |line| {
+                if let Some((name, st)) = parse_stat_line(line) {
+                    out.insert(name, st);
+                }
+            });
         }
-        let args = paths.iter().fold(String::new(), |mut acc, p| {
-            let _ = write!(acc, " {}", shell_single_quote(p));
-            acc
-        });
-        // `-L` follows links; `%s` size · `%b` blocks · `%B` block-size · `%F` type
-        // · `%n` the path as given (tab-separated so a spaced type like "regular
-        // file" stays one field, and a path with spaces is the whole last field).
-        let command = format!("stat -L -c '%s\t%b\t%B\t%F\t%n' --{args}");
-        let _ = self.exec_capture(&command, "", |line| {
-            if let Some((name, st)) = parse_stat_line(line) {
-                out.insert(name, st);
-            }
-        });
         out
     }
 
@@ -382,15 +425,11 @@ impl RemoteSession {
     /// a linked shard reports its target's real footprint, agreeing with the file
     /// browser and layout map (rather than the ~50 B link stub). Paths that don't
     /// resolve are omitted (treated as "unknown"), preserving the input order.
-    pub fn allocated_sizes(&self, paths: &[String]) -> Result<Vec<(String, u64, u64)>> {
+    pub fn allocated_sizes(&self, paths: &[String]) -> Result<Vec<(String, RemoteStat)>> {
         let stats = self.stat_paths(paths);
         Ok(paths
             .iter()
-            .filter_map(|p| {
-                stats
-                    .get(p)
-                    .map(|st| (p.clone(), st.apparent(), st.allocated()))
-            })
+            .filter_map(|p| stats.get(p).map(|st| (p.clone(), *st)))
             .collect())
     }
 
@@ -747,13 +786,20 @@ fn read_header(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<u8>> {
     Ok(header)
 }
 
-/// Parse one `stat -L -c '%s\t%b\t%B\t%F\t%n'` line into `(path, RemoteStat)`:
-/// size · blocks · block-size · type · path. The path (`%n`) is the whole last
-/// field, so a path containing spaces (or the type's own space, "regular file")
+/// Parse one `stat -L -c '%s\t%b\t%B\t%h\t%F\t%n'` line into `(path, RemoteStat)`:
+/// size · blocks · block-size · links · type · path. The path (`%n`) is the whole
+/// last field, so a path containing spaces (or the type's own space, "regular file")
 /// survives. Pure, so the format is unit-tested without a live SFTP server.
 fn parse_stat_line(line: &str) -> Option<(String, RemoteStat)> {
-    let mut it = line.splitn(5, '\t');
-    let (s, b, bs, kind, name) = (it.next()?, it.next()?, it.next()?, it.next()?, it.next()?);
+    let mut it = line.splitn(6, '\t');
+    let (s, b, bs, h, kind, name) = (
+        it.next()?,
+        it.next()?,
+        it.next()?,
+        it.next()?,
+        it.next()?,
+        it.next()?,
+    );
     let apparent = s.trim().parse::<u64>().ok()?;
     let blocks = b.trim().parse::<u64>().ok()?;
     let block_size = bs.trim().parse::<u64>().ok()?;
@@ -765,6 +811,10 @@ fn parse_stat_line(line: &str) -> Option<(String, RemoteStat)> {
             RemoteStat::File {
                 apparent,
                 allocated: blocks * block_size,
+                // A `stat` that can't report the count (or a non-GNU one whose `%h`
+                // came through literally) means "unknown", which is 1 — never 0, which
+                // would read as "this file has no names".
+                links: h.trim().parse::<u64>().unwrap_or(1).max(1),
             }
         },
     ))
@@ -803,34 +853,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_stat_line_reads_followed_size_and_allocation() {
-        // size · blocks · block-size · type · path — a followed (`-L`) regular file.
+    fn parse_stat_line_reads_followed_size_allocation_and_links() {
+        // size · blocks · block-size · links · type · path — a followed (`-L`) file.
         let (name, st) = parse_stat_line(
-            "6127900160\t11968752\t512\tregular file\t/ckpt/model-00000.safetensors",
+            "6127900160\t11968752\t512\t2\tregular file\t/ckpt/model-00000.safetensors",
         )
         .unwrap();
         assert_eq!(name, "/ckpt/model-00000.safetensors");
         assert_eq!(st.apparent(), 6_127_900_160);
         assert_eq!(st.allocated(), 11_968_752 * 512); // st_blocks × block-size
+        assert_eq!(st.links(), 2, "hardlinked: two names for these bytes");
         assert!(!st.is_dir());
 
+        // An ordinary file has one name.
+        assert_eq!(
+            parse_stat_line("10\t1\t512\t1\tregular file\t/p")
+                .unwrap()
+                .1
+                .links(),
+            1
+        );
         // A directory target (a followed symlink-to-dir).
         assert!(
-            parse_stat_line("4096\t8\t512\tdirectory\t/d")
+            parse_stat_line("4096\t8\t512\t2\tdirectory\t/d")
                 .unwrap()
                 .1
                 .is_dir()
         );
         // The path (last field) keeps embedded spaces intact.
         assert_eq!(
-            parse_stat_line("1\t1\t512\tregular file\t/a b/c d.safetensors")
+            parse_stat_line("1\t1\t512\t1\tregular file\t/a b/c d.safetensors")
                 .unwrap()
                 .0,
             "/a b/c d.safetensors"
         );
+        // A `stat` that couldn't report `%h` (or echoed it literally) means unknown —
+        // one name, never zero, which would read as "this file has no names".
+        assert_eq!(
+            parse_stat_line("1\t1\t512\t%h\tregular file\t/p")
+                .unwrap()
+                .1
+                .links(),
+            1
+        );
+        assert_eq!(
+            parse_stat_line("1\t1\t512\t0\tregular file\t/p")
+                .unwrap()
+                .1
+                .links(),
+            1
+        );
         // Garbage / short lines are ignored, not panics.
         assert!(parse_stat_line("nope").is_none());
-        assert!(parse_stat_line("x\ty\tz\tregular file\t/p").is_none());
+        assert!(parse_stat_line("x\ty\tz\t1\tregular file\t/p").is_none());
+        // The old five-field format no longer parses — the type lands in the links
+        // field and the path in the type's, so it must not silently half-succeed.
+        assert!(
+            parse_stat_line("1\t1\t512\tregular file\t/p").is_none(),
+            "a five-field line is not a six-field line"
+        );
     }
 
     /// A remote path reaches a shell in `stat_paths`' command line, so this quoting is

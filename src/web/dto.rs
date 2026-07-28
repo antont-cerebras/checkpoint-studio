@@ -21,6 +21,8 @@ pub(crate) enum WebFileNode {
         path: String,
         size: u64,
         files: usize,
+        /// How many files under here are hardlinked (0 where unknown, e.g. remote).
+        hardlinked: usize,
         children: Vec<Self>,
     },
     File {
@@ -34,6 +36,8 @@ pub(crate) enum WebFileNode {
         size_share: f64,
         /// Whether the index declares this file — `null` when it can't apply.
         index: Option<IndexMembership>,
+        /// Names this file's bytes have; `>1` means hardlinked (shared bytes).
+        links: u64,
     },
 }
 
@@ -48,12 +52,14 @@ impl WebFileNode {
                 children,
                 size,
                 files,
+                hardlinked,
                 ..
             } => Self::Dir {
                 name: name.clone(),
                 path: rel(path, root),
                 size: *size,
                 files: *files,
+                hardlinked: *hardlinked,
                 children: children.iter().map(|c| Self::from_node(c, root)).collect(),
             },
             FileNode::File {
@@ -64,6 +70,7 @@ impl WebFileNode {
                 shard,
                 size_share,
                 index,
+                links,
             } => Self::File {
                 name: name.clone(),
                 path: rel(path, root),
@@ -72,6 +79,7 @@ impl WebFileNode {
                 shard: *shard,
                 size_share: *size_share,
                 index: *index,
+                links: *links,
             },
         }
     }
@@ -304,6 +312,7 @@ mod tests {
             expanded: true,
             size: 10,
             files: 1,
+            hardlinked: 1,
             children: vec![FileNode::File {
                 name: "a.safetensors".into(),
                 path: root.join("sub/a.safetensors"),
@@ -316,6 +325,7 @@ mod tests {
                 }),
                 size_share: 0.5,
                 index: Some(IndexMembership::Unlisted),
+                links: 2,
             }],
         };
         let web = WebFileNode::from_node(&node, &root);

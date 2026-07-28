@@ -502,6 +502,11 @@ pub struct ShardDisk {
     pub apparent: u64,
     /// Bytes the filesystem actually allocated (`st_blocks × 512`).
     pub allocated: u64,
+    /// `st_nlink` — names these bytes have; `>1` when the shard is hardlinked, so its
+    /// allocation is shared rather than its own. Belongs with the other two: it is the
+    /// same `stat` and the same question they answer, which is what the checkpoint
+    /// really occupies (see [`DiskUsage`]'s inode dedup). `1` where unknown.
+    pub links: u64,
 }
 
 /// Filesystem allocation across the checkpoint's shard files — the true on-disk
@@ -545,6 +550,7 @@ impl DiskUsage {
                     name: shard_name(p),
                     apparent: md.len(),
                     allocated: md.blocks() * 512,
+                    links: md.nlink(),
                 })
             })
             .collect();
@@ -1867,16 +1873,19 @@ mod tests {
                 name: "shard-saver.safetensors".into(),
                 apparent: 4 * 1024 * 1024,
                 allocated: 1024 * 1024,
+                links: 1,
             },
             ShardDisk {
                 name: "shard-plain.safetensors".into(),
                 apparent: 4 * 1024 * 1024,
                 allocated: 4 * 1024 * 1024,
+                links: 1,
             },
             ShardDisk {
                 name: "shard-bigger.safetensors".into(),
                 apparent: 4 * 1024 * 1024,
                 allocated: 4 * 1024 * 1024 + 4096, // block rounding — larger on disk
+                links: 1,
             },
         ]);
         let stats = CheckpointStats::compute(&tensors, None, disk);

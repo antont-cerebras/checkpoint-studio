@@ -685,11 +685,13 @@ mod tests {
                 name: "shard-saver.safetensors".into(),
                 apparent: 4 << 20,
                 allocated: 1 << 20,
+                links: 1,
             },
             ShardDisk {
                 name: "shard-plain.safetensors".into(),
                 apparent: 4 << 20,
                 allocated: 4 << 20,
+                links: 1,
             },
         ]);
         let stats = CheckpointStats::compute(&tensors, None, disk);
