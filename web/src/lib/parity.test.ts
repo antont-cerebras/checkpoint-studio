@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { expandedIds, flatten, nodeId, type Row } from './flatten';
 import { sortRows } from './rows';
-import { humanCount, humanSize, percent } from './format';
+import { humanCount, humanSize, percent, shardNote } from './format';
 import { searchTree } from './search';
 import type { TreeNode } from './types';
 
@@ -39,6 +39,7 @@ interface Fixture {
   size: [number, string][];
   count: [number, string][];
   percent: [number, number, string][];
+  shard: [number, number, number, string][];
   tree: { nodes: TreeNode[]; rows: RowProjection[] };
   sort: { tensors: SortFixtureTensor[]; orders: SortCase[] };
   search: { names: string[]; matches: [string, string[]][] };
@@ -68,6 +69,17 @@ describe('zero fractions match the Rust format_percent', () => {
   it.each(fixture.percent)('%i of %i → %s', (zeros, count, expected) => {
     expect(percent(zeros / count, zeros === 0), HINT).toBe(expected);
   });
+});
+
+// The share arrives from the server rather than being divided here, so the fixture's
+// own `params_share` is the input — exactly as `/api/files` delivers it.
+describe('shard rows read the same as the TUI file browser', () => {
+  it.each(fixture.shard)(
+    '%i tensors, %i params → %s',
+    (tensors, params, paramsShare, expected) => {
+      expect(shardNote({ tensors, params, params_share: paramsShare }), HINT).toBe(expected);
+    },
+  );
 });
 
 describe('the search matcher matches the same names as the TUI', () => {

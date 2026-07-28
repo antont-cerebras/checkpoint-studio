@@ -31,6 +31,7 @@ cd web && npm test
 | byte sizes (`593.5 MiB`) | `utils::format_size` | `format.ts: humanSize` |
 | parameter counts (`30.9B`) | `utils::format_parameters` | `format.ts: humanCount` |
 | zero fraction (`0%` / `1.0e-7%` / `12.3%`) | `utils::format_percent` | `format.ts: percent` |
+| a shard's file-browser row (`1062 tensors · 6.4% of params`) | `filetree::ShardTensors::note` | `format.ts: shardNote` |
 | which tensors a search query matches | `SkimMatcherV2` (smart case) | `search.ts: searchTree` |
 | the tree's **rows** — order, depth, kind, expandability | `TreeBuilder::flatten_tree` | `flatten.ts: flatten` + `expandedIds` |
 

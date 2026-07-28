@@ -1,3 +1,5 @@
+import type { ShardTensors } from './types';
+
 // Human-readable formatting helpers. `humanSize`, `humanCount` and `percent` must
 // produce byte-identical strings to the Rust side's `format_size`, `format_parameters`
 // and `format_percent` (crates/core/src/utils.rs) — the same tensor has to report the
@@ -75,4 +77,13 @@ export function percent(fraction: number, isZero: boolean): string {
   if (isZero) return '0%';
   const pct = fraction * 100;
   return pct < 0.1 ? `${pct.toExponential(1)}%` : `${pct.toFixed(1)}%`;
+}
+
+/** What a shard contributes, for a file-browser row: `1062 tensors · 6.4% of params`.
+ * Mirrors `shard_note` in src/ui/files.rs — the same shard has to read the same way in
+ * both browsers, which is why the wording lives in one function per side rather than
+ * inline in a component. */
+export function shardNote(shard: ShardTensors): string {
+  const unit = shard.tensors === 1 ? 'tensor' : 'tensors';
+  return `${shard.tensors} ${unit} · ${percent(shard.params_share, shard.params === 0)} of params`;
 }

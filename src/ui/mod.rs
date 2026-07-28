@@ -374,6 +374,12 @@ mod small_terminal {
             size: 256,
             kind: crate::filetree::FileRowKind::File {
                 kind: crate::filetree::FileKind::Checkpoint,
+                // Annotated, so the widest form of the row is the one squeezed here.
+                shard: Some(crate::filetree::ShardTensors {
+                    tensors: 1062,
+                    params: 3_000_000_000,
+                    params_share: 0.0641,
+                }),
             },
         }];
         let badges = status_badges(AccessBadge::ReadOnly, None, false);

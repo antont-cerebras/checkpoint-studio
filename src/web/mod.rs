@@ -114,8 +114,12 @@ impl WebState {
         // the tree comes from the listing the read already returned (`Checkpoint::files` —
         // S3 object keys, or the SFTP shard listing). Without this the browser's Files
         // screen was empty for every `--ssh-proxy` source while the terminal listed it.
+        // Each shard is annotated with the tensors read from it, so a browsed listing of
+        // sixteen same-sized shards says which one holds what (see `ShardTensors`).
         let file_tree = if matches!(checkpoint.source, model::Source::Local) {
-            dto::WebFileNode::from_node(&filetree::build(Path::new(&root), 8), Path::new(&root))
+            let mut node = filetree::build(Path::new(&root), 8);
+            node.attribute_tensors(&tensors);
+            dto::WebFileNode::from_node(&node, Path::new(&root))
         } else {
             let objects: Vec<(String, u64)> = checkpoint
                 .files
@@ -128,7 +132,9 @@ impl WebState {
                 .find(|s| !s.is_empty())
                 .unwrap_or(&root)
                 .to_string();
-            dto::WebFileNode::from_node(&filetree::build_from_keys(&label, &objects), Path::new(""))
+            let mut node = filetree::build_from_keys(&label, &objects);
+            node.attribute_tensors(&tensors);
+            dto::WebFileNode::from_node(&node, Path::new(""))
         };
 
         let mut health: Vec<health::HealthReport> = index_specs

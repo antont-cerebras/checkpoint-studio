@@ -26,6 +26,7 @@
 
 use std::path::PathBuf;
 
+use checkpoint_studio_core::filetree::ShardTensors;
 use checkpoint_studio_core::kernel::{Session, sort_rows};
 use checkpoint_studio_core::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode,
@@ -102,6 +103,16 @@ const ZEROS: &[(u64, u64)] = &[
     (1, 3),
     (999, 1_000),
     (1_000, 1_000),
+];
+
+/// File-browser shard rows, as `(tensors, params, total_params)`: a shard of a
+/// sixteen-way split, the singular, a codebook file whose parameter share is far
+/// smaller than its size share, and an all-zero-parameter file.
+const SHARDS: &[(usize, usize, usize)] = &[
+    (1_062, 1_923_000_000, 30_000_000_000),
+    (1, 1_000, 30_000_000_000), // singular, and a share too small for one decimal
+    (14, 90_000_000, 30_000_000_000),
+    (3, 0, 30_000_000_000), // no parameters at all — an exact "0%"
 ];
 
 /// A realistic slice of tensor names, plus a couple of shapes that exercise
@@ -281,6 +292,17 @@ fn build() -> Value {
                 #[allow(clippy::cast_precision_loss)] // display only, and the inputs are small
                 let fraction = zeros as f64 / count as f64;
                 json!([zeros, count, format_percent(fraction, zeros == 0)])
+            })
+            .collect::<Vec<_>>(),
+        // A file-browser shard row's suffix. Both frontends write this row, so the
+        // wording (and the singular) is contracted, not just the percentage in it.
+        "shard": SHARDS
+            .iter()
+            .map(|&(tensors, params, total)| {
+                #[allow(clippy::cast_precision_loss)] // display only
+                let params_share = params as f64 / total as f64;
+                let shard = ShardTensors { tensors, params, params_share };
+                json!([tensors, params, params_share, shard.note()])
             })
             .collect::<Vec<_>>(),
         // The tree the two UIs flatten into rows. `tree` is the served hierarchy;

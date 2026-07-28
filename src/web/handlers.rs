@@ -775,7 +775,19 @@ mod contract {
         has_keys(
             "FileNode::file",
             file,
-            &["kind", "name", "path", "size", "file_kind"],
+            &["kind", "name", "path", "size", "file_kind", "shard"],
+        );
+        // The fixture's own shard is attributed, so `ShardTensors` is on the wire too
+        // (a sidecar's `shard` is null, which is why the key alone isn't enough).
+        let shard = root["children"]
+            .as_array()
+            .and_then(|c| c.iter().find(|n| !n["shard"].is_null()))
+            .map(|n| n["shard"].clone())
+            .expect("a shard child, attributed");
+        has_keys(
+            "ShardTensors",
+            &shard,
+            &["tensors", "params", "params_share"],
         );
     }
 

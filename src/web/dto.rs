@@ -7,7 +7,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::filetree::{FileKind, FileNode};
+use crate::filetree::{FileKind, FileNode, ShardTensors};
 use crate::sample::{HistBins, Histogram, Sample, SampleMode, Stats, ViewDtype};
 
 /// A file-tree node with every `path` relativized to the checkpoint root (never
@@ -28,6 +28,8 @@ pub(crate) enum WebFileNode {
         path: String,
         size: u64,
         file_kind: FileKind,
+        /// What the model reads out of this file, for a shard — `null` otherwise.
+        shard: Option<ShardTensors>,
     },
 }
 
@@ -55,11 +57,13 @@ impl WebFileNode {
                 path,
                 size,
                 kind,
+                shard,
             } => Self::File {
                 name: name.clone(),
                 path: rel(path, root),
                 size: *size,
                 file_kind: *kind,
+                shard: *shard,
             },
         }
     }
@@ -297,6 +301,11 @@ mod tests {
                 path: root.join("sub/a.safetensors"),
                 size: 10,
                 kind: FileKind::Checkpoint,
+                shard: Some(ShardTensors {
+                    tensors: 3,
+                    params: 40,
+                    params_share: 0.25,
+                }),
             }],
         };
         let web = WebFileNode::from_node(&node, &root);
@@ -307,6 +316,10 @@ mod tests {
         assert_eq!(json["children"][0]["path"], "sub/a.safetensors");
         assert_eq!(json["children"][0]["kind"], "file");
         assert!(!json.to_string().contains("/abs/root"));
+        // The shard annotation rides along, shaped as `types.ts` declares it.
+        assert_eq!(json["children"][0]["shard"]["tensors"], 3);
+        assert_eq!(json["children"][0]["shard"]["params"], 40);
+        assert_eq!(json["children"][0]["shard"]["params_share"], 0.25);
     }
 
     #[test]
