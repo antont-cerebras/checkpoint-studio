@@ -1374,7 +1374,8 @@ mod tests {
         // are shared and the checkpoint occupies less than its rows add up to. Sixteen
         // of the eighteen shards in a real LUT checkpoint look like this, and nothing in
         // the app said so until the browser started showing it.
-        let base = std::env::temp_dir().join("ce_filetree_hardlink_test");
+        let base =
+            std::env::temp_dir().join(format!("ce_filetree_hardlink_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("shared.safetensors"), vec![0u8; 512]).unwrap();

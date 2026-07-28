@@ -2032,7 +2032,9 @@ mod tests {
     fn header_check_flags_a_misaligned_data_blob_and_a_repeated_key() {
         // Real files: this check reads the header text back, which is the only way a
         // repeated key can be seen at all.
-        let dir = std::env::temp_dir().join("cs_check_headers_test");
+        // Per-process, so a second concurrent run of this binary can't race the same
+        // path — these tests write real files, unlike most here.
+        let dir = std::env::temp_dir().join(format!("cs_check_headers_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let one = r#"{"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#;
