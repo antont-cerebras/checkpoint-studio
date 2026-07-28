@@ -8,23 +8,30 @@ on:
 
 jobs:
   # ---------------------------------------------------------------- Rust ------
+  # Split by feature set so the two halves run in parallel instead of one after the other.
+  #
+  # The split is along HDF5 because that is where the cost is: the `hdf5` feature builds a
+  # bundled libhdf5 from C through cmake, so the all-features half needs an apt install and
+  # a multi-minute native build, while the default half needs neither. Running them as one
+  # job meant the cheap configuration waited behind the expensive one for no reason.
+  #
+  # Each job gets its own cache (Swatinem keys on the job), which also helps: two smaller,
+  # feature-specific caches restore more reliably than one that holds every profile.
   rust:
-    name: Rust (fmt, clippy, build, test)
+    name: Rust (clippy, build, test — all features)
     runs-on: ubuntu-latest
 
     steps:
-      # Check out repository code
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # Install the Rust toolchain (stable) and common components
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
 
-      # The `hdf5` feature statically builds a bundled libhdf5 from source,
-      # which needs a C toolchain, CMake and zlib development headers.
+      # Only this half needs them: the `hdf5` feature statically builds a bundled libhdf5
+      # from source.
       - name: Install HDF5 build prerequisites
         run: sudo apt-get update && sudo apt-get install -y cmake build-essential zlib1g-dev
 
@@ -44,21 +51,16 @@ jobs:
         with:
           cache-on-failure: true
 
-      # Ensure the codebase is formatted according to rustfmt
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
       # One clippy run, with all features on.
       #
       # It used to run twice — once with default features, once with all — which meant two
-      # full dependency-graph *check* builds, and the all-features one statically compiles
-      # a bundled libhdf5 from C. Neither run is a superset of the other (`--all-features`
-      # never compiles a `#[cfg(not(feature = "hdf5"))]` block), so folding them does give
-      # up clippy's opinion on the default-only code paths. That is an accepted trade: the
-      # default configuration is still compiled — and still rustc-linted, since the
-      # `[workspace.lints] rust` table denies every warning — by the default-features build
-      # step below. What is lost is clippy-specific lints on the handful of `not(hdf5)`
-      # arms, not compilation or dead-code coverage of them.
+      # full dependency-graph *check* builds. Neither run is a superset of the other
+      # (`--all-features` never compiles a `#[cfg(not(feature = "hdf5"))]` block), so
+      # folding them gives up clippy's opinion on six such arms. Accepted: the default
+      # configuration is still compiled, rustc-linted and now *tested* by the
+      # `rust-default` job below, since the `[workspace.lints] rust` table denies every
+      # warning. What is lost is clippy-specific lints on those arms, not compilation,
+      # dead-code or test coverage of them.
       #
       # `--workspace` matters: without it cargo lints only the root package, so the core
       # crate's own targets — including its ~340 tests, most of the test code in the
@@ -72,10 +74,6 @@ jobs:
       # stricter gate here, not the looser one.
       - name: Lint with clippy
         run: cargo clippy --workspace --all-targets --all-features
-
-      # Build both configurations in release mode
-      - name: Build (default features)
-        run: cargo build --workspace --release --verbose
 
       - name: Build (all features)
         run: cargo build --workspace --release --all-features --verbose
@@ -114,6 +112,43 @@ jobs:
           # the local test gate (the binary does the same at startup).
           HDF5_USE_FILE_LOCKING: "FALSE"
         run: cargo test --workspace --all-features --verbose
+
+  # The default-features half: what `cargo install checkpoint-studio` actually produces.
+  #
+  # No HDF5 means no apt install and no native build, so this finishes long before the
+  # all-features job and puts `cargo fmt` — the fastest gate and the most common failure —
+  # in front of a developer sooner.
+  #
+  # It runs the tests too, not only the build. Tests previously ran under `--all-features`
+  # only, so the pure-Rust configuration users install was never *executed* in CI; with the
+  # clippy runs folded, this is also what keeps the `not(hdf5)` arms covered. It costs
+  # nothing in wall-clock, because this job is otherwise idle while the other one builds C.
+  rust-default:
+    name: Rust (fmt, build, test — default features)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build (default features)
+        run: cargo build --workspace --release --verbose
+
+      - name: Run tests (default features)
+        run: cargo test --workspace --verbose
 
   # ---------------------------------------------------------------- Web -------
   # The Svelte UI is embedded into the binary from the COMMITTED `web/dist`, so it
