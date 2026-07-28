@@ -61,6 +61,29 @@ enum IsSymlink {
     No,
 }
 
+/// What reading one shard's header produced: its parsed contents, or why it couldn't be
+/// read. Tagged with the shard's index so results from several parallel readers merge
+/// back into a deterministic order.
+///
+/// A sum type rather than a `Result` in the vector because both arms are *results the
+/// caller keeps*: an unreadable shard is reported to the user, not propagated. See
+/// [`RemoteSession::read_shards`].
+#[derive(Debug, Clone)]
+pub enum ShardOutcome {
+    Parsed {
+        index: usize,
+        tensors: Vec<TensorInfo>,
+        metadata: Vec<MetadataInfo>,
+    },
+    Unreadable {
+        index: usize,
+        /// The file, in the display form the rest of the UI uses.
+        path: String,
+        /// The reader's message chain, flattened.
+        error: String,
+    },
+}
+
 /// One directory's entries — the file browser's view of a remote directory (see
 /// [`RemoteSession::walk_dir`]). Uses the shared [`crate::filetree::DirEntry`] sum
 /// type, so the remote listing and the local walk feed the browser the same shape.
@@ -434,20 +457,24 @@ impl RemoteSession {
     }
 
     /// Claim shards from the shared `next` counter and read+parse each header over
-    /// one SFTP channel, returning `(index, tensors, metadata)` per shard claimed.
+    /// one SFTP channel, returning each claimed shard's outcome.
     /// Several sessions sharing one `next` split the shards dynamically
     /// (work-stealing): each grabs the next unread shard with a single atomic
     /// increment, so a session that finishes early takes on more and a slow one
     /// doesn't hold up the rest. `displays[idx]` is the `source_path` stamped on the
     /// tensors of `files[idx]`.
-    #[allow(clippy::type_complexity)]
+    ///
+    /// **A shard that won't read doesn't stop the others**, and doesn't stop this worker
+    /// either: it comes back as [`ShardOutcome::Unreadable`] and the loop claims the next
+    /// one. Only failing to open the SFTP subsystem is fatal here — nothing can be read
+    /// through a channel that doesn't exist, so that stays an `Err`.
     pub fn read_shards(
         &self,
         files: &[String],
         displays: &[String],
         next: &std::sync::atomic::AtomicUsize,
         progress: Option<&crate::progress::LoadProgress>,
-    ) -> Result<Vec<(usize, Vec<TensorInfo>, Vec<MetadataInfo>)>> {
+    ) -> Result<Vec<ShardOutcome>> {
         use std::sync::atomic::Ordering;
         let sftp = self.session.sftp().context("opening the SFTP subsystem")?;
         let mut out = Vec::new();
@@ -461,9 +488,24 @@ impl RemoteSession {
             let (Some(file), Some(display)) = (files.get(idx), displays.get(idx)) else {
                 break;
             };
-            let header = read_header(&sftp, file)?;
-            let (ts, ms) = crate::stheader::parse_header(&header, display)?;
-            out.push((idx, ts, ms));
+            out.push(
+                match read_header(&sftp, file)
+                    .and_then(|header| crate::stheader::parse_header(&header, display))
+                {
+                    Ok((tensors, metadata)) => ShardOutcome::Parsed {
+                        index: idx,
+                        tensors,
+                        metadata,
+                    },
+                    Err(e) => ShardOutcome::Unreadable {
+                        index: idx,
+                        // The display form, so what's reported names the file the way the
+                        // rest of the UI does (scp form for a remote path).
+                        path: display.clone(),
+                        error: format!("{e:#}"),
+                    },
+                },
+            );
             if let Some(p) = progress {
                 p.advance();
             }

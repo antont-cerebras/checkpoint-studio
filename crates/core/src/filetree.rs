@@ -169,6 +169,10 @@ pub enum FileNode {
         /// deleting this name frees nothing, and the checkpoint's real footprint is
         /// smaller than the sum of its rows.
         links: u64,
+        /// Why this file's header wouldn't parse, when it wouldn't — see
+        /// [`FileNode::attribute_read_errors`]. `None` for every file of a healthy
+        /// checkpoint, and for one nobody tried to read.
+        read_error: Option<String>,
     },
 }
 
@@ -294,6 +298,59 @@ impl FileNode {
                         IndexMembership::Unlisted
                     }
                 });
+            }
+        }
+    }
+}
+
+impl FileNode {
+    /// Mark each file the read couldn't parse with the reason, from the model's own
+    /// account of what it skipped ([`crate::model::UnreadableShard`]).
+    ///
+    /// Matched by path, falling back to an unambiguous file name — the same reasoning as
+    /// [`Self::attribute_tensors`], and for the same reason: the tree and the read can
+    /// disagree about the path while agreeing about the file.
+    pub fn attribute_read_errors(&mut self, unreadable: &[crate::model::UnreadableShard]) {
+        if unreadable.is_empty() {
+            return;
+        }
+        let mut by_path: HashMap<&str, &str> = HashMap::new();
+        for bad in unreadable {
+            by_path.insert(bad.path.as_str(), bad.error.as_str());
+        }
+        let mut by_name: HashMap<&str, Option<&str>> = HashMap::new();
+        for (path, error) in &by_path {
+            let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            by_name
+                .entry(name)
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(error));
+        }
+        self.mark_read_errors(&by_path, &by_name);
+    }
+
+    fn mark_read_errors(
+        &mut self,
+        by_path: &HashMap<&str, &str>,
+        by_name: &HashMap<&str, Option<&str>>,
+    ) {
+        match self {
+            Self::Dir { children, .. } => {
+                for child in children {
+                    child.mark_read_errors(by_path, by_name);
+                }
+            }
+            Self::File {
+                name,
+                path,
+                read_error,
+                ..
+            } => {
+                *read_error = by_path
+                    .get(path.to_string_lossy().as_ref())
+                    .copied()
+                    .or_else(|| by_name.get(name.as_str()).copied().flatten())
+                    .map(ToString::to_string);
             }
         }
     }
@@ -591,6 +648,9 @@ fn build_dir(
                     // Filled in by `attribute_index`, which needs the index.
                     index: None,
                     links,
+                    // Filled in by `attribute_read_errors`, which needs the read's own
+                    // account of what it couldn't parse.
+                    read_error: None,
                 });
             }
         }
@@ -663,6 +723,8 @@ pub enum FileRowKind {
         index: Option<IndexMembership>,
         /// How many names this file's bytes have — see [`DirEntry::File::links`].
         links: u64,
+        /// Why this file's header wouldn't parse, when it wouldn't.
+        read_error: Option<String>,
     },
 }
 
@@ -734,6 +796,15 @@ impl FileRow {
             FileRowKind::File { .. } => 0,
         }
     }
+
+    /// Why this file's header wouldn't parse, when it wouldn't.
+    #[must_use]
+    pub fn read_error(&self) -> Option<&str> {
+        match &self.kind {
+            FileRowKind::File { read_error, .. } => read_error.as_deref(),
+            FileRowKind::Dir { .. } => None,
+        }
+    }
 }
 
 /// Flatten the tree into the visible rows (a collapsed directory hides its
@@ -782,6 +853,7 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
             size_share,
             index,
             links,
+            read_error,
         } => out.push(FileRow {
             depth,
             name: name.clone(),
@@ -793,6 +865,7 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
                 size_share: *size_share,
                 index: *index,
                 links: *links,
+                read_error: read_error.clone(),
             },
         }),
     }
@@ -1231,6 +1304,41 @@ mod tests {
         // A sidecar isn't a checkpoint file, so the question doesn't apply to it —
         // `config.json` must not read as an extra shard.
         assert_eq!(by_name["config.json"], None, "{by_name:?}");
+    }
+
+    #[test]
+    fn attribute_read_errors_marks_the_file_the_read_skipped() {
+        let mut root = two_shard_tree();
+        root.attribute_read_errors(&[crate::model::UnreadableShard {
+            path: "/ckpt/model-00002.safetensors".into(),
+            error: "Failed to parse SafeTensors header: expected value".into(),
+        }]);
+        let rows = flatten(&root);
+        let err = |name: &str| {
+            rows.iter()
+                .find(|r| r.name == name)
+                .and_then(|r| r.read_error().map(ToString::to_string))
+        };
+        assert!(err("model-00002.safetensors").is_some_and(|e| e.contains("expected value")));
+        assert_eq!(
+            err("model-00001.safetensors"),
+            None,
+            "the good shard is clean"
+        );
+        assert_eq!(err("config.json"), None);
+
+        // A remote read reports paths in a form the tree can't match, so the file name is
+        // the fallback — the same reasoning as `attribute_tensors`.
+        let mut root = two_shard_tree();
+        root.attribute_read_errors(&[crate::model::UnreadableShard {
+            path: "lab@host:/elsewhere/model-00001.safetensors".into(),
+            error: "boom".into(),
+        }]);
+        assert!(
+            flatten(&root)
+                .iter()
+                .any(|r| r.name == "model-00001.safetensors" && r.read_error() == Some("boom"))
+        );
     }
 
     #[test]

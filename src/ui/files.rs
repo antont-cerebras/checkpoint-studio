@@ -19,7 +19,7 @@ use super::popup::render_scroll_popup;
 use super::scroll::VScrollbar;
 use super::text::truncate_keep_end;
 use super::theme::tree_span;
-use super::theme::{HARDLINK_MARK, UNINDEXED_MARK};
+use super::theme::{HARDLINK_MARK, UNINDEXED_MARK, UNREADABLE_MARK};
 
 /// Footer rows below the file-browser list: a one-line status bar (the selected
 /// entry's path / size, or a copy confirmation).
@@ -400,6 +400,16 @@ fn file_row_line(
     if !note.is_empty() {
         s.push(tree_span(selected, palette::DIM, format!("  {note}")));
     }
+    // A file the read couldn't parse. Loudest fact about the row: its tensors are
+    // missing from the tree, the stats and the parameter count, and `check` says why.
+    if row.read_error().is_some() {
+        s.push(tree_span(
+            selected,
+            palette::ERROR,
+            format!("  {UNREADABLE_MARK} unreadable — see check"),
+        ));
+        return Line::from(s);
+    }
     // A checkpoint file the index doesn't declare, with the same mark and vivid red
     // the tensor tree and the detail screen use for an unindexed tensor — a loader
     // following only the index will not read this file.
@@ -445,6 +455,7 @@ mod tests {
                     size_share: 1.0,
                     index: None,
                     links: 1,
+                    read_error: None,
                 },
             },
             FileRow {
@@ -458,6 +469,7 @@ mod tests {
                     size_share: 0.1,
                     index: None,
                     links: 1,
+                    read_error: None,
                 },
             },
         ];
@@ -493,6 +505,7 @@ mod tests {
                 size_share: 1.0,
                 index,
                 links,
+                read_error: None,
             },
         };
         let rows = vec![
@@ -557,6 +570,31 @@ mod tests {
             "with the same mark the tensor tree uses:\n{out}"
         );
 
+        // A file that didn't read replaces the row's notes: what matters is that its
+        // tensors are absent, not how big it is.
+        let broken = FileRow {
+            depth: 0,
+            name: "torn.safetensors".into(),
+            path: "/ckpt/torn.safetensors".into(),
+            size: 100,
+            kind: FileRowKind::File {
+                kind: FileKind::Checkpoint,
+                shard: None,
+                size_share: 0.1,
+                index: Some(IndexMembership::Listed),
+                links: 1,
+                read_error: Some("expected value at line 1 column 1".into()),
+            },
+        };
+        let out_broken = crate::tui::headless_render(110, 8, |f| {
+            UI::render_files(f, "/ckpt", &[broken], 0, 0, None, true, &badges, None);
+        })
+        .unwrap();
+        assert!(
+            out_broken.contains("✗ unreadable"),
+            "the row says so:\n{out_broken}"
+        );
+
         // Hardlinked bytes: only the shard whose inode has two names says so, and it
         // says how many — an ordinary file adds nothing.
         let shared: Vec<&str> = out.lines().filter(|l| l.contains(HARDLINK_MARK)).collect();
@@ -592,6 +630,7 @@ mod tests {
                 size_share,
                 index: Some(IndexMembership::Listed),
                 links: 1,
+                read_error: None,
             },
         })
         .collect()

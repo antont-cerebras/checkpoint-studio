@@ -7,7 +7,7 @@ checkpoint-studio check: [FIXTURE]
   ✓ Byte-range integrity  — safetensors spans contiguous, sized correctly, no truncation
   ⊘ Layer completeness    — n/a for this checkpoint
   ✓ Shape / dtype sanity  — no duplicate names, no empty tensors, dtypes defined and uniform within each role
-  ✓ Header consistency    — data 8-byte aligned, index total right, no tensor in two shards, metadata text
+  ✓ Header consistency    — every header read, data 8-byte aligned, no tensor in two shards, index total right
   ⊘ Config consistency    — n/a for this checkpoint
   ⊘ Files & sharding      — n/a for this checkpoint
   ⊘ S3 object metadata    — n/a for this checkpoint

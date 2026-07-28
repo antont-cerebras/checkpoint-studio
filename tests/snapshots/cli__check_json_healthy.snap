@@ -38,7 +38,7 @@ expression: out
     {
       "id": "headers",
       "title": "Header consistency",
-      "note": "data 8-byte aligned, index total right, no tensor in two shards, metadata text",
+      "note": "every header read, data 8-byte aligned, no tensor in two shards, index total right",
       "status": "pass",
       "findings": []
     },

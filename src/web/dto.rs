@@ -38,6 +38,8 @@ pub(crate) enum WebFileNode {
         index: Option<IndexMembership>,
         /// Names this file's bytes have; `>1` means hardlinked (shared bytes).
         links: u64,
+        /// Why this file's header wouldn't parse — `null` for a file that read fine.
+        read_error: Option<String>,
     },
 }
 
@@ -71,6 +73,7 @@ impl WebFileNode {
                 size_share,
                 index,
                 links,
+                read_error,
             } => Self::File {
                 name: name.clone(),
                 path: rel(path, root),
@@ -80,6 +83,7 @@ impl WebFileNode {
                 size_share: *size_share,
                 index: *index,
                 links: *links,
+                read_error: read_error.clone(),
             },
         }
     }
@@ -326,6 +330,7 @@ mod tests {
                 size_share: 0.5,
                 index: Some(IndexMembership::Unlisted),
                 links: 2,
+                read_error: None,
             }],
         };
         let web = WebFileNode::from_node(&node, &root);

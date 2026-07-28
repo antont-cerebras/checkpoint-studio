@@ -77,6 +77,9 @@ export type FileNode =
        * is shared with another name rather than this file's own; `1` for an ordinary
        * file and for every remote source, which can't count names. */
       links: number;
+      /** Why this file's header wouldn't parse, when it wouldn't — the read carried on
+       * without it, so its tensors are absent from the tree and the stats. */
+      read_error: string | null;
     };
 
 /** A shard's contribution to the model (`filetree::ShardTensors`). */

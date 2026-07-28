@@ -3397,9 +3397,11 @@ impl Explorer {
         // distinguishable (see `filetree::ShardTensors`). A browse root that isn't the
         // open checkpoint simply matches nothing.
         tree.attribute_tensors(self.tensors());
-        // …and which of those files the index actually declares.
+        // …which of those files the index actually declares, and which the read couldn't
+        // parse at all — the row is where you notice a shard is missing from the tree.
         if let Some(cp) = self.checkpoint() {
             tree.attribute_index(&cp.index);
+            tree.attribute_read_errors(&cp.unreadable);
         }
         Ok(tree)
     }
@@ -3740,6 +3742,16 @@ impl Explorer {
                 "{}        hardlinked: one copy of the bytes under N names, so the size is shared",
                 crate::ui::HARDLINK_MARK
             ))),
+            Line::from(vec![
+                Span::styled(
+                    format!("{}       ", crate::ui::UNREADABLE_MARK),
+                    ratatui::style::Style::default().fg(crate::ui::error_color()),
+                ),
+                Span::raw(
+                    "this file's header wouldn't parse: its tensors are missing from the tree"
+                        .to_string(),
+                ),
+            ]),
             Line::from(vec![
                 crate::ui::unindexed_span(format!("{}       ", crate::ui::UNINDEXED_MARK)),
                 Span::raw(
