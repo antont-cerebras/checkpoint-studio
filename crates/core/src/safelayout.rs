@@ -67,6 +67,21 @@ pub struct LayoutMap {
 }
 
 impl LayoutMap {
+    /// Unaccounted bytes between segments: `(how many gaps, how many bytes)`.
+    ///
+    /// [`SegmentKind::Gap`] rows have always been produced and drawn, but nothing added
+    /// them up, so "is this file padded, and by how much?" could only be answered by
+    /// scrolling a thousand segments looking for gap rows. A total belongs in the summary
+    /// line: it is the one fact about a safetensors file's layout that is invisible from
+    /// the tensor list.
+    #[must_use]
+    pub fn gap_summary(&self) -> (usize, u64) {
+        self.segments
+            .iter()
+            .filter(|s| matches!(s.kind, SegmentKind::Gap))
+            .fold((0, 0), |(n, bytes), s| (n + 1, bytes + s.len()))
+    }
+
     /// Number of `__metadata__` entries (for the header summary line).
     #[must_use]
     pub fn metadata_entries(&self) -> usize {
@@ -313,6 +328,71 @@ fn gap(start: u64, end: u64) -> Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gaps_are_counted_and_totalled() {
+        // The whole point: "is this file padded, and by how much?" answered without
+        // scrolling a thousand segments hunting for gap rows.
+        let seg = |start, end, kind| Segment {
+            name: String::new(),
+            start,
+            end,
+            kind,
+        };
+        let map = LayoutMap {
+            name: "m.safetensors".into(),
+            total_len: 400,
+            header_len: 8,
+            tensor_count: 2,
+            metadata: vec![],
+            segments: vec![
+                seg(0, 8, SegmentKind::Header),
+                seg(
+                    8,
+                    100,
+                    SegmentKind::Tensor {
+                        dtype: "F32".into(),
+                        shape: vec![23],
+                    },
+                ),
+                seg(100, 128, SegmentKind::Gap),
+                seg(
+                    128,
+                    300,
+                    SegmentKind::Tensor {
+                        dtype: "F32".into(),
+                        shape: vec![43],
+                    },
+                ),
+                seg(300, 400, SegmentKind::Gap),
+            ],
+        };
+        assert_eq!(
+            map.gap_summary(),
+            (2, 128),
+            "28 + 100 bytes across two gaps"
+        );
+    }
+
+    #[test]
+    fn a_tightly_packed_file_reports_no_gaps() {
+        // Which is the norm, and why the summary line omits the field entirely rather
+        // than printing `0 gaps` for every well-formed file.
+        let map = LayoutMap {
+            name: "m.safetensors".into(),
+            total_len: 8,
+            header_len: 8,
+            tensor_count: 0,
+            metadata: vec![],
+            segments: vec![Segment {
+                name: "header".into(),
+                start: 0,
+                end: 8,
+                kind: SegmentKind::Header,
+            }],
+        };
+        assert_eq!(map.gap_summary(), (0, 0));
+    }
 
     #[test]
     fn from_tensors_matches_parse_from() {

@@ -76,6 +76,19 @@ impl UI {
                 dim,
             ));
         }
+        // Padding, when there is any. Omitted rather than shown as `gaps: 0` because a
+        // tightly packed file is the norm, and a zero would read as a fact worth checking.
+        let (gap_count, gap_bytes) = map.gap_summary();
+        if gap_count > 0 {
+            summary.push(Span::styled(
+                format!(
+                    " · {gap_count} gap{} {}",
+                    if gap_count == 1 { "" } else { "s" },
+                    format_size(gap_bytes as usize)
+                ),
+                Style::default().fg(palette::WARN),
+            ));
+        }
         let header_lines = vec![
             Line::from(Span::raw(format!("Layout - {}", map.name))),
             Line::from(summary),
@@ -322,6 +335,17 @@ fn band_style(seg: &crate::safelayout::Segment, total_len: u64) -> (char, Color)
 /// share of the file, at least one row each (so every tensor is labelled), summing
 /// to a scrollable total. `body_rows` seeds the resolution so a small file fills
 /// the viewport while a large one scrolls.
+/// The most rows one segment's band may occupy.
+///
+/// Strict proportionality made the view unusable on a real shard: `target` scales with the
+/// segment count, so in a 1062-segment 3.7 GiB file the 593.5 MiB embedding took ~170
+/// rows — you scrolled through one tensor, and every small segment after it was
+/// effectively unreachable. Capping trades the bar's exact size fidelity for the ability
+/// to reach everything; the size is written on the label beside it, and the *proportional*
+/// picture belongs in the (planned) minimap, which shows the whole file at once instead of
+/// one screen of it.
+const MAX_BAND_ROWS: usize = 3;
+
 fn band_rows(map: &crate::safelayout::LayoutMap, body_rows: usize) -> Vec<usize> {
     use crate::safelayout::SegmentKind;
     let total_len = map.total_len.max(1) as f64;
@@ -336,7 +360,9 @@ fn band_rows(map: &crate::safelayout::LayoutMap, body_rows: usize) -> Vec<usize>
                 // rows to show them (a label row + one per entry) even when its
                 // byte share is tiny — as it is for a multi-GB file.
                 SegmentKind::Header => proportional.max(1 + map.metadata.len()),
-                SegmentKind::Tensor { .. } | SegmentKind::Gap => proportional.max(1),
+                SegmentKind::Tensor { .. } | SegmentKind::Gap => {
+                    proportional.clamp(1, MAX_BAND_ROWS)
+                }
             }
         })
         .collect()
@@ -345,6 +371,100 @@ fn band_rows(map: &crate::safelayout::LayoutMap, body_rows: usize) -> Vec<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_single_band_can_swallow_the_screen() {
+        use crate::safelayout::{LayoutMap, Segment, SegmentKind};
+        // The regression: strict proportionality gave the 593.5 MiB embedding in a
+        // 1062-segment 3.7 GiB shard ~170 rows, so it filled several screens and every
+        // segment after it was unreachable by scrolling in practice.
+        let mut segments = vec![Segment {
+            name: "header".into(),
+            start: 0,
+            end: 128,
+            kind: SegmentKind::Header,
+        }];
+        // One dominant tensor, then a long tail of small ones.
+        segments.push(Segment {
+            name: "model.embed_tokens.weight".into(),
+            start: 128,
+            end: 600_000_128,
+            kind: SegmentKind::Tensor {
+                dtype: "BF16".into(),
+                shape: vec![151_936, 2048],
+            },
+        });
+        let mut at = 600_000_128u64;
+        for i in 0..200 {
+            segments.push(Segment {
+                name: format!("model.layers.{i}.w"),
+                start: at,
+                end: at + 4096,
+                kind: SegmentKind::Tensor {
+                    dtype: "BF16".into(),
+                    shape: vec![2048],
+                },
+            });
+            at += 4096;
+        }
+        let map = LayoutMap {
+            name: "shard.safetensors".into(),
+            total_len: at,
+            header_len: 128,
+            tensor_count: 201,
+            metadata: vec![],
+            segments,
+        };
+        let rows = band_rows(&map, 40);
+        assert_eq!(
+            rows[1], MAX_BAND_ROWS,
+            "the dominant tensor is capped, not proportional"
+        );
+        for (i, &h) in rows.iter().enumerate().skip(2) {
+            assert!(h >= 1, "every segment keeps at least one row (index {i})");
+            assert!(h <= MAX_BAND_ROWS, "and none exceeds the cap (index {i})");
+        }
+        // The tail is reachable: total height is bounded by the segment count times the
+        // cap, not by one segment's byte share.
+        assert!(
+            rows.iter().sum::<usize>() <= rows.len() * MAX_BAND_ROWS + map.metadata.len(),
+            "total height is bounded by the cap"
+        );
+    }
+
+    #[test]
+    fn the_header_band_still_gets_room_for_its_metadata() {
+        use crate::safelayout::{LayoutMap, Segment, SegmentKind};
+        // The header's byte share is negligible in a multi-GB file, so its band is sized
+        // by what it has to *list* — the cap must not take that away.
+        let map = LayoutMap {
+            name: "shard.safetensors".into(),
+            total_len: 1_000_000_000,
+            header_len: 256,
+            tensor_count: 1,
+            metadata: (0..7).map(|i| (format!("k{i}"), "v".into())).collect(),
+            segments: vec![
+                Segment {
+                    name: "header".into(),
+                    start: 0,
+                    end: 256,
+                    kind: SegmentKind::Header,
+                },
+                Segment {
+                    name: "w".into(),
+                    start: 256,
+                    end: 1_000_000_000,
+                    kind: SegmentKind::Tensor {
+                        dtype: "BF16".into(),
+                        shape: vec![500_000_000],
+                    },
+                },
+            ],
+        };
+        let rows = band_rows(&map, 40);
+        assert_eq!(rows[0], 1 + 7, "a label row plus one per metadata entry");
+        assert!(rows[0] > MAX_BAND_ROWS, "the header is exempt from the cap");
+    }
 
     #[test]
     fn layout_map_renders_summary_and_bands() {
