@@ -16,9 +16,16 @@ use super::scroll::VScrollbar;
 use super::text::truncate_keep_end;
 use super::{ChipRegions, Link, LinkRegions, UI};
 
-/// Header rows above the layout map's strip: the title, the size / tensor-count
-/// summary, and the separator rule.
-const LAYOUT_HEADER_ROWS: usize = 3;
+/// Header rows above the layout map's strip: the title, the size / tensor-count summary,
+/// the dtype breakdown, and the separator rule.
+///
+/// Fixed rather than computed. Every consumer — the scroll clamp, the visible-row count and
+/// the too-short-viewport guard — derives from this one constant, so bumping it keeps all of
+/// them consistent; making it *vary* per file is what would put those four in disagreement,
+/// and a disagreeing scroll clamp is how the terminal-resize panic happened. The breakdown
+/// row is therefore always drawn, blank when a file has no tensors, so the strip starts at
+/// the same row for every file.
+const LAYOUT_HEADER_ROWS: usize = 4;
 
 impl UI {
     /// The first terminal row of the layout map's strip (its fixed header height),
@@ -92,6 +99,7 @@ impl UI {
         let header_lines = vec![
             Line::from(Span::raw(format!("Layout - {}", map.name))),
             Line::from(summary),
+            Line::from(dtype_breakdown(map, width as usize)),
             Line::from(Span::styled(
                 "─".repeat(width as usize),
                 Style::default().fg(palette::DIM),
@@ -310,12 +318,74 @@ impl UI {
 /// layout-map strip: the header in the metadata violet, padding dim, tensors in
 /// the dtype amber with a fuller block the larger they are — the shading is the
 /// map's ASCII "graphic", so a big tensor reads as a solid column.
+/// The file's dtype composition, in the same colours the bands use — which is what makes
+/// this a *legend* rather than another statistic: the amber in the strip and the amber here
+/// are the same fact, so the strip becomes readable without a key beside it.
+///
+/// Ordered by byte share (from [`crate::safelayout::LayoutMap::dtype_tally`]), so the
+/// dominant dtype is first and stays first as the terminal narrows. What does not fit is
+/// summarised as `+N more` rather than silently dropped: a legend that hides an entry is
+/// worse than one that admits it ran out of room.
+fn dtype_breakdown(map: &crate::safelayout::LayoutMap, width: usize) -> Vec<Span<'static>> {
+    let rows = map.dtype_tally();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    for row in &rows {
+        let text = format!("{} {}", row.dtype, format_size(row.bytes));
+        // `+N more` needs room too, so reserve for it while deciding.
+        let sep = usize::from(shown > 0) * 3;
+        let remaining = rows.len() - shown;
+        let tail = if remaining > 1 { 10 } else { 0 };
+        if used + sep + text.chars().count() + tail > width {
+            break;
+        }
+        if shown > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(palette::DIM)));
+        }
+        used += sep + text.chars().count();
+        spans.push(Span::styled(
+            text,
+            Style::default().fg(dtype_color(&row.dtype)),
+        ));
+        shown += 1;
+    }
+    if shown < rows.len() {
+        spans.push(Span::styled(
+            format!(" · +{} more", rows.len() - shown),
+            Style::default().fg(palette::DIM),
+        ));
+    }
+    spans
+}
+
+/// The colour for a dtype family. The classification is shared with the web
+/// (`DtypeClass` in core); only this mapping to a terminal colour is ours.
+fn dtype_color(dtype: &str) -> Color {
+    use crate::stats::DtypeClass as C;
+    match C::of(dtype) {
+        C::FloatWide => palette::DTYPE_FLOAT_WIDE,
+        C::FloatHalf => palette::DTYPE_FLOAT_HALF,
+        C::FloatNarrow => palette::DTYPE_FLOAT_NARROW,
+        C::IntWide => palette::DTYPE_INT_WIDE,
+        C::IntNarrow => palette::DTYPE_INT_NARROW,
+        C::Bool => palette::DTYPE_BOOL,
+        C::Other => palette::DTYPE_OTHER,
+    }
+}
+
+/// A band's glyph and colour. The **glyph** encodes the segment's byte share and the
+/// **colour** its dtype family — two independent facts on one cell, which is what lets a
+/// capped band still say "big" without being tall.
 fn band_style(seg: &crate::safelayout::Segment, total_len: u64) -> (char, Color) {
     use crate::safelayout::SegmentKind;
     match &seg.kind {
         SegmentKind::Header => ('█', palette::META),
         SegmentKind::Gap => ('░', palette::DIM),
-        SegmentKind::Tensor { .. } => {
+        SegmentKind::Tensor { dtype, .. } => {
             let share = seg.len() as f64 / total_len.max(1) as f64;
             let glyph = if share >= 0.10 {
                 '█'
@@ -326,7 +396,7 @@ fn band_style(seg: &crate::safelayout::Segment, total_len: u64) -> (char, Color)
             } else {
                 '░'
             };
-            (glyph, palette::DTYPE)
+            (glyph, dtype_color(dtype))
         }
     }
 }
@@ -371,6 +441,123 @@ fn band_rows(map: &crate::safelayout::LayoutMap, body_rows: usize) -> Vec<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::safelayout::{LayoutMap, Segment, SegmentKind};
+
+    /// A segment. Shared by the tests below, which otherwise each re-spelled this closure —
+    /// jscpd counted that as duplication, and it was right to.
+    fn seg(name: &str, start: u64, end: u64, kind: SegmentKind) -> Segment {
+        Segment {
+            name: name.to_string(),
+            start,
+            end,
+            kind,
+        }
+    }
+
+    /// A tensor segment kind.
+    fn tensor(dtype: &str, shape: Vec<usize>) -> SegmentKind {
+        SegmentKind::Tensor {
+            dtype: dtype.to_string(),
+            shape,
+        }
+    }
+
+    /// A `LayoutMap` over `segments`, with the derived fields filled in consistently so a
+    /// test states only what it is about.
+    fn map_of(name: &str, header_len: u64, segments: Vec<Segment>) -> LayoutMap {
+        let total_len = segments.last().map_or(header_len, |s| s.end);
+        let tensor_count = segments
+            .iter()
+            .filter(|s| matches!(s.kind, SegmentKind::Tensor { .. }))
+            .count();
+        LayoutMap {
+            name: name.to_string(),
+            total_len,
+            header_len,
+            tensor_count,
+            metadata: vec![],
+            segments,
+        }
+    }
+
+    #[test]
+    fn the_dtype_breakdown_lists_families_biggest_first_and_admits_what_it_drops() {
+        let map = map_of(
+            "m.safetensors",
+            0,
+            vec![
+                seg("a", 0, 2048, tensor("BF16", vec![1])),
+                seg("b", 2048, 3072, tensor("U8", vec![1])),
+                seg("c", 3072, 3584, tensor("I32", vec![1])),
+                seg("d", 3584, 4096, tensor("F32", vec![1])),
+            ],
+        );
+        let text = |w: usize| -> String {
+            dtype_breakdown(&map, w)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+
+        // Wide: every family, dominant first.
+        let wide = text(120);
+        assert!(
+            wide.starts_with("BF16 2.0 KiB"),
+            "dominant dtype leads: {wide}"
+        );
+        for d in ["BF16", "U8", "I32", "F32"] {
+            assert!(wide.contains(d), "{d} missing from {wide}");
+        }
+        assert!(
+            !wide.contains("more"),
+            "nothing dropped when it fits: {wide}"
+        );
+
+        // Narrow: what fits, then an honest count of what did not.
+        let narrow = text(28);
+        assert!(
+            narrow.starts_with("BF16"),
+            "still leads with the dominant: {narrow}"
+        );
+        assert!(narrow.contains("more"), "says what it dropped: {narrow}");
+        assert!(
+            narrow.chars().count() <= 28,
+            "fits the width ({}): {narrow}",
+            narrow.chars().count()
+        );
+    }
+
+    #[test]
+    fn the_breakdown_is_blank_but_the_header_height_is_not_variable() {
+        // A file with no tensor segments has nothing to break down. The row still exists —
+        // the strip must start at the same terminal row for every file, because the scroll
+        // clamp and the visible-row count are derived from one fixed constant.
+        let map = map_of(
+            "empty.safetensors",
+            8,
+            vec![seg("header", 0, 8, SegmentKind::Header)],
+        );
+        assert!(dtype_breakdown(&map, 80).is_empty());
+        assert_eq!(LAYOUT_HEADER_ROWS, 4, "title, summary, breakdown, rule");
+    }
+
+    #[test]
+    fn the_breakdown_colours_match_the_bands() {
+        // The point of putting it here rather than in a separate key: the amber in the
+        // strip and the amber in the breakdown have to be the same fact.
+        let map = map_of(
+            "m.safetensors",
+            0,
+            vec![seg("w", 0, 1024, tensor("BF16", vec![512]))],
+        );
+        let spans = dtype_breakdown(&map, 80);
+        let (_, band) = band_style(&map.segments[0], map.total_len);
+        assert_eq!(
+            spans[0].style.fg,
+            Some(band),
+            "the legend entry is painted like the band it describes"
+        );
+    }
 
     #[test]
     fn no_single_band_can_swallow_the_screen() {

@@ -17,6 +17,18 @@
   --ok: #98c379;
   --row-h: 22px;
 
+  /* Layout bands by dtype family (see lib/layout.ts; classification is shared with
+     crates/core). One colour per family, not per dtype name — a dozen-entry palette stops
+     being readable. Half-precision keeps the app's own --dtype amber, since that is what
+     most published weights are, so the common case reads in the familiar colour. */
+  --dt-float-wide: #5fa8ff;
+  --dt-float-half: #e2b877;
+  --dt-float-narrow: #e58ee5;
+  --dt-int-wide: #8bd18b;
+  --dt-int-narrow: #c8a765;
+  --dt-bool: #a9b0bd;
+  --dt-other: #6f7784;
+
   color-scheme: dark;
   font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
   font-size: 13px;
@@ -30,6 +42,15 @@
   --bg: #ffffff;
   --bg-panel: #f4f5f7;
   --bg-elev: #eceef2;
+
+  /* Same hues, darkened to hold contrast on white. */
+  --dt-float-wide: #1668c4;
+  --dt-float-half: #8a5a00;
+  --dt-float-narrow: #a5309f;
+  --dt-int-wide: #2c7a2c;
+  --dt-int-narrow: #7a5c12;
+  --dt-bool: #5c6470;
+  --dt-other: #8a9099;
   --bg-hover: #e6e9ee;
   --bg-sel: #cfe3ff;
   --border: #d3d7de;
@@ -52,6 +73,16 @@
   --bg-panel: #07230f;
   --bg-elev: #0a2a13;
   --bg-hover: #0e3a1c;
+
+  /* Fallout is a single-hue phosphor theme, so the families separate by *brightness*
+     rather than by hue — otherwise they would stop reading as one terminal. */
+  --dt-float-wide: #d9ffcf;
+  --dt-float-half: #c2ff8a;
+  --dt-float-narrow: #9dff5e;
+  --dt-int-wide: #6fdd3a;
+  --dt-int-narrow: #55b52c;
+  --dt-bool: #3f8a21;
+  --dt-other: #2c6417;
   --bg-sel: #165a2c;
   --border: #1c5a2b;
   --fg: #35e46a;

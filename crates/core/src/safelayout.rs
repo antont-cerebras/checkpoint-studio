@@ -67,6 +67,21 @@ pub struct LayoutMap {
 }
 
 impl LayoutMap {
+    /// This file's dtype breakdown, biggest byte share first — the per-file answer to
+    /// "what is this shard made of", for the layout view's legend.
+    ///
+    /// Reads the dtypes off the segments rather than taking a tensor list, so it works
+    /// from a `LayoutMap` alone (which is what both frontends already have), and delegates
+    /// the grouping to [`crate::stats::DtypeStat::tally_pairs`] so the ordering rule — and
+    /// its tie-break — lives in one place.
+    #[must_use]
+    pub fn dtype_tally(&self) -> Vec<crate::stats::DtypeStat> {
+        crate::stats::DtypeStat::tally_pairs(self.segments.iter().filter_map(|s| match &s.kind {
+            SegmentKind::Tensor { dtype, .. } => Some((dtype.as_str(), s.len() as usize)),
+            SegmentKind::Header | SegmentKind::Gap => None,
+        }))
+    }
+
     /// Unaccounted bytes between segments: `(how many gaps, how many bytes)`.
     ///
     /// [`SegmentKind::Gap`] rows have always been produced and drawn, but nothing added
@@ -328,6 +343,73 @@ fn gap(start: u64, end: u64) -> Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dtype_tally_describes_the_file_and_excludes_non_tensor_bytes() {
+        // The legend's question: what is this shard made of? The header's 128 bytes and the
+        // gap's padding are not *tensor* data and must not appear as a dtype.
+        let seg = |name: &str, start, end, kind| Segment {
+            name: name.to_string(),
+            start,
+            end,
+            kind,
+        };
+        let tensor = |dtype: &str| SegmentKind::Tensor {
+            dtype: dtype.to_string(),
+            shape: vec![1],
+        };
+        let map = LayoutMap {
+            name: "shard.safetensors".into(),
+            total_len: 1128,
+            header_len: 128,
+            tensor_count: 3,
+            metadata: vec![],
+            segments: vec![
+                seg("header", 0, 128, SegmentKind::Header),
+                seg("a", 128, 628, tensor("BF16")),
+                seg("b", 628, 728, tensor("U8")),
+                seg("c", 728, 1028, tensor("BF16")),
+                seg("gap", 1028, 1128, SegmentKind::Gap),
+            ],
+        };
+        let got = map.dtype_tally();
+        assert_eq!(got.len(), 2, "two dtypes, not four segment kinds");
+        assert_eq!(
+            (got[0].dtype.as_str(), got[0].count, got[0].bytes),
+            ("BF16", 2, 800),
+            "500 + 300 bytes, biggest share first"
+        );
+        assert_eq!(
+            (got[1].dtype.as_str(), got[1].count, got[1].bytes),
+            ("U8", 1, 100)
+        );
+        // The bytes it accounts for plus the header and the gap are the whole file.
+        let tensor_bytes: usize = got.iter().map(|d| d.bytes).sum();
+        let (_, gap_bytes) = map.gap_summary();
+        assert_eq!(
+            tensor_bytes as u64 + map.header_len + gap_bytes,
+            map.total_len,
+            "the tally plus header plus padding accounts for every byte"
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_tensors_has_no_dtype_rows() {
+        let map = LayoutMap {
+            name: "empty.safetensors".into(),
+            total_len: 8,
+            header_len: 8,
+            tensor_count: 0,
+            metadata: vec![],
+            segments: vec![Segment {
+                name: "header".into(),
+                start: 0,
+                end: 8,
+                kind: SegmentKind::Header,
+            }],
+        };
+        assert!(map.dtype_tally().is_empty());
+    }
 
     #[test]
     fn gaps_are_counted_and_totalled() {

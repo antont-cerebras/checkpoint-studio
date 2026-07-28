@@ -40,6 +40,21 @@ pub(super) const UNINDEXED: Color = Color::Indexed(196);
 pub(super) const ACCENT: Color = Color::Indexed(81);
 /// A tensor's data type (warm amber, so the type pops).
 pub(super) const DTYPE: Color = Color::Indexed(215);
+/// Layout bands coloured by dtype *family* (`checkpoint_studio_core::stats::DtypeClass`).
+///
+/// One colour per family rather than per dtype name: a dozen-entry palette stops being
+/// readable, and "is this shard half-precision weights or 8-bit quantised" is a question
+/// about the family. Chosen to stay distinguishable from each other *and* from the header
+/// (`META`, violet) and gap (`DIM`, grey) bands they sit between, and to keep `DTYPE`'s
+/// amber for half-precision since that is what most published weights are — so the common
+/// case still reads in the colour the rest of the UI already uses for dtypes.
+pub(super) const DTYPE_FLOAT_WIDE: Color = Color::Indexed(75); // steel blue — F32/F64
+pub(super) const DTYPE_FLOAT_HALF: Color = DTYPE; //              amber      — F16/BF16
+pub(super) const DTYPE_FLOAT_NARROW: Color = Color::Indexed(213); // pink     — F8_*
+pub(super) const DTYPE_INT_WIDE: Color = Color::Indexed(114); //   green      — I32/I64
+pub(super) const DTYPE_INT_NARROW: Color = Color::Indexed(179); // ochre      — I8/U8/I16
+pub(super) const DTYPE_BOOL: Color = Color::Indexed(146); //       pale slate — BOOL
+pub(super) const DTYPE_OTHER: Color = Color::Indexed(245); //      neutral grey
 /// Metadata entries (the `†` marker and the entry name) — a muted slate
 /// violet, distinct from the cyan groups and amber dtypes but quiet enough
 /// that metadata reads as a side note rather than competing with tensors.

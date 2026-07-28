@@ -364,6 +364,71 @@ pub struct DtypeStat {
     pub bytes: usize,
 }
 
+/// A dtype's family, for colouring — a *semantic* class rather than a colour, because
+/// `crates/core` has no frontend: the terminal needs a Ratatui `Color` and the browser a
+/// CSS variable, and neither belongs here. Both map from this, so the two UIs group dtypes
+/// the same way even though they paint them differently.
+///
+/// Grouped by what a reader of a checkpoint actually asks — *how wide is this, and is it
+/// float or integer* — rather than one colour per dtype name. A palette with a dozen
+/// entries stops being readable, and "is this shard BF16 weights or 8-bit quantised" is
+/// answered by the family, not by telling `I8` from `U8` at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtypeClass {
+    /// 32- and 64-bit floats: full-precision weights, or an unquantised checkpoint.
+    FloatWide,
+    /// 16-bit floats (`F16`, `BF16`) — what most published weights are.
+    FloatHalf,
+    /// 8-bit floats (`F8_E4M3`, `F8_E5M2`).
+    FloatNarrow,
+    /// 32/64-bit integers: usually indices and offsets rather than weights.
+    IntWide,
+    /// 8- and 16-bit integers — quantised weights, codebook indices, scales.
+    IntNarrow,
+    /// Booleans and masks.
+    Bool,
+    /// Anything the table doesn't name, including sub-byte types spelled by a schema
+    /// rather than by the safetensors dtype. Deliberately last: an unknown dtype is
+    /// better shown in a neutral colour than guessed into the wrong family.
+    Other,
+}
+
+impl DtypeClass {
+    /// Classify a safetensors dtype name. Case-insensitive, since HDF5 and numpy sources
+    /// spell these differently from safetensors.
+    #[must_use]
+    pub fn of(dtype: &str) -> Self {
+        let d = dtype.trim().to_ascii_uppercase();
+        // Check the `F8_*` prefix before the plain names: `F8_E4M3` must not fall through
+        // to the wide-float arm on its leading `F`.
+        if d.starts_with("F8") {
+            return Self::FloatNarrow;
+        }
+        match d.as_str() {
+            "F64" | "F32" | "TF32" => Self::FloatWide,
+            "F16" | "BF16" => Self::FloatHalf,
+            "I64" | "U64" | "I32" | "U32" => Self::IntWide,
+            "I16" | "U16" | "I8" | "U8" => Self::IntNarrow,
+            "BOOL" => Self::Bool,
+            _ => Self::Other,
+        }
+    }
+
+    /// A short stable key the frontends use to look up their own colour.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::FloatWide => "float-wide",
+            Self::FloatHalf => "float-half",
+            Self::FloatNarrow => "float-narrow",
+            Self::IntWide => "int-wide",
+            Self::IntNarrow => "int-narrow",
+            Self::Bool => "bool",
+            Self::Other => "other",
+        }
+    }
+}
+
 impl DtypeStat {
     /// Group `tensors` by dtype, biggest byte share first (ties broken by name).
     ///
@@ -379,11 +444,22 @@ impl DtypeStat {
     /// keeps the output stable when two dtypes weigh the same.
     #[must_use]
     pub fn tally(tensors: &[TensorInfo]) -> Vec<Self> {
+        Self::tally_pairs(tensors.iter().map(|t| (t.dtype.as_str(), t.size_bytes)))
+    }
+
+    /// The same grouping over bare `(dtype, bytes)` pairs.
+    ///
+    /// A safetensors layout knows its dtypes from `SegmentKind::Tensor`, not from
+    /// `TensorInfo`, so without this the per-file legend would need a second copy of the
+    /// fold — and the ordering contract below is exactly the thing that must not exist
+    /// twice.
+    #[must_use]
+    pub fn tally_pairs<'a>(items: impl IntoIterator<Item = (&'a str, usize)>) -> Vec<Self> {
         let mut by_dtype: HashMap<&str, (usize, usize)> = HashMap::new();
-        for t in tensors {
-            let e = by_dtype.entry(t.dtype.as_str()).or_insert((0, 0));
+        for (dtype, bytes) in items {
+            let e = by_dtype.entry(dtype).or_insert((0, 0));
             e.0 += 1;
-            e.1 += t.size_bytes;
+            e.1 += bytes;
         }
         let mut out: Vec<Self> = by_dtype
             .into_iter()
@@ -1260,6 +1336,75 @@ fn expert_stats(
 
 #[cfg(test)]
 mod tests {
+
+    mod dtype_classes {
+        use super::super::DtypeClass;
+
+        #[test]
+        fn every_dtype_the_codebase_knows_lands_in_a_family() {
+            // The full set of names that appear in this codebase's readers. A dtype falling
+            // to `Other` here would be painted neutral and silently look unclassified.
+            let cases: &[(&str, DtypeClass)] = &[
+                ("F64", DtypeClass::FloatWide),
+                ("F32", DtypeClass::FloatWide),
+                ("F16", DtypeClass::FloatHalf),
+                ("BF16", DtypeClass::FloatHalf),
+                ("F8_E4M3", DtypeClass::FloatNarrow),
+                ("F8_E5M2", DtypeClass::FloatNarrow),
+                ("I64", DtypeClass::IntWide),
+                ("U64", DtypeClass::IntWide),
+                ("I32", DtypeClass::IntWide),
+                ("U32", DtypeClass::IntWide),
+                ("I16", DtypeClass::IntNarrow),
+                ("U16", DtypeClass::IntNarrow),
+                ("I8", DtypeClass::IntNarrow),
+                ("U8", DtypeClass::IntNarrow),
+                ("BOOL", DtypeClass::Bool),
+            ];
+            for &(dtype, want) in cases {
+                assert_eq!(DtypeClass::of(dtype), want, "{dtype}");
+            }
+        }
+
+        /// The ordering trap: `F8_E4M3` starts with `F`, and a naive prefix match on floats
+        /// would file it with `F32`. It is the *narrowest* float there is.
+        #[test]
+        fn an_eight_bit_float_is_not_a_wide_float() {
+            assert_eq!(DtypeClass::of("F8_E4M3"), DtypeClass::FloatNarrow);
+            assert_eq!(DtypeClass::of("F8_E5M2"), DtypeClass::FloatNarrow);
+            assert_ne!(DtypeClass::of("F8_E4M3"), DtypeClass::of("F32"));
+        }
+
+        #[test]
+        fn spelling_does_not_matter() {
+            // HDF5 and numpy sources spell dtypes differently from safetensors.
+            for name in ["bf16", "BF16", " bf16 ", "Bf16"] {
+                assert_eq!(DtypeClass::of(name), DtypeClass::FloatHalf, "{name:?}");
+            }
+        }
+
+        #[test]
+        fn an_unknown_dtype_is_neutral_rather_than_guessed() {
+            for name in ["", "u4", "MXFP4", "complex64", "???"] {
+                assert_eq!(DtypeClass::of(name), DtypeClass::Other, "{name:?}");
+            }
+        }
+
+        #[test]
+        fn the_keys_are_distinct_so_a_frontend_lookup_cannot_collide() {
+            let all = [
+                DtypeClass::FloatWide,
+                DtypeClass::FloatHalf,
+                DtypeClass::FloatNarrow,
+                DtypeClass::IntWide,
+                DtypeClass::IntNarrow,
+                DtypeClass::Bool,
+                DtypeClass::Other,
+            ];
+            let keys: std::collections::HashSet<&str> = all.iter().map(|c| c.key()).collect();
+            assert_eq!(keys.len(), all.len(), "keys must be unique");
+        }
+    }
 
     /// The tally's *ordering* is its contract — every consumer reads the first row as the
     /// dominant dtype — so these pin it rather than just the arithmetic.
