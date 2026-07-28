@@ -15,6 +15,10 @@
   --danger: #e06c75;
   --warn: #e5c07b;
   --ok: #98c379;
+  /* A file on disk that the index doesn't declare. Mirrors the terminal's
+     palette::UNINDEXED (a vivid red, ANSI 196) — deliberately louder than --danger,
+     because it has to stand out against dimmed text one column from the edge. */
+  --unindexed: #ff2d2d;
   --row-h: 22px;
 
   /* Layout bands by dtype family (see lib/layout.ts; classification is shared with
@@ -64,6 +68,7 @@
   --danger: #c0392b;
   --warn: #8a6d00;
   --ok: #3f8c2f;
+  --unindexed: #d40000;
   color-scheme: light;
 }
 
@@ -95,6 +100,9 @@
   --danger: #ff7a5c;
   --warn: #ffe066;
   --ok: #35e46a;
+  /* The one place the phosphor theme breaks its own hue: an extra file on disk is a
+     thing to notice, and a green-on-green mark is exactly what nobody notices. */
+  --unindexed: #ff5b3d;
   color-scheme: dark;
 }
 /* Subtle phosphor glow. */
