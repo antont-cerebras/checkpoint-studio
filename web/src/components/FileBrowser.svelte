@@ -4,6 +4,7 @@
   import type { FileNode } from '../lib/types';
   import { humanSize } from '../lib/format';
   import { openFile } from '../stores/view';
+  import { flattenFiles, toggleDir } from '../lib/filerows';
 
   let root: FileNode | null = null;
   let err = '';
@@ -12,37 +13,18 @@
   onMount(async () => {
     try {
       root = await api.files();
-      if (root) expanded.add(root.path);
-      expanded = expanded;
+      if (root) expanded = toggleDir(expanded, root.path);
     } catch (e) {
       err = e instanceof Error ? e.message : String(e);
     }
   });
 
-  interface Row {
-    node: FileNode;
-    depth: number;
-  }
-
-  function flatten(node: FileNode, depth: number, out: Row[]) {
-    out.push({ node, depth });
-    if (node.kind === 'dir' && expanded.has(node.path)) {
-      for (const c of node.children) flatten(c, depth + 1, out);
-    }
-  }
-
-  $: rows = (() => {
-    if (!root) return [] as Row[];
-    const out: Row[] = [];
-    flatten(root, 0, out);
-    return out;
-  })();
+  // Both arguments are named here so the compiler sees the fold set as a dependency.
+  $: rows = flattenFiles(root, expanded);
 
   function activate(node: FileNode) {
     if (node.kind === 'dir') {
-      if (expanded.has(node.path)) expanded.delete(node.path);
-      else expanded.add(node.path);
-      expanded = expanded;
+      expanded = toggleDir(expanded, node.path);
     } else {
       openFile(node.path, node.name, node.file_kind);
     }

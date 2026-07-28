@@ -232,7 +232,7 @@ pub(crate) fn tensor(s: &WebState, q: &Query) -> Reply {
 /// Read a text/JSON file's content (capped) for the file browser's preview. Only
 /// serves paths that are in the checkpoint's own file list — no path traversal.
 pub(crate) fn file(s: &WebState, q: &Query) -> Reply {
-    const CAP: usize = 1 << 20; // 1 MiB — enough for config/index/readme/merges
+    const CAP: usize = crate::filetree::PREVIEW_CAP as usize;
     let Some(rel) = q.get("path") else {
         return err(400, "missing ?path=");
     };
@@ -275,6 +275,7 @@ pub(crate) fn file(s: &WebState, q: &Query) -> Reply {
                 "name": entry.name,
                 "size": entry.apparent(),
                 "truncated": truncated,
+                "cap": CAP,
                 "binary": binary,
                 "text": text,
             }))

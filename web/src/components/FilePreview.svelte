@@ -1,12 +1,17 @@
 <script lang="ts">
   import { api } from '../lib/api';
   import { humanSize } from '../lib/format';
+  import { highlightJson, type Token } from '../lib/jsonhl';
   import Spinner from './Spinner.svelte';
 
   export let path: string;
   export let name: string;
 
-  let data: { text: string; truncated: boolean; size: number } | null = null;
+  let data: { text: string; truncated: boolean; size: number; cap?: number } | null = null;
+  /* Highlighted runs, or null for a file that isn't JSON (or a truncated one, which no
+     longer parses) — those keep the plain <pre>, exactly as in the TUI. */
+  let tokens: Token[] | null;
+  $: tokens = data && !data.truncated ? highlightJson(data.text) : null;
   let err = '';
   let loading = true;
 
@@ -29,13 +34,19 @@
   <div class="head">
     <span class="name">{name}</span>
     {#if data}
-      <span class="dim">· {humanSize(data.size)}{data.truncated ? ' · truncated to 1 MiB' : ''}</span>
+      <span class="dim"
+        >· {humanSize(data.size)}{data.truncated && data.cap
+          ? ` · truncated to ${humanSize(data.cap)}`
+          : ''}</span
+      >
     {/if}
   </div>
   {#if loading}
     <Spinner label="reading file…" />
   {:else if err}
     <p class="err">{err}</p>
+  {:else if tokens}
+    <pre>{#each tokens as [text, cls], i (i)}{#if cls}<span class={cls}>{text}</span>{:else}{text}{/if}{/each}</pre>
   {:else if data}
     <pre>{data.text}</pre>
   {/if}
@@ -68,6 +79,24 @@
     tab-size: 2;
     font-size: 12px;
     line-height: 1.5;
+  }
+  /* The same roles the TUI's json_styler paints: keys in the structural accent, strings
+     green, numbers amber, colons dimmed behind their values. */
+  pre :global(.k) {
+    color: var(--accent);
+    font-weight: 600;
+  }
+  pre :global(.s) {
+    color: var(--ok);
+  }
+  pre :global(.n) {
+    color: var(--dtype);
+  }
+  pre :global(.b) {
+    color: var(--warn);
+  }
+  pre :global(.p) {
+    color: var(--fg-dim);
   }
   .err {
     padding: 14px;

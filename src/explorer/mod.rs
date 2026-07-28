@@ -3606,7 +3606,7 @@ impl Explorer {
         name: &str,
         kind: crate::filetree::FileKind,
     ) {
-        const CAP: u64 = 4 << 20; // 4 MiB — plenty for config/tokenizer sidecars
+        const CAP: u64 = crate::filetree::PREVIEW_CAP;
         // Read the sidecar locally, or over SFTP for a remote checkpoint (small
         // file, read-only). s3 browse never previews (handled before this call).
         let read = match self.remote_browse() {

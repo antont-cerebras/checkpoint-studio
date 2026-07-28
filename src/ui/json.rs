@@ -273,4 +273,34 @@ mod tests {
             text(&highlight_json_lines_inline(raw).unwrap())
         );
     }
+
+    /// A real `model.safetensors.index.json` is ~1.7 MB and tens of thousands of
+    /// lines. Highlighting has to survive that, because the alternative is a
+    /// silent fall-through to unhighlighted text — which is what a user sees, with
+    /// no error, when the ANSI re-parse gives up on a large input.
+    #[test]
+    fn a_shard_index_sized_document_still_highlights() {
+        let mut map = serde_json::Map::new();
+        for i in 0..40_000 {
+            map.insert(
+                format!("model.layers.{i}.mlp.experts.down_proj.weight"),
+                serde_json::Value::String(format!("model-{:05}-of-40000.safetensors", i / 100)),
+            );
+        }
+        let raw = serde_json::to_string(&serde_json::json!({
+            "metadata": {"total_size": 30_000_000_000u64},
+            "weight_map": map,
+        }))
+        .unwrap();
+        assert!(
+            raw.len() > 1 << 20,
+            "the fixture is index-sized: {}",
+            raw.len()
+        );
+        let lines = highlight_json_lines(&raw);
+        assert!(
+            lines.is_some_and(|l| l.len() > 40_000),
+            "a 1.7 MB index must highlight, not fall back to plain text"
+        );
+    }
 }
