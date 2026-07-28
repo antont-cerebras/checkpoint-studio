@@ -469,8 +469,10 @@ impl Mode for LayoutMode {
             }
             KeyCode::Home => self.selected = 0,
             KeyCode::End => self.selected = n.saturating_sub(1),
-            // Enter on the header previews the raw JSON header; on a tensor it jumps
-            // to that tensor's place in the tree.
+            // Enter on the header previews the raw JSON header; on a tensor it opens
+            // that tensor's detail screen — the same thing Enter does on a tree row,
+            // and what clicking the band does in the browser. Its *underlined name* is
+            // still a link to the tree, for finding it among its siblings.
             // A foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS.
             #[allow(clippy::wildcard_enum_match_arm)]
             KeyCode::Enter => match self.map().segments.get(self.selected).map(|s| &s.kind) {
@@ -484,7 +486,7 @@ impl Mode for LayoutMode {
                     );
                 }
                 Some(crate::safelayout::SegmentKind::Tensor { .. }) => {
-                    if let Some(nav) = ex.reveal_layout_selection(self.map(), self.selected)? {
+                    if let Some(nav) = ex.open_layout_selection(self.map(), self.selected) {
                         return Ok(Outcome::Leave(nav));
                     }
                 }
@@ -3112,6 +3114,57 @@ mod tests {
                     .unwrap()
             ),
             "back"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_layout_band_opens_that_tensor_s_detail_screen() {
+        // The layout map answers "what occupies these bytes"; ↵ answers the question
+        // that follows, which is about the tensor — the same key, the same destination
+        // as ↵ on a tree row and a click on a band in the browser.
+        let (mut ex, mut term) = loaded();
+        let path = ex.files[0].to_string_lossy().to_string();
+        let total = std::fs::metadata(&path).expect("the fixture exists").len();
+        let map = crate::safelayout::from_tensors(&path, total, 0, ex.tensors(), ex.metadata());
+        // The first tensor band (segment 0 is the header, which previews JSON instead).
+        let band = map
+            .segments
+            .iter()
+            .position(|s| matches!(s.kind, crate::safelayout::SegmentKind::Tensor { .. }))
+            .expect("the fixture's map has tensor bands");
+        let name = map.segments[band].name.clone();
+
+        let mut mode = LayoutMode::new(path.clone(), Ok(map.clone()), band, 0);
+        mode.on_enter(&mut ex, &mut term).expect("the map opens");
+        assert_eq!(
+            outcome(
+                &mode
+                    .handle_key(&mut ex, &mut term, code(KeyCode::Enter))
+                    .unwrap()
+            ),
+            format!("detail:{name}"),
+        );
+
+        // A band from some *other* checkpoint's file can't open: nothing navigates, and
+        // the reason is flashed rather than silently swallowed.
+        let mut foreign = map;
+        foreign.segments[band].name = "not.in.this.checkpoint".into();
+        let mut mode = LayoutMode::new(path, Ok(foreign), band, 0);
+        mode.on_enter(&mut ex, &mut term).expect("the map opens");
+        assert_eq!(
+            outcome(
+                &mode
+                    .handle_key(&mut ex, &mut term, code(KeyCode::Enter))
+                    .unwrap()
+            ),
+            "stay",
+        );
+        assert!(
+            ex.copied_flash
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("not in the open checkpoint")),
+            "the reason is on screen: {:?}",
+            ex.copied_flash
         );
     }
 
