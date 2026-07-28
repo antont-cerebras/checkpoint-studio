@@ -59,6 +59,10 @@ export type FileNode =
       file_kind: string;
       /** What the model reads out of this file; null for anything that isn't a shard. */
       shard: ShardTensors | null;
+      /** This file's size as a fraction of the largest file in the tree, for the
+       * proportional bar. Served rather than computed here so the bar means the same
+       * thing in the terminal, and doesn't rescale as the tree is folded. */
+      size_share: number;
     };
 
 /** A shard's contribution to the model (`filetree::ShardTensors`). */

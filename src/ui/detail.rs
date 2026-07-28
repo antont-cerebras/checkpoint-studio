@@ -276,6 +276,28 @@ pub(super) fn render_line_gauge(
         .render(area, frame.buffer_mut());
 }
 
+/// A ratio that makes [`render_line_gauge`] fill the **nearest** whole number of its
+/// `cells`, rather than truncating down to one.
+///
+/// `LineGauge` takes its filled length as `floor(cells × ratio)`. For progress that is
+/// right — a bar should never claim a step it hasn't finished — but for a *quantity* it
+/// misreads: a shard 0.03% smaller than the largest in a checkpoint drew a whole cell
+/// less than it, a visible step for a difference that is noise. At this resolution one
+/// cell is 1/`cells` of the whole and the exact number sits in the column beside the
+/// bar, so nearest is the honest reading.
+///
+/// The result lands a quarter-cell above the target, so the widget's `floor` can't be
+/// knocked back under it by the rounding of this division itself. A full bar overshoots
+/// 1.0 and the widget clamps it, which is what a full bar wants.
+#[allow(clippy::cast_precision_loss)] // cell counts, far below f64's exact range
+pub(super) fn rounded_to_cells(ratio: f64, cells: usize) -> f64 {
+    if cells == 0 {
+        return ratio;
+    }
+    let filled = (ratio.clamp(0.0, 1.0) * cells as f64).round();
+    (filled + 0.25) / cells as f64
+}
+
 /// When statistics are computing *with a known fraction*, the `(ratio, label)` for
 /// a [`render_line_gauge`] row; otherwise `None` (the caller shows the normal stats
 /// text — the spinner-only "computing…", the finished stats, or the "press s" hint).

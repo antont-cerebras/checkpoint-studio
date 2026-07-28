@@ -30,6 +30,8 @@ pub(crate) enum WebFileNode {
         file_kind: FileKind,
         /// What the model reads out of this file, for a shard — `null` otherwise.
         shard: Option<ShardTensors>,
+        /// Fraction of the largest file's size, for the proportional bar.
+        size_share: f64,
     },
 }
 
@@ -58,12 +60,14 @@ impl WebFileNode {
                 size,
                 kind,
                 shard,
+                size_share,
             } => Self::File {
                 name: name.clone(),
                 path: rel(path, root),
                 size: *size,
                 file_kind: *kind,
                 shard: *shard,
+                size_share: *size_share,
             },
         }
     }
@@ -306,6 +310,7 @@ mod tests {
                     params: 40,
                     params_share: 0.25,
                 }),
+                size_share: 0.5,
             }],
         };
         let web = WebFileNode::from_node(&node, &root);

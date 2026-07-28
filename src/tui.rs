@@ -132,9 +132,20 @@ pub(crate) fn headless_render(
     height: u16,
     f: impl FnOnce(&mut Frame),
 ) -> Result<String> {
+    Ok(buffer_to_string(&headless_buffer(width, height, f)?))
+}
+
+/// The same headless render, kept as a [`Buffer`] — for the few assertions that are
+/// about **style** rather than text (a proportional bar distinguishes its filled part
+/// by colour alone, so flattening to a string would throw away the thing under test).
+pub(crate) fn headless_buffer(
+    width: u16,
+    height: u16,
+    f: impl FnOnce(&mut Frame),
+) -> Result<Buffer> {
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal.draw(f)?;
-    Ok(buffer_to_string(terminal.backend().buffer()))
+    Ok(terminal.backend().buffer().clone())
 }
 
 /// Flatten a Ratatui [`Buffer`] to plain text: one line per row (cell symbols

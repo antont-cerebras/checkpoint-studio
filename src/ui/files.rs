@@ -11,6 +11,7 @@ use crate::utils::format_size;
 
 use super::UI;
 use super::badge::Badge;
+use super::detail::{render_line_gauge, rounded_to_cells};
 use super::hints::{chip_regions, close_button, files_hint_lines};
 use super::palette;
 use super::popup::render_scroll_popup;
@@ -125,9 +126,12 @@ impl UI {
             frame.buffer_mut(),
         );
 
+        // One geometry for every row, so the sizes read as a column instead of
+        // trailing each name at whatever column it happens to end.
+        let layout = RowLayout::of(rows, body_width as usize, interactive);
         let mut body: Vec<Line> = Vec::with_capacity(body_rows);
         for (idx, row) in rows.iter().enumerate().skip(scroll).take(body_rows) {
-            body.push(file_row_line(row, idx == selected));
+            body.push(file_row_line(row, idx == selected, &layout));
         }
         Paragraph::new(body).render(
             Rect {
@@ -136,6 +140,27 @@ impl UI {
             },
             frame.buffer_mut(),
         );
+
+        // The proportional size bars, overlaid on the blank column each row reserved
+        // for them. Drawn as widgets rather than as glyphs in the line because the
+        // gauge is the app's one bar primitive — `render_line_gauge`, the same
+        // `LineGauge` the repack and statistics bars use.
+        for (idx, row) in rows.iter().enumerate().skip(scroll).take(body_rows) {
+            if let (Some(x), Some(share)) = (layout.gauge_x(), row.size_share()) {
+                render_line_gauge(
+                    frame,
+                    Rect {
+                        x: x as u16,
+                        y: header_rows as u16 + (idx - scroll) as u16,
+                        width: layout.bar as u16 + 1,
+                        height: 1,
+                    },
+                    Line::default(),
+                    rounded_to_cells(share, layout.bar),
+                    None,
+                );
+            }
+        }
 
         // (The scroll bar itself is drawn by the engine — see `render_vscrollbar`.)
 
@@ -212,36 +237,92 @@ impl UI {
     }
 }
 
-/// One file-browser row as a styled [`Line`]: a directory shows a fold arrow, its
-/// name in the accent with a trailing `/`, and a dim size + file count; a file
-/// shows a kind marker (a distinct glyph for openable checkpoints), its name
-/// coloured by kind, and its dim size. `selected` draws the whole row in the
-/// selection colours (via [`tree_span`], shared with the tensor tree).
-fn file_row_line(row: &crate::filetree::FileRow, selected: bool) -> Line<'static> {
-    use crate::filetree::{FileKind, FileRowKind};
-    let indent = "  ".repeat(row.depth);
-    let mut s: Vec<Span> = vec![tree_span(selected, Color::Reset, indent)];
-    match row.kind {
-        FileRowKind::Dir { expanded, files } => {
-            let arrow = if expanded { "▾" } else { "▸" };
-            s.push(tree_span(selected, palette::ACCENT, arrow));
-            s.push(tree_span(selected, Color::Reset, " "));
-            s.push(tree_span(
-                selected,
-                palette::ACCENT,
-                format!("{}/", row.name),
-            ));
-            s.push(tree_span(
-                selected,
-                palette::DIM,
-                format!(
-                    "  {} · {files} {}",
-                    format_size(row.size as usize),
-                    if files == 1 { "file" } else { "files" }
-                ),
-            ));
+/// Cells the right-aligned size column occupies — `1023.9 PiB`, the widest thing
+/// [`format_size`] can produce.
+const SIZE_W: usize = 10;
+/// Cells the proportional size bar occupies.
+const BAR_W: usize = 12;
+/// Blank cells between the name column and the size.
+const NAME_GAP: usize = 2;
+/// A floor for the name column, so a listing of short names still has one.
+const MIN_NAME_END: usize = 14;
+
+/// Where each file row's columns sit. Computed once per frame from every row, so
+/// the sizes read as a column rather than trailing each name at whatever width it
+/// happens to have.
+struct RowLayout {
+    /// The column names are padded to (or truncated at).
+    name_end: usize,
+    /// Cells reserved for the proportional bar, `0` when it isn't drawn.
+    bar: usize,
+}
+
+impl RowLayout {
+    /// Fit the columns to `rows` within `width`. The bar is dropped when there's no
+    /// colour to carry it (`--plain`): the gauge distinguishes full from empty by
+    /// *style*, so in a plain dump every row would print the same twelve cells and
+    /// quietly claim every file is the same size.
+    fn of(rows: &[crate::filetree::FileRow], width: usize, interactive: bool) -> Self {
+        let bar = if interactive { BAR_W } else { 0 };
+        let widest = rows.iter().map(Self::label_width).max().unwrap_or(0);
+        // Leave the size column, the bar and a little of the note room; a very narrow
+        // terminal squeezes the name rather than pushing the size off-screen.
+        let cap = width
+            .saturating_sub(NAME_GAP + SIZE_W + 1 + bar + 2)
+            .max(MIN_NAME_END);
+        Self {
+            name_end: widest.clamp(MIN_NAME_END, cap),
+            bar,
         }
-        FileRowKind::File { kind, shard } => {
+    }
+
+    /// Columns a row's marker + name want, unpadded.
+    fn label_width(row: &crate::filetree::FileRow) -> usize {
+        row.depth * 2 + 2 + row.name.chars().count() + usize::from(row.is_dir())
+    }
+
+    /// Cells a row at `depth` has for its name (after the indent and marker).
+    fn name_room(&self, depth: usize) -> usize {
+        self.name_end.saturating_sub(depth * 2 + 2)
+    }
+
+    /// Where a row's gauge is drawn, or `None` when there is no bar.
+    ///
+    /// One column *before* the bar itself: a [`ratatui::widgets::LineGauge`] reserves
+    /// its first cell as the gap after its label (empty here), so starting on the
+    /// blank cell between the size and the bar puts the drawn line exactly on the
+    /// cells the row reserved for it.
+    fn gauge_x(&self) -> Option<usize> {
+        (self.bar > 0).then_some(self.name_end + NAME_GAP + SIZE_W)
+    }
+}
+
+/// One file-browser row as a styled [`Line`]: a directory shows a fold arrow, its
+/// name in the accent with a trailing `/`, and its file count; a file shows a kind
+/// marker (a distinct glyph for openable checkpoints), its name coloured by kind,
+/// and what the model reads out of it. Between the two sits the shared size column —
+/// right-aligned, with a blank run after it that [`UI::render_files`] overlays the
+/// proportional bar onto. `selected` draws the whole row in the selection colours
+/// (via [`tree_span`], shared with the tensor tree).
+fn file_row_line(
+    row: &crate::filetree::FileRow,
+    selected: bool,
+    layout: &RowLayout,
+) -> Line<'static> {
+    use crate::filetree::{FileKind, FileRowKind};
+    let room = layout.name_room(row.depth);
+    // The marker, the name (truncated from the left, so a shard's number survives)
+    // and the trailing note, per row kind — the columns after them are shared.
+    let (marker, marker_color, name_color, name, note) = match row.kind {
+        FileRowKind::Dir { expanded, files } => (
+            if expanded { "▾" } else { "▸" },
+            palette::ACCENT,
+            palette::ACCENT,
+            // The `/` is part of the name's width, hence one cell less to fill.
+            format!("{}/", truncate_keep_end(&row.name, room.saturating_sub(1))),
+            format!("{files} {}", if files == 1 { "file" } else { "files" }),
+        ),
+        FileRowKind::File { kind, shard, .. } => {
             // A checkpoint gets the tensor glyph (it opens into the tree) and the
             // amber dtype accent; JSON/text/other stay quiet, so the openable ones
             // stand out.
@@ -251,25 +332,48 @@ fn file_row_line(row: &crate::filetree::FileRow, selected: bool) -> Line<'static
                 FileKind::Text => ("·", Color::Reset),
                 FileKind::Other => ("·", palette::DIM),
             };
-            s.push(tree_span(selected, palette::DIM, marker));
-            s.push(tree_span(selected, Color::Reset, " "));
-            s.push(tree_span(selected, name_color, row.name.clone()));
-            s.push(tree_span(
-                selected,
+            (
+                marker,
                 palette::DIM,
-                format!("  {}", format_size(row.size as usize)),
-            ));
-            // What the model reads out of this shard: sixteen equal-sized shards are
-            // otherwise sixteen indistinguishable rows. The wording is core's, shared
-            // with the browser's row through `shared/parity/format.json`.
-            if let Some(sh) = shard {
-                s.push(tree_span(
-                    selected,
-                    palette::DIM,
-                    format!(" · {}", sh.note()),
-                ));
-            }
+                name_color,
+                truncate_keep_end(&row.name, room),
+                // What the model reads out of this shard: sixteen equal-sized shards
+                // are otherwise sixteen indistinguishable rows. The wording is core's,
+                // shared with the browser through `shared/parity/format.json`.
+                shard.map(|sh| sh.note()).unwrap_or_default(),
+            )
         }
+    };
+
+    let indent = "  ".repeat(row.depth);
+    let used = indent.chars().count() + 2 + name.chars().count();
+    let mut s: Vec<Span> = vec![
+        tree_span(selected, Color::Reset, indent),
+        tree_span(selected, marker_color, marker),
+        tree_span(selected, Color::Reset, " "),
+        tree_span(selected, name_color, name),
+        // Pad to the shared column, then the right-aligned size.
+        tree_span(
+            selected,
+            Color::Reset,
+            " ".repeat(layout.name_end.saturating_sub(used) + NAME_GAP),
+        ),
+        tree_span(
+            selected,
+            palette::DIM,
+            format!("{:>width$}", format_size(row.size as usize), width = SIZE_W),
+        ),
+    ];
+    if layout.bar > 0 {
+        // Blank cells for the overlaid gauge — one of separation, then its width.
+        s.push(tree_span(
+            selected,
+            Color::Reset,
+            " ".repeat(1 + layout.bar),
+        ));
+    }
+    if !note.is_empty() {
+        s.push(tree_span(selected, palette::DIM, format!("  {note}")));
     }
     Line::from(s)
 }
@@ -301,6 +405,7 @@ mod tests {
                 kind: FileRowKind::File {
                     kind: FileKind::Checkpoint,
                     shard: None,
+                    size_share: 1.0,
                 },
             },
             FileRow {
@@ -311,6 +416,7 @@ mod tests {
                 kind: FileRowKind::File {
                     kind: FileKind::Json,
                     shard: None,
+                    size_share: 0.1,
                 },
             },
         ];
@@ -343,6 +449,7 @@ mod tests {
             kind: FileRowKind::File {
                 kind: FileKind::Checkpoint,
                 shard,
+                size_share: 1.0,
             },
         };
         let rows = vec![
@@ -383,6 +490,113 @@ mod tests {
         assert!(
             !out.contains("0 tensors"),
             "an unattributed row claims nothing:\n{out}"
+        );
+    }
+
+    /// Rows of wildly different name lengths and sizes, for the column assertions.
+    /// The shares are chosen so flooring and rounding to whole cells disagree — see
+    /// [`the_size_bar_is_proportional_and_dropped_without_colour`].
+    fn sized_rows() -> Vec<crate::filetree::FileRow> {
+        use crate::filetree::{FileKind, FileRow, FileRowKind};
+        [
+            ("model-00001-of-00016.safetensors", 4_000_000_000u64, 1.0),
+            ("model-00002-of-00016.safetensors", 3_998_000_000, 0.9995),
+            ("qscales.safetensors", 700_000_000, 0.175),
+            ("codebooks.safetensors", 200_000_000, 0.05),
+            ("a.safetensors", 40_000_000, 0.01),
+        ]
+        .into_iter()
+        .map(|(name, size, size_share)| FileRow {
+            depth: 1,
+            name: name.into(),
+            path: format!("/ckpt/{name}").into(),
+            size,
+            kind: FileRowKind::File {
+                kind: FileKind::Checkpoint,
+                shard: None,
+                size_share,
+            },
+        })
+        .collect()
+    }
+
+    #[test]
+    fn sizes_land_in_one_column_whatever_the_name_length() {
+        let badges = status_badges(AccessBadge::ReadOnly, None, false);
+        let out = crate::tui::headless_render(110, 12, |f| {
+            UI::render_files(f, "/ckpt", &sized_rows(), 0, 0, None, true, &badges, None);
+        })
+        .unwrap();
+        // Every size ends at the same column — the point of the column.
+        let ends: Vec<usize> = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with('▦'))
+            .map(|l| l.find(" GiB").or_else(|| l.find(" MiB")).unwrap() + 4)
+            .collect();
+        assert_eq!(ends.len(), sized_rows().len(), "every file row:\n{out}");
+        assert!(
+            ends.windows(2).all(|w| w[0] == w[1]),
+            "sizes right-aligned to one column, got {ends:?}:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_size_bar_is_proportional_and_dropped_without_colour() {
+        let rows = sized_rows();
+        let badges = status_badges(AccessBadge::ReadOnly, None, false);
+        let buf = crate::tui::headless_buffer(110, 12, |f| {
+            UI::render_files(f, "/ckpt", &rows, 0, 0, None, true, &badges, None);
+        })
+        .unwrap();
+
+        // The gauge marks its filled part by colour alone, so count bar cells (the
+        // gauge's own THICK glyph) by their colour rather than looking at the text.
+        let bar_cells = |y: u16, fg: Color| -> usize {
+            (0..110)
+                .filter(|&x| buf[(x, y)].symbol() == "━" && buf[(x, y)].fg == fg)
+                .count()
+        };
+        // Row 0 is the header, row 1 the rule, so the files start at y = 2. Cells are
+        // the NEAREST whole number, not the truncation — the three assertions with a
+        // "floor would" note are the ones that distinguish the two.
+        assert_eq!(
+            bar_cells(2, palette::KEY),
+            BAR_W,
+            "the largest file fills it"
+        );
+        assert_eq!(
+            bar_cells(3, palette::KEY),
+            BAR_W,
+            "0.05% smaller is not a whole cell smaller (floor would say {})",
+            BAR_W - 1
+        );
+        assert_eq!(bar_cells(4, palette::KEY), 2, "17.5% of {BAR_W} cells");
+        assert_eq!(
+            bar_cells(5, palette::KEY),
+            1,
+            "5% of {BAR_W} cells is over half a cell (floor would say 0)"
+        );
+        assert_eq!(
+            bar_cells(6, palette::KEY),
+            0,
+            "1% rounds to nothing — which is the truth"
+        );
+        // …and the rest of each bar is drawn dim rather than left blank.
+        assert_eq!(
+            bar_cells(6, palette::DIM),
+            BAR_W,
+            "the empty bar is still a bar"
+        );
+
+        // Without colour (`--plain`) the bar would be BAR_W identical cells on every
+        // row, claiming every file is the same size — so it isn't drawn at all.
+        let plain = crate::tui::headless_buffer(110, 12, |f| {
+            UI::render_files(f, "/ckpt", &rows, 0, 0, None, false, &badges, None);
+        })
+        .unwrap();
+        assert!(
+            (0..110).all(|x| plain[(x, 2)].symbol() != "━"),
+            "no gauge in a plain render"
         );
     }
 }
