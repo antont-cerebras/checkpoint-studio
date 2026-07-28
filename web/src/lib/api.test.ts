@@ -100,6 +100,27 @@ describe('urls', () => {
     expect(urls[0]).toBe('/api/schema?q=*.mlp.*');
   });
 
+  /* The durable version of the two tests below. `api.compact` and `api.diff` went
+     uncovered because every other case names its endpoint by hand, so a method added with
+     a feature is only tested if someone remembers to come back here. This calls all of
+     them generically: a new accessor that never reaches the network fails immediately,
+     whatever it is called. */
+  it('every accessor issues exactly one request to an /api/ path', async () => {
+    const urls = stubFetch({ body: {} });
+    const names = Object.keys(api) as (keyof typeof api)[];
+    expect(names.length, 'the api object is not empty').toBeGreaterThan(10);
+    for (const name of names) {
+      // One string argument satisfies every accessor's first parameter (name / path /
+      // query / against); the ones taking none ignore it.
+      const call = api[name] as (...args: unknown[]) => Promise<unknown>;
+      await call('x');
+    }
+    expect(urls).toHaveLength(names.length);
+    for (const [i, url] of urls.entries()) {
+      expect(url, `${names[i]} must hit the JSON API`).toMatch(/^\/api\//);
+    }
+  });
+
   it('asks the compact endpoint for the family-folded tree, scoped by the filter', async () => {
     const urls = stubFetch({ body: { tree: [], counts: {}, varying: [], tensor_count: 0 } });
     await expect(api.compact('')).resolves.toEqual({
