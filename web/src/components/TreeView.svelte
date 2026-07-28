@@ -1,5 +1,6 @@
 <script lang="ts">
   import { visibleRows, selectedId, expanded, searching, filterMatches, toggle, openDetail, navigate } from '../stores/view';
+  import { unindexed } from '../stores/server';
   import type { Row } from '../lib/flatten';
   import { humanCount, humanSize, pyShape } from '../lib/format';
   import { copyText } from '../lib/clipboard';
@@ -62,6 +63,12 @@
     return p.split('/').pop() || p;
   }
   $: tipInfo = tipRow && tipRow.node.kind === 'tensor' ? tipRow.node.info : null;
+
+  /** A tensor whose file the index doesn't list. Takes the caret slot, where the
+      terminal puts the same mark in place of a tensor's `·` bullet. */
+  function isExtra(row: Row): boolean {
+    return row.node.kind === 'tensor' && $unindexed.has(row.node.info.source_path);
+  }
   $: tipStyle = tipRow
     ? `left:${Math.min(tipLeft + 8, window.innerWidth - 330)}px; top:${Math.max(8, Math.min(tipTop, window.innerHeight - 230))}px`
     : '';
@@ -132,7 +139,9 @@
         on:mouseenter={(e) => openTip(e, row)}
         on:mouseleave={leaveRow}
       >
-        <span class="caret">{row.hasChildren ? ($expanded.has(row.id) ? '▾' : '▸') : ''}</span>
+        <span class="caret" class:extra={isExtra(row)} title={isExtra(row) ? 'on disk but not listed in model.safetensors.index.json' : undefined}
+          >{row.hasChildren ? ($expanded.has(row.id) ? '▾' : '▸') : isExtra(row) ? '✚' : ''}</span
+        >
         <span class="lbl">{label(row, flat)}</span>
         {#if row.node.kind === 'tensor'}
           <span class="tmeta">
@@ -215,6 +224,10 @@
   }
   .row.group .lbl {
     color: var(--group);
+  }
+  /* The same vivid red the terminal uses (palette::UNINDEXED). */
+  .caret.extra {
+    color: var(--unindexed);
   }
   .row.tensor .lbl {
     color: var(--tensor);

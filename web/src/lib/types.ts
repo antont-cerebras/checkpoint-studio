@@ -36,6 +36,10 @@ export interface TreeResponse {
   root: string;
   tensor_count: number;
   tree: TreeNode[];
+  /** `source_path`s of tensors on disk that `model.safetensors.index.json` doesn't
+   * list. Sent with the tree because that's where they're marked, and keyed on
+   * `source_path` so the test here is the same one the TUI makes. */
+  unindexed: string[];
   /** The server's no-access-control caution, or null when it is bound to loopback and so
    * only reachable from the machine it runs on. The server sends the same sentence it
    * prints to its terminal at startup. */
