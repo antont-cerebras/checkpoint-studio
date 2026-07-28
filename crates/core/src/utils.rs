@@ -77,6 +77,64 @@ pub fn term_width(fallback: usize) -> usize {
     terminal_size::terminal_size().map_or(fallback, |(w, _)| w.0 as usize)
 }
 
+/// Wrap a `prefix: text` note to `width` columns, continuation lines indented two
+/// spaces.
+///
+/// The CLI's notes are written as one long sentence each, which a terminal then hard-wraps
+/// mid-word at whatever column it happens to be — so a `diff --values` run opened with two
+/// paragraph-shaped blobs that ran into each other and were genuinely hard to read. Two
+/// spaces rather than alignment under the prefix because `checkpoint-studio diff: ` is 24
+/// columns, and giving those up on an 80-column terminal costs more than the alignment is
+/// worth. It matches the indent the S3 and check sections already use for their detail
+/// lines.
+///
+/// Words longer than the width (a URI, a tensor name) are left over-long rather than
+/// broken: a split path is worse than a wrapped line, and it can't be pasted.
+#[must_use]
+pub fn wrap_note(prefix: &str, text: &str, width: usize) -> Vec<String> {
+    const INDENT: &str = "  ";
+    // Enough room for the indent plus something after it; below this, wrapping produces
+    // one word per line, which is less readable than letting the terminal do it.
+    let width = width.max(INDENT.len() + 20);
+    let mut lines = Vec::new();
+    let mut line = prefix.to_string();
+    for word in text.split_whitespace() {
+        // A prefix that already ends in a space (`"… diff: "`) must not get a second one,
+        // and neither must a freshly-indented continuation line.
+        let joined = !line.is_empty() && !line.ends_with(char::is_whitespace);
+        let room = width.saturating_sub(line.chars().count());
+        if joined && word.chars().count() + 1 > room {
+            lines.push(std::mem::take(&mut line));
+            line.push_str(INDENT);
+        } else if joined {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.trim().is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// The widest a note is allowed to get, however wide the terminal is.
+///
+/// Wrapping at the terminal edge is not enough: on a 200-column window a note becomes one
+/// 200-column line, which is what "the notes are too wide" was about. Prose gets hard to
+/// track past roughly this measure, and these notes are prose — the tables and bars that
+/// want the full width don't come through here.
+const NOTE_COLS: usize = 96;
+
+/// Print a wrapped note to stderr, fitted to the terminal but never wider than
+/// [`NOTE_COLS`].
+///
+/// Notes go to stderr so a piped `diff` keeps a clean stdout.
+pub fn eprint_note(prefix: &str, text: &str) {
+    for line in wrap_note(prefix, text, term_width(NOTE_COLS).min(NOTE_COLS)) {
+        eprintln!("{line}");
+    }
+}
+
 // The display formatters below are duplicated in the web client
 // (`web/src/lib/format.ts`), because a browser can't call into this crate. Their
 // agreement is not left to comments: `tests/parity.rs` generates
@@ -155,6 +213,86 @@ pub fn format_percent(fraction: f64, is_zero: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    mod wrapped_notes {
+        use super::super::wrap_note;
+
+        const PREFIX: &str = "checkpoint-studio diff: ";
+        const NOTE: &str = "note — both sides are byte-identical (same S3 objects); the value                             comparison will read the data and confirm every tensor is identical.                             Pass two different checkpoints to see real value differences.";
+
+        #[test]
+        fn every_line_fits_the_width() {
+            for width in [40usize, 60, 80, 100, 120] {
+                for line in wrap_note(PREFIX, NOTE, width) {
+                    assert!(
+                        line.chars().count() <= width,
+                        "width {width}: {} cols in {line:?}",
+                        line.chars().count()
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn the_first_line_carries_the_prefix_and_the_rest_are_indented() {
+            let lines = wrap_note(PREFIX, NOTE, 80);
+            assert!(lines.len() > 1, "this note has to wrap at 80");
+            assert!(lines[0].starts_with(PREFIX));
+            for line in &lines[1..] {
+                assert!(line.starts_with("  "), "continuation indented: {line:?}");
+                assert!(!line.starts_with("   "), "but not more than two: {line:?}");
+            }
+        }
+
+        #[test]
+        fn no_word_is_lost_or_duplicated() {
+            let lines = wrap_note(PREFIX, NOTE, 56);
+            let round_trip: Vec<&str> = lines
+                .iter()
+                .flat_map(|l| l.split_whitespace())
+                .skip(PREFIX.split_whitespace().count())
+                .collect();
+            assert_eq!(round_trip, NOTE.split_whitespace().collect::<Vec<_>>());
+        }
+
+        #[test]
+        fn a_short_note_stays_on_one_line() {
+            assert_eq!(
+                wrap_note(PREFIX, "compared 378 S3 object(s)' metadata", 100),
+                vec!["checkpoint-studio diff: compared 378 S3 object(s)' metadata"]
+            );
+        }
+
+        /// A URI or tensor name longer than the width is left over-long: breaking it would
+        /// make it unpastable, which is worse than one wide line.
+        #[test]
+        fn an_unbreakable_word_is_not_split() {
+            let uri = "s3://inference-testing/moonlight-16b-a3b-instruct/260717/fp16";
+            let lines = wrap_note("", &format!("reading {uri} now"), 30);
+            assert!(
+                lines.iter().any(|l| l.contains(uri)),
+                "the URI survives whole: {lines:?}"
+            );
+        }
+
+        #[test]
+        fn an_absurdly_narrow_terminal_does_not_produce_one_word_per_line() {
+            let lines = wrap_note(PREFIX, NOTE, 4);
+            assert!(
+                lines
+                    .iter()
+                    .all(|l| l.split_whitespace().count() > 1 || l.len() > 4),
+                "clamped to something readable: {lines:?}"
+            );
+        }
+
+        #[test]
+        fn an_empty_note_prints_nothing() {
+            assert!(wrap_note("", "", 80).is_empty());
+            assert!(wrap_note("", "   ", 80).is_empty());
+        }
+    }
+
     use super::expand_tilde;
     use std::path::PathBuf;
 

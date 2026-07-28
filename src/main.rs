@@ -1758,9 +1758,10 @@ fn run_diff(
                 // we're still authenticating and nothing is being read yet).
                 let sa = r.open_with(&mut password)?;
                 let sb = r.open_with(&mut password)?;
-                eprintln!(
-                    "checkpoint-studio diff: reading each checkpoint's tensor list over ssh \
-                 (names/dtypes/shapes only — no tensor data is transferred) …"
+                utils::eprint_note(
+                    "checkpoint-studio diff: ",
+                    "reading each checkpoint's tensor list over ssh (names/dtypes/shapes \
+                     only — no tensor data is transferred) …",
                 );
                 let bars = progress::Bars::start(&[old_str.to_string(), new_str.to_string()]);
                 // If one side fails to load, there's no point finishing the *other*
@@ -1935,10 +1936,11 @@ fn run_diff(
         && let (Some(o), Some(n)) = (&old_s3, &new_s3)
         && s3_objects_identical(o, n)
     {
-        eprintln!(
-            "checkpoint-studio diff: note — both sides are byte-identical (same S3 objects); \
-             the value comparison will read the data and confirm every tensor is identical. \
-             Pass two different checkpoints to see real value differences."
+        utils::eprint_note(
+            "checkpoint-studio diff: ",
+            "note — both sides are byte-identical (same S3 objects); the value comparison \
+             will read the data and confirm every tensor is identical. Pass two different \
+             checkpoints to see real value differences.",
         );
     }
 
@@ -2073,8 +2075,12 @@ fn run_diff(
             name_map.len()
         );
         for target in &collisions {
-            eprintln!(
-                "checkpoint-studio diff: warning: a rename rule maps multiple tensors onto {target:?} (keeping the last)"
+            utils::eprint_note(
+                "checkpoint-studio diff: ",
+                &format!(
+                    "warning: a rename rule maps multiple tensors onto {target:?} \
+                     (keeping the last)"
+                ),
             );
         }
     }
@@ -2612,20 +2618,30 @@ fn fetch_remote_repack(
 ) -> Result<HashMap<String, remote::RepackResult>> {
     let session = r.open_with(password)?;
     if auto_sparse {
-        eprintln!(
-            "checkpoint-studio diff: comparing {} sparse-packed expert weight(s) as {bits}-bit \
-             indices on {} (auto-detected sibling codebook), decoding on the remote …",
-            pairs.len(),
-            r.host,
+        utils::eprint_note(
+            "checkpoint-studio diff: ",
+            &format!(
+                "comparing {} sparse-packed expert weight(s) as {bits}-bit indices on {} \
+                 (auto-detected sibling codebook), decoding on the remote …",
+                pairs.len(),
+                r.host,
+            ),
         );
     } else {
-        eprintln!(
-            "checkpoint-studio diff: verifying repack of {} tensor(s) on {}, decoding {bits}-bit \
-             indices on the remote (reads the full tensors, {} at a time):\n  old (sparse) {old_uri}\n  new (dense)  {new_uri}",
-            pairs.len(),
-            r.host,
-            pairs.len().clamp(1, 4),
+        utils::eprint_note(
+            "checkpoint-studio diff: ",
+            &format!(
+                "verifying repack of {} tensor(s) on {}, decoding {bits}-bit indices on the \
+                 remote (reads the full tensors, {} at a time):",
+                pairs.len(),
+                r.host,
+                pairs.len().clamp(1, 4),
+            ),
         );
+        // The two URIs on their own lines: they are long, unbreakable, and the pair is
+        // what you check first when a verify looks wrong.
+        eprintln!("  old (sparse) {old_uri}");
+        eprintln!("  new (dense)  {new_uri}");
     }
     // One bar for the whole verify, relabelled with the tensor being read — a bar per
     // tensor is thousands of them at checkpoint scale (see `ValueBar`).
@@ -3095,14 +3111,17 @@ fn fetch_remote_value_diff(
     total_bytes: u64,
 ) -> Result<HashMap<String, remote::RemoteTensorDiff>> {
     let session = r.open_with(password)?;
-    eprintln!(
-        "checkpoint-studio diff: comparing {} tensor(s) on {} — reading ≈ {} from S3 \
-         (processed on the remote, not streamed here; {}-way parallel — use --jobs to tune, \
-         --jobs 1 if the remote misbehaves) …",
-        pairs.len(),
-        r.host,
-        utils::format_size(total_bytes as usize),
-        vopts.jobs.max(1),
+    utils::eprint_note(
+        "checkpoint-studio diff: ",
+        &format!(
+            "comparing {} tensor(s) on {} — reading ≈ {} from S3 (processed on the remote, \
+             not streamed here; {}-way parallel — use --jobs to tune, --jobs 1 if the \
+             remote misbehaves) …",
+            pairs.len(),
+            r.host,
+            utils::format_size(total_bytes as usize),
+            vopts.jobs.max(1),
+        ),
     );
     // One bar for the whole compare, filling over the total both sides will stream and
     // relabelled with the tensor being read (the values are still compared on the proxy —
