@@ -504,21 +504,6 @@ impl Explorer {
         }
     }
 
-    /// Files on disk but absent from the index (per the health reports' extra
-    /// files), resolved to absolute paths so they match each tensor's
-    /// `source_path` — the tree dims their rows.
-    pub(super) fn unindexed_files(reports: &[crate::health::HealthReport]) -> HashSet<String> {
-        let mut unindexed = HashSet::new();
-        for report in reports {
-            if let Some(dir) = Path::new(&report.index_path).parent() {
-                for file in &report.extra_files {
-                    unindexed.insert(absolute_path(&dir.join(file)));
-                }
-            }
-        }
-        unindexed
-    }
-
     /// Shared post-read setup: dedup, sort, parameter/schema/tree build.
     pub(super) fn finalize_load(
         &mut self,
@@ -539,7 +524,7 @@ impl Explorer {
             .filter(checkpoint_studio_core::health::HealthReport::has_issues)
             .collect();
         self.health_reports.extend(local);
-        self.unindexed = Self::unindexed_files(&self.health_reports);
+        self.unindexed = crate::health::unindexed_files(&self.health_reports);
 
         // The derived reports (health / stats) are keyed to the tensors — drop any
         // cached from a prior load so they're recomputed against the new set.

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tree, cachedStats } from '../stores/server';
+  import { tree, cachedStats, unindexed } from '../stores/server';
   import { setTab, navigate, type DataTab } from '../stores/view';
   import type { StatsDto, TensorInfo, TreeNode } from '../lib/types';
   import { humanCount, humanSize, num, percent } from '../lib/format';
@@ -41,6 +41,7 @@
   // cstorch (no byte ranges) / HDF5 (chunked) that map doesn't exist, so the link
   // would go nowhere.
   $: isS3 = info?.source_path.startsWith('s3://') ?? false;
+  $: isExtra = info !== null && info !== undefined && $unindexed.has(info.source_path);
   $: hasByteLayout = info ? offsets(info.layout) != null : false;
 
   // Whole-tensor statistics are shown on the Info tab, scanned on demand.
@@ -87,6 +88,15 @@
               {/if}
             </td>
           </tr>
+          <!-- The terminal's detail screen carries this flag too, in the same red:
+           the file is on disk but the index never names it, so a loader following
+           only the index will not read this tensor. -->
+          {#if isExtra}
+            <tr>
+              <th></th>
+              <td class="extra">✚ on disk but not listed in model.safetensors.index.json</td>
+            </tr>
+          {/if}
         </tbody>
       </table>
 
@@ -178,6 +188,10 @@
   }
   .statsblock table {
     margin: 0;
+  }
+  /* The same vivid red the terminal marks an unindexed tensor with. */
+  .extra {
+    color: var(--unindexed);
   }
   .src {
     word-break: break-all;

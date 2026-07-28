@@ -42,6 +42,12 @@ export async function loadCompact(q: string): Promise<CompactTree | null> {
 }
 export const treeError = writable<string | null>(null);
 
+/** Tensors on disk but not listed in the index, by `source_path` — a Set, because the
+ * tree tests it once per visible row. Marked with the same glyph and vivid red the
+ * terminal uses (see `palette::UNINDEXED`); a loader following only the index will not
+ * read these. */
+export const unindexed = derived(tree, ($t) => new Set($t?.unindexed ?? []));
+
 /** Every tensor name, and every shard basename, in the checkpoint. These back the
  * universal `<Ref>` link resolver: a name found here is turned into a link to the
  * tensor-detail or byte-layout screen; anything else stays plain text. */

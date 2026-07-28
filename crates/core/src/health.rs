@@ -99,6 +99,33 @@ pub fn parse_index_spec(dir: &Path, index_path: &Path) -> Result<IndexSpec> {
     })
 }
 
+/// The files these reports found on disk but absent from the index, as **absolute
+/// paths** — so they compare directly against each [`TensorInfo::source_path`], which
+/// is how both frontends mark an unindexed tensor.
+///
+/// In core because every frontend needs the same set from the same reports: the
+/// terminal marks its tree rows from it and the web server sends it to the browser for
+/// the same purpose. Two derivations of "which files are extras" would be two chances
+/// to disagree about it.
+#[must_use]
+pub fn unindexed_files(reports: &[HealthReport]) -> std::collections::HashSet<String> {
+    let mut unindexed = std::collections::HashSet::new();
+    for report in reports {
+        if let Some(dir) = Path::new(&report.index_path).parent() {
+            for file in &report.extra_files {
+                let path = dir.join(file);
+                unindexed.insert(
+                    std::path::absolute(&path)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    unindexed
+}
+
 /// Compare an index against the checkpoint as actually loaded: the `.safetensors`
 /// files on disk (a directory listing — no header reads) and the tensor names the
 /// loader already parsed from each shard's header. `tensors` is the whole loaded
@@ -593,6 +620,42 @@ mod tests {
         // A referenced file or tensor that's missing on disk is a real error.
         assert!(report(&["model-00007.safetensors"], &[], &[]).has_errors());
         assert!(report(&[], &[], &["a.weight  (expected in x)"]).has_errors());
+    }
+
+    #[test]
+    fn unindexed_files_resolves_against_the_index_directory() {
+        // The paths have to come out as `source_path` records them — absolute, in the
+        // index's own directory — because both UIs mark a row by comparing the two
+        // strings. A bare `extra_files` basename would match nothing and the mark
+        // would silently never appear.
+        let report = HealthReport {
+            kind: HealthKind::IndexVsFiles,
+            index_path: "/ckpt/model.safetensors.index.json".into(),
+            missing_files: Vec::new(),
+            extra_files: vec!["codebooks.safetensors".into(), "qscales.safetensors".into()],
+            missing_tensors: Vec::new(),
+            extra_tensors: Vec::new(),
+            mismatched_tensors: Vec::new(),
+            unverified_tensors: Vec::new(),
+        };
+        let set = unindexed_files(std::slice::from_ref(&report));
+        assert!(set.contains("/ckpt/codebooks.safetensors"), "{set:?}");
+        assert!(set.contains("/ckpt/qscales.safetensors"), "{set:?}");
+        assert_eq!(set.len(), 2);
+
+        // Nothing extra, nothing marked — and a report with no directory in its index
+        // path doesn't panic on the way to that answer.
+        assert!(unindexed_files(&[]).is_empty());
+        assert!(
+            unindexed_files(&[HealthReport {
+                index_path: "idx.json".into(),
+                extra_files: vec!["x.safetensors".into()],
+                ..report
+            }])
+            .iter()
+            .all(|p| p.ends_with("x.safetensors")),
+            "a relative index path still resolves"
+        );
     }
 
     /// A `TensorInfo` named `name` whose `source_path` is `dir/file` (absolute,

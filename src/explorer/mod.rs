@@ -7240,15 +7240,6 @@ fn wait_for_dismiss() {
     }
 }
 
-/// Resolve a path to an absolute string without requiring it to exist or
-/// resolving symlinks; falls back to the original path on error.
-fn absolute_path(path: &Path) -> String {
-    std::path::absolute(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-
 /// The final path component (file name) of a path string.
 fn file_name(path: &str) -> String {
     Path::new(path)

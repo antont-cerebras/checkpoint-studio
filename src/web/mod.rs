@@ -48,6 +48,12 @@ pub(crate) struct WebState {
     pub file_tree: dto::WebFileNode,
     pub stats: stats::CheckpointStats,
     pub health: Vec<health::HealthReport>,
+    /// `source_path`s of tensors on disk but not listed in the index, **sorted** — the
+    /// browser marks those tree rows with it, exactly as the terminal does. Sorted
+    /// because a `HashSet`'s order is randomised per process, and this body is encoded
+    /// once and cached: an arbitrary order would make the same checkpoint serve a
+    /// different `/api/tree` on every restart.
+    pub unindexed: Vec<String>,
     pub check: Option<check::CheckReport>,
     pub layouts: Vec<safelayout::LayoutMap>,
     /// Canonical (deduped, natural-sorted) tensors, for detail + data-view lookup.
@@ -168,6 +174,9 @@ impl WebState {
             1,
         ));
 
+        let mut unindexed: Vec<String> = health::unindexed_files(&health).into_iter().collect();
+        unindexed.sort();
+
         let layouts = checkpoint
             .shards
             .iter()
@@ -193,6 +202,7 @@ impl WebState {
             file_tree,
             stats: checkpoint_stats,
             health,
+            unindexed,
             check,
             layouts,
             tensors,

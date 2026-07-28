@@ -75,6 +75,10 @@ pub(crate) fn tree(s: &WebState) -> Reply {
         // Already rooted by `Session::build_rooted_tree` — the same tree, with the same
         // summarising root and label, that the TUI renders.
         "tree": s.tree,
+        // Which tensors are extras — on disk but absent from the index. Sent with the
+        // tree because that is where they're marked, and keyed on `source_path` so the
+        // client's test is the same one the terminal makes.
+        "unindexed": s.unindexed,
     }))
 }
 
@@ -706,7 +710,13 @@ mod contract {
     fn tree_response_and_nodes_match_types_ts() {
         let s = state();
         let tree = json(&super::tree(&s));
-        has_keys("TreeResponse", &tree, &["root", "tensor_count", "tree"]);
+        has_keys(
+            "TreeResponse",
+            &tree,
+            &["root", "tensor_count", "tree", "unindexed"],
+        );
+        // A list, even when empty — the client turns it straight into a Set.
+        assert!(tree["unindexed"].is_array(), "unindexed is a list");
 
         // Walk to one group and one tensor node — both variants are consumed by the UI.
         let nodes = tree["tree"].as_array().expect("tree array");
