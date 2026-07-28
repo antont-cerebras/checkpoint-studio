@@ -176,6 +176,7 @@ impl WebState {
             &health,
             config.as_ref(),
             &all,
+            check::HeaderInputs::from(&checkpoint),
             false,
             1,
         ));

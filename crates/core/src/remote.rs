@@ -686,6 +686,9 @@ impl RemoteRead {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
+                // The remote listing parses the weight map only, so the declared total
+                // is unknown here and the check reports n/a rather than guessing.
+                total_size: None,
             })
             .into_iter()
             .collect::<Vec<_>>();

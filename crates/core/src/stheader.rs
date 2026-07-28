@@ -18,6 +18,77 @@ pub fn header_len(raw: u64, source: &str) -> Result<usize> {
     Ok(raw as usize)
 }
 
+/// Top-level keys the raw header declares **more than once**, in name order.
+///
+/// [`parse_header`] cannot tell you this and never could: it goes through
+/// `serde_json::Map`, which keeps the *last* of two identical keys. A header that
+/// declares `w` twice therefore parses as one tensor, and the first declaration — its
+/// dtype, its shape, its byte span — is discarded without a word. Every consumer then
+/// agrees with every other consumer about a file that says two things.
+///
+/// The format has no notion of a repeated key and no writer should emit one, so a file
+/// that does is one whose writer and reader disagree about its contents — worth an error
+/// even though nothing will crash.
+///
+/// Walks the header with a visitor that keeps each entry as it comes instead of folding
+/// it into a map, and discards the values: only the key sequence matters here.
+pub fn duplicate_keys(header_buf: &[u8]) -> Result<Vec<String>> {
+    let keys: KeySequence = serde_json::from_slice(header_buf)
+        .with_context(|| "Failed to re-scan the SafeTensors header for repeated keys")?;
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for key in keys.0 {
+        *counts.entry(key).or_default() += 1;
+    }
+    Ok(counts
+        .into_iter()
+        .filter(|&(_, n)| n > 1)
+        .map(|(k, _)| k)
+        .collect())
+}
+
+/// Every top-level key of a JSON object, in file order, duplicates kept.
+struct KeySequence(Vec<String>);
+
+impl<'de> serde::Deserialize<'de> for KeySequence {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Keys;
+        impl<'de> serde::de::Visitor<'de> for Keys {
+            type Value = KeySequence;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a safetensors header object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<KeySequence, A::Error> {
+                let mut keys = Vec::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    // Required by `MapAccess`, and the values are genuinely not wanted:
+                    // `IgnoredAny` walks each one without allocating it.
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                    keys.push(key);
+                }
+                Ok(KeySequence(keys))
+            }
+        }
+        d.deserialize_map(Keys)
+    }
+}
+
+/// The JSON type name of a value, for [`MetadataInfo::value_type`].
+fn json_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+        serde_json::Value::Null => "null",
+    }
+}
+
 /// Parse a safetensors header (the JSON blob after the 8-byte length) into
 /// tensors + metadata. `source` is the tensors' `source_path` (a local path or a
 /// remote marker). Every non-`__metadata__` entry describes a tensor.
@@ -46,7 +117,11 @@ pub fn parse_header(
                         value: meta_value
                             .as_str()
                             .map_or_else(|| meta_value.to_string(), ToString::to_string),
-                        value_type: "string".to_string(),
+                        // The value's REAL JSON type, not "string" for everything. The
+                        // spec makes `__metadata__` a string→string map, so anything
+                        // else is a non-conforming writer — and reporting it as a string
+                        // is how that went unnoticed. `check_headers` flags it.
+                        value_type: json_type(meta_value).to_string(),
                     });
                 }
             }
@@ -97,4 +172,88 @@ pub fn parse_header(
     }
 
     Ok((tensors, metadata))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_keys_sees_what_serde_json_folds_away() {
+        // The whole reason this function exists: parsing keeps the LAST of two identical
+        // keys, so the header below describes one tensor as far as every consumer is
+        // concerned — and the first description of it is gone.
+        let dup = br#"{"w": {"dtype":"F32","shape":[4],"data_offsets":[0,16]},
+                      "w": {"dtype":"F16","shape":[8],"data_offsets":[0,16]}}"#;
+        let (tensors, _) = parse_header(dup, "mem.safetensors").expect("it parses");
+        assert_eq!(tensors.len(), 1, "one tensor survives the fold");
+        assert_eq!(tensors[0].dtype, "F16", "and it is the second declaration");
+
+        assert_eq!(
+            duplicate_keys(dup).expect("valid JSON"),
+            vec!["w".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicate_keys_is_quiet_on_an_ordinary_header() {
+        let ok = br#"{"a": {"dtype":"F32","shape":[1],"data_offsets":[0,4]},
+                     "b": {"dtype":"F32","shape":[1],"data_offsets":[4,8]},
+                     "__metadata__": {"format":"pt"}}"#;
+        assert!(duplicate_keys(ok).expect("valid JSON").is_empty());
+        // Repeats *inside* a value are not repeated tensor names — only the top level
+        // decides what the file declares.
+        let nested = br#"{"a": {"dtype":"F32","dtype":"F16","shape":[1],"data_offsets":[0,4]}}"#;
+        assert!(duplicate_keys(nested).expect("valid JSON").is_empty());
+    }
+
+    #[test]
+    fn a_damaged_header_is_an_error_not_a_panic() {
+        // Every shape of damage a header can arrive in. None of these may panic: the
+        // callers turn the error into a message (a popup, a check finding, a non-zero
+        // exit), and a panic would take the whole TUI down instead.
+        for bad in [
+            &b""[..],                  // empty
+            &b"{"[..],                 // truncated object
+            &b"\xff\xfe not json"[..], // not JSON at all, and not UTF-8
+            &b"[1, 2, 3]"[..],         // valid JSON, wrong shape
+            &b"\"a string\""[..],      // ditto
+            &b"null"[..],
+        ] {
+            assert!(parse_header(bad, "mem.safetensors").is_err(), "{bad:?}");
+            assert!(duplicate_keys(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn header_len_rejects_an_absurd_prefix() {
+        // A corrupt / non-safetensors file whose first 8 bytes read as a huge number:
+        // refuse before allocating it, with the file named.
+        let err = header_len(1 << 40, "/c/x.safetensors").expect_err("rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("too large") && msg.contains("/c/x.safetensors"),
+            "{msg}"
+        );
+        assert_eq!(header_len(1024, "/c/x.safetensors").expect("sane"), 1024);
+    }
+
+    #[test]
+    fn metadata_values_keep_their_real_json_type() {
+        // The spec says string→string. A writer that puts a number there gets reported
+        // as a number, so `check_headers` can say so — this used to claim "string".
+        let h =
+            br#"{"__metadata__": {"format":"pt","count":7,"flag":true,"nested":{},"nil":null}}"#;
+        let (_, meta) = parse_header(h, "mem.safetensors").expect("it parses");
+        let ty = |name: &str| {
+            meta.iter()
+                .find(|m| m.name == name)
+                .map(|m| m.value_type.as_str())
+        };
+        assert_eq!(ty("format"), Some("string"));
+        assert_eq!(ty("count"), Some("number"));
+        assert_eq!(ty("flag"), Some("bool"));
+        assert_eq!(ty("nested"), Some("object"));
+        assert_eq!(ty("nil"), Some("null"));
+    }
 }

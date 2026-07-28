@@ -1107,6 +1107,12 @@ fn run_check(
                 &rc.health,
                 config.as_ref(),
                 &filter,
+                // A remote read keeps the index it parsed but not the per-shard header
+                // lengths, so the alignment half of the check reads n/a.
+                check::HeaderInputs {
+                    index: &rc.index,
+                    ..Default::default()
+                },
                 false,
                 jobs,
             ))
@@ -1122,7 +1128,7 @@ fn run_check(
             if files.is_empty() {
                 anyhow::bail!("no checkpoint files found");
             }
-            let ((tensors, metadata, config, _disk, _health), _cp) =
+            let ((tensors, metadata, config, _disk, _health), cp) =
                 Explorer::gather_checkpoint(&files, None)?;
             // Index-vs-disk health from the tensors just loaded (no extra header
             // reads); folded into the file check below.
@@ -1144,6 +1150,11 @@ fn run_check(
                 &health,
                 config.as_ref(),
                 &filter,
+                // The read kept every shard's header length and the index it declares —
+                // what the header-consistency check needs.
+                cp.as_ref()
+                    .map(check::HeaderInputs::from)
+                    .unwrap_or_default(),
                 values,
                 jobs,
             ))

@@ -31,7 +31,14 @@ expression: out
     {
       "id": "shapes_dtypes",
       "title": "Shape / dtype sanity",
-      "note": "no duplicate names, no empty tensors, dtype uniform within each role",
+      "note": "no duplicate names, no empty tensors, dtypes defined and uniform within each role",
+      "status": "pass",
+      "findings": []
+    },
+    {
+      "id": "headers",
+      "title": "Header consistency",
+      "note": "data 8-byte aligned, index total right, no tensor in two shards, metadata text",
       "status": "pass",
       "findings": []
     },
