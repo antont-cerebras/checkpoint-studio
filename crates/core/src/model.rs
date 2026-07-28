@@ -338,6 +338,7 @@ impl Checkpoint {
                 name: f.name.clone(),
                 apparent: f.apparent(),
                 allocated: f.allocated(),
+                links: f.node.links(),
             })
             .collect();
         DiskUsage::from_shards(shards)

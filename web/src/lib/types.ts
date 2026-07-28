@@ -53,6 +53,9 @@ export type FileNode =
       path: string;
       size: number;
       files: number;
+      /** Hardlinked files under here — how much of the directory shares its bytes.
+       * 0 where unknown, which is every remote source (`st_nlink` needs a local stat). */
+      hardlinked: number;
       children: FileNode[];
     }
   | {
@@ -70,6 +73,10 @@ export type FileNode =
       /** Whether `model.safetensors.index.json` declares this file; null when the
        * question can't apply (not a checkpoint file, or there is no index). */
       index: 'listed' | 'unlisted' | null;
+      /** Names this file's bytes have (`st_nlink`). `>1` means hardlinked, so the size
+       * is shared with another name rather than this file's own; `1` for an ordinary
+       * file and for every remote source, which can't count names. */
+      links: number;
     };
 
 /** A shard's contribution to the model (`filetree::ShardTensors`). */

@@ -776,7 +776,15 @@ mod contract {
         has_keys(
             "FileNode::dir",
             &root,
-            &["kind", "name", "path", "size", "files", "children"],
+            &[
+                "kind",
+                "name",
+                "path",
+                "size",
+                "files",
+                "hardlinked",
+                "children",
+            ],
         );
         let file = root["children"]
             .as_array()
@@ -794,6 +802,7 @@ mod contract {
                 "shard",
                 "size_share",
                 "index",
+                "links",
             ],
         );
         // The fixture's own shard is attributed, so `ShardTensors` is on the wire too

@@ -130,6 +130,15 @@ pub enum FileNode {
         /// Aggregate size (bytes) and file count of everything under here.
         size: u64,
         files: usize,
+        /// How many of those files are hardlinked (their bytes have another name).
+        ///
+        /// The per-row marks say which files share their bytes; this says how much of
+        /// the directory does, which is the question you actually have when a listing
+        /// adds up to 57 GiB. Deliberately a **count, not a byte total**: hardlinked
+        /// bytes are shared, not free — someone pays for them once — and a "55 GiB
+        /// shared" figure would read as "this checkpoint is nearly free", which is only
+        /// true if you already have the other copy.
+        hardlinked: usize,
     },
     File {
         name: String,
@@ -155,6 +164,11 @@ pub enum FileNode {
         /// Whether the index declares this file, once [`FileNode::attribute_index`] has
         /// run. `None` when the question doesn't apply — see [`IndexMembership`].
         index: Option<IndexMembership>,
+        /// How many names this file's bytes have — see [`DirEntry::File::links`]. `>1`
+        /// means the file is hardlinked, so its size is shared rather than its own:
+        /// deleting this name frees nothing, and the checkpoint's real footprint is
+        /// smaller than the sum of its rows.
+        links: u64,
     },
 }
 
@@ -305,8 +319,19 @@ fn share(params: usize, total: usize) -> f64 {
 /// real, descendable directory is `Directory`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirEntry {
-    File { name: String, size: u64 },
-    Directory { name: String },
+    File {
+        name: String,
+        size: u64,
+        /// `st_nlink` of the file's inode: `1` for an ordinary file, `>1` when the
+        /// same bytes are reachable under more than one name. `1` when unknown, which
+        /// is what every remote backend reports — `st_nlink` needs a local `stat`, and
+        /// an S3 object has no inode to count names of. Same convention (and the same
+        /// meaning) as [`crate::model::FsNode::File::links`].
+        links: u64,
+    },
+    Directory {
+        name: String,
+    },
 }
 
 impl DirEntry {
@@ -314,6 +339,35 @@ impl DirEntry {
     pub fn name(&self) -> &str {
         match self {
             Self::File { name, .. } | Self::Directory { name } => name,
+        }
+    }
+}
+
+/// One entry in a **flat** listing for [`build_from_keys`] — an S3 object key or a
+/// remote file's checkpoint-relative path, with what is known about it.
+///
+/// Named rather than a `(String, u64, u64)` triple for the same reason [`DirEntry`]
+/// exists: two adjacent byte counts that could be stored swapped, and a caller with no
+/// way to see it had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectEntry {
+    /// Prefix-relative key, `/`-separated (`layer_0/weight`). Becomes the node's path
+    /// verbatim, so a browser can rebuild the full URI from it.
+    pub key: String,
+    pub size: u64,
+    /// Names the bytes have — see [`DirEntry::File::links`]. Use [`Self::object`] for a
+    /// listing that cannot know (a real S3 object has no inode to share).
+    pub links: u64,
+}
+
+impl ObjectEntry {
+    /// An entry from a listing with no notion of hard links — an S3 object.
+    #[must_use]
+    pub fn object(key: String, size: u64) -> Self {
+        Self {
+            key,
+            size,
+            links: 1,
         }
     }
 }
@@ -393,7 +447,7 @@ fn apply_size_shares(node: &mut FileNode, max: u64) {
 /// key** (`a/b/c` for the object `a/b/c`), so the browser rebuilds the full
 /// `s3://…` URI as `{uri}/{path}`. Browse-only — no per-object layout or preview.
 #[must_use]
-pub fn build_from_keys(root_label: &str, objects: &[(String, u64)]) -> FileNode {
+pub fn build_from_keys(root_label: &str, objects: &[ObjectEntry]) -> FileNode {
     use std::collections::{HashMap, HashSet};
     // Directory (a relative path; "" is the root) → its immediate entries.
     // Intermediate dirs are materialized once (`dir_seen`); files carry their
@@ -401,7 +455,7 @@ pub fn build_from_keys(root_label: &str, objects: &[(String, u64)]) -> FileNode 
     // composed path (`dir.join(name)`) equal its exact prefix-relative key.
     let mut listing: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
     let mut dir_seen: HashSet<PathBuf> = HashSet::new();
-    for (key, size) in objects {
+    for ObjectEntry { key, size, links } in objects {
         let comps: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
         let Some((leaf, dirs)) = comps.split_last() else {
             continue;
@@ -422,6 +476,7 @@ pub fn build_from_keys(root_label: &str, objects: &[(String, u64)]) -> FileNode 
         listing.entry(cur).or_default().push(DirEntry::File {
             name: (*leaf).to_string(),
             size: *size,
+            links: *links,
         });
     }
     let list = move |p: &Path| listing.get(p).cloned().unwrap_or_default();
@@ -452,16 +507,39 @@ fn local_list(dir: &Path) -> Vec<DirEntry> {
             out.push(match meta {
                 // A real directory descends; a symlinked directory is a File leaf.
                 Ok(m) if m.is_dir() && !is_symlink => DirEntry::Directory { name },
-                Ok(m) if m.is_dir() => DirEntry::File { name, size: 0 },
+                Ok(m) if m.is_dir() => DirEntry::File {
+                    name,
+                    size: 0,
+                    links: 1,
+                },
                 Ok(m) => DirEntry::File {
                     name,
                     size: m.len(),
+                    links: link_count(&m),
                 },
-                Err(_) => DirEntry::File { name, size: 0 },
+                Err(_) => DirEntry::File {
+                    name,
+                    size: 0,
+                    links: 1,
+                },
             });
         }
     }
     out
+}
+
+/// The inode's hard-link count, or `1` where the platform has no such notion.
+///
+/// Free here: [`local_list`] already `stat`s every entry to follow symlinks, so this
+/// reads a field it has rather than making a syscall of its own.
+#[cfg(unix)]
+fn link_count(meta: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::nlink(meta)
+}
+
+#[cfg(not(unix))]
+fn link_count(_meta: &std::fs::Metadata) -> u64 {
+    1
 }
 
 /// The label for the root directory node — its final component, or the whole
@@ -496,9 +574,10 @@ fn build_dir(
                     expanded: false,
                     size: 0,
                     files: 0,
+                    hardlinked: 0,
                 });
             }
-            DirEntry::File { name, size } => {
+            DirEntry::File { name, size, links } => {
                 let kind = FileKind::of(&name);
                 files.push(FileNode::File {
                     name,
@@ -511,6 +590,7 @@ fn build_dir(
                     size_share: 0.0,
                     // Filled in by `attribute_index`, which needs the index.
                     index: None,
+                    links,
                 });
             }
         }
@@ -530,6 +610,13 @@ fn build_dir(
             FileNode::File { .. } => 1,
         })
         .sum();
+    let hardlinked = children
+        .iter()
+        .map(|c| match c {
+            FileNode::Dir { hardlinked, .. } => *hardlinked,
+            FileNode::File { links, .. } => usize::from(*links > 1),
+        })
+        .sum();
 
     FileNode::Dir {
         name,
@@ -538,6 +625,7 @@ fn build_dir(
         expanded: false, // the root is expanded by `build`; nested dirs collapsed
         size,
         files: file_count,
+        hardlinked,
     }
 }
 
@@ -563,6 +651,8 @@ pub enum FileRowKind {
     Dir {
         expanded: bool,
         files: usize,
+        /// Hardlinked files under here — see [`FileNode::Dir::hardlinked`].
+        hardlinked: usize,
     },
     File {
         kind: FileKind,
@@ -571,6 +661,8 @@ pub enum FileRowKind {
         size_share: f64,
         /// Whether the index declares this file — see [`IndexMembership`].
         index: Option<IndexMembership>,
+        /// How many names this file's bytes have — see [`DirEntry::File::links`].
+        links: u64,
     },
 }
 
@@ -622,6 +714,26 @@ impl FileRow {
             FileRowKind::Dir { .. } => None,
         }
     }
+
+    /// How many names this file's bytes have (`1` for an ordinary file or a directory)
+    /// — see [`DirEntry::File::links`].
+    #[must_use]
+    pub fn links(&self) -> u64 {
+        match self.kind {
+            FileRowKind::File { links, .. } => links,
+            FileRowKind::Dir { .. } => 1,
+        }
+    }
+
+    /// Hardlinked files under this directory row (0 for a file row) — see
+    /// [`FileNode::Dir::hardlinked`].
+    #[must_use]
+    pub fn hardlinked(&self) -> usize {
+        match self.kind {
+            FileRowKind::Dir { hardlinked, .. } => hardlinked,
+            FileRowKind::File { .. } => 0,
+        }
+    }
 }
 
 /// Flatten the tree into the visible rows (a collapsed directory hides its
@@ -642,6 +754,7 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
             expanded,
             size,
             files,
+            hardlinked,
         } => {
             out.push(FileRow {
                 depth,
@@ -651,6 +764,7 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
                 kind: FileRowKind::Dir {
                     expanded: *expanded,
                     files: *files,
+                    hardlinked: *hardlinked,
                 },
             });
             if *expanded {
@@ -667,6 +781,7 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
             shard,
             size_share,
             index,
+            links,
         } => out.push(FileRow {
             depth,
             name: name.clone(),
@@ -677,6 +792,7 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
                 shard: *shard,
                 size_share: *size_share,
                 index: *index,
+                links: *links,
             },
         }),
     }
@@ -800,17 +916,20 @@ mod tests {
                     DirEntry::File {
                         name: "model.safetensors".into(),
                         size: 100,
+                        links: 1,
                     },
                     DirEntry::Directory { name: "sub".into() },
                     DirEntry::File {
                         name: "config.json".into(),
                         size: 2,
+                        links: 1,
                     },
                 ],
                 "/ckpt/sub" => vec![
                     DirEntry::File {
                         name: "extra.json".into(),
                         size: 8,
+                        links: 1,
                     },
                     DirEntry::Directory {
                         name: "deep".into(),
@@ -819,6 +938,7 @@ mod tests {
                 "/ckpt/sub/deep" => vec![DirEntry::File {
                     name: "leaf.bin".into(),
                     size: 4,
+                    links: 1,
                 }],
                 _ => Vec::new(),
             }
@@ -926,14 +1046,17 @@ mod tests {
                     DirEntry::File {
                         name: "model-00001.safetensors".into(),
                         size: 600,
+                        links: 1,
                     },
                     DirEntry::File {
                         name: "model-00002.safetensors".into(),
                         size: 400,
+                        links: 1,
                     },
                     DirEntry::File {
                         name: "config.json".into(),
                         size: 2,
+                        links: 1,
                     },
                 ]
             } else {
@@ -1011,6 +1134,64 @@ mod tests {
     }
 
     #[test]
+    fn attribute_tensors_works_for_the_remote_source_path_forms() {
+        // A remote read stamps `source_path` in a form the browse tree's own paths can
+        // never equal: scp form for `--ssh-proxy` (`host:/dir/shard`, tree nodes have no
+        // `host:`) and the full URI for `s3://` (tree nodes are prefix-relative keys).
+        // The name fallback is what makes the counts appear at all there, so it is
+        // tested on the shapes those two readers actually produce.
+        for source in [
+            "lab@host:/remote/ckpt/model-00001.safetensors",
+            "s3://bucket/ckpt/model-00001.safetensors",
+        ] {
+            let mut root = two_shard_tree();
+            root.attribute_tensors(&[tensor("a", source, 10), tensor("b", source, 30)]);
+            let shard = shards_of(&root)["model-00001.safetensors"]
+                .unwrap_or_else(|| panic!("attributed from {source}"));
+            assert_eq!((shard.tensors, shard.params), (2, 40));
+            assert!((shard.params_share - 1.0).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn attribute_index_works_for_a_remote_index_path() {
+        // A remote index's `path` is scp form or a URI, and its weight-map values are
+        // still bare basenames — which is exactly why membership is matched on the name.
+        // Without this the `--ssh-proxy` file browser marked nothing.
+        for path in [
+            "lab@host:/remote/ckpt/model.safetensors.index.json",
+            "s3://bucket/ckpt/model.safetensors.index.json",
+        ] {
+            let index = crate::model::IndexEntry {
+                path: path.to_string(),
+                weight_map: std::iter::once((
+                    "a".to_string(),
+                    "model-00001.safetensors".to_string(),
+                ))
+                .collect(),
+            };
+            let mut root = two_shard_tree();
+            root.attribute_index(std::slice::from_ref(&index));
+            let rows = flatten(&root);
+            let membership = |name: &str| {
+                rows.iter()
+                    .find(|r| r.name == name)
+                    .and_then(FileRow::index_membership)
+            };
+            assert_eq!(
+                membership("model-00001.safetensors"),
+                Some(IndexMembership::Listed),
+                "listed, from {path}"
+            );
+            assert_eq!(
+                membership("model-00002.safetensors"),
+                Some(IndexMembership::Unlisted),
+                "an extra, from {path}"
+            );
+        }
+    }
+
+    #[test]
     fn attribute_index_marks_only_the_files_no_index_names() {
         // An index that lists one of the two shards — the other is an extra on disk,
         // which is what a LUT checkpoint's codebooks/qscales files are.
@@ -1076,13 +1257,51 @@ mod tests {
         assert!(first.params_share.abs() < f64::EPSILON);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn build_counts_the_names_a_hardlinked_file_has() {
+        // A blob-dedup layout: the shard in the checkpoint is a *hardlink*, so its bytes
+        // are shared and the checkpoint occupies less than its rows add up to. Sixteen
+        // of the eighteen shards in a real LUT checkpoint look like this, and nothing in
+        // the app said so until the browser started showing it.
+        let base = std::env::temp_dir().join("ce_filetree_hardlink_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("shared.safetensors"), vec![0u8; 512]).unwrap();
+        std::fs::hard_link(
+            base.join("shared.safetensors"),
+            base.join("second-name.safetensors"),
+        )
+        .unwrap();
+        std::fs::write(base.join("alone.safetensors"), vec![0u8; 512]).unwrap();
+
+        let links: HashMap<String, u64> = flatten(&build(&base, 8))
+            .into_iter()
+            .map(|r| (r.name.clone(), r.links()))
+            .collect();
+        assert_eq!(links["shared.safetensors"], 2, "{links:?}");
+        assert_eq!(links["second-name.safetensors"], 2, "{links:?}");
+        assert_eq!(
+            links["alone.safetensors"], 1,
+            "an ordinary file has one name"
+        );
+
+        // …and the directory row totals them, so a listing that adds up to more than
+        // the checkpoint occupies says how much of itself is shared.
+        let root = build(&base, 8);
+        assert_eq!(flatten(&root)[0].hardlinked(), 2, "two of the three files");
+        assert!(matches!(root, FileNode::Dir { files: 3, .. }));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn build_from_keys_makes_an_s3_native_tree() {
         // A flat object listing with a shared "layer_0/" prefix + a top-level file.
         let objects = vec![
-            ("layer_0/weight".to_string(), 100u64),
-            ("layer_0/bias".to_string(), 10u64),
-            ("metadata.json".to_string(), 5u64),
+            ObjectEntry::object("layer_0/weight".to_string(), 100),
+            ObjectEntry::object("layer_0/bias".to_string(), 10),
+            ObjectEntry::object("metadata.json".to_string(), 5),
         ];
         let root = build_from_keys("my-ckpt", &objects);
         let FileNode::Dir {
@@ -1120,5 +1339,29 @@ mod tests {
         assert!(
             matches!(weight, FileNode::File { path, .. } if path == Path::new("layer_0/weight"))
         );
+        // An object listing knows nothing of hard links, so every row has one name.
+        assert!(flatten(&root).iter().all(|r| r.links() == 1));
+    }
+
+    #[test]
+    fn build_from_keys_carries_a_remote_listing_s_link_counts() {
+        // The web builds a remote browse tree from the model's own file listing, and an
+        // `--ssh-proxy` read does know `st_nlink` (its batched `stat` asks for `%h`). So
+        // this path has to carry it, or the browser would show hardlinks for a local
+        // checkpoint and nothing for the same checkpoint read over ssh.
+        let objects = vec![
+            ObjectEntry {
+                key: "model-00001.safetensors".to_string(),
+                size: 100,
+                links: 2,
+            },
+            ObjectEntry::object("config.json".to_string(), 2),
+        ];
+        let root = build_from_keys("ckpt", &objects);
+        let rows = flatten(&root);
+        let links = |name: &str| rows.iter().find(|r| r.name == name).map(FileRow::links);
+        assert_eq!(links("model-00001.safetensors"), Some(2));
+        assert_eq!(links("config.json"), Some(1));
+        assert_eq!(rows[0].hardlinked(), 1, "the root row totals them");
     }
 }
