@@ -1,9 +1,9 @@
 //! Ratatui scaffolding shared by the interactive and headless render paths.
 //!
 //! This module owns the bits both the live loop and the `--plain` / screen-copy
-//! paths need: the live [`Terminal`] lifecycle (deliberately *not* using the
-//! alternate screen, so the last frame stays on exit) and an in-memory
-//! [`TestBackend`] render for headless output.
+//! paths need: the live [`Terminal`] lifecycle (on the **alternate screen**, so
+//! quitting restores the pre-launch screen and tmux -CC / iTerm2 render it
+//! efficiently) and an in-memory [`TestBackend`] render for headless output.
 
 use std::io::{self, Stdout};
 
@@ -11,8 +11,7 @@ use anyhow::Result;
 use crossterm::{
     cursor,
     event::{DisableMouseCapture, EnableMouseCapture},
-    execute,
-    terminal::{self, ClearType},
+    execute, terminal,
 };
 use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
@@ -21,27 +20,25 @@ use ratatui::{
 };
 
 /// The live terminal type owned by the interactive loop.
-pub type LiveTerminal = Terminal<CrosstermBackend<Stdout>>;
+pub(crate) type LiveTerminal = Terminal<CrosstermBackend<Stdout>>;
 
-/// Set up the live terminal: raw mode, a cleared screen, hidden cursor, and a
-/// Ratatui terminal over stdout. Deliberately **no** alternate screen — quitting
-/// leaves the last frame on screen (see [`restore`]).
-pub fn init() -> Result<LiveTerminal> {
+/// Set up the live terminal: raw mode, the **alternate screen**, hidden cursor,
+/// and a Ratatui terminal over stdout. The alternate screen gives the TUI its own
+/// buffer — quitting restores the pre-launch screen (see [`restore`]), and, since
+/// tmux -CC / iTerm2 render an alt-screen app on a dedicated surface, dense full
+/// repaints forward far faster than they do on the primary buffer (which caused
+/// ~1s tmux -CC lag switching into a big tree). Entering it also hides any pre-TUI
+/// output (e.g. the `--ssh-proxy` password prompt + read spinner) without having to
+/// scrub the primary scrollback.
+pub(crate) fn init() -> Result<LiveTerminal> {
     terminal::enable_raw_mode()?;
     let mut out = io::stdout();
     // Capture the mouse so rows can be clicked and the wheel scrolls. (This means
     // the terminal's own text selection needs Shift held — the `y`/`c` shortcuts
     // and OSC-52 copy are the primary copy paths anyway.)
-    // Clear the screen AND the scrollback, then home the cursor, before the
-    // fullscreen viewport takes over. Any pre-TUI output (e.g. the `--ssh-read`
-    // password prompt + read spinner) otherwise leaves lines the plain screen
-    // clear (`\x1b[2J`) doesn't remove from the scrollback, so the tree appears
-    // pushed down from the top.
     execute!(
         out,
-        terminal::Clear(ClearType::All),
-        terminal::Clear(ClearType::Purge),
-        cursor::MoveTo(0, 0),
+        terminal::EnterAlternateScreen,
         cursor::Hide,
         EnableMouseCapture
     )?;
@@ -54,21 +51,32 @@ pub fn init() -> Result<LiveTerminal> {
     Ok(terminal)
 }
 
-/// Restore the terminal after the interactive loop. Mirrors the previous
-/// hand-rolled exit: leave the last rendered frame on screen, clear anything
-/// below the cursor, show the cursor, leave raw mode, and drop the shell prompt
-/// onto a fresh line just below the frame.
-pub fn restore(terminal: &mut LiveTerminal) -> Result<()> {
-    let height = terminal.size().map(|s| s.height).unwrap_or(0);
+/// A [`LiveTerminal`] for tests: no raw mode, no alternate screen, no mouse capture —
+/// just a terminal over stdout with a **fixed** viewport.
+///
+/// The fixed viewport is what makes this work off a tty: `Viewport::Fullscreen` asks
+/// the backend for the real window size, which fails when stdout is a pipe (as it is
+/// under `cargo test`). With this, the mode drivers — whose `handle_key` /
+/// `handle_mouse` take `&mut LiveTerminal` — can be exercised in unit tests instead of
+/// only through the end-to-end `--plain` snapshots.
+#[cfg(test)]
+pub(crate) fn test_terminal(width: u16, height: u16) -> LiveTerminal {
+    Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Fixed(ratatui::layout::Rect::new(0, 0, width, height)),
+        },
+    )
+    .expect("a fixed viewport needs no terminal size query")
+}
+
+/// Restore the terminal after the interactive loop: stop mouse capture, leave the
+/// alternate screen (which brings back the pre-launch primary buffer + shell
+/// prompt), show the cursor, and leave raw mode.
+pub(crate) fn restore(_terminal: &mut LiveTerminal) -> Result<()> {
     let mut out = io::stdout();
-    // Park the cursor at the bottom of the frame so the prompt lands below it.
-    execute!(
-        out,
-        DisableMouseCapture,
-        cursor::MoveTo(0, height.saturating_sub(1)),
-        terminal::Clear(ClearType::FromCursorDown),
-        cursor::Show
-    )?;
+    // Stop mouse capture before leaving the alternate screen / handing back the tty.
+    execute!(out, DisableMouseCapture)?;
     // Discard input still arriving before we hand the (cooked, echoing) terminal
     // back to the shell. Quitting mid-scroll (e.g. Ctrl-C during a mouse-wheel
     // burst) leaves a tail of unread SGR mouse reports in the buffer — plus, over
@@ -98,10 +106,10 @@ pub fn restore(terminal: &mut LiveTerminal) -> Result<()> {
             pfd.revents = 0;
             // A short gap with no input means the terminal has settled (the
             // disable took hold and the link drained); then we're done.
-            if libc::poll(&mut pfd, 1, 60) <= 0 {
+            if libc::poll(&raw mut pfd, 1, 60) <= 0 {
                 break;
             }
-            if libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) <= 0 {
+            if libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) <= 0 {
                 break;
             }
             if start.elapsed() > Duration::from_millis(1200) {
@@ -110,8 +118,8 @@ pub fn restore(terminal: &mut LiveTerminal) -> Result<()> {
         }
         libc::tcflush(fd, libc::TCIFLUSH);
     }
+    execute!(out, terminal::LeaveAlternateScreen, cursor::Show)?;
     terminal::disable_raw_mode()?;
-    println!();
     Ok(())
 }
 
@@ -119,7 +127,11 @@ pub fn restore(terminal: &mut LiveTerminal) -> Result<()> {
 /// the resulting screen as plain text — the headless render path. Each row is the
 /// buffer's cell symbols with trailing spaces trimmed, and trailing blank rows are
 /// dropped, matching the shape the snapshot tests expect.
-pub fn headless_render(width: u16, height: u16, f: impl FnOnce(&mut Frame)) -> Result<String> {
+pub(crate) fn headless_render(
+    width: u16,
+    height: u16,
+    f: impl FnOnce(&mut Frame),
+) -> Result<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal.draw(f)?;
     Ok(buffer_to_string(terminal.backend().buffer()))
@@ -128,7 +140,7 @@ pub fn headless_render(width: u16, height: u16, f: impl FnOnce(&mut Frame)) -> R
 /// Flatten a Ratatui [`Buffer`] to plain text: one line per row (cell symbols
 /// concatenated; a wide glyph's trailing skip cell contributes nothing), trailing
 /// spaces trimmed per row, trailing blank rows dropped.
-pub fn buffer_to_string(buffer: &Buffer) -> String {
+pub(crate) fn buffer_to_string(buffer: &Buffer) -> String {
     use unicode_width::UnicodeWidthStr;
     let width = buffer.area.width as usize;
     let height = buffer.area.height as usize;
@@ -141,7 +153,12 @@ pub fn buffer_to_string(buffer: &Buffer) -> String {
         // 2-cell emoji doesn't leak a stray space.
         let mut skip = 0usize;
         for col in 0..width {
-            let symbol = cells[row * width + col].symbol();
+            let Some(symbol) = cells
+                .get(row * width + col)
+                .map(ratatui::buffer::Cell::symbol)
+            else {
+                break; // `row`/`col` come from the buffer's own dimensions
+            };
             if skip == 0 {
                 line.push_str(symbol);
             }
@@ -152,7 +169,7 @@ pub fn buffer_to_string(buffer: &Buffer) -> String {
         }
         lines.push(line);
     }
-    while lines.last().is_some_and(|l| l.is_empty()) {
+    while lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }
     lines.join("\n")

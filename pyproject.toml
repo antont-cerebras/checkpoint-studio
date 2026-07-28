@@ -1,0 +1,194 @@
+# Python tooling config. There is no Python *package* here — this file exists so
+# ruff and pyright have one source of truth for the Python we ship:
+#
+#   crates/core/src/python/*.py   the remote reader/compare scripts, embedded into
+#                                 the binary with include_str! and executed on the
+#                                 ssh proxy (see crates/core/src/remote.rs)
+#   gen_demo.py, record_demo.py   local dev utilities for the README demo
+#
+# The remote scripts run under whatever interpreter the proxy's cstorch venv has,
+# which we don't control — so target the oldest we're willing to support (3.9) and
+# let pyupgrade rules keep us inside it, rather than suggesting 3.10+ syntax that
+# would crash on an older cluster.
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+extend-exclude = ["target", "web"]
+
+[tool.ruff.lint]
+# Every rule ruff ships, minus the opt-outs below — the Python counterpart of the Rust
+# side's `clippy::all + pedantic + nursery + cargo` at deny. `ALL` rather than a list of
+# families is deliberate: it makes a new ruff release's rules arrive as opt-*out*. The
+# version is pinned in CI, so an upgrade is a step where new findings get triaged, not a
+# surprise that reds the build overnight.
+#
+# Switching this on (ruff 0.16, which has ~970 rules) found 38 of ruff's linter families
+# already clean on this tree — those are now held that way for free. Everything below is
+# either a rule ruff itself says conflicts with another, or a deliberate decision with the
+# reason attached. Nothing here is "too noisy to look at": each was read.
+select = ["ALL"]
+ignore = [
+  # --- pairs ruff itself reports as mutually exclusive ---------------------------
+  "D203", # blank line *before* a class docstring — conflicts with D211, which wins
+  "D213", # summary on the *second* line — conflicts with D212, which wins
+  # --- style, on scripts written to a deliberately compact shape ------------------
+  # These are scripts, not a library: they're written in a deliberately compact style
+  # (`emit(...); sys.exit(0)`) and cross an ssh boundary as a single payload. Line
+  # length and one-statement-per-line would mean reformatting ~150 lines of code that
+  # runs on a production cluster, for no behavioural gain.
+  "E501",  # line too long
+  "E701",  # multiple statements on one line (colon)
+  "E702",  # multiple statements on one line (semicolon)
+  "COM812", # missing trailing comma — ruff's docs flag COM as formatter-conflicting
+  "COM819", # ditto, prohibited trailing comma
+  # printf-style `%` formatting is used throughout and is fine — `%r` for repr in
+  # error paths is the idiom here. Rewriting 41 sites in cluster code buys nothing.
+  "UP031",
+  # `Any` is the honest annotation for torch / numpy / boto3 / cstorch values: those
+  # packages aren't importable at lint time (see reportMissingImports), so there is no
+  # more precise type available. Everything else IS annotated — ANN001/ANN2xx stay on.
+  "ANN401",
+  # `×` in comments is intentional (matches the Rust docs' style).
+  "RUF003",
+  # --- what these programs *are* --------------------------------------------------
+  # stdout is the protocol: every remote script's entire output is the JSON line it
+  # prints, which the Rust side parses. `print` is the interface, not a leftover debug.
+  "T201",
+  "T203",
+  # The remote scripts are execed by absolute path on the proxy and the stub trees are
+  # resolved by path too — none of these directories is an importable package, and
+  # adding `__init__.py` to make a linter happy would change how they load.
+  "INP001",
+  # No license headers in this repo (it carries a top-level LICENSE instead).
+  "CPY001",
+  # The Python tests use `unittest`, on purpose: the harness runs on machines where we
+  # can't count on pytest being installed. PT009 would have us rewrite 35 assertions
+  # into a framework we deliberately don't depend on.
+  "PT009",
+  # `raise RuntimeError("...")` reads better than assigning the message to a name
+  # first, and these messages are read by a human staring at a failed cluster job.
+  "EM101",
+  "EM102",
+  "TRY003",
+  # --- docstring *presence* (the formatting rules, D2xx/D4xx, stay on) ------------
+  # Same call as the Rust side's `missing_errors_doc` / `missing_panics_doc`: 59 sites
+  # of prose, on code that is already densely commented, where the comment usually
+  # explains *why* rather than restating the signature. Worse, in a `.pyi` stub a
+  # docstring is itself a lint (PYI021) — so D1xx and PYI021 cannot both be satisfied.
+  "D100", "D101", "D102", "D103", "D104", "D105", "D107",
+  # --- overlapping ceilings -------------------------------------------------------
+  # `value_diff.work` / `repack_verify.work` are the chunked compare loops, and are
+  # already held by one ceiling (C901, max-complexity 15 below, with a documented
+  # per-file exemption). Three more counters over the same two functions would not
+  # tell us anything the first one doesn't.
+  "PLR0912", # too many branches
+  "PLR0915", # too many statements
+  "PLR0913", # too many arguments
+  # Comparisons against small integers in dtype / rank / bit-width code, where `3` and
+  # `4` are the domain (3-bit and 4-bit packing), not magic numbers wanting a name.
+  "PLR2004",
+  # --- policy, not correctness ----------------------------------------------------
+  # A TODO is a note to ourselves; making one fail the build just moves it out of the
+  # code and into someone's memory, which is worse.
+  "FIX", "TD",
+  # pydoclint's rules are all preview-only in 0.16, so selecting them here would be a
+  # no-op that silently activates on a future upgrade. Revisit when they stabilise.
+  "DOC",
+]
+
+[tool.ruff.lint.mccabe]
+# The scripts are linear pipelines; the S3 metadata pass is the most branching thing
+# here. This is a ceiling to stop a new one growing unnoticed, not a target.
+max-complexity = 15
+
+[tool.ruff.lint.per-file-ignores]
+# The remote scripts talk to cstorch/S3 over a network on a machine we can't debug
+# interactively: a broad `except Exception` that reports the failure as structured
+# JSON is the intended design, not a smell.
+"crates/core/src/python/*.py" = [
+  "BLE001",
+  # The scripts import inside `try` blocks on purpose: a missing torch/boto3 has to be
+  # reported as structured JSON, not crash the interpreter at import time.
+  "PLC0415",
+  # One `try/except/pass`: the S3 *probe* is best-effort diagnosis of an already-failed
+  # load, and there is nowhere to log — its whole output is the JSON line it returns.
+  "S110",
+  # `value_diff.work` / `repack_verify.work` are the chunked compare loops: branching on
+  # dtype, rank, packing and cancellation in one pass over the tensor. Splitting them
+  # would mean threading a dozen locals through helpers on code that runs on a cluster
+  # we cannot step through. The complexity ceiling still applies to everything else.
+  "C901",
+  # The fast path's whole purpose is to reach into cstorch's `DeferredObject` for the S3
+  # coordinates (`._reader`, `._key`) that its public API doesn't expose, and to memoize
+  # the patch with a private marker. That access is the feature — see remote.rs — so
+  # flagging it here would only teach us to stop reading the warning.
+  "SLF001",
+  # `E`, `W`, `N` are the experts / weight / row dimensions of the arrays being compared.
+  # Single capitals are the notation this arithmetic is written in everywhere else.
+  "N806",
+]
+# The test harness deliberately does the things bandit flags: `exec` is how it runs the
+# scripts under test, `assert` is how a test asserts, and a temp path is where a fixture
+# goes. Flagging them here would be noise, not security.
+"crates/core/tests/python/*.py" = ["S101", "S102", "S301", "S108"]
+# A stub's job is to restate someone else's API *exactly*: boto3's keyword arguments are
+# PascalCase (`Bucket`, `Key`, `MaxKeys`), torch has a class that isn't CapWords and
+# parameters that shadow builtins. Renaming any of them would make the stub describe a
+# library that doesn't exist. See typings/README.md.
+"typings/**/*.pyi" = ["N801", "N802", "N803", "A002", "A003"]
+# The demo recorders shell out to the terminal recorder and write to a fixed temp path;
+# that is what they are for.
+"{gen_demo,record_demo}.py" = ["S101", "S311", "S603", "S606", "S607", "S110", "S108"]
+
+# There is deliberately no `[tool.pyright]` table here: pyright reads pyrightconfig.json
+# in preference to pyproject.toml, so a table here would be silently dead config that
+# disagrees with the file actually in force. Pyright's settings live in
+# pyrightconfig.json, and only there.
+
+[tool.ty.environment]
+# The hand-written stubs for the cluster-side packages (see typings/README.md). ty has no
+# `stubPath`, so they go on the module search path instead — `.pyi` files there resolve
+# the same way. Without this, ty silently treated every `torch.*` / `boto3.*` value as
+# Unknown and checked nothing in exactly the code most worth checking: verified by
+# mutating `torch.isfinite` to `torch.isfinit` and watching ty pass.
+extra-paths = ["typings"]
+
+[tool.ty.rules]
+# Every third-party import now resolves — through the stubs above, or through a real
+# numpy — so an unresolved import is a genuine error again: a new dependency that no
+# environment can satisfy. (Previously ignored, because nothing resolved.)
+unresolved-import = "error"
+
+# --- coverage.py -------------------------------------------------------------
+#
+# The remote scripts are the thing worth measuring: they run on a cluster we can't
+# debug interactively. `crates/core/tests/python/test_remote_scripts.py` execs them
+# under their real paths (so these lines are attributable) with cstorch/boto3 stubbed.
+#
+# `value_diff.py` / `repack_verify.py` are omitted on purpose: their bodies are
+# numpy/torch array arithmetic, and a fake numpy convincing enough to exercise them
+# would itself be the least trustworthy thing in the suite. They are covered instead by
+# the recorded-transcript replay tests in `crates/core/src/remote.rs`. Counting them
+# here would make the floor a fiction.
+#
+# Enforced by scripts/coverage.sh against coverage-floors.json.
+[tool.coverage.run]
+source = ["crates/core/src/python"]
+omit = [
+  "crates/core/src/python/value_diff.py",
+  "crates/core/src/python/repack_verify.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+# The offline half of the ratchet (Codecov compares against the parent commit; this
+# catches a drop in a fork or on a laptop). Raise it when coverage rises.
+fail_under = 90
+exclude_lines = [
+  "pragma: no cover",
+  # The scripts' broad `except Exception` blocks report a cluster failure as JSON; the
+  # ones that need a real cstorch/boto3 error to trigger aren't reachable from a stub.
+  "except Exception as e:  # unreachable under stubs",
+]

@@ -1,4 +1,4 @@
-# Checkpoint Explorer
+# Checkpoint Studio
 
 A fast terminal UI for looking **inside** model checkpoints — not just the tree
 of tensor names and shapes, but the **actual data**: heatmaps, grids of real
@@ -44,19 +44,19 @@ subcommands for comparing and health-checking checkpoints.
   parameter-count change, per-tensor dtype/shape changes, and git-style line diffs
   for metadata — or add `--values`/`--histogram` with name/dtype/shape **filters**
   to compare only the tensors you care about, in parallel even across huge MoE
-  checkpoints. Diffs **S3 / MinIO** and remote-SSH checkpoints too (`--ssh-read`),
+  checkpoints. Diffs **S3 / MinIO** and remote-SSH checkpoints too (`--ssh-proxy`),
   so you can compare two deployed checkpoints without downloading either.
 - 🩺 **`check` a checkpoint's health.** A scriptable
   [subcommand](#checking-checkpoints-check) (`diff`-style exit codes) that flags
   **truncated / corrupt** safetensors files, **missing layers** or dropped
   shards, index/file mismatches, and dtype/shape oddities — all header-only, so it
-  works over `--ssh-read` / S3 — plus a `--values` pass that scans tensor data for
+  works over `--ssh-proxy` / S3 — plus a `--values` pass that scans tensor data for
   **NaN/±Inf** and all-zero/constant tensors.
 - 🌐 **Built for big & remote.** Loads only metadata (fast startup on huge
   models), and **browses *and* diffs checkpoints on S3 / MinIO** — or any box you
   reach by SSH — whose credentials never leave the server, by delegating the read
-  to a remote host (`--ssh-read`, or an scp-style `host:/path`; see
-  [Remote checkpoints](#remote-checkpoints-on-s3--minio---ssh-read)). The remote
+  to a remote host (`--ssh-proxy`, or an scp-style `host:/path`; see
+  [Remote checkpoints](#remote-checkpoints-over-ssh---ssh-proxy)). The remote
   access is **strictly read-only** — it can't create, modify, or delete anything
   on the host, so it's safe to point at production checkpoints. Copies to your
   local clipboard over SSH via **OSC 52**, and a `y` key prints the exact CLI
@@ -76,16 +76,19 @@ Plus the essentials: 🔎 fuzzy search (`/`), 🔢 natural sort for layer number
 
 ### Install
 ```bash
-cargo install --git https://github.com/antont-cerebras/checkpoint-explorer
+cargo install --git https://github.com/antont-cerebras/checkpoint-studio
 ```
 
 ### Prerequisites
 - Rust 1.88 or later (the crate uses edition 2024 and let-chains)
+- **Node 20+ only if you change the web UI** (`web/`). Building or installing
+  `checkpoint-studio` itself needs no Node at all — `web/dist` is committed and
+  embedded at compile time. See [Rebuilding the UI](#web-ui-web).
 
 ### Build from source
 ```bash
-git clone https://github.com/antont-cerebras/checkpoint-explorer
-cd checkpoint-explorer
+git clone https://github.com/antont-cerebras/checkpoint-studio
+cd checkpoint-studio
 cargo build --release
 ```
 
@@ -105,10 +108,10 @@ cargo build --release --features hdf5
 ### Basic usage
 ```bash
 # Explore a single safetensors file
-checkpoint-explorer model.safetensors
+checkpoint-studio model.safetensors
 
 # Explore a GGUF file
-checkpoint-explorer model.gguf
+checkpoint-studio model.gguf
 
 # Or if building from source
 cargo run -- model.safetensors
@@ -118,50 +121,189 @@ cargo run -- model.gguf
 ### Directory exploration
 ```bash
 # Explore all safetensors and GGUF files in a directory
-checkpoint-explorer /path/to/model/directory
+checkpoint-studio /path/to/model/directory
 
 # Recursively search subdirectories
-checkpoint-explorer -r /path/to/models
+checkpoint-studio -r /path/to/models
 
 # The tool automatically detects and uses model.safetensors.index.json if present
-checkpoint-explorer /path/to/huggingface/model
+checkpoint-studio /path/to/huggingface/model
 ```
 
 ### Multi-file exploration
 ```bash
 # Explore multiple files as a unified model
-checkpoint-explorer model-00001-of-00003.safetensors model-00002-of-00003.safetensors model-00003-of-00003.safetensors
+checkpoint-studio model-00001-of-00003.safetensors model-00002-of-00003.safetensors model-00003-of-00003.safetensors
 
 # Mix safetensors and GGUF files
-checkpoint-explorer model.safetensors model.gguf
+checkpoint-studio model.safetensors model.gguf
 
 # Mix files and directories
-checkpoint-explorer model.safetensors /path/to/additional/models
+checkpoint-studio model.safetensors /path/to/additional/models
 ```
 
 ### Glob pattern support
 ```bash
 # Use wildcards to select multiple files
-checkpoint-explorer *.safetensors
+checkpoint-studio *.safetensors
 
 # Match files with specific patterns
-checkpoint-explorer model-*.gguf
+checkpoint-studio model-*.gguf
 
 # Match numbered checkpoint files
-checkpoint-explorer checkpoint-[0-9]*.safetensors
+checkpoint-studio checkpoint-[0-9]*.safetensors
 
 # Combine multiple patterns
-checkpoint-explorer *.safetensors *.gguf
+checkpoint-studio *.safetensors *.gguf
 
 # Mix glob patterns with explicit paths
-checkpoint-explorer model.safetensors checkpoint-*.safetensors
+checkpoint-studio model.safetensors checkpoint-*.safetensors
 ```
 
-### Remote checkpoints over SSH (`--ssh-read`)
+### Web UI (`web`)
+Prefer a browser? The `web` subcommand serves the same information as the TUI over
+an HTTP server:
+
+```bash
+checkpoint-studio web /path/to/checkpoint          # serve on all interfaces, port 8080
+checkpoint-studio web --port 9000 /path/to/ckpt    # pick a port
+```
+
+It binds all interfaces by default (`--host 0.0.0.0`) and prints the reachable URL
+using this machine's hostname — e.g. `http://your-vm.example.com:8080/` — so you
+can open it from another machine's browser with no tunnel. Pass `--host 127.0.0.1`
+to restrict it to loopback.
+
+The server (a dependency-light, blocking `tiny_http` server — no async runtime)
+**supplies the data** as JSON; the **browser owns the view state** (which screen,
+tree folding, selection, search). It reads the checkpoint once and serves the
+tensor tree, tensor detail, file browser, byte-layout map, stats, and the health /
+structural check — plus on-demand heatmaps, value histograms, sample/slice grids,
+and whole-tensor statistics that scan tensor bytes only when you open them. Remote
+checkpoints work too — `web --ssh-proxy HOST:VENV s3://…` serves a source read over SSH,
+with the same restriction the terminal has: the structure, stats and health are all there,
+while the data views (which need the bytes) report that the checkpoint is metadata-only.
+The UI is a Svelte single-page app **embedded in the binary**, so a released
+`checkpoint-studio` needs nothing extra to serve it.
+
+> [!WARNING]
+> **There is no access control.** The server has no authentication of any kind, and it
+> binds `0.0.0.0` by default so it is reachable at your machine's hostname. Anyone who can
+> reach the port can read the served checkpoint — and, through `/api/diff?against=PATH`,
+> the structure of **any checkpoint path the serving user can read**. Pass
+> `--host 127.0.0.1` to restrict it to your own machine. When the bind is not loopback,
+> the startup banner says so in the terminal and the page carries a strip saying the same.
+
+**Reverse parity — what the browser has that the terminal deliberately doesn't.** The
+terminal now has the compact (family-folded) tree (`k` / `--compact`) and flat-list sorting
+(`o` / `O` / `--sort`). It does **not** have a theme switch: recolouring is browser-idiomatic
+presentation, the terminal already answers to its own colour scheme, and this is left as an
+intentional medium difference rather than a gap.
+
+**What the web UI deliberately does not do.** It is **read-only**: renaming tensors in
+place and repacking an HDF5 codec are offered by the CLI (`convert`) and the TUI (`R` and
+the palette's repack command) but have no web equivalent, because they rewrite checkpoint
+files and the server accepts requests from anywhere it is reachable. Diffing is available
+everywhere, but only its **structural** half — the value comparison (`diff --values`) and
+repack verification (`diff --verify-repack`) stay on the CLI, where a scan that reads every
+byte of both checkpoints has a progress bar, cancellation, and somewhere to report
+per-tensor findings.
+
+**Rebuilding the UI** — only needed when changing `web/`. Requires **Node 20**
+(pinned in `web/.nvmrc` / `web/.node-version`; `engine-strict` makes npm enforce it,
+and the `pre*` scripts refuse to run on an older Node):
+```bash
+cd web
+nvm use          # or: fnm use
+npm ci
+npm run check    # svelte-check (types)
+npm run lint     # eslint — type-aware, incl. Svelte templates
+npm run build    # regenerates web/dist
+npm run dup      # jscpd — copy-paste detection over the RUST sources (see below)
+```
+`web/dist` is **committed** and embedded at compile time, and CI rebuilds it on the
+`.nvmrc` Node and fails if the result differs — so commit the regenerated `dist`
+alongside your `web/src` change, built on Node 20. (Why 20: Node 16 is EOL and ESLint
+10 won't run on it.) For development, `npm run dev` runs Vite with hot-reload and
+proxies `/api` to a running `web` instance.
+
+**Duplication** is a gate too. `npm run dup` (or `npx jscpd@5.0.12 --config .jscpd.json` from the
+repo root — it needs only Node, not the web toolchain) runs token-based copy-paste detection
+over `crates/core/src` and `src`, and fails if duplication rises above the `threshold` in
+`.jscpd.json`. That number is the current measurement, not an aspiration: lower it when a
+refactor earns it, and raising it needs a reason in the commit — the same rule the coverage
+floor follows. Tests are excluded, because a test's job is to spell its case out.
+
+**Adding a data source** is one `Source` impl in `src/source.rs` plus an arm in
+`resolve` — nothing else. Features never match on a source kind: they ask
+`crates/core/src/capability.rs`, which derives what is possible from the pair (format ×
+location) plus how the source is reached:
+
+| capability | needs |
+| --- | --- |
+| read tensor bytes | local today — a capability, not a synonym for "is local", so the Hub gaining `Range` reads is one row |
+| modify in place | safetensors **and** local (the rename editor) |
+| repack | HDF5 **and** local (writes a *new* file, so a different capability) |
+| byte-layout map | safetensors over **any** transport — a Hub repo has one |
+| browse the file tree | every location has a listing |
+| per-object metadata | S3 only |
+| codec info | HDF5 only |
+| `reach` | `Direct`, or `ViaSshProxy` for a source whose credentials live elsewhere |
+
+`Capabilities` is serializable and served on `/api/tree`, so the browser asks rather than
+inferring from the source's shape, and each unavailability carries one shared sentence —
+a Hub repo is told the weights aren't there, not to "copy the checkpoint down".
+
+**The Python side** (the scripts that run on the ssh proxy, plus the `typings/` stubs that
+let a type checker see them) is gated by three tools, all **version-pinned** in CI:
+
+```bash
+python3 -m venv ~/.venvs/ckpt-tools           # any interpreter; the tools ship wheels
+~/.venvs/ckpt-tools/bin/pip install "ruff==0.16.0" "pyright==1.1.409" "ty==0.0.63" "numpy<2"
+ruff check .                                   # config in pyproject.toml
+pyright                                        # strict; config in pyrightconfig.json
+ty check crates/core/src/python crates/core/tests/python gen_demo.py record_demo.py
+python3 -m unittest discover -s crates/core/tests/python -t crates/core/tests/python
+```
+
+Ruff runs with `select = ["ALL"]` — every rule it ships, minus a list of opt-outs that each
+carry their reason in `pyproject.toml`. That is why the versions are pinned: with the whole
+rule set at deny, a new ruff release would otherwise add rules to a red build on a commit
+that changed nothing. Upgrading is a deliberate commit where the new findings get triaged.
+
+### Hugging Face Hub (`hf://owner/name`)
+Explore a repo on the Hub without downloading it:
+
+```bash
+checkpoint-studio hf://moonshotai/Kimi-K3            # or paste the browser URL
+checkpoint-studio https://huggingface.co/moonshotai/Kimi-K3#2-model-summary
+checkpoint-studio hf://owner/name@refs/pr/3 --stats  # a branch, tag or commit
+```
+
+A safetensors file begins with an 8-byte header length and that many bytes of JSON
+describing every tensor — name, dtype, shape, and its byte range. The Hub serves files with
+HTTP `Range` support, so the whole structure of a multi-terabyte repo costs a couple of
+small requests per shard. Kimi-K3 is 96 shards and 1.4 TiB on the Hub; its 497,220 tensors
+come back from ~3 KB of header per shard, and the tree, the compact view, the statistics,
+the health check and the byte-layout map all work from that. **No weights are fetched.**
+
+Which means the data views (heatmap, values, histogram, whole-tensor statistics) are *not*
+available — they read tensor bytes, the one thing this never downloads. Same restriction as
+`--ssh-proxy`, reported the same way. `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) is sent as a
+bearer token, so gated and private repos work with the token you already have; `HF_ENDPOINT`
+points at a mirror.
+
+All three frontends take a Hub reference, including the web UI:
+
+```bash
+checkpoint-studio web hf://moonshotai/Kimi-K3 --host 127.0.0.1
+```
+
+### Remote checkpoints over SSH (`--ssh-proxy`)
 Browse a checkpoint that lives only on a remote host — either behind credentials
 you (rightly) don't want to copy to your laptop (a Cerebras **cstorch** checkpoint
 on MinIO, brokered by a secrets manager), or simply on a box you reach by SSH.
-`--ssh-read [USER@]HOST` delegates the read to that host and renders the tree
+`--ssh-proxy [USER@]HOST` delegates the read to that host and renders the tree
 locally. It handles:
 - a **directory of safetensors shards** (or a single `.safetensors` file) at a
   remote path — read over **pure-Rust SFTP** (the tool speaks SSH/SFTP itself, no
@@ -177,16 +319,43 @@ locally. It handles:
   that runs anything remotely (Python/cstorch, over `ssh`), since cstorch/akeyless
   access is the whole point of it.
 ```bash
-checkpoint-explorer --ssh-read lab@usernode \
-  /opt/cerebras/inference/models/some-model-4bit                # safetensors dir (SFTP)
-checkpoint-explorer --ssh-read lab@usernode \
-  s3://inference-testing/some-model/4bit/260504/checkpoint      # s3 cstorch
-# scp-style shorthand for a remote safetensors dir (no --ssh-read needed):
-checkpoint-explorer usernode:/opt/cerebras/inference/models/some-model-4bit
+checkpoint-studio --ssh-proxy you@host.example.com \
+  /opt/models/some-model-4bit                                   # safetensors dir (SFTP)
+checkpoint-studio --ssh-proxy you@host.example.com \
+  s3://my-bucket/some-model/4bit/260504/checkpoint              # s3 cstorch
+# scp-style shorthand for a remote safetensors dir (no --ssh-proxy needed):
+checkpoint-studio host.example.com:/opt/models/some-model-4bit
 ```
 **Nothing but the header metadata leaves the server** — no keys, no tensor data.
 
-> **Read-only, guaranteed.** `--ssh-read` never modifies the remote checkpoint.
+**Default proxy in a config file.** Typing `--ssh-proxy …` every time gets old, so
+set the host you usually use in `~/.config/checkpoint-studio/config.toml` (or
+`$XDG_CONFIG_HOME/checkpoint-studio/config.toml`):
+```toml
+ssh_proxy = "you@host.example.com"
+ssh_venv  = "~/venv"   # optional — the cstorch venv on that host (default: ~/venv)
+```
+Then plain `checkpoint-studio s3://my-bucket/…/checkpoint` (or `diff`, `check`,
+`web`) reads through that proxy with no flag. For a **remote filesystem path** (which
+looks just like a local one), prefix it with `:` to route it there:
+```bash
+checkpoint-studio :/opt/models/some-model-4bit     # = --ssh-proxy <config host> /opt/models/…
+```
+The `:` is the explicit opt-in, so a same-named *local* directory is never silently
+read off-host (and `:PATH` with no proxy configured is an error, not a local read).
+An explicit `--ssh-proxy` / `--ssh-venv` on the command line always overrides the
+config, and a missing or malformed config file is simply ignored. (`--ssh-read` still
+works as an alias for `--ssh-proxy`, so older commands keep running.)
+
+**Recording a remote transcript.** Set `CHECKPOINT_STUDIO_RECORD_REMOTE=<dir>` and the
+stdout of each remote script is saved to `<dir>/{dump,value_diff,repack_verify,list_objects}.txt`.
+Only what already crossed the ssh link is written — metadata and results, never tensor
+data. Useful twice over: it's the fastest way to report a remote problem (send the
+transcript rather than describe it), and the checked-in fixtures under
+`crates/core/tests/fixtures/remote/` are recordings replayed through the parsers in tests,
+so the protocol is pinned to what the cluster really emits rather than to what we assumed.
+
+> **Read-only, guaranteed.** `--ssh-proxy` never modifies the remote checkpoint.
 > Files are opened strictly read-only (`OpenFlags::READ` — no create/write/
 > truncate), the tool issues no `mkdir`/`remove`/`rename`/`chmod`, and the `s3://`
 > path only *loads* the checkpoint and prints metadata to stdout (no
@@ -199,10 +368,10 @@ badges; hover it for the why). The data views (heatmap / numeric grid / histogra
 / statistics) need the bytes locally, so copy the checkpoint down to preview its
 values. The **[file browser](#file-browser-tab)** (`Tab` / `--files`) *does* work
 remotely — it reads only directory listings and safetensors headers (see there).
-`diff` takes `--ssh-read` too, for a
+`diff` takes `--ssh-proxy` too, for a
 structural (dtype/shape) comparison of two remote checkpoints:
 ```bash
-checkpoint-explorer diff --ssh-read lab@usernode /opt/…/model-a /opt/…/model-b
+checkpoint-studio diff --ssh-proxy lab@usernode /opt/…/model-a /opt/…/model-b
 ```
 (The two checkpoints are read **in parallel** — any mix of `s3://` and safetensors
 dirs — each with its own colour progress spinner and elapsed timer. The password
@@ -228,17 +397,17 @@ Jump straight to a tensor's preview on startup instead of navigating the tree �
 handy for scripting or revisiting a known tensor:
 ```bash
 # Open a tensor's detail screen
-checkpoint-explorer model.hdf5 --tensor model.layers.0.mlp.down_proj.weight
+checkpoint-studio model.hdf5 --tensor model.layers.0.mlp.down_proj.weight
 
 # Open straight into the numeric values grid, reinterpreted as packed 4-bit,
 # in the first/last edges submode
-checkpoint-explorer model.hdf5 \
+checkpoint-studio model.hdf5 \
   --tensor model.layers.0.block_sparse_moe.experts.down_proj.weight \
   --dtype u4 --values --edge
 
 # --tensor is optional when the checkpoint holds a single tensor (always so for
 # a .npy): reshape a flat dump and view it as packed 4-bit, no name needed
-checkpoint-explorer weights.npy --shape 128,3088,2992 --dtype u4 --values
+checkpoint-studio weights.npy --shape 128,3088,2992 --dtype u4 --values
 ```
 The flags below act on the opened tensor. `--tensor` names it (exact name), but
 is **optional when the checkpoint has only one tensor** — always the case for a
@@ -286,31 +455,33 @@ accept `--format json`; add `-v` for per-tensor detail. Output is pipe-safe
 
 ```bash
 # The whole tree as text, fully expanded
-checkpoint-explorer model.safetensors --print-tree
+checkpoint-studio model.safetensors --print-tree
 
 # A flat, one-per-line list of every tensor (natural-sorted)
-checkpoint-explorer shards/ --print-tensors
+checkpoint-studio shards/ --print-tensors
 
 # A model.safetensors.index.json-style object: metadata.total_size + a
 # weight_map of tensor name -> shard file
-checkpoint-explorer shards/ --print-tree --format json
+checkpoint-studio shards/ --print-tree --format json
 
 # -v adds detail: the source file in text; a `tensors` block (dtype/shape/
 # element count, plus codec + on-disk size for compressed tensors) in JSON
-checkpoint-explorer model.safetensors --print-tensors --format json -v
+checkpoint-studio model.safetensors --print-tensors --format json -v
 
 # Works over SSH too — only the structure crosses the wire
-checkpoint-explorer host:/opt/model --print-tree --format json
+checkpoint-studio host:/opt/model --print-tree --format json
 
 # Filter by a name glob (repeatable); prefix ! to exclude
-checkpoint-explorer model.safetensors --print-tree --name '*.mlp.*'
-checkpoint-explorer model.safetensors --print-tensors --name '!*.bias'
+checkpoint-studio model.safetensors --print-tree --name '*.mlp.*'
+checkpoint-studio model.safetensors --print-tensors --name '!*.bias'
 ```
 
 | Flag | Effect |
 |------|--------|
 | `--print-tree` | Print the grouped tree (fully expanded) and exit |
 | `--print-tensors` | Print a flat list of every tensor and exit |
+| `--print-model` | Print the whole central checkpoint model (files + headers + config + index) as JSON and exit — the serializable datatype the app reads everything into |
+| `--print-view` | Print the tensor-tree screen's `ViewModel` (visible rows, selection, search) as JSON and exit — the kernel's frontend-agnostic output contract a web/MCP frontend would serve |
 | `--format <text\|json>` | Output format for the above (default `text`) |
 | `-v` / `--verbose` | Add per-tensor detail (source file in text; a `tensors` block / detail objects — dtype, shape, element count, and codec + on-disk size for compressed tensors — in JSON) |
 | `--name <GLOB>` | Restrict the printed tree/list to matching tensor names (repeatable; prefix `!` to exclude, e.g. `'!*.bias'` = everything but biases) |
@@ -406,13 +577,24 @@ again (or `Backspace`) returns to the tensor tree; launch straight into it with
 - a **JSON** sidecar opens a scrollable, syntax-highlighted preview; other
   **text** files (`.txt`, `.md`, `.py`, `README`, …) preview as plain scrollable
   text.
+
+  **Markdown is a rendered document in the web UI only.** `checkpoint-studio web`
+  renders a README or model card properly — headings, tables, clickable links,
+  and syntax-highlighted code blocks — with the model's `---` frontmatter lifted
+  out as a field list, and a *source* toggle for the highlighted raw file. The
+  terminal has no equivalent library, and hand-writing one would just disagree
+  with it, so the TUI shows markdown as plain text on purpose.
+
+  A card comes from a checkpoint someone else built, so the rendered HTML is
+  sanitized before it is shown: scripts, event handlers, `javascript:` URLs and
+  `<style>` blocks don't survive, and links open in a new tab with `noopener`.
 - anything else shows a short info pop-up (no preview).
 
 The file view has the same command palette (`Space` / `:`), `l` legend, `c` /
 `f` / `y` copies (screen / file path / command), and `y` round-trips through
 `--files`, like the tree.
 
-**Remote checkpoints too** (`--ssh-read`) — the browser adapts to the source,
+**Remote checkpoints too** (`--ssh-proxy`) — the browser adapts to the source,
 reading only metadata (no tensor data leaves the host):
 
 - a **remote safetensors directory** is browsed over SFTP just like a local one —
@@ -425,7 +607,7 @@ reading only metadata (no tensor data leaves the host):
   and size (cstorch objects aren't per-file safetensors, so there's no per-object
   layout or preview).
 
-`y` round-trips the remote view too (`--ssh-read … --files`, and `--layout` for a
+`y` round-trips the remote view too (`--ssh-proxy … --files`, and `--layout` for a
 remote shard).
 
 ### safetensors layout map
@@ -625,12 +807,12 @@ full-screen view summarising the whole model at a glance (it scrolls with
   holes** — so a mostly-zero checkpoint that squashes on ZFS shows its real disk
   usage. The per-shard list is **folded by default** to a one-line summary
   (`N of M smaller`); press `f`, or click the row, to expand it to **every**
-  shard's apparent → allocated size. For `--ssh-read` dirs it's measured by a single
+  shard's apparent → allocated size. For `--ssh-proxy` dirs it's measured by a single
   read-only `stat -L` on the remote host (SFTP carries no block count) — the same
   symlink-following size resolution the file browser uses, so a symlinked shard
   shows its real target footprint, not the link stub. It's omitted for `s3://` and
   in the deterministic `--plain` render (a live measurement isn't reproducible).
-- **☁ S3 objects** — for an `s3://` cstorch source (`--ssh-read`), the underlying
+- **☁ S3 objects** — for an `s3://` cstorch source (`--ssh-proxy`), the underlying
   object store's metadata: object count and total size, **stored-checksum coverage**
   by algorithm (e.g. `126 with SHA256`, or "none stored" when equality would rest on
   the ETag), how many objects reported an **ETag**, **tag** coverage (or
@@ -716,10 +898,10 @@ The same is available non-interactively:
 
 ```bash
 # Repack with zstd (default level), 256 MiB streaming buffer
-checkpoint-explorer convert --codec zstd model.hdf5 model.zst.hdf5
+checkpoint-studio convert --codec zstd model.hdf5 model.zst.hdf5
 
 # Pick a level (gzip 0–9, zstd 1–22), a 1 GiB buffer, and allow overwriting
-checkpoint-explorer convert -c gzip -l 9 -b 1G -f model.hdf5 model.gz.hdf5
+checkpoint-studio convert -c gzip -l 9 -b 1G -f model.hdf5 model.gz.hdf5
 ```
 
 Datasets are streamed in bounded row-blocks sized to the buffer, so memory stays
@@ -745,10 +927,10 @@ single `.safetensors` file.
 
 ```bash
 # Drop the "model.layers." prefix across every shard, in place
-checkpoint-explorer convert ./my-checkpoint --map 'model\.layers\.=>layers.'
+checkpoint-studio convert ./my-checkpoint --map 'model\.layers\.=>layers.'
 
 # Two rules, apply without the confirmation prompt
-checkpoint-explorer convert model.safetensors \
+checkpoint-studio convert model.safetensors \
   --map 'self_attn=>attn' --map 'mlp=>feed_forward' --force
 ```
 
@@ -830,7 +1012,7 @@ round-trips through `y`:
 
 ```bash
 # Open the rename editor with one rule pre-filled (renames every layer's q_proj)
-checkpoint-explorer ./my-checkpoint --rename \
+checkpoint-studio ./my-checkpoint --rename \
   --rename-rule 'model.layers.{layer}.attn.q_proj.weight=>model.layers.{layer}.self_attn.q_proj.weight'
 ```
 
@@ -840,18 +1022,36 @@ checkpoint-explorer ./my-checkpoint --rename \
 # Structural diff: which tensors (name/dtype/shape) and metadata were added,
 # removed, or changed. Fast — tensor data is not read. Exit 0 = identical,
 # 1 = differences, 2 = trouble (like the `diff` utility).
-checkpoint-explorer diff old.safetensors new.safetensors
+checkpoint-studio diff old.safetensors new.safetensors
 
 # Also compare element values (not just dtype/shape): promotes a values-only
 # change to a difference and reports max/mean |Δ|. Reads the data.
-checkpoint-explorer diff old.safetensors new.safetensors --values
+checkpoint-studio diff old.safetensors new.safetensors --values
 ```
+
+**Scoping a side to a subtree (`#SUBTREE`).** When two checkpoints hold the same
+weights under different top-level namespaces — e.g. an HF export nests everything
+under `language_model.` (`language_model.model.layers.…`) while a converted
+checkpoint has it at the root (`model.layers.…`) — append `#SUBTREE` to a source to
+**descend into that subtree** and compare from there, so the names line up:
+```bash
+checkpoint-studio diff ':/opt/models/hf#language_model' s3://bkt/converted
+#                                      └── compares the HF model's language_model.*
+#                                          (as model.layers.*) vs the other side's root
+```
+It's a **scope change**, not a rename: the comparison starts N levels down, sibling
+subtrees (`vision_tower`, `mm_projector`, …) fall outside it, and the totals + header
+reflect the subtree. It applies to **either or both** operands. A local `--values` /
+`--histogram` comparison is scoped the same way (data is read by byte offset, so the
+tensors keep their real names); over `--ssh-proxy` the value comparison runs on the
+remote *by name*, so there it's structural only. Split is on the last `#`, so a `#`
+inside a path/key is preserved.
 
 A remote structural diff of two `s3://` cstorch checkpoints — read over a single
 SSH session (one password prompt), rendered in colour (old **red**, new **green**,
 secondary detail dimmed):
 
-![diff --ssh-read comparing two remote S3 checkpoints](diff-example.svg)
+![diff --ssh-proxy comparing two remote S3 checkpoints](diff-example.svg)
 
 **Comparing a subset of tensors.** Any of the filters below scopes the whole
 diff (structural *and* `--values`/`--histogram`) to the matching tensors, so you
@@ -870,13 +1070,13 @@ engine (`*`, `**`, `?`, `[…]`):
 
 ```bash
 # Value-compare just the down_proj weights across every layer
-checkpoint-explorer diff old/ new/ --values --name '*.down_proj.weight'
+checkpoint-studio diff old/ new/ --values --name '*.down_proj.weight'
 
 # Only the BF16 tensors whose shape ends in 2048
-checkpoint-explorer diff old/ new/ --dtype-is BF16 --shape-is '**,2048'
+checkpoint-studio diff old/ new/ --dtype-is BF16 --shape-is '**,2048'
 
 # A specific set of tensors listed in a file
-checkpoint-explorer diff old/ new/ --values --names-from tensors.txt
+checkpoint-studio diff old/ new/ --values --names-from tensors.txt
 ```
 
 With a filter active, a line on **stderr** reports how many tensors matched (of
@@ -900,14 +1100,14 @@ rule can rewrite a shared segment across every layer at once:
 
 ```bash
 # gpt-oss (mlp.experts) vs a block_sparse_moe-named checkpoint
-checkpoint-explorer diff old/ new/ \
+checkpoint-studio diff old/ new/ \
   --map '\.mlp\.experts\.=>.block_sparse_moe.experts.' \
   --map 'experts\.(down|gate_up)_proj$=>experts.${1}_proj.weight'
 
 # Or load the rules from a file (merged after any --map). A '.json' file is a
 # JSON array of [pattern, replacement] pairs; any other extension is one
 # 'REGEX=>REPLACEMENT' rule per line ('#' comments and blank lines ignored).
-checkpoint-explorer diff old/ new/ --map-from rename.txt
+checkpoint-studio diff old/ new/ --map-from rename.txt
 ```
 
 A note on **stderr** reports how many rules were applied; if a rule is broad
@@ -920,6 +1120,30 @@ runs **in parallel** — `--jobs N` sets how many tensors are compared at once
 lists the tensors currently being compared; the total elapsed time is printed
 when it finishes. All progress goes to stderr, so a piped diff on stdout stays
 clean.
+
+**How remote value comparison works (over `--ssh-proxy`).** For an s3-vs-s3
+`--values` / `--histogram` / `--tensor` run, the tensor data isn't reachable from
+your machine — so the comparison is done **entirely on the proxy**, by a read-only
+`cerebras.pytorch` (cstorch) script on the host that holds the S3 access. For each
+compared tensor the proxy streams both sides' S3 objects itself (chunked, straight
+from S3 — much faster than letting cstorch materialize them), decodes them with
+torch, and computes the differing count, max/mean **|Δ|**, and histogram distance
+**there**. Only the small per-tensor *results* come back over SSH — **never tensor
+data**. Each tensor gets its own live download bar (size + bytes read, then a
+`comparing…` phase while the proxy decodes and compares); reads run `--jobs`-wide in
+parallel. A final line reports the bytes read and throughput.
+
+**`--verify-repack`** proves two `s3://` checkpoints hold the *same* quantized
+expert weights in different index packings (**sparse**: one N-bit index per 16-bit
+word ↔ **dense**: several indices folded into each word). On the proxy it decodes
+and compares the packed indices, validates the packing (the unused high bits must
+be zero), reports how many indices differ and by how much (an all-±1 difference is
+the signature of an independent re-quantization, not a lossless repack), and diffs
+the sibling **`codebook` / `qscale`** tensors — which share a shape on both sides
+and so never show up in a structural diff, yet a codebook change explains index
+drift. `--values` on a quantized expert weight (one with a sibling `.codebook`)
+auto-detects the packing and compares it as indices the same way. Scope it with
+`--name` — it reads the full tensors, so it's for a few layers at a time.
 
 Related flags: `--tensor <NAME>` focuses one tensor (with a bin-by-bin
 `--histogram` table); `--histogram` compares value *distributions* (total
@@ -935,23 +1159,23 @@ be read) — so it drops straight into CI or a pre-flight script.
 
 ```bash
 # Structural checks (header-only, fast)
-checkpoint-explorer check /path/to/model/
+checkpoint-studio check /path/to/model/
 
 # Also scan tensor data for NaN/±Inf and all-zero / constant tensors
-checkpoint-explorer check model.safetensors --values
+checkpoint-studio check model.safetensors --values
 
 # Machine-readable report for scripts / agents / CI
-checkpoint-explorer check /path/to/model/ --format json
+checkpoint-studio check /path/to/model/ --format json
 
 # SARIF 2.1.0 — upload to GitHub code scanning / feed static-analysis tooling
-checkpoint-explorer check /path/to/model/ --format sarif > checkpoint.sarif
+checkpoint-studio check /path/to/model/ --format sarif > checkpoint.sarif
 
 # A remote / S3 checkpoint (structural checks only — data stays on the host)
-checkpoint-explorer check --ssh-read lab@usernode s3://bucket/model/checkpoint
+checkpoint-studio check --ssh-proxy lab@usernode s3://bucket/model/checkpoint
 ```
 
 The **structural** checks read only headers, so they're cheap and work over
-`--ssh-read` / `s3://` too:
+`--ssh-proxy` / `s3://` too:
 
 - **Byte-range integrity** — safetensors tensor spans are sized correctly for
   their dtype/shape, packed contiguously from offset 0 with no gaps or overlaps,
@@ -972,7 +1196,7 @@ The **structural** checks read only headers, so they're cheap and work over
   legitimate mix of dtypes-by-role — weights BF16, quant scales F16, codebooks
   F32 — is **not** flagged; only a within-role outlier is.
 - **Config consistency** — cross-checks `config.json` (read from beside the
-  checkpoint, or fetched over `--ssh-read`) against the tensor tree: the
+  checkpoint, or fetched over `--ssh-proxy`) against the tensor tree: the
   **layer count** (`num_hidden_layers`), **experts per layer** (`num_experts`),
   the **tied/untied LM head** (`tie_word_embeddings`), the **embedding shape**
   (`vocab_size` × `hidden_size`), and **QK-norm** (`use_qk_norm`). Catches a
@@ -1001,14 +1225,14 @@ fold) unfolds the full list, and `--health-findings` opens it expanded. There,
 `v` runs the value-tier data scan (progress bar; `Esc` cancels), `r` copies the
 report, `c` copies the tree screen, and `y` copies the CLI command that reopens
 the popup (`… --health` / `--health-findings`); `Esc` or a click elsewhere
-dismisses. (`v` is offered only for a local checkpoint — a remote `--ssh-read`
+dismisses. (`v` is offered only for a local checkpoint — a remote `--ssh-proxy`
 source has no local bytes to scan.) When the explorer auto-detects an index/file
 mismatch on startup it points you to `h`.
 
 ## Example Output
 
 ```
-Checkpoint Explorer - model.safetensors (1/1)
+Checkpoint Studio - model.safetensors (1/1)
 ↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter open · Space/: commands · E/C all · / search · l legend · h health · s stats · c copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · q quit
 ────────────────────────────────────────────────────────────────────────────────
 

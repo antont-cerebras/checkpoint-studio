@@ -1,0 +1,1015 @@
+//! The **kernel**: the frontend-agnostic core over a cached
+//! [`crate::model::Checkpoint`]. No terminal, no disk — everything comes from the
+//! model the readers already cached, so it's trivially unit-testable and the same
+//! kernel backs the interactive terminal, a headless web server, or an MCP tool.
+//! It has three parts:
+//!
+//! - [`Session`] — the single owner of the checkpoint's **canonical data**
+//!   (deduped + natural-sorted tensors, metadata, config, parameter count) and
+//!   its cached reports (stats). A frontend loads the tree from it and asks it for
+//!   reports.
+//! - the **view-state + command surface** — [`TreeState`] / [`FileState`] /
+//!   [`DataViewState`], the browser state a frontend owns and persists across
+//!   loads, with the navigation/fold operations as methods (`move_selection`,
+//!   `toggle_group_at`, `reveal`, …) the frontend drives.
+//! - the **output contract** — [`ViewModel`], a serializable snapshot projected
+//!   from the live view-state ([`ViewModel::from_tree`] / [`ViewModel::from_files`])
+//!   that a TUI renders, a web server sends as JSON, or an MCP tool returns.
+
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+
+use crate::config::ModelConfig;
+use crate::model::Checkpoint;
+use crate::sample::ViewDtype;
+use crate::stats::CheckpointStats;
+use crate::tree::{MetadataInfo, TensorInfo, TreeBuilder, TreeNode, natural_sort_key};
+use crate::viewstate::{DataLayout, NumBase, SortDir, SortKey, StripeMode};
+
+/// Which screen the session is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Screen {
+    Tree,
+    Files,
+}
+
+/// One visible row in the [`ViewModel`] — the frontend renders these; it doesn't
+/// walk the tree itself.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Row {
+    pub depth: usize,
+    pub label: String,
+    /// A group/directory (has children) vs a leaf (tensor / file).
+    pub is_group: bool,
+}
+
+/// The serializable snapshot of what's on screen — the kernel's one output
+/// contract, shared by every frontend (TUI renders it, a web server sends it as
+/// JSON, an MCP tool returns it).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ViewModel {
+    pub screen: Screen,
+    /// The checkpoint root (the header line).
+    pub root: String,
+    pub rows: Vec<Row>,
+    /// Index of the highlighted row in `rows`.
+    pub selected: usize,
+    /// The bottom status line (e.g. the selected row's path/summary).
+    pub status: String,
+    /// The active search query, if any.
+    pub search: Option<String>,
+}
+
+/// The tensor-tree browser state — the tree itself, its flattened/filtered rows,
+/// and the selection/scroll/search. Kernel-owned, with its navigation + fold
+/// operations as methods on this type (`move_selection`, `move_to_*`,
+/// `toggle_group_at`, `set_all_expanded`, `reveal`, `reflatten`) — the tree
+/// screen's command surface. A frontend drives those methods and renders the
+/// resulting fields; the search-filter refresh stays on the frontend only because
+/// it needs the tensor list (which the [`Session`] owns).
+#[derive(Default)]
+pub struct TreeState {
+    /// The grouped tree (a single root node summarising the checkpoint).
+    pub tree: Vec<TreeNode>,
+    /// The tree flattened to visible rows `(node, depth)` (fold-aware).
+    pub flattened: Vec<(TreeNode, usize)>,
+    /// Highlighted row index (into the visible tree).
+    pub selected: usize,
+    /// Viewport scroll offset.
+    pub scroll: usize,
+    /// Live search — `Some` only while searching. The query, its caret, and the
+    /// results it produced travel together (a `Some` iff we're in search mode),
+    /// so there's no `search_mode` bool that can disagree with a stale query /
+    /// filtered list.
+    pub search: Option<SearchState>,
+    /// A persistent structured filter (`--filter` / the palette), `Some` while
+    /// active. Its flat result rows are shown instead of the folded tree (but an
+    /// in-progress `search` takes precedence). Populated by the frontend from the
+    /// full tensor list, so it can be edited/cleared live without a destructive
+    /// prune.
+    pub filter: Option<FilterState>,
+    /// How the **flat** (search / filter) list is ordered — the tree itself is never
+    /// reordered. `SortKey::None` leaves the natural order (fuzzy score for a search,
+    /// tree order for a filter). Applied by the frontend when it (re)builds those rows,
+    /// because restoring the natural order means rebuilding them, not un-sorting them.
+    pub sort: (SortKey, SortDir),
+}
+
+/// Order a **flat** row list (a search or filter result) by one facet.
+///
+/// Rows carrying no tensor — a group header, a metadata entry — compare equal, and the
+/// sort is stable, so they keep their relative position instead of being herded to one
+/// end. The tree itself is never sorted: its order *is* the checkpoint's structure.
+///
+/// `SortKey::None` is a no-op, leaving the natural order (fuzzy score for a search, tree
+/// order for a filter).
+///
+/// Mirrored by the web client's `rows.ts: sortRows`, with `shared/parity/format.json`
+/// holding the two to the same answers — including the two details most likely to drift:
+/// names collate **numerically** (so `layers.2` precedes `layers.10`, not follows it), and
+/// dtype collates as plain text.
+pub fn sort_rows(rows: &mut [(TreeNode, usize)], key: SortKey, dir: SortDir) {
+    /// A row's tensor, or `None` for a group header / metadata row.
+    fn facet(node: &TreeNode) -> Option<&TensorInfo> {
+        match node {
+            TreeNode::Tensor { info, .. } => Some(info),
+            TreeNode::Group { .. } | TreeNode::Metadata { .. } => None,
+        }
+    }
+
+    if matches!(key, SortKey::None) {
+        return;
+    }
+    rows.sort_by(|(a, _), (b, _)| {
+        let (Some(x), Some(y)) = (facet(a), facet(b)) else {
+            return std::cmp::Ordering::Equal;
+        };
+        let ord = match key {
+            // Numeric collation, so `layers.2` sorts before `layers.10`.
+            SortKey::Name => natural_sort_key(&x.name).cmp(&natural_sort_key(&y.name)),
+            SortKey::Size => x.size_bytes.cmp(&y.size_bytes),
+            SortKey::Params => x.num_elements.cmp(&y.num_elements),
+            SortKey::Rank => x.shape.len().cmp(&y.shape.len()),
+            SortKey::Dtype => x.dtype.cmp(&y.dtype),
+            SortKey::None => std::cmp::Ordering::Equal,
+        };
+        match dir {
+            SortDir::Asc => ord,
+            SortDir::Desc => ord.reverse(),
+        }
+    });
+}
+
+/// The tree screen's persistent structured filter: the query text and the flat
+/// result rows it produced (the tensors passing [`crate::tensorfilter`]).
+#[derive(Default)]
+pub struct FilterState {
+    pub query: String,
+    pub filtered: Vec<(TreeNode, usize)>,
+}
+
+/// The tree screen's live search: the query being typed, its caret, and the
+/// (fuzzy-matched) result rows shown instead of the folded tree.
+#[derive(Default)]
+pub struct SearchState {
+    /// The live search query.
+    pub query: String,
+    /// Caret position within `query` (character index in `0..=query.chars().count()`).
+    pub cursor: usize,
+    /// The search-result rows (shown instead of `flattened` while searching).
+    pub filtered: Vec<(TreeNode, usize)>,
+}
+
+impl TreeState {
+    /// Whether search input is active.
+    #[must_use]
+    pub fn search_mode(&self) -> bool {
+        self.search.is_some()
+    }
+    /// The live search query, or `""` when not searching.
+    #[must_use]
+    pub fn search_query(&self) -> &str {
+        self.search.as_ref().map_or("", |s| s.query.as_str())
+    }
+    /// The caret position, or 0 when not searching.
+    #[must_use]
+    pub fn search_cursor(&self) -> usize {
+        self.search.as_ref().map_or(0, |s| s.cursor)
+    }
+
+    // Search-caret motion (all no-ops when not searching).
+    pub fn search_cursor_home(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.cursor = 0;
+        }
+    }
+    pub fn search_cursor_end(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.cursor = s.query.chars().count();
+        }
+    }
+    pub fn search_cursor_left(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.cursor = s.cursor.saturating_sub(1);
+        }
+    }
+    pub fn search_cursor_right(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.cursor = (s.cursor + 1).min(s.query.chars().count());
+        }
+    }
+
+    /// The currently visible rows: an in-progress search wins, then a persistent
+    /// structured filter, else the fold-aware flattened tree. The one selector
+    /// every navigation op reads.
+    #[must_use]
+    pub fn visible(&self) -> &[(TreeNode, usize)] {
+        if let Some(s) = &self.search {
+            return &s.filtered;
+        }
+        if let Some(f) = &self.filter {
+            return &f.filtered;
+        }
+        &self.flattened
+    }
+
+    /// Order the flat rows by the current [`Self::sort`]. Called by the frontend right
+    /// after it builds them; a no-op for `SortKey::None`, which is why the frontend must
+    /// rebuild (not un-sort) when returning to the natural order.
+    pub fn apply_sort(&mut self) {
+        let (key, dir) = self.sort;
+        if let Some(s) = self.search.as_mut() {
+            sort_rows(&mut s.filtered, key, dir);
+        }
+        if let Some(f) = self.filter.as_mut() {
+            sort_rows(&mut f.filtered, key, dir);
+        }
+    }
+
+    /// Advance the sort key through its cycle, keeping the direction. Returns the new key
+    /// so a caller can report it.
+    pub fn cycle_sort(&mut self) -> SortKey {
+        self.sort.0 = self.sort.0.next();
+        self.sort.0
+    }
+
+    /// Reverse the sort direction. A no-op in effect while the key is `None` (there is no
+    /// order to reverse), but the direction is still remembered for the next key.
+    pub fn flip_sort_dir(&mut self) -> SortDir {
+        self.sort.1 = self.sort.1.flip();
+        self.sort.1
+    }
+
+    /// Whether what's on screen is a **flat** list (a search or a filter result) rather
+    /// than the folded tree — i.e. whether sorting applies at all.
+    #[must_use]
+    pub fn flat_list_showing(&self) -> bool {
+        self.search.is_some() || self.filter.is_some()
+    }
+
+    /// Whether a persistent structured filter is active.
+    #[must_use]
+    pub fn filter_active(&self) -> bool {
+        self.filter.is_some()
+    }
+
+    /// The active filter query, or `""` when none.
+    #[must_use]
+    pub fn filter_query(&self) -> &str {
+        self.filter.as_ref().map_or("", |f| f.query.as_str())
+    }
+
+    /// Set (or replace) the persistent filter with its precomputed flat rows, and
+    /// reset the cursor/scroll since the visible set changes wholesale.
+    pub fn set_filter(&mut self, query: String, filtered: Vec<(TreeNode, usize)>) {
+        self.filter = Some(FilterState { query, filtered });
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Drop the persistent filter (back to the folded tree).
+    pub fn clear_filter(&mut self) {
+        self.filter = None;
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Rebuild the flattened rows from the (possibly re-folded) tree. The pure
+    /// half of a re-flatten; the search-filtered rows refresh separately (they
+    /// need the tensor list) only when the query changes.
+    pub fn reflatten(&mut self) {
+        self.flattened = TreeBuilder::flatten_tree(&self.tree);
+    }
+
+    /// Expand/collapse the group at flattened index `idx` in place and re-flatten.
+    /// Toggles the tree directly rather than cloning it first — that full
+    /// deep-clone made every expand/collapse lag on a big checkpoint.
+    pub fn toggle_group_at(&mut self, idx: usize) {
+        TreeBuilder::toggle_node_by_index(idx, &mut self.tree);
+        self.reflatten();
+    }
+
+    /// Whether any group is still folded — what the single expand/collapse key asks
+    /// to decide which direction it goes.
+    #[must_use]
+    pub fn any_collapsed(&self) -> bool {
+        TreeBuilder::any_collapsed(&self.tree)
+    }
+
+    /// Expand or collapse every group, then reset the cursor to the top since the
+    /// visible rows change wholesale.
+    pub fn set_all_expanded(&mut self, expanded: bool) {
+        TreeBuilder::set_all_expanded(&mut self.tree, expanded);
+        self.reflatten();
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Move the cursor by `delta` rows within the visible list, clamped.
+    pub fn move_selection(&mut self, delta: i32) {
+        let n = self.visible().len();
+        if n == 0 {
+            return;
+        }
+        self.selected = if delta < 0 {
+            self.selected.saturating_sub((-delta) as usize)
+        } else {
+            (self.selected + delta as usize).min(n - 1)
+        };
+    }
+
+    /// Move the cursor to the parent group of the selected row (the nearest
+    /// preceding row at a shallower depth). No-op at the top level.
+    pub fn move_to_parent(&mut self) {
+        let Some(&(_, depth)) = self.visible().get(self.selected) else {
+            return;
+        };
+        if depth == 0 {
+            return;
+        }
+        let visible = self.visible();
+        let parent = (0..self.selected)
+            .rev()
+            .find(|&i| visible.get(i).is_some_and(|row| row.1 < depth));
+        if let Some(p) = parent {
+            self.selected = p;
+        }
+    }
+
+    /// Move the cursor to the next/previous sibling: the nearest row at the same
+    /// depth before a shallower row (i.e. without leaving the parent).
+    pub fn move_to_sibling(&mut self, forward: bool) {
+        let Some(&(_, depth)) = self.visible().get(self.selected) else {
+            return;
+        };
+        let indices: Vec<usize> = if forward {
+            (self.selected + 1..self.visible().len()).collect()
+        } else {
+            (0..self.selected).rev().collect()
+        };
+        for i in indices {
+            let Some(d) = self.visible().get(i).map(|row| row.1) else {
+                break;
+            };
+            if d < depth {
+                break; // left the parent: no sibling in this direction
+            }
+            if d == depth {
+                self.selected = i;
+                break;
+            }
+            // d > depth: a descendant, keep scanning
+        }
+    }
+
+    /// Enter the selected group: expand it if collapsed, then move the cursor to
+    /// its first child. No-op for leaf rows or empty groups (and in search mode,
+    /// where the list is flat).
+    pub fn move_to_first_child(&mut self) {
+        if self.search_mode() {
+            return;
+        }
+        let (expanded, has_children, depth) = match self.flattened.get(self.selected) {
+            Some((
+                TreeNode::Group {
+                    expanded, children, ..
+                },
+                depth,
+            )) => (*expanded, !children.is_empty(), *depth),
+            _ => return,
+        };
+        if !has_children {
+            return;
+        }
+        if !expanded {
+            self.toggle_group_at(self.selected);
+        }
+        // The first child is the next row, one level deeper.
+        if let Some((_, child_depth)) = self.flattened.get(self.selected + 1)
+            && *child_depth == depth + 1
+        {
+            self.selected += 1;
+        }
+    }
+
+    /// Move the cursor onto the leaf named `name`, expanding any collapsed groups
+    /// so it's visible. Fast path when the row is already on screen (returning to
+    /// an expanded tree — the common case): just move the cursor, no rebuild. In
+    /// search mode the list is flat, so an absent name leaves the cursor put.
+    pub fn reveal(&mut self, name: &str) {
+        if let Some(idx) = self
+            .visible()
+            .iter()
+            .position(|(node, _)| node.name() == name)
+        {
+            self.selected = idx;
+            return;
+        }
+        if !self.search_mode() {
+            TreeBuilder::expand_to_tensor(&mut self.tree, name);
+            self.reflatten();
+            if let Some(idx) = self.flattened.iter().position(|(n, _)| n.name() == name) {
+                self.selected = idx;
+            }
+        }
+    }
+}
+
+/// The file-browser state — the directory tree (built from the model / a remote
+/// listing), its flattened visible rows, and the selection/scroll. Kernel-owned,
+/// like [`TreeState`].
+#[derive(Default)]
+pub struct FileState {
+    pub tree: Option<crate::filetree::FileNode>,
+    pub rows: Vec<crate::filetree::FileRow>,
+    pub selected: usize,
+    pub scroll: usize,
+}
+
+impl FileState {
+    /// Re-flatten the directory tree into visible rows, clamping the selection.
+    pub fn rebuild_rows(&mut self) {
+        self.rows = self
+            .tree
+            .as_ref()
+            .map(crate::filetree::flatten)
+            .unwrap_or_default();
+        let n = self.rows.len();
+        self.selected = self.selected.min(n.saturating_sub(1));
+    }
+
+    /// Move the cursor by `delta` rows within the file list, clamped.
+    pub fn move_selection(&mut self, delta: i32) {
+        let len = self.rows.len();
+        if len == 0 {
+            return;
+        }
+        self.selected = if delta < 0 {
+            self.selected.saturating_sub((-delta) as usize)
+        } else {
+            (self.selected + delta as usize).min(len - 1)
+        };
+    }
+
+    /// Expand/collapse the directory at row `idx` and re-flatten.
+    pub fn toggle_dir(&mut self, idx: usize) {
+        if let Some(tree) = self.tree.as_mut() {
+            crate::filetree::toggle_by_index(tree, idx);
+        }
+        self.rebuild_rows();
+    }
+
+    /// `←`: collapse the selected directory if it's open, else jump to its parent.
+    pub fn collapse_or_parent(&mut self) {
+        let Some((is_dir, expanded, depth)) = self
+            .rows
+            .get(self.selected)
+            .map(|r| (r.is_dir(), r.expanded(), r.depth))
+        else {
+            return;
+        };
+        if is_dir && expanded {
+            self.toggle_dir(self.selected);
+            return;
+        }
+        if depth == 0 {
+            return;
+        }
+        if let Some(parent) = (0..self.selected)
+            .rev()
+            .find(|&i| self.rows.get(i).is_some_and(|r| r.depth < depth))
+        {
+            self.selected = parent;
+        }
+    }
+
+    /// `→`: expand the selected directory if it's collapsed (a no-op otherwise).
+    pub fn expand_or_child(&mut self) {
+        let Some((is_dir, expanded)) = self
+            .rows
+            .get(self.selected)
+            .map(|r| (r.is_dir(), r.expanded()))
+        else {
+            return;
+        };
+        if is_dir && !expanded {
+            self.toggle_dir(self.selected);
+        }
+    }
+}
+
+/// The **data-view presentation state** — the session-remembered toggles that
+/// control how the numeric grid / heatmap / histogram screens render a tensor:
+/// the per-tensor dtype/shape reinterpretations, the histogram bucket count, the
+/// layout (overview / edges / window) and its edge-split / window-offset knobs,
+/// and the zebra-striping + numeral-base choices.
+///
+/// Kernel-owned, like [`TreeState`]/[`FileState`]. The fields keep interior
+/// mutability (`Cell`/`RefCell`) because the TUI mutates them from within `&self`
+/// renders; a `&mut self` command surface and serde (for `y` / JSON) come when
+/// the data-view screens migrate onto the kernel. These toggles already
+/// round-trip through the argv-based `--emit-command` path today.
+pub struct DataViewState {
+    /// Per-tensor dtype reinterpretation chosen in the data views, keyed by
+    /// tensor name. Session-scoped: remembered until the app exits.
+    pub dtype_overrides: RefCell<HashMap<String, ViewDtype>>,
+    /// Per-tensor shape override (a reshape with the same element count) chosen
+    /// in the data views with `r`, keyed by tensor name. Session-scoped.
+    pub shape_overrides: RefCell<HashMap<String, Vec<usize>>>,
+    /// Requested histogram bucket count (the `b` key / `--bins`); `None` lets the
+    /// layout pick automatically. Session-wide, like the other view toggles.
+    pub histogram_bins: Cell<Option<usize>>,
+    /// Which layout the data views use (overview / edges / window). Session-
+    /// scoped: remembered as you move between tensors and in/out of the preview.
+    pub data_view_layout: Cell<DataLayout>,
+    /// In the edges view, how the fixed row/column budget is split between the
+    /// first (head) and last (tail) indices: `0.0` shows only the first, `1.0`
+    /// only the last, `0.5` is balanced. Adjustable with the arrow keys.
+    pub data_view_row_tail: Cell<f32>,
+    pub data_view_col_tail: Cell<f32>,
+    /// The last edges-view row/column budgets actually rendered, so an arrow
+    /// press can move the divider by exactly one index (step = 1 / budget).
+    pub edge_row_budget: Cell<usize>,
+    pub edge_col_budget: Cell<usize>,
+    /// The window view's top-left corner (row/column offset into the matrix).
+    /// Clamped to a valid position on every draw (read back from the rendered
+    /// sample), so panning behaves at the edges. Session-remembered.
+    pub data_view_win_row: Cell<usize>,
+    pub data_view_win_col: Cell<usize>,
+    /// The last window's visible size (rows/cols actually shown), so a
+    /// `Shift`+arrow press can stride by one screenful.
+    pub win_page_rows: Cell<usize>,
+    pub win_page_cols: Cell<usize>,
+    /// The numeric grid's zebra striping (rows / columns / off). Session-
+    /// remembered; cycled with `z`.
+    pub data_view_stripe: Cell<StripeMode>,
+    /// The numeric grid's numeral base (dec / hex / oct / bin). Session-
+    /// remembered; cycled with `b`.
+    pub data_view_base: Cell<NumBase>,
+}
+
+impl Default for DataViewState {
+    fn default() -> Self {
+        Self {
+            dtype_overrides: RefCell::new(HashMap::new()),
+            shape_overrides: RefCell::new(HashMap::new()),
+            histogram_bins: Cell::new(None),
+            data_view_layout: Cell::new(DataLayout::default()),
+            data_view_row_tail: Cell::new(0.5),
+            data_view_col_tail: Cell::new(0.5),
+            edge_row_budget: Cell::new(1),
+            edge_col_budget: Cell::new(1),
+            data_view_win_row: Cell::new(0),
+            data_view_win_col: Cell::new(0),
+            win_page_rows: Cell::new(1),
+            win_page_cols: Cell::new(1),
+            data_view_stripe: Cell::new(StripeMode::default()),
+            data_view_base: Cell::new(NumBase::default()),
+        }
+    }
+}
+
+/// A frontend-agnostic browsing session over a cached checkpoint.
+///
+/// The session is the single owner of the checkpoint's **canonical** primary
+/// data — the tensors deduplicated by name (first shard wins) and natural-sorted,
+/// the metadata, and the config — so a frontend never keeps its own copy that can
+/// drift. For a local checkpoint it's built from the serializable
+/// [`Checkpoint`] model ([`Session::from_model`]); a remote (`--ssh-proxy`) read
+/// that hasn't produced a model yet supplies the parts directly
+/// ([`Session::from_parts`]).
+pub struct Session {
+    /// The serializable model — `Some` for a local read; `None` for a remote read
+    /// whose model isn't assembled yet (its tensors/metadata still populate the
+    /// canonical fields below).
+    model: Option<Checkpoint>,
+    /// Canonical tensor list: deduplicated by name (first occurrence in shard
+    /// order wins) then natural-sorted. The one primary tensor list every view /
+    /// report / status line reads.
+    tensors: Vec<TensorInfo>,
+    /// The metadata entries, in model / shard order.
+    metadata: Vec<MetadataInfo>,
+    /// The checkpoint's `config.json`, when present.
+    config: Option<ModelConfig>,
+    /// Total element count across the canonical tensors (parameter count).
+    total_parameters: usize,
+    /// Cached stats report (computed on first request).
+    stats: Option<CheckpointStats>,
+}
+
+impl Session {
+    /// Open a session over an already-read checkpoint model (local reads).
+    #[must_use]
+    pub fn from_model(model: Checkpoint) -> Self {
+        let tensors = model.tensors_vec();
+        let metadata = model.metadata_vec();
+        let config = model.config.clone();
+        Self::assemble(Some(model), tensors, metadata, config)
+    }
+
+    /// Open a session from raw parts — a remote read whose serializable model
+    /// isn't assembled yet. Canonicalises the tensors exactly as [`from_model`].
+    #[must_use]
+    pub fn from_parts(
+        tensors: Vec<TensorInfo>,
+        metadata: Vec<MetadataInfo>,
+        config: Option<ModelConfig>,
+    ) -> Self {
+        Self::assemble(None, tensors, metadata, config)
+    }
+
+    /// Shared construction: canonicalise the tensors (dedup by name, natural-sort),
+    /// build the tree, and cache the parameter count.
+    fn assemble(
+        model: Option<Checkpoint>,
+        tensors: Vec<TensorInfo>,
+        metadata: Vec<MetadataInfo>,
+        config: Option<ModelConfig>,
+    ) -> Self {
+        let tensors = Self::canonical_tensors(tensors);
+        let total_parameters = tensors.iter().map(|t| t.num_elements).sum();
+        Self {
+            model,
+            tensors,
+            metadata,
+            config,
+            total_parameters,
+            stats: None,
+        }
+    }
+
+    /// Build the initial tensor tree (fold-aware) from the canonical data — the
+    /// starting point a frontend loads into its [`TreeState`]. No disk.
+    #[must_use]
+    pub fn build_tree(&self) -> Vec<TreeNode> {
+        if self.metadata.is_empty() {
+            TreeBuilder::build_tree(&self.tensors)
+        } else {
+            TreeBuilder::build_tree_mixed(&self.tensors, &self.metadata)
+        }
+    }
+
+    /// [`Self::build_tree`] wrapped in the single root node that summarises the whole
+    /// checkpoint — `▾ <label> (▦ N, P params, S)` — so the tree reads top-down from one
+    /// place instead of from a separate footer. `files` names the root (see
+    /// [`crate::model::root_label`]).
+    ///
+    /// This is the *whole* tree a frontend shows, root included. It exists because the
+    /// TUI and the web server each used to wrap the forest themselves, each with its own
+    /// copy of the seven-field root and its own idea of the label — and they disagreed
+    /// about that label for a single-file checkpoint, which is the commonest case there
+    /// is. A tree assembled in one place cannot disagree with itself.
+    #[must_use]
+    pub fn build_rooted_tree(&self, files: &[std::path::PathBuf]) -> Vec<TreeNode> {
+        self.rooted(files, self.build_tree())
+    }
+
+    /// The **compact** tree, rooted the same way: uniform layer / expert stacks folded
+    /// into one templated subtree each, with every family's member count folded into its
+    /// row label (`down_proj.weight ×48`) — see [`crate::compact`].
+    ///
+    /// The root still summarises the *real* totals, so the header says 31,251 tensors
+    /// while the body shows the 19 families they fold into.
+    #[must_use]
+    pub fn build_compact_rooted_tree(&self, files: &[std::path::PathBuf]) -> Vec<TreeNode> {
+        let mut c = crate::compact::compact_rooted(&self.tensors, files);
+        crate::compact::label_counts(&mut c.tree, &c.counts, &c.varying);
+        c.tree
+    }
+
+    /// `children` under the single root node that summarises the whole checkpoint — the
+    /// shared wrap, so the plain and compact trees cannot differ in their header.
+    fn rooted(&self, files: &[std::path::PathBuf], children: Vec<TreeNode>) -> Vec<TreeNode> {
+        vec![crate::tree::root_group(
+            crate::model::root_label(files),
+            children,
+            &self.tensors,
+        )]
+    }
+
+    /// Deduplicate tensors by name (keeping the first occurrence in shard order,
+    /// so a name in two shards is resolved to the first) and natural-sort them —
+    /// the canonical order the tree / stats / diff all consume.
+    fn canonical_tensors(mut tensors: Vec<TensorInfo>) -> Vec<TensorInfo> {
+        let mut seen = HashSet::new();
+        tensors.retain(|t| seen.insert(t.name.clone()));
+        // `sort_by_cached_key`, not `sort_by_key`: the natural-sort key allocates a
+        // `Vec`, and `sort_by_key` would recompute it O(n log n) times.
+        tensors.sort_by_cached_key(|a| natural_sort_key(&a.name));
+        tensors
+    }
+
+    /// Drop the tensors and metadata whose names don't pass `keep`, recompute the
+    /// parameter count, and invalidate the cached stats — backs the
+    /// `--print-tree`/`--print-tensors` name-filter subset. The frontend rebuilds
+    /// its tree afterwards.
+    pub fn retain_named<F: FnMut(&str) -> bool>(&mut self, mut keep: F) {
+        self.tensors.retain(|t| keep(&t.name));
+        self.metadata.retain(|m| keep(&m.name));
+        self.total_parameters = self.tensors.iter().map(|t| t.num_elements).sum();
+        self.stats = None;
+    }
+
+    /// Keep only the tensors passing `keep` — a whole-[`TensorInfo`] predicate, for
+    /// the rich tensor filter ([`crate::tensorfilter`]). Metadata is dropped (the
+    /// filter is tensor-focused, matching the web filter's tensor-only results).
+    pub fn retain_tensors<F: FnMut(&TensorInfo) -> bool>(&mut self, mut keep: F) {
+        self.tensors.retain(|t| keep(t));
+        self.metadata.clear();
+        self.total_parameters = self.tensors.iter().map(|t| t.num_elements).sum();
+        self.stats = None;
+    }
+
+    /// The serializable model (local reads only), for serialization / reports.
+    #[must_use]
+    pub fn model(&self) -> Option<&Checkpoint> {
+        self.model.as_ref()
+    }
+
+    /// The canonical tensor list (deduped + natural-sorted).
+    #[must_use]
+    pub fn tensors(&self) -> &[TensorInfo] {
+        &self.tensors
+    }
+
+    /// The metadata entries (model / shard order).
+    #[must_use]
+    pub fn metadata(&self) -> &[MetadataInfo] {
+        &self.metadata
+    }
+
+    /// The checkpoint's config, when present.
+    #[must_use]
+    pub fn config(&self) -> Option<&ModelConfig> {
+        self.config.as_ref()
+    }
+
+    /// Total element count across the canonical tensors.
+    #[must_use]
+    pub fn total_parameters(&self) -> usize {
+        self.total_parameters
+    }
+
+    /// The checkpoint stats report — computed once from the canonical data, cached.
+    /// `disk` is the on-disk footprint the caller resolves (from the model for a
+    /// local read, or the captured remote usage for `--ssh-proxy`).
+    pub fn stats_with_disk(&mut self, disk: Option<crate::stats::DiskUsage>) -> &CheckpointStats {
+        if self.stats.is_none() {
+            self.stats = Some(CheckpointStats::compute(
+                &self.tensors,
+                self.config.as_ref(),
+                disk,
+            ));
+        }
+        // Set immediately above (the `if` that precedes this fills it), so the option
+        // is always `Some` here. Returning a reference is why it can't just be moved.
+        #[allow(clippy::expect_used)]
+        self.stats.as_ref().expect("just set")
+    }
+
+    /// The checkpoint stats report, using the model's own disk usage (local reads).
+    pub fn stats(&mut self) -> &CheckpointStats {
+        let disk = self.model.as_ref().and_then(Checkpoint::disk_usage);
+        self.stats_with_disk(disk)
+    }
+}
+
+impl ViewModel {
+    /// Project the tensor-tree screen into a serializable snapshot: the visible
+    /// (fold-aware, search-filtered) rows, the selection, and the search query,
+    /// straight from the frontend's live [`TreeState`]. Pure — the kernel's output
+    /// contract that a TUI renders, a web server sends as JSON, or an MCP tool
+    /// returns.
+    #[must_use]
+    pub fn from_tree(root: &str, tree: &TreeState) -> Self {
+        let rows: Vec<Row> = tree
+            .visible()
+            .iter()
+            .map(|(node, depth)| Row {
+                depth: *depth,
+                label: node.name().to_string(),
+                is_group: matches!(node, TreeNode::Group { .. }),
+            })
+            .collect();
+        let selected = tree.selected.min(rows.len().saturating_sub(1));
+        let status = rows
+            .get(selected)
+            .map(|r| r.label.clone())
+            .unwrap_or_default();
+        Self {
+            screen: Screen::Tree,
+            root: root.to_string(),
+            rows,
+            selected,
+            status,
+            search: tree
+                .search
+                .as_ref()
+                .map(|s| s.query.clone())
+                .filter(|q| !q.is_empty()),
+        }
+    }
+
+    /// Project the file-browser screen into a serializable snapshot from the
+    /// frontend's live [`FileState`].
+    #[must_use]
+    pub fn from_files(root: &str, files: &FileState) -> Self {
+        let rows: Vec<Row> = files
+            .rows
+            .iter()
+            .map(|r| Row {
+                depth: r.depth,
+                label: r.name.clone(),
+                is_group: r.is_dir(),
+            })
+            .collect();
+        let selected = files.selected.min(rows.len().saturating_sub(1));
+        let status = rows
+            .get(selected)
+            .map(|r| r.label.clone())
+            .unwrap_or_default();
+        Self {
+            screen: Screen::Files,
+            root: root.to_string(),
+            rows,
+            selected,
+            status,
+            search: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{FileEntry, ShardHeader, Source};
+    use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo};
+
+    fn model() -> Checkpoint {
+        let ti = |name: &str| TensorInfo {
+            name: name.into(),
+            dtype: "F32".into(),
+            shape: vec![2, 2],
+            size_bytes: 16,
+            num_elements: 4,
+            storage: Storage::Unknown,
+            source_path: "/ckpt/model.safetensors".into(),
+            layout: Layout::ByteRange { start: 0, end: 16 },
+        };
+        Checkpoint {
+            source: Source::Local,
+            root: "/ckpt".into(),
+            files: vec![
+                FileEntry {
+                    rel_path: "model.safetensors".into(),
+                    name: "model.safetensors".into(),
+                    depth: 0,
+                    mode: None,
+                    mtime: None,
+                    inode: None,
+                    node: crate::model::FsNode::File {
+                        apparent: 100,
+                        allocated: 512,
+                        kind: crate::filetree::FileKind::Checkpoint,
+                        links: 1,
+                    },
+                },
+                FileEntry {
+                    rel_path: "config.json".into(),
+                    name: "config.json".into(),
+                    depth: 0,
+                    mode: None,
+                    mtime: None,
+                    inode: None,
+                    node: crate::model::FsNode::File {
+                        apparent: 20,
+                        allocated: 512,
+                        kind: crate::filetree::FileKind::Json,
+                        links: 1,
+                    },
+                },
+            ],
+            shards: vec![ShardHeader {
+                path: "/ckpt/model.safetensors".into(),
+                total_len: 116,
+                header_len: 100,
+                tensors: vec![
+                    ti("model.embed_tokens.weight"),
+                    ti("model.layers.0.mlp.down_proj.weight"),
+                ],
+                metadata: vec![MetadataInfo {
+                    name: "format".into(),
+                    value: "pt".into(),
+                    value_type: "string".into(),
+                }],
+            }],
+            config: None,
+            index: vec![],
+            s3: None,
+        }
+    }
+
+    #[test]
+    fn session_owns_data_and_viewmodel_projects_the_live_state() {
+        let mut s = Session::from_model(model());
+        // The session owns the canonical data + reports (no disk).
+        assert_eq!(s.tensors().len(), 2);
+        assert_eq!(s.stats().n_tensors, 2);
+
+        // A frontend loads the session's tree into its own TreeState and drives it.
+        let mut tree = TreeState {
+            tree: s.build_tree(),
+            ..Default::default()
+        };
+        tree.reflatten();
+        tree.set_all_expanded(true);
+
+        // The ViewModel is a projection of that live view-state.
+        let vm = ViewModel::from_tree(s.model().unwrap().root.as_str(), &tree);
+        assert_eq!(vm.screen, Screen::Tree);
+        assert_eq!(vm.root, "/ckpt");
+        assert!(!vm.rows.is_empty());
+        assert_eq!(vm.selected, 0);
+        assert!(vm.search.is_none());
+
+        // Search state flows through the projection.
+        tree.search = Some(SearchState {
+            query: "q".into(),
+            cursor: 1,
+            filtered: tree.flattened.iter().take(1).cloned().collect(),
+        });
+        let vm = ViewModel::from_tree("/ckpt", &tree);
+        assert_eq!(vm.search.as_deref(), Some("q"));
+        assert_eq!(vm.rows.len(), 1);
+        // An empty query projects no search even in search mode.
+        tree.search.as_mut().unwrap().query.clear();
+        assert!(ViewModel::from_tree("/ckpt", &tree).search.is_none());
+
+        // The file screen projects from a FileState the same way.
+        let files = FileState {
+            rows: vec![crate::filetree::FileRow {
+                depth: 0,
+                name: "config.json".into(),
+                path: "/ckpt/config.json".into(),
+                size: 20,
+                kind: crate::filetree::FileRowKind::File {
+                    kind: crate::filetree::FileKind::Json,
+                },
+            }],
+            ..Default::default()
+        };
+        let fvm = ViewModel::from_files("/ckpt", &files);
+        assert_eq!(fvm.screen, Screen::Files);
+        assert_eq!(fvm.rows[0].label, "config.json");
+
+        // The ViewModel serializes (the frontends' output contract) and round-trips.
+        let json = serde_json::to_string(&fvm).unwrap();
+        assert!(json.contains("\"screen\":\"files\""), "{json}");
+        let back: ViewModel = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.screen, Screen::Files);
+    }
+
+    #[test]
+    fn tree_state_ops_navigate_fold_and_reveal() {
+        let ti = |name: &str| TensorInfo {
+            name: name.into(),
+            dtype: "F32".into(),
+            shape: vec![2, 2],
+            size_bytes: 16,
+            num_elements: 4,
+            storage: Storage::Unknown,
+            source_path: "/x.safetensors".into(),
+            layout: Layout::ByteRange { start: 0, end: 16 },
+        };
+        // Two nested groups (blk.0.{a,b}, blk.1.{a,b}).
+        let tensors = vec![ti("blk.0.a"), ti("blk.0.b"), ti("blk.1.a"), ti("blk.1.b")];
+        let mut ts = TreeState {
+            tree: TreeBuilder::build_tree(&tensors),
+            ..Default::default()
+        };
+        ts.reflatten();
+
+        // Expand everything; selection clamps to the visible range.
+        ts.set_all_expanded(true);
+        let n = ts.visible().len();
+        assert!(n > 0);
+        ts.move_selection(1000);
+        assert_eq!(ts.selected, n - 1);
+        ts.move_selection(-1000);
+        assert_eq!(ts.selected, 0);
+
+        // Reveal an already-visible leaf: the cursor just moves onto it.
+        ts.reveal("blk.1.b");
+        assert_eq!(ts.visible()[ts.selected].0.name(), "blk.1.b");
+
+        // Collapse-all resets the cursor and hides the leaves; reveal re-expands
+        // to the target and grows the visible list.
+        ts.set_all_expanded(false);
+        assert_eq!(ts.selected, 0);
+        let collapsed = ts.visible().len();
+        ts.reveal("blk.1.b");
+        assert!(ts.visible().len() > collapsed);
+        assert_eq!(ts.visible()[ts.selected].0.name(), "blk.1.b");
+    }
+}

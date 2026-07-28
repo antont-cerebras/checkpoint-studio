@@ -1,0 +1,7 @@
+# Recorded from a real cstorch proxy (see remote.rs::record_transcript, enabled with
+# CHECKPOINT_STUDIO_RECORD_REMOTE). Non-sentinel lines like this one are ignored by the
+# parsers, which is itself part of what these fixtures verify.
+/home/user/venv/lib64/python3.11/site-packages/urllib3/connectionpool.py:1097: InsecureRequestWarning: Unverified HTTPS request is being made to host '10.4.47.16'. Adding certificate verification is strongly advised. See: https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
+  warnings.warn(
+# Payload trimmed: 934 objects -> 8. Structure untouched.
+CKPT_EXPLORER_META:{"objects": [["__METADATA__", 1213324], ["lm_head.weight", 1229193216], ["model.embed_tokens.weight", 1229193216], ["model.layers.0.block_sparse_moe.experts.down_proj.codebook", 3784704], ["model.layers.0.block_sparse_moe.experts.down_proj.qscale", 60555264], ["model.layers.0.block_sparse_moe.experts.down_proj.weight", 605552640], ["model.layers.0.block_sparse_moe.experts.gate_up_proj.codebook", 3784704], ["model.layers.0.block_sparse_moe.experts.gate_up_proj.qscale", 60555264]]}

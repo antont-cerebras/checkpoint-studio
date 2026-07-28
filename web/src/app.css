@@ -1,0 +1,162 @@
+:root {
+  --bg: #12141a;
+  --bg-panel: #181b22;
+  --bg-elev: #1f2027;
+  --bg-hover: #232733;
+  --bg-sel: #2d4b6e;
+  --border: #2a2e39;
+  --fg: #d6dae3;
+  --fg-dim: #7f8796;
+  --accent: #5fd7ff;
+  --group: #5fd7ff;
+  --tensor: #c6ccd6;
+  --dtype: #e2b877;
+  --meta: #b48ead;
+  --danger: #e06c75;
+  --warn: #e5c07b;
+  --ok: #98c379;
+  --row-h: 22px;
+
+  color-scheme: dark;
+  font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+/* Light theme — applied when `data-theme="light"` is set on <html> (see
+   stores/theme.ts, which resolves dark/light/system to a concrete value). */
+:root[data-theme='light'] {
+  --bg: #ffffff;
+  --bg-panel: #f4f5f7;
+  --bg-elev: #eceef2;
+  --bg-hover: #e6e9ee;
+  --bg-sel: #cfe3ff;
+  --border: #d3d7de;
+  --fg: #1c2027;
+  --fg-dim: #67707d;
+  --accent: #0a6fbf;
+  --group: #0a6fbf;
+  --tensor: #2b313b;
+  --dtype: #8a5a00;
+  --meta: #7a3fa0;
+  --danger: #c0392b;
+  --warn: #8a6d00;
+  --ok: #3f8c2f;
+  color-scheme: light;
+}
+
+/* Fallout Pip-Boy — green phosphor CRT. */
+:root[data-theme='fallout'] {
+  --bg: #04140a;
+  --bg-panel: #07230f;
+  --bg-elev: #0a2a13;
+  --bg-hover: #0e3a1c;
+  --bg-sel: #165a2c;
+  --border: #1c5a2b;
+  --fg: #35e46a;
+  --fg-dim: #1f9a45;
+  --accent: #86ffab;
+  --group: #86ffab;
+  --tensor: #35e46a;
+  --dtype: #c2ff8a;
+  --meta: #5cffb2;
+  --danger: #ff7a5c;
+  --warn: #ffe066;
+  --ok: #35e46a;
+  color-scheme: dark;
+}
+/* Subtle phosphor glow. */
+:root[data-theme='fallout'] body {
+  text-shadow: 0 0 2px color-mix(in srgb, var(--fg) 45%, transparent);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+}
+
+button {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+button:hover {
+  background: var(--bg-hover);
+}
+button.active {
+  background: var(--bg-sel);
+  border-color: var(--accent);
+}
+
+input,
+select {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+
+a {
+  color: var(--accent);
+}
+
+.dim {
+  color: var(--fg-dim);
+}
+.mono {
+  font-variant-numeric: tabular-nums;
+}
+
+/* thin scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 6px;
+}
+
+/* Visible keyboard focus. Buttons/inputs/selects here are styled bare, so without
+   this a keyboard-only user has no idea where they are (17 of 19 tabbables had no
+   indicator). `:focus-visible` only, so a mouse click never draws a ring. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* Off-screen but readable by assistive tech — for the page's document title. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}

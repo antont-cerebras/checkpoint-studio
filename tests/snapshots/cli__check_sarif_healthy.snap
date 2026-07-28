@@ -9,22 +9,15 @@ expression: out
     {
       "tool": {
         "driver": {
-          "name": "checkpoint-explorer",
+          "name": "checkpoint-studio",
           "version": "[VERSION]",
-          "informationUri": "https://github.com/antont-cerebras/checkpoint-explorer",
+          "informationUri": "https://github.com/antont-cerebras/checkpoint-studio",
           "rules": [
             {
               "id": "byte_ranges",
               "name": "Byte-range integrity",
               "shortDescription": {
                 "text": "safetensors spans contiguous, sized correctly, no truncation"
-              }
-            },
-            {
-              "id": "hdf5",
-              "name": "HDF5 integrity",
-              "shortDescription": {
-                "text": "chunk shapes consistent with tensor shapes, datatypes recognized"
               }
             },
             {
@@ -53,6 +46,13 @@ expression: out
               "name": "Files & sharding",
               "shortDescription": {
                 "text": "index matches files on disk, shard numbering complete"
+              }
+            },
+            {
+              "id": "s3_metadata",
+              "name": "S3 object metadata",
+              "shortDescription": {
+                "text": "every tensor's dtype/shape matches its own object's metadata, and each object holds the bytes it declares"
               }
             }
           ]

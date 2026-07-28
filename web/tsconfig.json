@@ -1,0 +1,38 @@
+{
+  "extends": "@tsconfig/svelte/tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "module": "ESNext",
+    "resolveJsonModule": true,
+    "allowJs": true,
+    "checkJs": true,
+    "isolatedModules": true,
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+
+    // Beyond `strict`. The one that matters most here is noUncheckedIndexedAccess:
+    // this UI indexes sampled tensor grids (`values[i][j]`, `rows[i]`) constantly, and
+    // a short/stale window silently yielding `undefined` is exactly how it ends up
+    // rendering something wrong instead of failing loudly.
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    // Added in the strictness pass, each measured clean on this tree. Two more were
+    // measured and left off, with what they would cost: `noPropertyAccessFromIndexSignature`
+    // (5 sites reading `.ByteRange` / `.j` off index-signature types — mechanical bracket
+    // access) and `noUncheckedSideEffectImports` (needs a declaration for `import
+    // './app.css'`). Both are small, deliberate follow-ups rather than silent omissions.
+    "noFallthroughCasesInSwitch": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
+    "verbatimModuleSyntax": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts", "src/**/*.svelte"]
+}

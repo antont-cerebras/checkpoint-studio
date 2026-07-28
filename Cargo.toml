@@ -1,13 +1,204 @@
 [package]
-name = "checkpoint-explorer"
+name = "checkpoint-studio"
 version = "0.2.1"
 edition = "2024"
-repository = "https://github.com/antont-cerebras/checkpoint-explorer"
+repository = "https://github.com/antont-cerebras/checkpoint-studio"
 license = "MIT"
 authors = ["Eric Buehler"]
 description = "CLI utility to inspect and explore .safetensors, .gguf and HDF5 checkpoint files"
+keywords = ["safetensors", "gguf", "hdf5", "checkpoint", "tui"]
+categories = ["command-line-utilities", "development-tools", "visualization"]
+readme = "README.md"
+
+[workspace]
+members = ["crates/core"]
+resolver = "2"
+
+# --- Lints -------------------------------------------------------------------
+#
+# Everything clippy offers as a real diagnostic group is on, at `deny`, plus every rustc
+# warning. CI runs `cargo clippy --workspace --all-targets` with and without
+# `--all-features`, so this file is the gate.
+#
+# NOT enabled: `clippy::restriction`. It is not a diagnostic group — clippy's own docs say
+# it "is not meant to be enabled as a whole" — and on this tree it produces 27,900 hits
+# that are mostly unsatisfiable or actively wrong here:
+#   * `implicit_return` (6,068) demands `return x;` on every tail expression, which
+#     *contradicts* `needless_return` in `clippy::style`. The two cannot both be satisfied.
+#   * `min_ident_chars` (4,218) bans `i`, `n`, `t`; `question_mark_used` (1,322) bans `?`;
+#     `as_conversions` (1,252) bans `as`; `arithmetic_side_effects` (1,394) bans `+`.
+#   * `non_ascii_literal` (852) bans `▀ ━ ✓ ⠋` — the glyphs this TUI is drawn with.
+#   * `single_call_fn` (503) bans a helper called once, i.e. every extraction that removed
+#     a copy-pasted block.
+# The individually useful ones from that group are enabled by name at the bottom.
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+
+# --- The families that stay allowed, and why ----------------------------------
+#
+# Each of these was measured, triaged, and left off for a stated reason — not a count.
+
+# Numeric casts. AUDITED: every cast was triaged and the real defects fixed — wide-integer
+# histogram bins, the 64-bit value display, GGUF sizes computed in f32, two saturating
+# subtractions. What remains is provably safe: Ratatui geometry bounded by the terminal
+# size, bit-shift amounts, masked 3/4-bit indices, pre-validated header lengths, and
+# display maths. `u64 as usize` is sound because both crates assert a 64-bit target (see
+# the `usize::BITS >= 64` const assert in lib.rs / main.rs). Turning these on would mean
+# ~1,000 `#[allow]`s or `try_from().unwrap_or()` chains that add a panic path each to
+# silence a cast we have already shown cannot lose data.
+#
+# `float_cmp` is deliberately NOT here: its few sites carry per-function justifications, so
+# a NEW accidental float comparison still fails the build.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+cast_sign_loss = "allow"
+
+# Documentation prose, not correctness: a first paragraph over one line, an undocumented
+# `Err` variant on a function whose error type is a `String` message, an identifier that
+# reads like code but isn't in backticks. Worth doing as writing; not worth gating a build.
+too_long_first_doc_paragraph = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# 200+ functions that *could* be `const`. Left off because it would freeze the
+# implementation of functions we still change — a `const fn` cannot later call a
+# non-const one without breaking every caller that relied on it in a const context.
+missing_const_for_fn = "allow"
+
+# Directly contradicts rustc's `unreachable_pub`, which is on below: inside a `pub(crate)`
+# module this lint wants `pub`, and `unreachable_pub` then wants `pub(crate)` back. Only one
+# can be satisfied, and `unreachable_pub` is the more useful of the two — it is what makes
+# rustc's `dead_code` analysis work at all in a library crate, where a `pub` item counts as
+# reachable and is therefore never reported as unused.
+redundant_pub_crate = "allow"
+
+# A 100-line ceiling on 7 functions that are flat, top-to-bottom report builders — the
+# check runner, the diff renderer, the health reconciler, the stats formatter. They are long
+# because the report has that many sections, not because they hide nested logic, and cutting
+# them at an arbitrary line count would scatter one linear output across helpers that each
+# have one caller.
+too_many_lines = "allow"
+
+# Two versions of `windows-sys` arrive through transitive dependencies (crossterm and
+# terminal_size disagree). Nothing here can pick one, and this crate does not build for
+# Windows anyway.
+multiple_crate_versions = "allow"
+
+# --- Families left allowed after this pass, with the reason for each --------------
+#
+# These are the ones where clippy's fix is either wrong here or a wash. Everything else the
+# groups above report has been fixed; a new hit in any lint NOT listed here fails the build.
+
+# 38 sites, and merging them would make the tables worse. Two thirds are `ui/hints.rs`'s
+# help table, one arm per (screen, key) — several screens legitimately give the same help
+# for the same key, and collapsing those into `(Tree | Files | Layout, Char('c'))` destroys
+# the per-screen enumeration that makes a missing entry visible. The rest is `ui/theme.rs`
+# mapping both a named colour and its indexed twin to one output, which is the same story.
+match_same_arms = "allow"
+
+# Taking a `Vec`/`Arc` by value where the body only reads it. Several of these are spawned
+# onto a thread (the value must be owned), and the rest are one-shot builders where the
+# caller has nothing left to do with the value.
+needless_pass_by_value = "allow"
+needless_pass_by_ref_mut = "allow"
+
+# Structs of 4-6 independent switches, each mapping 1:1 to a CLI flag. See `DiffOpts` for
+# the reasoning: the lint's real suggestion is an enum, which only helps when the options
+# are mutually exclusive — and these are not. (The *parameter* form is denied below: a bool
+# in a signature is read at the call site with no field name to explain it.)
+struct_excessive_bools = "allow"
+
+# `&Option<T>` → `Option<&T>` on four internal signatures whose callers all hold an
+# `Option<T>` field; converting at each call site adds `.as_ref()` noise to say nothing.
+ref_option = "allow"
+
+# `let hit = …` next to `let hits = …`. Renaming to satisfy a similarity heuristic makes the
+# names worse, not clearer.
+similar_names = "allow"
+
+# The remaining sites are cfg pairs (`Result`/`Option` is the shared signature of a
+# feature-gated pair, see `read_hdf5_shard`) and the mode driver, where the `Result` is the
+# trait's return type.
+unnecessary_wraps = "allow"
+
+# This IS a CLI: stdout is the product, stderr is where progress goes.
+print_stdout = "allow"
+print_stderr = "allow"
+
+# --- Individually chosen `restriction` lints ----------------------------------
+#
+# The ones from that group that are real diagnostics here, each measured clean so it
+# catches a regression rather than logging debt.
+dbg_macro = "deny"            # a stray `dbg!` in a TUI corrupts the screen
+todo = "deny"
+unimplemented = "deny"
+mem_forget = "deny"
+verbose_file_reads = "deny"
+lossy_float_literal = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+# A panic is a crashed TUI or a dead server. The audit that turned these on found 52 sites
+# in product code: 6 could actually fire and were rewritten to propagate, 13 carry a
+# per-site proof, and the rest were lifecycle invariants that have since been made
+# structural (see `explorer/`). Test code is exempt at each crate root: an unwrap in a test
+# IS the assertion.
+unwrap_used = "deny"
+expect_used = "deny"
+
+# --- The defensive-programming set -------------------------------------------
+#
+# From <https://corrode.dev/blog/defensive-programming/>, whose argument is the one this
+# codebase already runs on: make the compiler enforce the invariant instead of writing a
+# comment that says it holds.
+#
+# `indexing_slicing` is the substantive one. `v[i]` is a panic branch the type system can't
+# see, and a length check plus an index are two operations that drift apart independently —
+# which is exactly how three of the crashes fixed this week happened (the region gather
+# reading past an empty segment, `decode_prim` on a short tail, GGUF's unbounded string
+# length). Core code uses `get`/`get_mut`/`first`/`chunks_exact` and handles the `None`.
+indexing_slicing = "deny"
+# A `From` that can panic is a `TryFrom` wearing the wrong trait: the caller has no way to
+# see the failure coming.
+fallible_impl_from = "deny"
+# `..` where the fields could be named, so a new field is a decision rather than a default.
+unneeded_field_pattern = "deny"
+# See `indexing_slicing` above: enforced in the core crate, pending in the binary.
+wildcard_enum_match_arm = "deny"
+# A bool parameter is read at the call site as a bare `true`, with no field name to say what
+# it means. `struct_excessive_bools` stays allowed (see above) because a struct literal names
+# its fields; a call does not.
+fn_params_excessive_bools = "deny"
+# NOT enabled: `rc_buffer`. The static-body cache is `Arc<Vec<u8>>` on purpose — the
+# suggested `Arc<[u8]>` would copy every cached response body once to convert it, which is
+# the allocation that cache exists to avoid.
+
+[workspace.lints.rust]
+# Every rustc warning is an error. Measured: the default warn set is already clean, so this
+# is a ratchet rather than a cleanup.
+warnings = "deny"
+# Plus the allow-by-default lints worth having, all measured clean.
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "deny"
+unused_lifetimes = "deny"
+single_use_lifetimes = "deny"
+unreachable_pub = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_import_braces = "deny"
+# NOT enabled: `unsafe_code`. Two places need it and both are justified — registering the
+# HDF5 LZ4 filter (FFI into the bundled libhdf5) and the pty test's `openpty`/`ioctl` — so a
+# blanket deny would mean a blanket allow at both, which says less than the per-call safety
+# comments already there. `elided_lifetimes_in_paths` is off too: 144 purely notational
+# sites (`Foo` vs `Foo<'_>`).
 
 [dependencies]
+# The frontend-free core: model + readers + views + reports. The TUI/CLI here
+# drive it and render its serializable outputs.
+checkpoint-studio-core = { path = "crates/core" }
 safetensors = "0.4"
 clap = { version = "4.0", features = ["derive"] }
 anyhow = "1.0"
@@ -16,8 +207,15 @@ crossterm = "0.28"
 # rename (`convert --map`) rewrites a safetensors header without reshuffling its
 # entries (a `BTreeMap` would sort them), and index.json round-trips unchanged.
 serde_json = { version = "1.0", features = ["preserve_order"] }
+# The central checkpoint model + reports serialize to JSON (and other formats)
+# via derive — the backbone of the "read once into one serializable datatype"
+# architecture.
+serde = { version = "1.0", features = ["derive"] }
 glob = "0.3"
 fuzzy-matcher = "0.3"
+# Terminal width for output formatting (diff/progress) without pulling the full
+# crossterm terminal layer into the core — a tiny, dependency-light ioctl wrapper.
+terminal_size = "0.4"
 # Zero-copy reads (mmap) + parallel scans for whole-tensor statistics.
 memmap2 = "0.9"
 rayon = "1"
@@ -54,6 +252,18 @@ similar = "2.7"
 # `diff --map` rename rules (regex → replacement) applied to tensor names before
 # the structural comparison. Also used by tests to normalize the scan duration.
 regex = "1"
+# `--web`: a minimal synchronous HTTP server (no async runtime / tokio, matching
+# the project's blocking-IO stance) that serves the checkpoint model + reports as
+# JSON and the embedded Svelte UI.
+tiny_http = "0.12"
+# Decode URL-encoded query values (tensor names carry `/` and `.`).
+percent-encoding = "2"
+# gzip the web responses (the tensor-tree JSON is tens of MB for a big
+# checkpoint; gzip cuts the transfer ~10x). Pure-Rust (miniz_oxide backend).
+flate2 = "1"
+# Embed the built Svelte SPA (`web/dist`) into the binary so `--web` is
+# self-contained. Reads from disk in debug, embeds in release.
+rust-embed = "8"
 
 # Unix only: flush the tty input buffer on exit (discard mouse-wheel reports
 # still queued when quitting mid-scroll) so the shell doesn't echo them as
@@ -67,8 +277,14 @@ libc = "0.2"
 # `cargo insta review` (or `INSTA_UPDATE=always cargo test`).
 insta = { version = "1", features = ["filters"] }
 
+# `tests/pty.rs` runs the TUI in a real pseudo-terminal — the only way to reach the
+# interactive loop (raw mode, the alternate screen, the event read). `openpty` +
+# `TIOCSWINSZ` is all that's needed, so libc rather than a pty crate.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [features]
-hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "dep:half", "dep:zstd"]
+hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "dep:half", "dep:zstd", "checkpoint-studio-core/hdf5"]
 
 # Diagnostic: dump dataset shape/chunk/filter layout of an HDF5 file.
 [[example]]
@@ -79,3 +295,6 @@ required-features = ["hdf5"]
 [[example]]
 name = "gen_hdf5_fixture"
 required-features = ["hdf5"]
+
+[lints]
+workspace = true
