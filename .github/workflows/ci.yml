@@ -28,17 +28,37 @@ jobs:
       - name: Install HDF5 build prerequisites
         run: sudo apt-get update && sudo apt-get install -y cmake build-essential zlib1g-dev
 
-      # Cache compiled dependencies (including the built libhdf5) to speed-up
-      # subsequent runs
+      # Cache compiled dependencies (including the statically built libhdf5, which is a
+      # cmake C build and the most expensive thing here).
+      #
+      # `cache-on-failure` because the default (`false`) turns a red PR into a cold start
+      # every retry: the post-step declines to save, so the next push re-downloads and
+      # recompiles all ~146 crates and rebuilds libhdf5 before it can even tell you the
+      # same test still fails. Nothing about a failing *test* makes the dependency
+      # artifacts wrong, and iterating on a red build is exactly when the cache is worth
+      # most. GitHub also evicts caches unused for 7 days, so a quiet week on the default
+      # branch leaves PRs with nothing to restore — another reason not to also throw away
+      # the one a PR run could have seeded.
       - name: Cache cargo build outputs
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       # Ensure the codebase is formatted according to rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      # Lint the default (pure-Rust) configuration that `cargo install` produces,
-      # then again with all features enabled (which compiles the HDF5 support).
+      # One clippy run, with all features on.
+      #
+      # It used to run twice — once with default features, once with all — which meant two
+      # full dependency-graph *check* builds, and the all-features one statically compiles
+      # a bundled libhdf5 from C. Neither run is a superset of the other (`--all-features`
+      # never compiles a `#[cfg(not(feature = "hdf5"))]` block), so folding them does give
+      # up clippy's opinion on the default-only code paths. That is an accepted trade: the
+      # default configuration is still compiled — and still rustc-linted, since the
+      # `[workspace.lints] rust` table denies every warning — by the default-features build
+      # step below. What is lost is clippy-specific lints on the handful of `not(hdf5)`
+      # arms, not compilation or dead-code coverage of them.
       #
       # `--workspace` matters: without it cargo lints only the root package, so the core
       # crate's own targets — including its ~340 tests, most of the test code in the
@@ -50,10 +70,7 @@ jobs:
       # families deliberately left off. The table sets `deny` itself — `clippy::all`,
       # `pedantic`, `nursery`, `cargo`, and rustc's `warnings` — so plain `clippy` is the
       # stricter gate here, not the looser one.
-      - name: Lint with clippy (default features)
-        run: cargo clippy --workspace --all-targets
-
-      - name: Lint with clippy (all features)
+      - name: Lint with clippy
         run: cargo clippy --workspace --all-targets --all-features
 
       # Build both configurations in release mode
