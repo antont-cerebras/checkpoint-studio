@@ -1663,7 +1663,7 @@ fn run_diff(
     tensor: Option<&str>,
     view: sample::ViewDtype,
     bins: Option<usize>,
-    opts: diff::DiffOpts,
+    mut opts: diff::DiffOpts,
     filter: &diff::TensorFilter,
     name_map: &diff::NameMap,
     jobs: usize,
@@ -1819,11 +1819,42 @@ fn run_diff(
     // independent of `--only-tensors`, which only hides the metadata *diff*. Only
     // needed when values / distributions are compared.
     let compares_data = opts.values || opts.histogram || tensor.is_some();
+    let mut compares_data_unavailable = false;
 
     // A remote source's tensor *data* isn't reachable locally, so value/distribution
     // comparison for `--ssh-proxy` must run on the proxy. Only an s3-vs-s3 pair is
     // supported (both cstorch checkpoints the remote can load); for a non-s3 remote
     // (a safetensors dir) or a mixed pair, fall back to a structural diff and say so.
+    // A side whose source cannot give us tensor bytes can't be value-compared at all. Asked
+    // as a capability so every source answers the same way — this is what caught `hf://`,
+    // which reads structure over HTTPS and would otherwise have fallen through to a local
+    // read of a path that isn't one.
+    if compares_data && remote.is_none() {
+        for (label, spec) in [("OLD", &*old_str), ("NEW", &*new_str)] {
+            let location = if hf::is_uri(spec) {
+                capability::Location::Hf
+            } else if s3::is_uri(spec) {
+                capability::Location::S3
+            } else {
+                capability::Location::Local
+            };
+            if !capability::Capabilities::of(capability::Format::Safetensors, location).read_bytes {
+                eprintln!(
+                    "checkpoint-studio diff: {label} ({spec}) can't supply tensor bytes, so \
+                     values can't be compared — comparing structure only.\n  {}",
+                    capability::Capabilities::data_view_note(location).unwrap_or_default()
+                );
+                compares_data_unavailable = true;
+                // Clear the request too, so the report's "scope:" header says element
+                // values were NOT compared. Leaving it set printed a scope line claiming a
+                // comparison that had just been refused two lines above.
+                opts.values = false;
+                opts.histogram = false;
+            }
+        }
+    }
+    let compares_data = compares_data && !compares_data_unavailable;
+
     let s3_pair = old_str.starts_with("s3://") && new_str.starts_with("s3://");
     let remote_values = match remote {
         Some(_) if compares_data && !s3_pair => {

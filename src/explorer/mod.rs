@@ -5410,10 +5410,16 @@ impl Explorer {
     /// The single HDF5 file backing this checkpoint, if repacking applies (one
     /// `.h5`/`.hdf5` file). `None` for safetensors/GGUF or multi-file views.
     fn repack_input(&self) -> Option<PathBuf> {
+        // `repack` is "HDF5 and local" — the pair — so this no longer restates the format
+        // test, and a remote HDF5 (which nothing can repack in place today) is excluded by
+        // the same row rather than by an omission.
+        if !self.capabilities().repack {
+            return None;
+        }
         match self.files.as_slice() {
-            [f] if matches!(f.extension().and_then(|e| e.to_str()), Some("h5" | "hdf5")) => {
-                Some(f.clone())
-            }
+            [f] => Some(f.clone()),
+            // Repacking rewrites one file into one file; a directory of them is not a
+            // single input.
             _ => None,
         }
     }
