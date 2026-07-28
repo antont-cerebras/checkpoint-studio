@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
-  import { tree, treeError, ensureTree } from './stores/server';
+  import { tree, treeError, ensureTree, treeProgress } from './stores/server';
   import { warningDismissed } from './stores/warning';
   import {
     screen,
@@ -44,7 +44,7 @@
   import FilePreview from './components/FilePreview.svelte';
   import StatusBar from './components/StatusBar.svelte';
   import Footer from './components/Footer.svelte';
-  import Spinner from './components/Spinner.svelte';
+  import LoadingBar from './components/LoadingBar.svelte';
   import Palette from './components/Palette.svelte';
   import FilterBuilder from './components/FilterBuilder.svelte';
   import CompactView from './components/CompactView.svelte';
@@ -456,7 +456,9 @@
     {#if $treeError}
       <div class="error">Failed to load checkpoint: {$treeError}</div>
     {:else if !$tree}
-      <div class="loading"><Spinner label="reading checkpoint…" /></div>
+      <div class="loading">
+        <LoadingBar label="reading checkpoint structure" progress={$treeProgress} />
+      </div>
     {:else if $screen.kind === 'tree'}
       {#if $compact}<CompactView />{:else}<TreeView />{/if}
     {:else if $screen.kind === 'detail'}

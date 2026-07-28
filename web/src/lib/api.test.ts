@@ -7,17 +7,48 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api } from './api';
 
+/**
+ * A stand-in `Response` that answers what the real one does: status, `headers` (so
+ * `totalBytes` has something to read), `json`/`text`, and a readable `body` — which
+ * `api.tree(onProgress)` streams. A mock without those looks like a `Response` right up
+ * until the code asks it something.
+ */
+function response(
+  status: number,
+  body: unknown,
+  opts: { malformed?: boolean; headers?: Record<string, string> } = {},
+) {
+  const text = opts.malformed ? 'not json' : JSON.stringify(body ?? null);
+  const bytes = new TextEncoder().encode(text);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: new Headers(opts.headers ?? { 'Content-Length': String(bytes.length) }),
+    json: () => (opts.malformed ? Promise.reject(new Error('not json')) : Promise.resolve(body)),
+    text: () => Promise.resolve(text),
+    body: {
+      getReader() {
+        let sent = false;
+        return {
+          read: () =>
+            Promise.resolve(
+              sent ? { done: true, value: undefined } : ((sent = true), { done: false, value: bytes }),
+            ),
+        };
+      },
+    },
+  };
+}
+
 /** Record the URLs requested and reply with a canned response. */
 function stubFetch(reply: { status?: number; body?: unknown; malformed?: boolean }) {
   const urls: string[] = [];
   const fetchStub = vi.fn((url: string) => {
     urls.push(url);
     const status = reply.status ?? 200;
-    return Promise.resolve({
-      ok: status >= 200 && status < 300,
-      status,
-      json: () => (reply.malformed ? Promise.reject(new Error('not json')) : Promise.resolve(reply.body)),
-    });
+    return Promise.resolve(
+      response(status, reply.body, { malformed: reply.malformed ?? false }),
+    );
   });
   vi.stubGlobal('fetch', fetchStub);
   return urls;
@@ -111,7 +142,8 @@ describe('urls', () => {
     expect(names.length, 'the api object is not empty').toBeGreaterThan(10);
     for (const name of names) {
       // One string argument satisfies every accessor's first parameter (name / path /
-      // query / against); the ones taking none ignore it.
+      // query / against); the ones taking none ignore it, and `tree` — whose parameter is
+      // a progress callback — checks `typeof` rather than truthiness so it does too.
       const call = api[name] as (...args: unknown[]) => Promise<unknown>;
       await call('x');
     }

@@ -58,10 +58,29 @@ function stubFetch(replies: { status?: number; body?: unknown }[]) {
       calls.push(url);
       const r = replies[Math.min(i++, replies.length - 1)] ?? { body: {} };
       const status = r.status ?? 200;
+      const text = JSON.stringify(r.body ?? null);
+      const bytes = new TextEncoder().encode(text);
       return Promise.resolve({
         ok: status >= 200 && status < 300,
         status,
+        // `headers` and `body` because `api.tree` streams and measures — see the
+        // `response` helper in lib/api.test.ts for the same shape.
+        headers: new Headers({ 'Content-Length': String(bytes.length) }),
         json: () => Promise.resolve(r.body),
+        text: () => Promise.resolve(text),
+        body: {
+          getReader() {
+            let sent = false;
+            return {
+              read: () =>
+                Promise.resolve(
+                  sent
+                    ? { done: true, value: undefined }
+                    : ((sent = true), { done: false, value: bytes }),
+                ),
+            };
+          },
+        },
       });
     }),
   );

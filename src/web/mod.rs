@@ -78,8 +78,21 @@ pub(crate) struct WebState {
 /// cached. Everything else takes query parameters or reads tensor bytes on demand.
 const STATIC_ENDPOINTS: &[&str] = &["tree", "files", "stats", "health", "check", "model"];
 
+/// A cached response: the bytes as they go on the wire, plus how long the body is
+/// *before* any encoding.
+///
+/// The identity length is the one number a browser can't work out for itself. Under
+/// `Content-Encoding: gzip` the `Content-Length` it sees is the compressed size, while the
+/// stream it reads is decoded — so a client counting bytes to draw a progress bar has a
+/// numerator in one unit and a denominator in another. Announcing this makes the fraction
+/// real (see `X-Uncompressed-Length`).
+pub(crate) struct CachedBody {
+    pub bytes: Vec<u8>,
+    pub identity_len: u64,
+}
+
 /// `(endpoint, gzipped)` -> the fully-encoded response body.
-type StaticBodies = Mutex<HashMap<(&'static str, bool), Arc<Vec<u8>>>>;
+type StaticBodies = Mutex<HashMap<(&'static str, bool), Arc<CachedBody>>>;
 
 impl WebState {
     /// Build the shared state from a local checkpoint read. `files`/`index_specs`
@@ -232,7 +245,7 @@ impl WebState {
 
     /// The encoded body for a fixed-content endpoint, building (and caching) it on
     /// first use. `None` for endpoints that aren't cacheable.
-    fn cached_body(&self, api: &str, gzipped: bool) -> Option<Arc<Vec<u8>>> {
+    fn cached_body(&self, api: &str, gzipped: bool) -> Option<Arc<CachedBody>> {
         let name = STATIC_ENDPOINTS.iter().copied().find(|&e| e == api)?;
         // Bind the lookup to a local so the guard is dropped before the build below,
         // rather than living to the end of an `if let`.
@@ -263,12 +276,16 @@ impl WebState {
         if status != 200 {
             return None; // don't cache an error; let the normal path report it
         }
+        let identity_len = json.len() as u64;
         let body = if gzipped {
             gzip_bytes(&json).ok()?
         } else {
             json
         };
-        let body = Arc::new(body);
+        let body = Arc::new(CachedBody {
+            bytes: body,
+            identity_len,
+        });
         self.static_bodies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -407,14 +424,14 @@ const JSON_CT: &str = "application/json; charset=utf-8";
 /// so a repeat `/api/tree` hands out an `Arc` instead of copying 14 MB.
 enum Body {
     Owned(Vec<u8>),
-    Shared(Arc<Vec<u8>>),
+    Shared(Arc<CachedBody>),
 }
 
 impl Body {
     fn as_slice(&self) -> &[u8] {
         match self {
             Self::Owned(v) => v,
-            Self::Shared(a) => a,
+            Self::Shared(a) => &a.bytes,
         }
     }
 }
@@ -427,6 +444,10 @@ struct Prepared {
     content_type: &'static str,
     gzipped: bool,
     cache_control: Option<&'static str>,
+    /// The body's length before encoding, when it differs from what `Content-Length` will
+    /// say — i.e. when the response is gzipped. Sent as `X-Uncompressed-Length` so a client
+    /// reading the decoded stream can draw a progress bar against the right total.
+    identity_len: Option<u64>,
 }
 
 fn handle(state: &WebState, req: tiny_http::Request) {
@@ -458,6 +479,7 @@ fn handle(state: &WebState, req: tiny_http::Request) {
             content_type: JSON_CT,
             gzipped: false,
             cache_control: Some("no-store"),
+            identity_len: None,
         }
     });
     send_encoded(
@@ -467,6 +489,7 @@ fn handle(state: &WebState, req: tiny_http::Request) {
         prepared.content_type,
         prepared.gzipped,
         prepared.cache_control,
+        prepared.identity_len,
     );
 }
 
@@ -484,15 +507,18 @@ fn prepare(state: &WebState, path: &str, query_str: &str, gzip: bool) -> Prepare
     if q.is_empty()
         && let Some(body) = state.cached_body(api, gzip)
     {
+        let identity_len = gzip.then_some(body.identity_len);
         return Prepared {
             status: 200,
             body: Body::Shared(body),
             content_type: JSON_CT,
             gzipped: gzip,
             cache_control: Some("no-store"),
+            identity_len,
         };
     }
     let (status, data) = route_api(state, api, &q);
+    let identity_len = data.len() as u64;
     let (body, gzipped) = maybe_gzip(data, gzip);
     Prepared {
         status,
@@ -500,6 +526,7 @@ fn prepare(state: &WebState, path: &str, query_str: &str, gzip: bool) -> Prepare
         content_type: JSON_CT,
         gzipped,
         cache_control: Some("no-store"),
+        identity_len: gzipped.then_some(identity_len),
     }
 }
 
@@ -565,6 +592,7 @@ fn prepare_asset(path: &str, gzip: bool) -> Prepared {
                 content_type: "text/plain; charset=utf-8",
                 gzipped: false,
                 cache_control: Some("no-cache"),
+                identity_len: None,
             };
         }
         None => match assets::WebAssets::get("index.html") {
@@ -583,6 +611,7 @@ fn prepare_asset(path: &str, gzip: bool) -> Prepared {
                     content_type: "text/plain; charset=utf-8",
                     gzipped: false,
                     cache_control: Some("no-cache"),
+                    identity_len: None,
                 };
             }
         },
@@ -594,6 +623,7 @@ fn prepare_asset(path: &str, gzip: bool) -> Prepared {
         content_type: ctype,
         gzipped,
         cache_control: Some(cache),
+        identity_len: None,
     }
 }
 
@@ -617,6 +647,7 @@ fn send_encoded(
     content_type: &str,
     gzipped: bool,
     cache_control: Option<&str>,
+    identity_len: Option<u64>,
 ) {
     let mut headers = vec![header("Content-Type", content_type)];
     if let Some(cc) = cache_control {
@@ -624,6 +655,12 @@ fn send_encoded(
     }
     if gzipped {
         headers.push(header("Content-Encoding", "gzip"));
+    }
+    // What the body weighs *before* encoding. `Content-Length` describes the compressed
+    // bytes while a browser reads the decoded stream, so this is the only denominator a
+    // client can count against — see `CachedBody`.
+    if let Some(len) = identity_len {
+        headers.push(header("X-Uncompressed-Length", &len.to_string()));
     }
     let mut resp = tiny_http::Response::from_data(body).with_status_code(status);
     for h in headers {
