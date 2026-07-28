@@ -4,6 +4,7 @@
   import { api } from '../lib/api';
   import type { LayoutMap, Segment, TreeNode } from '../lib/types';
   import { humanSize } from '../lib/format';
+  import { gapSummary } from '../lib/layout';
   import { cssVar } from '../lib/color';
   import { theme } from '../stores/theme';
   import Spinner from './Spinner.svelte';
@@ -21,6 +22,7 @@
 
   $: shards = collect($tree?.tree ?? []);
   $: wanted = $screen.kind === 'layout' ? $screen.file : undefined;
+  $: gaps = map ? gapSummary(map) : { count: 0, bytes: 0 };
   $: if (shards.length && !shards.includes(selected)) selected = shards[0] ?? '';
   $: if (wanted && shards.includes(wanted)) selected = wanted;
   $: if (selected) void load(selected);
@@ -99,7 +101,17 @@
       </select>
     </label>
     {#if map}
-      <span class="dim">{humanSize(map.total_len)} · header {humanSize(map.header_len)} · {map.tensor_count} tensors{map.metadata.length ? ` · ${map.metadata.length} metadata` : ''}</span>
+      <span class="dim"
+        >{humanSize(map.total_len)} · header {humanSize(map.header_len)} · {map.tensor_count}
+        tensors{map.metadata.length ? ` · ${map.metadata.length} metadata` : ''}</span
+      >
+      <!-- Padding, when there is any; omitted rather than shown as a zero, since a tightly
+       packed file is the norm and `0 gaps` reads as a fact worth checking. -->
+      {#if gaps.count > 0}
+        <span class="gaps"
+          >· {gaps.count} gap{gaps.count === 1 ? '' : 's'} {humanSize(gaps.bytes)}</span
+        >
+      {/if}
     {/if}
   </div>
 
@@ -179,6 +191,10 @@
     gap: 16px;
     margin-bottom: 12px;
     flex-wrap: wrap;
+  }
+  /* Padding is worth noticing but is not an error — the same amber the TUI uses for it. */
+  .gaps {
+    color: var(--warn);
   }
   .map {
     flex: 1 1 auto;

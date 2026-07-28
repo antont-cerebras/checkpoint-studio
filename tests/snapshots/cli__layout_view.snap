@@ -38,7 +38,7 @@ Layout - [FIXTURE]                                                              
 0x0000000002f8 │ █  model.layers.0.mlp.down_proj.weight  U16 (3, 4, 5)  120 B
                │ █
                │ █
-               │ █
-               │ █
+0x000000000370 ┴ ▒  model.scale.u8  U8 (8)  8 B
+
 ↑/↓ select · PgUp/PgDn page · ↵ in tree · Tab tensor tree · Space/: commands · l legend · c copy screen · y copy command
 ⌫/\ back/fwd · q quit
