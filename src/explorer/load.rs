@@ -374,6 +374,7 @@ impl Explorer {
         let mut health: Vec<crate::health::HealthReport> = Vec::new();
         let mut s3_meta: Option<crate::remote::S3Meta> = None;
         let mut unreadable: Vec<crate::model::UnreadableShard> = Vec::new();
+        let mut index: Vec<crate::model::IndexEntry> = Vec::new();
         for file_path in &self.files {
             let as_str = file_path.to_string_lossy().into_owned();
             let bars = crate::progress::Bars::start(std::slice::from_ref(&as_str));
@@ -405,6 +406,7 @@ impl Explorer {
             // Shards the read skipped, so the browser marks their rows and `check` names
             // them — the same account a local read keeps.
             unreadable.extend(rc.unreadable);
+            index.extend(rc.index);
             if let Some(s3) = rc.s3 {
                 s3_meta = Some(s3); // one `s3://` source per run
             }
@@ -474,7 +476,10 @@ impl Explorer {
             files,
             shards,
             config: config.clone(),
-            index: Vec::new(),
+            // The index the read already parsed — without this the file browser marked
+            // nothing over `--ssh-proxy`, because `attribute_index` had nothing to match.
+            // (`read_checkpoint` assembles its own model; this is the explorer's.)
+            index,
             s3: s3_meta.clone(),
             unreadable,
         };
