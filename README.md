@@ -234,6 +234,26 @@ over `crates/core/src` and `src`, and fails if duplication rises above the `thre
 refactor earns it, and raising it needs a reason in the commit — the same rule the coverage
 floor follows. Tests are excluded, because a test's job is to spell its case out.
 
+**Adding a data source** is one `Source` impl in `src/source.rs` plus an arm in
+`resolve` — nothing else. Features never match on a source kind: they ask
+`crates/core/src/capability.rs`, which derives what is possible from the pair (format ×
+location) plus how the source is reached:
+
+| capability | needs |
+| --- | --- |
+| read tensor bytes | local today — a capability, not a synonym for "is local", so the Hub gaining `Range` reads is one row |
+| modify in place | safetensors **and** local (the rename editor) |
+| repack | HDF5 **and** local (writes a *new* file, so a different capability) |
+| byte-layout map | safetensors over **any** transport — a Hub repo has one |
+| browse the file tree | every location has a listing |
+| per-object metadata | S3 only |
+| codec info | HDF5 only |
+| `reach` | `Direct`, or `ViaSshProxy` for a source whose credentials live elsewhere |
+
+`Capabilities` is serializable and served on `/api/tree`, so the browser asks rather than
+inferring from the source's shape, and each unavailability carries one shared sentence —
+a Hub repo is told the weights aren't there, not to "copy the checkpoint down".
+
 **The Python side** (the scripts that run on the ssh proxy, plus the `typings/` stubs that
 let a type checker see them) is gated by three tools, all **version-pinned** in CI:
 

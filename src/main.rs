@@ -3736,10 +3736,16 @@ fn run_convert(
     use anyhow::bail;
     use std::io::Write;
 
-    let ext = input.extension().and_then(|e| e.to_str());
-    if !matches!(ext, Some("h5" | "hdf5")) {
+    // Repacking is a capability of the (format, location) pair, so ask it rather than
+    // re-testing the extension here: that keeps this refusal in step with the TUI's
+    // repack command, which hides itself for exactly the inputs this rejects.
+    let caps = capability::Capabilities::of(
+        capability::Format::of_path(&input.to_string_lossy()).unwrap_or(capability::Format::Mixed),
+        capability::Location::of_source_path(&input.to_string_lossy()),
+    );
+    if !caps.repack {
         bail!(
-            "convert only supports HDF5 inputs (.h5/.hdf5), got: {}",
+            "convert repacks HDF5 inputs (.h5/.hdf5) held locally, got: {}",
             input.display()
         );
     }
