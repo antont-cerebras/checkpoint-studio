@@ -364,6 +364,40 @@ pub struct DtypeStat {
     pub bytes: usize,
 }
 
+impl DtypeStat {
+    /// Group `tensors` by dtype, biggest byte share first (ties broken by name).
+    ///
+    /// Lived inline in [`CheckpointStats::compute`], which meant the *only* thing that
+    /// could answer "what dtypes is this made of, and in what proportion" was a whole
+    /// checkpoint. The same question is worth asking of one shard — for the layout view's
+    /// legend, and for per-file statistics — and a second copy of the fold is not the way
+    /// to get it: duplication is a gate here (jscpd, 0.79% against a 0.80 ceiling), and
+    /// two copies of a sort rule drift in exactly the way the tie-break exists to prevent.
+    ///
+    /// The ordering is part of the contract, not an implementation detail: it is what makes
+    /// the first row the dominant dtype in every consumer, and the name tie-break is what
+    /// keeps the output stable when two dtypes weigh the same.
+    #[must_use]
+    pub fn tally(tensors: &[TensorInfo]) -> Vec<Self> {
+        let mut by_dtype: HashMap<&str, (usize, usize)> = HashMap::new();
+        for t in tensors {
+            let e = by_dtype.entry(t.dtype.as_str()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += t.size_bytes;
+        }
+        let mut out: Vec<Self> = by_dtype
+            .into_iter()
+            .map(|(dtype, (count, bytes))| Self {
+                dtype: dtype.to_string(),
+                count,
+                bytes,
+            })
+            .collect();
+        out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.dtype.cmp(&b.dtype)));
+        out
+    }
+}
+
 /// Per-file (per-shard) logical-size distribution — the tensor-size stats, but
 /// over whole files. Sizes are logical (Σ of each file's tensor `size_bytes`).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -666,22 +700,7 @@ impl CheckpointStats {
             by_size.get(by_size.len() / 2).copied().unwrap_or(0)
         };
 
-        // dtype breakdown, biggest byte-share first (ties broken by name).
-        let mut dmap: HashMap<&str, (usize, usize)> = HashMap::new();
-        for t in tensors {
-            let e = dmap.entry(t.dtype.as_str()).or_insert((0, 0));
-            e.0 += 1;
-            e.1 += t.size_bytes;
-        }
-        let mut dtypes: Vec<DtypeStat> = dmap
-            .into_iter()
-            .map(|(d, (count, bytes))| DtypeStat {
-                dtype: d.to_string(),
-                count,
-                bytes,
-            })
-            .collect();
-        dtypes.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.dtype.cmp(&b.dtype)));
+        let dtypes = DtypeStat::tally(tensors);
 
         Self {
             files,
@@ -1241,6 +1260,104 @@ fn expert_stats(
 
 #[cfg(test)]
 mod tests {
+
+    /// The tally's *ordering* is its contract — every consumer reads the first row as the
+    /// dominant dtype — so these pin it rather than just the arithmetic.
+    mod dtype_tally {
+        use super::super::DtypeStat;
+        use crate::tree::{Layout, Storage, TensorInfo};
+
+        /// Only name/dtype/size matter to the tally; the rest is filled to be valid.
+        fn t(name: &str, dtype: &str, bytes: usize) -> TensorInfo {
+            TensorInfo {
+                name: name.into(),
+                dtype: dtype.into(),
+                shape: vec![bytes],
+                size_bytes: bytes,
+                num_elements: bytes,
+                storage: Storage::Unknown,
+                source_path: "mem.safetensors".into(),
+                layout: Layout::None,
+            }
+        }
+
+        #[test]
+        fn it_groups_by_dtype_and_sums_counts_and_bytes() {
+            let got =
+                DtypeStat::tally(&[t("a", "BF16", 100), t("b", "U8", 10), t("c", "BF16", 50)]);
+            assert_eq!(got.len(), 2);
+            assert_eq!(
+                (got[0].dtype.as_str(), got[0].count, got[0].bytes),
+                ("BF16", 2, 150)
+            );
+            assert_eq!(
+                (got[1].dtype.as_str(), got[1].count, got[1].bytes),
+                ("U8", 1, 10)
+            );
+        }
+
+        #[test]
+        fn the_biggest_byte_share_comes_first_regardless_of_count() {
+            // A thousand tiny layernorms must not outrank one embedding: the legend and the
+            // stats screen both lead with whatever dominates the *bytes*.
+            let mut tensors = vec![t("embed", "BF16", 600_000_000)];
+            tensors.extend((0..1000).map(|i| t(&format!("ln{i}"), "F32", 4096)));
+            let got = DtypeStat::tally(&tensors);
+            assert_eq!(got[0].dtype, "BF16");
+            assert_eq!(got[1].count, 1000, "and the many-but-small dtype is second");
+        }
+
+        #[test]
+        fn equal_byte_shares_are_ordered_by_name_so_the_output_is_stable() {
+            // Without the tie-break the order comes from HashMap iteration, which Rust
+            // randomises per process — the same checkpoint would render differently twice.
+            let got = DtypeStat::tally(&[t("a", "U8", 64), t("b", "I8", 64), t("c", "F16", 64)]);
+            let names: Vec<&str> = got.iter().map(|d| d.dtype.as_str()).collect();
+            assert_eq!(names, ["F16", "I8", "U8"]);
+        }
+
+        #[test]
+        fn a_repeated_tally_is_identical() {
+            let tensors = [t("a", "U8", 64), t("b", "I8", 64), t("c", "BF16", 64)];
+            let first = DtypeStat::tally(&tensors);
+            for _ in 0..8 {
+                let again = DtypeStat::tally(&tensors);
+                let a: Vec<&str> = first.iter().map(|d| d.dtype.as_str()).collect();
+                let b: Vec<&str> = again.iter().map(|d| d.dtype.as_str()).collect();
+                assert_eq!(a, b, "stable across runs, not HashMap order");
+            }
+        }
+
+        #[test]
+        fn no_tensors_is_no_rows() {
+            assert!(DtypeStat::tally(&[]).is_empty());
+        }
+
+        /// The extraction must not have changed what the stats screen shows: the tally over
+        /// a checkpoint's tensors is the same list `compute` puts in `dtypes`.
+        #[test]
+        fn it_matches_what_checkpoint_stats_reports() {
+            use crate::stats::CheckpointStats;
+            let tensors = [
+                t("model.embed_tokens.weight", "BF16", 1024),
+                t("model.layers.0.w", "U8", 256),
+                t("model.layers.1.w", "U8", 256),
+            ];
+            let stats = CheckpointStats::compute(&tensors, None, None);
+            let direct = DtypeStat::tally(&tensors);
+            let from_stats: Vec<(&str, usize, usize)> = stats
+                .dtypes
+                .iter()
+                .map(|d| (d.dtype.as_str(), d.count, d.bytes))
+                .collect();
+            let expected: Vec<(&str, usize, usize)> = direct
+                .iter()
+                .map(|d| (d.dtype.as_str(), d.count, d.bytes))
+                .collect();
+            assert_eq!(from_stats, expected);
+        }
+    }
+
     use super::*;
     use crate::tree::Layout;
 
