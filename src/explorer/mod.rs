@@ -4092,35 +4092,41 @@ impl Explorer {
         visible.max(1)
     }
 
-    /// `Enter` in the layout map: if the selected segment is a tensor that belongs
-    /// to the loaded checkpoint, reveal it in the tensor tree (opening that screen);
-    /// otherwise flash a note. Returns `Some(Nav)` when it navigates.
-    fn reveal_layout_selection(
+    /// `Enter` in the layout map: open the selected tensor's **detail** screen.
+    ///
+    /// The layout map answers "what occupies these bytes"; the next question is always
+    /// about that tensor — its dtype and shape, its values, its statistics — and that
+    /// is the detail screen. It is also what `Enter` does on a tree row and what
+    /// clicking a band does in the browser, so one key means one thing everywhere.
+    /// Finding the tensor among its *siblings* is the other question, and the band's
+    /// underlined name still links to the tree for it (`Link::Tree`, followed by
+    /// [`Self::open_link`]).
+    ///
+    /// `None` (with a flash) for a segment that isn't a tensor of the open checkpoint —
+    /// browsing another file's layout from the file browser reaches exactly that. No
+    /// full load is forced: a safetensors checkpoint reads its whole structure in one
+    /// header pass, so a name missing here really is missing.
+    fn open_layout_selection(
         &mut self,
         map: &crate::safelayout::LayoutMap,
         selected: usize,
-    ) -> Result<Option<Nav>> {
+    ) -> Option<Nav> {
         use crate::safelayout::SegmentKind;
-        let Some(seg) = map.segments.get(selected) else {
-            return Ok(None);
-        };
+        let seg = map.segments.get(selected)?;
         if !matches!(seg.kind, SegmentKind::Tensor { .. }) {
-            return Ok(None);
+            return None;
         }
-        let name = seg.name.clone();
-        if self.tensors().iter().any(|t| t.name == name) {
-            self.ensure_full_load()?;
-            self.tree_state.reveal(&name);
-            Ok(Some(Nav::Open(Screen::Tree)))
-        } else {
-            // A different checkpoint's file — its tensors aren't in this tree. Flash
-            // a note (set directly, since it isn't a "copied" confirmation).
+        if self.tensor_named(&seg.name).is_none() {
             self.copied_flash = Some((
-                format!("{name} is not in the open checkpoint"),
+                format!("{} is not in the open checkpoint", seg.name),
                 std::time::Instant::now(),
             ));
-            Ok(None)
+            return None;
         }
+        Some(Nav::Open(Screen::Detail {
+            tensor: seg.name.clone(),
+            slice: 0,
+        }))
     }
 
     /// `Enter` on the layout map's header band: float a scrollable, syntax-
@@ -7005,6 +7011,14 @@ fn layout_legend_lines() -> Vec<Line<'static>> {
         Line::default(),
         Line::from(crate::ui::dim_span(
             "Each band's height ∝ its share of the file; offsets are absolute bytes.",
+        )),
+        Line::default(),
+        // The two questions a band raises have two answers, so they have two keys.
+        Line::from(Span::raw(
+            "↵           open the selected tensor (dtype, shape, values, statistics)".to_string(),
+        )),
+        Line::from(Span::raw(
+            "click name  find that tensor in the tree, among its siblings".to_string(),
         )),
     ]
 }

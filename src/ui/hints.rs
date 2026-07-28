@@ -791,7 +791,7 @@ pub(crate) fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>)
     wrap_hint_items(items, width)
 }
 
-/// The layout map's footer hints (`↑↓ select · ↵ in tree · …`), wrapped to
+/// The layout map's footer hints (`↑↓ select · ↵ open tensor · …`), wrapped to
 /// `width` like the tree's, with clickable [`ChipHit`]s.
 pub(crate) fn layout_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
     use KeyCode::{Enter, Tab};
@@ -799,7 +799,10 @@ pub(crate) fn layout_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>
     let mut items: Vec<(Vec<Seg>, &str)> = vec![
         (nav_updown(), "select"),
         (nav_pages(), "page"),
-        (vec![Seg::Key("↵", KeyEvent::new(Enter, plain))], "in tree"),
+        (
+            vec![Seg::Key("↵", KeyEvent::new(Enter, plain))],
+            "open tensor",
+        ),
         (
             vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))],
             "tensor tree",
