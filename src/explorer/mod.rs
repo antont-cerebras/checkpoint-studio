@@ -3396,6 +3396,10 @@ impl Explorer {
         // distinguishable (see `filetree::ShardTensors`). A browse root that isn't the
         // open checkpoint simply matches nothing.
         tree.attribute_tensors(self.tensors());
+        // …and which of those files the index actually declares.
+        if let Some(cp) = self.checkpoint() {
+            tree.attribute_index(&cp.index);
+        }
         Ok(tree)
     }
 
@@ -3711,6 +3715,26 @@ impl Explorer {
             Line::from(Span::raw(
                 "·        text / other — Enter previews plain text".to_string(),
             )),
+            Line::default(),
+            // The columns after the name, in the order a row shows them.
+            Line::from(Span::raw(
+                "size     right-aligned in one column, so the listing reads down".to_string(),
+            )),
+            Line::from(Span::raw(
+                "━━━      this file against the largest file here (directories have none)"
+                    .to_string(),
+            )),
+            Line::from(Span::raw(
+                "tensors  what the model reads out of this file, and its share of the parameters"
+                    .to_string(),
+            )),
+            Line::from(vec![
+                crate::ui::unindexed_span(format!("{}       ", crate::ui::UNINDEXED_MARK)),
+                Span::raw(
+                    "an extra: on disk but not listed in the index (model.safetensors.index.json)"
+                        .to_string(),
+                ),
+            ]),
         ];
         self.float_scroll_popup(
             term,

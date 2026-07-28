@@ -101,6 +101,24 @@ impl ShardTensors {
     }
 }
 
+/// Whether a checkpoint file is one the index declares.
+///
+/// `Option::None` at the use sites means the question doesn't apply — the file isn't a
+/// checkpoint, or the checkpoint has no `model.safetensors.index.json` to be in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexMembership {
+    /// Named in an index's weight map — the ordinary case, and unmarked.
+    Listed,
+    /// A checkpoint file on disk that no index names.
+    ///
+    /// Not an error, and often expected: a LUT-quantised checkpoint ships codebooks
+    /// and scales the index never mentions. But a loader that follows only the index
+    /// will not read it, which is exactly what you want to know while looking at the
+    /// file — the health check already says so, one screen away.
+    Unlisted,
+}
+
 /// A node in the file-browser tree.
 #[derive(Debug, Clone)]
 pub enum FileNode {
@@ -134,6 +152,9 @@ pub enum FileNode {
         /// Computed by [`build_from`], so it is the same number in both frontends and
         /// doesn't drift as the tree is folded.
         size_share: f64,
+        /// Whether the index declares this file, once [`FileNode::attribute_index`] has
+        /// run. `None` when the question doesn't apply — see [`IndexMembership`].
+        index: Option<IndexMembership>,
     },
 }
 
@@ -212,6 +233,52 @@ impl FileNode {
                     tensors,
                     params,
                     params_share: share(params, total),
+                });
+            }
+        }
+    }
+}
+
+impl FileNode {
+    /// Mark each checkpoint file [`IndexMembership::Listed`] or
+    /// [`IndexMembership::Unlisted`] against `indexes`; everything else keeps `None`.
+    /// With no index there is nothing to be in, so every file keeps `None` — a
+    /// single-file checkpoint should not report itself as an extra.
+    ///
+    /// Matched on the **file name**, deliberately. A weight map's values are bare
+    /// basenames (`"model-00001-of-00016.safetensors"`) because an index governs its
+    /// own directory; that is the index format's own notion of identity, so matching
+    /// anything more precise would be inventing one. It also means this works for a
+    /// remote or `s3://` listing, whose node paths aren't in the same form as the
+    /// index's own path.
+    pub fn attribute_index(&mut self, indexes: &[crate::model::IndexEntry]) {
+        if indexes.is_empty() {
+            return;
+        }
+        let listed: std::collections::HashSet<&str> = indexes
+            .iter()
+            .flat_map(|i| i.weight_map.values())
+            .map(String::as_str)
+            .collect();
+        self.mark_index(&listed);
+    }
+
+    fn mark_index(&mut self, listed: &std::collections::HashSet<&str>) {
+        match self {
+            Self::Dir { children, .. } => {
+                for child in children {
+                    child.mark_index(listed);
+                }
+            }
+            Self::File {
+                name, kind, index, ..
+            } => {
+                *index = (*kind == FileKind::Checkpoint).then(|| {
+                    if listed.contains(name.as_str()) {
+                        IndexMembership::Listed
+                    } else {
+                        IndexMembership::Unlisted
+                    }
                 });
             }
         }
@@ -442,6 +509,8 @@ fn build_dir(
                     shard: None,
                     // Filled in by `build_from`, which can see the whole tree.
                     size_share: 0.0,
+                    // Filled in by `attribute_index`, which needs the index.
+                    index: None,
                 });
             }
         }
@@ -500,6 +569,8 @@ pub enum FileRowKind {
         shard: Option<ShardTensors>,
         /// Fraction of the largest file's size — see [`FileNode::File::size_share`].
         size_share: f64,
+        /// Whether the index declares this file — see [`IndexMembership`].
+        index: Option<IndexMembership>,
     },
 }
 
@@ -537,6 +608,17 @@ impl FileRow {
     pub fn size_share(&self) -> Option<f64> {
         match self.kind {
             FileRowKind::File { size_share, .. } => Some(size_share),
+            FileRowKind::Dir { .. } => None,
+        }
+    }
+
+    /// Whether the index declares this file — `None` when the question doesn't apply
+    /// (a directory, a sidecar, or a checkpoint with no index). See
+    /// [`IndexMembership`].
+    #[must_use]
+    pub fn index_membership(&self) -> Option<IndexMembership> {
+        match self.kind {
+            FileRowKind::File { index, .. } => index,
             FileRowKind::Dir { .. } => None,
         }
     }
@@ -584,6 +666,7 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
             kind,
             shard,
             size_share,
+            index,
         } => out.push(FileRow {
             depth,
             name: name.clone(),
@@ -593,6 +676,7 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
                 kind: *kind,
                 shard: *shard,
                 size_share: *size_share,
+                index: *index,
             },
         }),
     }
@@ -923,6 +1007,60 @@ mod tests {
         assert!(
             shards_of(&root)["model-00001.safetensors"].is_none(),
             "an ambiguous name is not attributed"
+        );
+    }
+
+    #[test]
+    fn attribute_index_marks_only_the_files_no_index_names() {
+        // An index that lists one of the two shards — the other is an extra on disk,
+        // which is what a LUT checkpoint's codebooks/qscales files are.
+        let index = crate::model::IndexEntry {
+            path: "/ckpt/model.safetensors.index.json".into(),
+            weight_map: [
+                ("a".to_string(), "model-00001.safetensors".to_string()),
+                ("b".to_string(), "model-00001.safetensors".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let mut root = two_shard_tree();
+        root.attribute_index(std::slice::from_ref(&index));
+
+        let by_name: HashMap<String, Option<IndexMembership>> = flatten(&root)
+            .into_iter()
+            .filter_map(|r| {
+                r.index_membership()
+                    .map(|m| (r.name.clone(), Some(m)))
+                    .or(match r.kind {
+                        FileRowKind::File { .. } => Some((r.name, None)),
+                        FileRowKind::Dir { .. } => None,
+                    })
+            })
+            .collect();
+        assert_eq!(
+            by_name["model-00001.safetensors"],
+            Some(IndexMembership::Listed)
+        );
+        assert_eq!(
+            by_name["model-00002.safetensors"],
+            Some(IndexMembership::Unlisted)
+        );
+        // A sidecar isn't a checkpoint file, so the question doesn't apply to it —
+        // `config.json` must not read as an extra shard.
+        assert_eq!(by_name["config.json"], None, "{by_name:?}");
+    }
+
+    #[test]
+    fn with_no_index_nothing_is_an_extra() {
+        // A single-file checkpoint has no index to be in; calling itself "not in the
+        // index" would be an accusation about a file that is the whole model.
+        let mut root = two_shard_tree();
+        root.attribute_index(&[]);
+        assert!(
+            flatten(&root)
+                .iter()
+                .all(|r| r.index_membership().is_none()),
+            "no index, no verdict"
         );
     }
 

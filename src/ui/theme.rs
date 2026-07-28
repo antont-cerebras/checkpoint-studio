@@ -9,7 +9,7 @@ use super::palette;
 
 /// Marks a tensor that's on disk but not listed in the index (an "extra"),
 /// shown in [`palette::UNINDEXED`] in the tree, detail screen and legends.
-pub(super) const UNINDEXED_MARK: &str = "✚";
+pub(crate) const UNINDEXED_MARK: &str = "✚";
 
 /// Storage tag for a tensor stored uncompressed on disk. Shared by the tree row,
 /// the detail screen and the legend so the wording stays consistent.
@@ -71,6 +71,14 @@ pub(super) fn tree_span(selected: bool, color: Color, text: impl Into<String>) -
 /// A dimmed span (field labels, chrome) for the detail screen.
 pub(crate) fn dim_span(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(palette::DIM))
+}
+
+/// A span in the vivid red that marks something on disk but absent from the index —
+/// the tree's tensor mark, the detail screen's flag, the file browser's row, and the
+/// legends explaining them. Exported so a legend doesn't need the palette itself; one
+/// definition is what keeps the colour from drifting across four screens.
+pub(crate) fn unindexed_span(text: impl Into<String>) -> Span<'static> {
+    Span::styled(text.into(), Style::default().fg(palette::UNINDEXED))
 }
 
 /// A bold green span — a "✓ copied" style confirmation, matching the copy

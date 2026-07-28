@@ -63,6 +63,9 @@ export type FileNode =
        * proportional bar. Served rather than computed here so the bar means the same
        * thing in the terminal, and doesn't rescale as the tree is folded. */
       size_share: number;
+      /** Whether `model.safetensors.index.json` declares this file; null when the
+       * question can't apply (not a checkpoint file, or there is no index). */
+      index: 'listed' | 'unlisted' | null;
     };
 
 /** A shard's contribution to the model (`filetree::ShardTensors`). */

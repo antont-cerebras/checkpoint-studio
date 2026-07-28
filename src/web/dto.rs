@@ -7,7 +7,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::filetree::{FileKind, FileNode, ShardTensors};
+use crate::filetree::{FileKind, FileNode, IndexMembership, ShardTensors};
 use crate::sample::{HistBins, Histogram, Sample, SampleMode, Stats, ViewDtype};
 
 /// A file-tree node with every `path` relativized to the checkpoint root (never
@@ -32,6 +32,8 @@ pub(crate) enum WebFileNode {
         shard: Option<ShardTensors>,
         /// Fraction of the largest file's size, for the proportional bar.
         size_share: f64,
+        /// Whether the index declares this file — `null` when it can't apply.
+        index: Option<IndexMembership>,
     },
 }
 
@@ -61,6 +63,7 @@ impl WebFileNode {
                 kind,
                 shard,
                 size_share,
+                index,
             } => Self::File {
                 name: name.clone(),
                 path: rel(path, root),
@@ -68,6 +71,7 @@ impl WebFileNode {
                 file_kind: *kind,
                 shard: *shard,
                 size_share: *size_share,
+                index: *index,
             },
         }
     }
@@ -311,6 +315,7 @@ mod tests {
                     params_share: 0.25,
                 }),
                 size_share: 0.5,
+                index: Some(IndexMembership::Unlisted),
             }],
         };
         let web = WebFileNode::from_node(&node, &root);

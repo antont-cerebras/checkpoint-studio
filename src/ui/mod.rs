@@ -64,7 +64,7 @@ pub(crate) use legend::Legend;
 pub(crate) use popup::render_shortcut_bubble;
 pub(crate) use rename::{RenameCompletion, RenameRuleView, RenameView};
 pub(crate) use scroll::VScrollbar;
-pub(crate) use theme::{dim_span, success_span};
+pub(crate) use theme::{UNINDEXED_MARK, dim_span, success_span, unindexed_span};
 pub(crate) use tree::{tensor_list_line, tree_row_line, tree_row_text};
 // The footer builders are `ui` internals — the screens above call them directly.
 // They're re-exported for tests only, where the explorer's mode tests assert that
@@ -381,6 +381,7 @@ mod small_terminal {
                     params_share: 0.0641,
                 }),
                 size_share: 1.0,
+                index: Some(crate::filetree::IndexMembership::Listed),
             },
         }];
         let badges = status_badges(AccessBadge::ReadOnly, None, false);

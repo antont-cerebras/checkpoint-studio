@@ -119,6 +119,7 @@ impl WebState {
         let file_tree = if matches!(checkpoint.source, model::Source::Local) {
             let mut node = filetree::build(Path::new(&root), 8);
             node.attribute_tensors(&tensors);
+            node.attribute_index(&checkpoint.index);
             dto::WebFileNode::from_node(&node, Path::new(&root))
         } else {
             let objects: Vec<(String, u64)> = checkpoint
@@ -134,6 +135,7 @@ impl WebState {
                 .to_string();
             let mut node = filetree::build_from_keys(&label, &objects);
             node.attribute_tensors(&tensors);
+            node.attribute_index(&checkpoint.index);
             dto::WebFileNode::from_node(&node, Path::new(""))
         };
 

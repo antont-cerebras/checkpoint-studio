@@ -775,7 +775,16 @@ mod contract {
         has_keys(
             "FileNode::file",
             file,
-            &["kind", "name", "path", "size", "file_kind", "shard"],
+            &[
+                "kind",
+                "name",
+                "path",
+                "size",
+                "file_kind",
+                "shard",
+                "size_share",
+                "index",
+            ],
         );
         // The fixture's own shard is attributed, so `ShardTensors` is on the wire too
         // (a sidecar's `shard` is null, which is why the key alone isn't enough).

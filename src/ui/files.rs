@@ -7,6 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
+use crate::filetree::IndexMembership;
 use crate::utils::format_size;
 
 use super::UI;
@@ -17,6 +18,7 @@ use super::palette;
 use super::popup::render_scroll_popup;
 use super::scroll::VScrollbar;
 use super::text::truncate_keep_end;
+use super::theme::UNINDEXED_MARK;
 use super::theme::tree_span;
 
 /// Footer rows below the file-browser list: a one-line status bar (the selected
@@ -375,6 +377,17 @@ fn file_row_line(
     if !note.is_empty() {
         s.push(tree_span(selected, palette::DIM, format!("  {note}")));
     }
+    // A checkpoint file the index doesn't declare, with the same mark and vivid red
+    // the tensor tree and the detail screen use for an unindexed tensor — a loader
+    // following only the index will not read this file.
+    if row.index_membership() == Some(IndexMembership::Unlisted) {
+        let lead = if note.is_empty() { "  " } else { " · " };
+        s.push(tree_span(
+            selected,
+            palette::UNINDEXED,
+            format!("{lead}{UNINDEXED_MARK} not in the index"),
+        ));
+    }
     Line::from(s)
 }
 
@@ -406,6 +419,7 @@ mod tests {
                     kind: FileKind::Checkpoint,
                     shard: None,
                     size_share: 1.0,
+                    index: None,
                 },
             },
             FileRow {
@@ -417,6 +431,7 @@ mod tests {
                     kind: FileKind::Json,
                     shard: None,
                     size_share: 0.1,
+                    index: None,
                 },
             },
         ];
@@ -441,7 +456,7 @@ mod tests {
     #[test]
     fn a_shard_row_says_what_it_holds() {
         use crate::filetree::{FileKind, FileRow, FileRowKind, ShardTensors};
-        let row = |name: &str, shard: Option<ShardTensors>| FileRow {
+        let row = |name: &str, shard: Option<ShardTensors>, index| FileRow {
             depth: 0,
             name: name.into(),
             path: format!("/ckpt/{name}").into(),
@@ -450,6 +465,7 @@ mod tests {
                 kind: FileKind::Checkpoint,
                 shard,
                 size_share: 1.0,
+                index,
             },
         };
         let rows = vec![
@@ -460,6 +476,7 @@ mod tests {
                     params: 641,
                     params_share: 0.0641,
                 }),
+                Some(IndexMembership::Listed),
             ),
             row(
                 "codebooks.safetensors",
@@ -468,10 +485,11 @@ mod tests {
                     params: 1,
                     params_share: 0.0001,
                 }),
+                Some(IndexMembership::Unlisted),
             ),
             // Unattributed (a shard of some other checkpoint, or an unmatched tree):
             // the row keeps its old shape rather than claiming zero tensors.
-            row("stranger.safetensors", None),
+            row("stranger.safetensors", None, None),
         ];
         let badges = status_badges(AccessBadge::ReadOnly, None, false);
         let out = crate::tui::headless_render(110, 12, |f| {
@@ -490,6 +508,24 @@ mod tests {
         assert!(
             !out.contains("0 tensors"),
             "an unattributed row claims nothing:\n{out}"
+        );
+
+        // Only the exception is marked. A listed shard says nothing (sixteen "in the
+        // index" notes would bury the one row that isn't), and neither does a file the
+        // question can't apply to.
+        let marks = out.matches("not in the index").count();
+        assert_eq!(marks, 1, "only the unlisted row is marked:\n{out}");
+        let marked = out
+            .lines()
+            .find(|l| l.contains("not in the index"))
+            .unwrap_or_default();
+        assert!(
+            marked.contains("codebooks.safetensors"),
+            "…and it's the unlisted one:\n{out}"
+        );
+        assert!(
+            marked.contains(UNINDEXED_MARK),
+            "with the same mark the tensor tree uses:\n{out}"
         );
     }
 
@@ -515,6 +551,7 @@ mod tests {
                 kind: FileKind::Checkpoint,
                 shard: None,
                 size_share,
+                index: Some(IndexMembership::Listed),
             },
         })
         .collect()

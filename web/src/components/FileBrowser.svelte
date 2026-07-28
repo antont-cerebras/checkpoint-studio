@@ -36,6 +36,13 @@
     return node.kind === 'file' ? node.size_share : 0;
   }
 
+  /** True for a checkpoint file no index declares — a loader following only the index
+      will not read it. Only the exception is marked: sixteen "in the index" notes
+      would bury the one row that isn't. */
+  function unlisted(node: FileNode): boolean {
+    return node.kind === 'file' && node.index === 'unlisted';
+  }
+
   function activate(node: FileNode) {
     if (node.kind === 'dir') {
       expanded = toggleDir(expanded, node.path);
@@ -83,7 +90,10 @@
         </span>
         <span class="note dim">
           {#if node.kind === 'dir'}{node.files} {node.files === 1 ? 'file' : 'files'}
-          {:else}{shardSuffix(node)}{/if}
+          {:else}{shardSuffix(node)}{#if unlisted(node)}<span class="extra"
+                title="on disk but not listed in model.safetensors.index.json"
+                >{shardSuffix(node) ? ' · ' : ''}✚ not in the index</span
+              >{/if}{/if}
         </span>
       </div>
     {/each}
@@ -168,10 +178,16 @@
     background: var(--accent);
   }
   /* Fixed, though it's the last column: a note whose width varied would change how
-     much slack the name gets, and the columns before it would wander per row. */
+     much slack the name gets, and the columns before it would wander per row. Wide
+     enough for the longest form — the shard note plus the index mark. */
   .note {
-    flex: 0 0 32ch;
+    flex: 0 0 50ch;
     font-size: 12px;
+  }
+  /* The same vivid red the terminal marks an unindexed file with (palette::UNINDEXED)
+     — one signal, whichever UI you're in. */
+  .note .extra {
+    color: var(--unindexed);
   }
   .err {
     color: var(--danger);
