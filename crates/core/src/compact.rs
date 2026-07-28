@@ -150,9 +150,45 @@ fn contiguous_families(tensors: &[TensorInfo]) -> Vec<TensorFamily> {
 
     order
         .iter()
-        .filter_map(|k| buckets.remove(k))
-        .flat_map(|bucket| tensor_families(&bucket))
+        .filter_map(|k| buckets.remove(k).map(|b| (k.clone(), b)))
+        .flat_map(|((axis, run), bucket)| {
+            // The run this bucket is, so a single-layer run can be braced like the ranges.
+            let span = runs.get(&axis).and_then(|rs| rs.get(run)).copied();
+            tensor_families(&bucket)
+                .into_iter()
+                .map(move |f| brace_single(f, &axis, span))
+                .collect::<Vec<_>>()
+        })
         .collect()
+}
+
+/// Render a **single**-layer run as `{3}` rather than bare `3`, so it has the same shape as
+/// its `{4-6}` siblings.
+///
+/// Why this matters beyond looks: the tree sorts siblings by name, and a bare digit and a
+/// `{` compare differently, so the two forms landed in separate blocks — every range first,
+/// then every single layer, putting layer 0 after layer 92 and breaking the
+/// only-ever-increasing rule the runs themselves satisfy.
+///
+/// Done here, on the family name, because that name is also the `counts` / `varying` key and
+/// what the tree builder groups on — they must all be the one string. `diff`'s own summaries
+/// keep the bare form, where `layers.3.foo` reads better than `layers.{3}.foo`.
+fn brace_single(mut family: TensorFamily, axis: &str, span: Option<(u64, u64)>) -> TensorFamily {
+    let Some((lo, hi)) = span else { return family };
+    if lo != hi {
+        return family; // already `{lo-hi}`
+    }
+    // `axis` ends in the placeholder, so everything before it is the literal prefix the
+    // index follows.
+    let Some(prefix) = axis.strip_suffix("{}") else {
+        return family;
+    };
+    let index = lo.to_string();
+    let head = format!("{prefix}{index}");
+    if let Some(rest) = family.name.strip_prefix(&head) {
+        family.name = format!("{prefix}{{{index}}}{rest}");
+    }
+    family
 }
 
 /// The index axis a template belongs to: everything up to and including its first `{}`
@@ -401,8 +437,8 @@ mod tests {
             "the odd tensor gets its own family: {names:?}"
         );
         assert!(
-            names.iter().any(|n| n.contains("layers.2.")),
-            "layer 2 is named on its own, not inside a range: {names:?}"
+            names.iter().any(|n| n.contains("layers.{2}.")),
+            "layer 2 is named on its own — braced like every other run, so the siblings              sort together: {names:?}"
         );
     }
 
@@ -708,5 +744,71 @@ mod count_tests {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    fn t(name: &str) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            dtype: "BF16".to_string(),
+            shape: vec![4],
+            size_bytes: 8,
+            num_elements: 4,
+            storage: Storage::Unknown,
+            source_path: "m.safetensors".to_string(),
+            layout: Layout::None,
+        }
+    }
+
+    /// The reported break: every `{a-b}` range sorted before every bare single layer, so
+    /// layer 0 came after layer 92. Single runs are braced now, so a mixed set of single and
+    /// multi-layer runs renders in increasing order.
+    ///
+    /// This asserts what the earlier partition test did not — that the *rendered labels*
+    /// sort monotonically, not merely that the runs are disjoint. That gap is what let the
+    /// break reach a screen.
+    #[test]
+    fn single_and_multi_layer_runs_render_in_increasing_order() {
+        // Layer 0 alone, then 1-3 alike, then 4 alone: a signature change at each boundary.
+        let mut tensors = vec![t("model.layers.0.solo.weight")];
+        for layer in 1..4 {
+            tensors.push(t(&format!("model.layers.{layer}.shared.weight")));
+        }
+        tensors.push(t("model.layers.4.other.weight"));
+
+        let c = compact_tree(&tensors);
+        // Every family names its layer in braces, so the forms are uniform.
+        for name in c.counts.keys() {
+            let after = name.split("layers.").nth(1).unwrap_or_default();
+            assert!(
+                after.starts_with('{'),
+                "every run should be braced for a uniform sort: {name}"
+            );
+        }
+
+        // Sorted by name — which is how the tree orders siblings — the layer numbers only
+        // increase.
+        let mut names: Vec<&String> = c.counts.keys().collect();
+        names.sort_by_key(|n| crate::tree::natural_sort_key(n));
+        let firsts: Vec<u64> = names
+            .iter()
+            .filter_map(|n| {
+                let after = n.split("layers.{").nth(1)?;
+                after.split(['-', '}']).next()?.parse().ok()
+            })
+            .collect();
+        assert_eq!(
+            firsts.len(),
+            names.len(),
+            "each name yields a layer: {names:?}"
+        );
+        assert!(
+            firsts.windows(2).all(|w| w[0] <= w[1]),
+            "layer numbers must only increase: {firsts:?} from {names:?}"
+        );
     }
 }

@@ -336,7 +336,13 @@ fn fetch_header(agent: &ureq::Agent, repo: &RepoRef, file: &HubFile) -> Result<S
         // A header bigger than the probe: ask for exactly it.
         None => fetch_range(agent, repo, &file.path, 8, len as u64)?,
     };
-    let (tensors, metadata) = crate::stheader::parse_header(&json, &file.path)?;
+    // Tag each tensor with the repo, not just the shard path: everything downstream asks
+    // `remote::is_remote_source(&t.source_path)` before opening tensor bytes, and a bare
+    // `model-00001.safetensors` looks local — so a data view on a Hub tensor tried to open
+    // it from the working directory and reported `No such file or directory` instead of
+    // saying the weights aren't here. The `hf://…` prefix makes it unmistakably remote.
+    let source = format!("{}/{}", repo.spec(), file.path);
+    let (tensors, metadata) = crate::stheader::parse_header(&json, &source)?;
     Ok(ShardHeader {
         path: file.path.clone(),
         total_len: file.size,
@@ -629,6 +635,26 @@ mod tests {
 
     /// Shard metadata repeats the same `format` / `total_size` entry in every file; the
     /// flattened list keeps one of each rather than 96.
+    /// A Hub tensor must look remote to everything that gates on the source path, or a data
+    /// view will try to open it as a local file. Pinned because the failure was a raw
+    /// `No such file or directory` rather than the capability's explanation.
+    #[test]
+    fn a_hub_tensor_source_path_reads_as_remote() {
+        let repo = RepoRef {
+            id: "owner/name".to_string(),
+            revision: "main".to_string(),
+        };
+        let source = format!("{}/{}", repo.spec(), "model-00001-of-00002.safetensors");
+        assert!(
+            crate::remote::is_remote_source(&source),
+            "{source} must be recognised as remote"
+        );
+        // The bare shard path — what this used to be — does not.
+        assert!(!crate::remote::is_remote_source(
+            "model-00001-of-00002.safetensors"
+        ));
+    }
+
     #[test]
     fn flattening_deduplicates_repeated_shard_metadata() {
         let meta = |k: &str, v: &str| MetadataInfo {

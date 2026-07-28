@@ -1502,12 +1502,12 @@ pub fn open_reader(t: &TensorInfo) -> Result<Box<dyn TensorReader>, String> {
     // Remote sources (`--ssh-proxy`: `s3://…` or scp-style `host:/path`) are
     // metadata-only: their metadata was read on the remote, but the data views
     // (heatmap/values/stats) read locally via mmap, so there are no bytes here.
-    if crate::remote::is_remote_source(&t.source_path) {
-        return Err(
-            "data views are local-only for remote (--ssh-proxy) sources — copy the checkpoint \
-             locally to preview its data"
-                .to_string(),
-        );
+    // The reason comes from the capability table, keyed by what the path says the source is
+    // — so a Hugging Face tensor is told the weights aren't on the Hub side, not to
+    // "copy the checkpoint locally" as if it were an ssh proxy.
+    let location = crate::capability::Location::of_source_path(&t.source_path);
+    if let Some(note) = crate::capability::Capabilities::data_view_note(location) {
+        return Err(note.to_string());
     }
     let ext = std::path::Path::new(&t.source_path)
         .extension()

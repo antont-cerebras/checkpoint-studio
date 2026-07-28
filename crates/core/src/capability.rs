@@ -101,6 +101,25 @@ impl Location {
         }
     }
 
+    /// The location a tensor's `source_path` implies — `hf://…`, `s3://…`, an scp-style
+    /// `host:/path`, or a local path.
+    ///
+    /// For code that holds a tensor rather than a source (the sampler, deep in core), so it
+    /// can give the *right* reason instead of assuming every remote is an ssh proxy.
+    #[must_use]
+    pub fn of_source_path(path: &str) -> Self {
+        if path.starts_with("hf://") {
+            return Self::Hf;
+        }
+        if path.starts_with("s3://") {
+            return Self::S3;
+        }
+        if crate::remote::is_remote_source(path) {
+            return Self::Sftp;
+        }
+        Self::Local
+    }
+
     /// Whether the bytes are on this machine. Not the same question as "can we read tensor
     /// data" — see [`Capabilities::read_bytes`].
     #[must_use]
@@ -309,6 +328,30 @@ mod tests {
         // Location-specific extras.
         assert!(st_s3.object_metadata && !st_hf.object_metadata);
         assert!(h5_local.codec_info && !st_local.codec_info);
+    }
+
+    /// A tensor's path tells core which reason to give — the sampler holds a tensor, not a
+    /// source, and used to assume every remote was an ssh proxy.
+    #[test]
+    fn a_location_can_be_read_off_a_source_path() {
+        assert_eq!(
+            Location::of_source_path("hf://owner/name/shard.safetensors"),
+            Location::Hf
+        );
+        assert_eq!(Location::of_source_path("s3://bucket/key"), Location::S3);
+        assert_eq!(
+            Location::of_source_path("host:/opt/ckpt/shard.safetensors"),
+            Location::Sftp
+        );
+        assert_eq!(
+            Location::of_source_path("/local/shard.safetensors"),
+            Location::Local
+        );
+        assert_eq!(
+            Location::of_source_path("shard.safetensors"),
+            Location::Local,
+            "a bare relative name is local"
+        );
     }
 
     /// Reachability is its own axis: `s3://` is not openable without a proxy however
