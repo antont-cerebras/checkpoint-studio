@@ -21,10 +21,12 @@ use hdf5_metno::types::VarLenUnicode;
 
 const PATH: &str = "tests/fixtures/tiny.hdf5";
 
-fn main() {
-    std::fs::create_dir_all("tests/fixtures").expect("create fixtures dir");
+type Fallible = Result<(), Box<dyn std::error::Error>>;
+
+fn main() -> Fallible {
+    std::fs::create_dir_all("tests/fixtures")?;
     let _ = std::fs::remove_file(PATH);
-    let f = File::create(PATH).expect("create hdf5");
+    let f = File::create(PATH)?;
 
     // A few transformer layers of fused-MoE U16 codebook weights (3D experts),
     // gzip + multi-chunk, plus a layernorm and an attention projection each. The
@@ -41,7 +43,7 @@ fn main() {
             Some(&[2, 3, 4]),
             true,
             &ramp_u16(72),
-        );
+        )?;
         write_ds::<f16>(
             &f,
             &format!("{moe}.down_proj.weight.codebook"),
@@ -49,7 +51,7 @@ fn main() {
             None,
             true,
             &ramp_f16(32),
-        );
+        )?;
         write_ds::<f16>(
             &f,
             &format!("{moe}.down_proj.weight.qscale"),
@@ -57,7 +59,7 @@ fn main() {
             None,
             true,
             &ramp_f16(96),
-        );
+        )?;
         write_ds::<u16>(
             &f,
             &format!("{moe}.gate_up_proj.weight"),
@@ -65,7 +67,7 @@ fn main() {
             Some(&[2, 3, 4]),
             true,
             &ramp_u16(72),
-        );
+        )?;
         write_ds::<f32>(
             &f,
             &format!("model.layers.{layer}.input_layernorm.weight"),
@@ -73,7 +75,7 @@ fn main() {
             None,
             true,
             &ramp_f32(4),
-        );
+        )?;
         write_ds::<i32>(
             &f,
             &format!("model.layers.{layer}.self_attn.q_proj.weight"),
@@ -81,7 +83,7 @@ fn main() {
             None,
             true,
             &ramp_i32(16),
-        );
+        )?;
     }
 
     // A U16 tensor whose schema is per-tensor (`…__metadata__`, uniform u4×4).
@@ -92,10 +94,10 @@ fn main() {
         None,
         true,
         &ramp_u16(20),
-    );
+    )?;
 
     // Assorted dtypes / shapes / storage outside the layer stack.
-    write_ds::<f16>(&f, "lm_head.weight", &[10, 4], None, true, &ramp_f16(40));
+    write_ds::<f16>(&f, "lm_head.weight", &[10, 4], None, true, &ramp_f16(40))?;
     write_ds::<f16>(
         &f,
         "model.embed_tokens.weight",
@@ -103,9 +105,9 @@ fn main() {
         None,
         true,
         &ramp_f16(40),
-    );
-    write_ds::<f32>(&f, "model.norm.weight", &[4], None, false, &ramp_f32(4)); // uncompressed
-    write_ds::<i8>(&f, "model.scale.i8", &[8], None, true, &ramp_i8(8));
+    )?;
+    write_ds::<f32>(&f, "model.norm.weight", &[4], None, false, &ramp_f32(4))?; // uncompressed
+    write_ds::<i8>(&f, "model.scale.i8", &[8], None, true, &ramp_i8(8))?;
 
     // Metadata (root attributes).
     // Top-level schema keyed by projection segment; no `.__metadata__` wrapper.
@@ -113,32 +115,29 @@ fn main() {
         &f,
         "codebook_packing_schema",
         r#"{"down_proj":{"bit_widths":[3,3,3,3,3]},"gate_up_proj":{"bit_widths":[4,3,3,6]}}"#,
-    );
+    )?;
     // Per-tensor schema: a torch `.__metadata__` wrapper carrying a quantization_schema.
     write_attr_str(
         &f,
         "model.layers.0.custom_proj.weight.__metadata__",
         r#"{"model.layers.0.custom_proj.weight.__metadata__":{"quantization_schema":{"bit_widths":[4,4,4,4]}}}"#,
-    );
+    )?;
     // A string-valued config metadata (the StringSerializer wrapper).
     write_attr_str(
         &f,
         "inference_version.__metadata__",
         r#"{"inference_version.__metadata__":{"string_value":"1.5","__TYPE__":"StringSerializer"}}"#,
-    );
+    )?;
     f.new_attr::<f64>()
-        .create("__version__")
-        .unwrap()
-        .write_scalar(&0.5f64)
-        .unwrap();
+        .create("__version__")?
+        .write_scalar(&0.5f64)?;
     f.new_attr::<bool>()
-        .create("__SUCCESS__")
-        .unwrap()
-        .write_scalar(&true)
-        .unwrap();
+        .create("__SUCCESS__")?
+        .write_scalar(&true)?;
 
     drop(f);
     println!("wrote {PATH}");
+    Ok(())
 }
 
 /// Write one dataset, optionally chunked and/or gzip-compressed.
@@ -149,7 +148,7 @@ fn write_ds<T: hdf5_metno::H5Type>(
     chunk: Option<&[usize]>,
     gzip: bool,
     data: &[T],
-) {
+) -> Fallible {
     let ds = match (chunk, gzip) {
         (Some(c), true) => f
             .new_dataset::<T>()
@@ -161,17 +160,19 @@ fn write_ds<T: hdf5_metno::H5Type>(
         (None, true) => f.new_dataset::<T>().shape(shape).deflate(4).create(name),
         (None, false) => f.new_dataset::<T>().shape(shape).create(name),
     }
-    .unwrap_or_else(|e| panic!("create {name}: {e}"));
+    .map_err(|e| format!("create {name}: {e}"))?;
     ds.write_raw(data)
-        .unwrap_or_else(|e| panic!("write {name}: {e}"));
+        .map_err(|e| format!("write {name}: {e}"))?;
+    Ok(())
 }
 
-fn write_attr_str(f: &File, name: &str, json: &str) {
+fn write_attr_str(f: &File, name: &str, json: &str) -> Fallible {
     f.new_attr::<VarLenUnicode>()
         .create(name)
-        .unwrap()
-        .write_scalar(&VarLenUnicode::from_str(json).unwrap())
-        .unwrap();
+        .map_err(|e| format!("create attr {name}: {e}"))?
+        .write_scalar(&VarLenUnicode::from_str(json)?)
+        .map_err(|e| format!("write attr {name}: {e}"))?;
+    Ok(())
 }
 
 // Deterministic payloads (values aren't checked by the tree / detail screens).

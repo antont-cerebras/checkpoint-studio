@@ -11,25 +11,30 @@ Stdlib only (no numpy) — writes valid `.safetensors` files into /tmp/ckpt-demo
 """
 
 import json
-import os
 import random
 import struct
+from collections.abc import Sequence
+from pathlib import Path
 
 random.seed(7)
-OUT = "/tmp/ckpt-demo"
-os.makedirs(OUT, exist_ok=True)
+OUT = Path("/tmp/ckpt-demo")
+OUT.mkdir(parents=True, exist_ok=True)
 
 DT_SIZE = {"F32": 4, "F16": 2, "BF16": 2, "U16": 2, "U8": 1, "I8": 1}
 
 
-def numel(shape):
+def numel(shape: Sequence[int]) -> int:
     n = 1
     for s in shape:
         n *= s
     return n
 
 
-def write_safetensors(path, tensors, metadata):
+def write_safetensors(
+    path: str,
+    tensors: Sequence[tuple[str, str, Sequence[int], bytes]],
+    metadata: dict[str, str],
+) -> None:
     """tensors: list of (name, dtype, shape, data_bytes)."""
     header, blob = {}, bytearray()
     for name, dtype, shape, data in tensors:
@@ -43,22 +48,22 @@ def write_safetensors(path, tensors, metadata):
     if metadata:
         header["__metadata__"] = metadata
     hb = json.dumps(header).encode()
-    with open(path, "wb") as f:
+    with Path(path).open("wb") as f:
         f.write(struct.pack("<Q", len(hb)))
         f.write(hb)
         f.write(bytes(blob))
 
 
-def f32(shape):
-    """A real-valued F32 tensor (standard-normal) so the data views look alive."""
+def f32(shape: Sequence[int]) -> bytes:
+    """Build a real-valued F32 tensor (standard-normal) so the data views look alive."""
     return struct.pack("<%df" % numel(shape), *[random.gauss(0.0, 1.0) for _ in range(numel(shape))])
 
 
-def u8(shape):
+def u8(shape: Sequence[int]) -> bytes:
     return bytes(random.randrange(256) for _ in range(numel(shape)))
 
 
-def zeros(dtype, shape):
+def zeros(dtype: str, shape: Sequence[int]) -> bytes:
     return b"\x00" * (numel(shape) * DT_SIZE[dtype])
 
 
@@ -76,7 +81,7 @@ for i in range(6):
 write_safetensors(
     f"{OUT}/model.safetensors",
     model,
-    {"format": "pt", "producer": "checkpoint-explorer demo"},
+    {"format": "pt", "producer": "checkpoint-studio demo"},
 )
 
 # --- the diff pair: dtype change, shape change, add, remove, metadata edit ----

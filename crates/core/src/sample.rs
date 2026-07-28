@@ -1,0 +1,4475 @@
+//! On-demand sampling of tensor data for the heatmap and numeric views.
+//!
+//! Tensors can be many GB, so we never read a whole one for the preview: we
+//! pick a small grid of element indices that fit the screen (including the
+//! edges) and read just those rows' column spans. Backing formats are reached
+//! through one [`TensorReader`] abstraction — memory-mapped safetensors and
+//! libhdf5 datasets today — so the preview and the statistics scan are written
+//! once and work the same regardless of format (and a new one, e.g. remote/S3
+//! shards, is just another implementation).
+
+use std::collections::{HashMap, HashSet};
+use std::ops::{ControlFlow, Range};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+use rayon::prelude::*;
+
+use crate::tree::{Layout, MetadataInfo, TensorInfo};
+
+/// How a fused-MoE codebook weight is bit-packed: a list of per-expert bit
+/// widths, least-significant-field first. Each `U16` word packs `len_p()`
+/// experts — expert `k` occupies bits `[offset(k), offset(k)+bit_widths[k])` —
+/// so unpacking it ("unmerging") shifts the word right by the field's offset and
+/// masks off the higher bits. Invariants (per the conversion spec): non-empty,
+/// every width > 0, and `sum(bit_widths) <= 16`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackingSchema {
+    bit_widths: Vec<u32>,
+    /// The declared mode label (e.g. `"3bit"`), for display only.
+    quant_mode: Option<String>,
+}
+
+impl PackingSchema {
+    /// Build a schema, validating the spec invariants.
+    pub fn new(bit_widths: Vec<u32>, quant_mode: Option<String>) -> Result<Self, String> {
+        if bit_widths.is_empty() {
+            return Err("empty bit_widths".to_string());
+        }
+        if bit_widths.contains(&0) {
+            return Err("a bit width is zero".to_string());
+        }
+        let total: u32 = bit_widths.iter().sum();
+        if total > 16 {
+            return Err(format!(
+                "bit widths sum to {total} (> 16, exceeds the U16 word)"
+            ));
+        }
+        Ok(Self {
+            bit_widths,
+            quant_mode,
+        })
+    }
+
+    /// Experts packed per stored word (`lenP`).
+    #[must_use]
+    pub fn len_p(&self) -> usize {
+        self.bit_widths.len()
+    }
+
+    /// Bit offset of field `k` (sum of the preceding widths).
+    #[must_use]
+    pub fn offset(&self, k: usize) -> u32 {
+        // A `k` past the end sums every width, which is the offset just past the last
+        // field — the same answer indexing would give for `k == len`, without the panic.
+        self.bit_widths
+            .get(..k)
+            .unwrap_or(&self.bit_widths)
+            .iter()
+            .sum()
+    }
+
+    /// Bit width of field `k`.
+    #[must_use]
+    pub fn width(&self, k: usize) -> u32 {
+        // 0 for a field this schema doesn't have: a zero-width field contributes nothing,
+        // which is what the decoders do with an absent one anyway.
+        self.bit_widths.get(k).copied().unwrap_or(0)
+    }
+
+    /// Unmerge field `k` from a stored word: shift right past the lower fields,
+    /// then mask to the field's width (unsigned codebook index).
+    #[must_use]
+    pub fn extract(&self, word: u64, k: usize) -> u64 {
+        let mask = (1u64 << self.width(k)) - 1;
+        (word >> self.offset(k)) & mask
+    }
+
+    /// The single width when all fields share it (e.g. `[3,3,3,3,3]` → 3).
+    #[must_use]
+    pub fn uniform_width(&self) -> Option<u32> {
+        let first = *self.bit_widths.first()?;
+        self.bit_widths.iter().all(|&w| w == first).then_some(first)
+    }
+
+    /// The widest field — the intrinsic value range is `0..=2^max_width-1`.
+    #[must_use]
+    pub fn max_width(&self) -> u32 {
+        self.bit_widths.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Display label: `u3×5` when uniform, else the explicit width list.
+    pub fn label(&self) -> String {
+        // Early return rather than `map_or_else`: the uniform case is the common one and
+        // one line long, and a closure pair would put the seven-line fallback first.
+        if let Some(w) = self.uniform_width() {
+            return format!("u{w}×{}", self.len_p());
+        }
+        format!(
+            "[{}]",
+            self.bit_widths
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    #[must_use]
+    pub fn bit_widths(&self) -> &[u32] {
+        &self.bit_widths
+    }
+
+    #[must_use]
+    pub fn quant_mode(&self) -> Option<&str> {
+        self.quant_mode.as_deref()
+    }
+}
+
+/// A user override for how a tensor's bytes are decoded, for visualization.
+///
+/// The stored dtype can misrepresent the data, so the user can reinterpret the
+/// raw bytes two ways:
+///
+/// * [`ViewDtype::As`] decodes each stored container as a *different same-width*
+///   dtype — e.g. show a `BF16`-tagged tensor as `F16` (both 16-bit). No shape
+///   change.
+/// * The 4-bit views ([`ViewDtype::U4`] / [`ViewDtype::I4`]) handle quantized
+///   weights stored inside a wider container (e.g. gpt-oss `MoE`: 4-bit values in
+///   a `bf16`/`f16` slot). They unpack every nibble densely (a 16-bit slot
+///   yields four values, expanding the last dimension).
+/// * [`ViewDtype::Unpacked`] applies a fused-MoE codebook [`PackingSchema`] (read
+///   from metadata, stored per-tensor): each `U16` word is "unmerged" along the
+///   *first* (expert) dimension, expanding it by `lenP` so each logical expert is
+///   a correct 2D slice. Unlike `U4`, the widths can differ per field and the
+///   expansion is on dim 0, not the last.
+///
+/// Overrides apply wherever we read the raw stored bytes — both safetensors and
+/// HDF5.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum ViewDtype {
+    /// Decode using the tensor's real dtype.
+    #[default]
+    Stored,
+    /// Reinterpret each container as this (same byte width) dtype, e.g. `"F16"`.
+    As(&'static str),
+    /// Unsigned 4-bit: every nibble unpacked densely (last dim ×(bytes·2)).
+    U4,
+    /// Signed 4-bit (two's complement): every nibble unpacked densely.
+    I4,
+    /// Unmerge a fused codebook [`PackingSchema`] along the first dimension. The
+    /// per-tensor widths live outside the (Copy) enum and are passed alongside.
+    Unpacked,
+}
+
+impl ViewDtype {
+    /// Short label for the active override, or `None` when using the stored dtype.
+    #[must_use]
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Stored => None,
+            Self::As(dt) => Some(dt),
+            Self::U4 => Some("u4"),
+            Self::I4 => Some("i4"),
+            Self::Unpacked => Some("unpacked"),
+        }
+    }
+
+    /// The `--dtype` CLI value that re-selects this view (e.g. `f16`, `u4`), or
+    /// `None` for the stored dtype (no flag needed). Inverse of
+    /// [`parse_view_dtype`].
+    #[must_use]
+    pub fn cli_value(self) -> Option<String> {
+        Some(match self {
+            // For a schema tensor `stored` is a real override (raw U16 vs the
+            // unpacked default), so it must round-trip via `--dtype stored`. For a
+            // plain tensor `stored` is the default and is never recorded as an
+            // override, so the flag is simply never emitted there.
+            Self::Stored => "stored".to_string(),
+            Self::As(dt) => dt.to_ascii_lowercase(),
+            Self::U4 => "u4".to_string(),
+            Self::I4 => "i4".to_string(),
+            Self::Unpacked => "unpacked".to_string(),
+        })
+    }
+
+    /// A compact label for the selection menu (e.g. `stored`, `F16`, `u4`).
+    #[must_use]
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            Self::Stored => "stored",
+            Self::As(dt) => dt,
+            Self::U4 => "u4",
+            Self::I4 => "i4",
+            Self::Unpacked => "unpacked",
+        }
+    }
+
+    /// How many logical 4-bit values are unpacked from each stored container of
+    /// `item_bytes` bytes. `1` for everything except the 4-bit views, which
+    /// unpack `item_bytes * 2` nibbles per container.
+    fn packing(self, item_bytes: usize) -> usize {
+        match self {
+            Self::U4 | Self::I4 => item_bytes * 2,
+            Self::Stored | Self::As(_) | Self::Unpacked => 1,
+        }
+    }
+
+    fn is_signed(self) -> bool {
+        matches!(self, Self::I4)
+    }
+
+    /// Whether the decoded values are integers (so they should be shown without
+    /// a fractional part). True for the 4-bit views and for integer stored / `As`
+    /// dtypes; false for floats.
+    #[must_use]
+    pub fn is_integer(self, stored: &str) -> bool {
+        match self {
+            Self::Stored => dtype_is_integer(stored),
+            Self::As(dt) => dtype_is_integer(dt),
+            Self::U4 | Self::I4 | Self::Unpacked => true, // all 4-bit views are integer-valued
+        }
+    }
+
+    /// Whether those integers are **signed** — needed to print a value exactly from
+    /// its raw bits (see [`format_int_bits`]), which is the only way to show a wide
+    /// I64/U64 element correctly.
+    #[must_use]
+    pub fn is_signed_integer(self, stored: &str) -> bool {
+        match self {
+            Self::Stored => dtype_is_signed_integer(stored),
+            Self::As(dt) => dtype_is_signed_integer(dt),
+            other @ (Self::U4 | Self::I4 | Self::Unpacked) => other.is_signed(),
+        }
+    }
+
+    /// Bit width of one element under this view — 4 for the packed/nibble views,
+    /// otherwise the byte width of the (possibly reinterpreted) dtype. Used to
+    /// size and zero-pad hex/octal/binary cells, and matches [`RawBits::width`].
+    #[must_use]
+    pub fn bit_width(self, stored: &str) -> u32 {
+        match self {
+            Self::Stored => item_size(stored).unwrap_or(4) as u32 * 8,
+            Self::As(dt) => item_size(dt).unwrap_or(4) as u32 * 8,
+            // The unmerged value is a sub-field of the U16 word; the exact field
+            // width is known only with the schema (see `raw_bits_field`), so this
+            // fallback is the container width.
+            Self::Unpacked => 16,
+            Self::U4 | Self::I4 => 4,
+        }
+    }
+
+    /// Display width (chars, incl. a 1-col gap) for one value cell in the
+    /// numeric grid. Floats use a fixed scientific-notation width. Integer
+    /// views size to the *actual* values: given the exact whole-tensor `range`
+    /// (min, max), a sparse 16-bit tensor of two-digit numbers packs as many
+    /// columns as a 4-bit view, instead of always reserving room for `-32768`.
+    /// Without a range (stats not computed yet) it falls back to the dtype's
+    /// theoretical maximum width.
+    #[must_use]
+    pub fn cell_width(self, stored: &str, range: Option<(f64, f64)>) -> usize {
+        // Floats render in scientific notation — a fixed width regardless of
+        // magnitude (e.g. `-1.234e-05`).
+        if !self.is_integer(stored) {
+            return 11;
+        }
+        let digits = match range {
+            Some((lo, hi)) => int_digits(lo).max(int_digits(hi)),
+            None => self.int_max_digits(stored),
+        };
+        // +1 for a separating space; a small floor keeps tiny values readable.
+        (digits + 1).max(3)
+    }
+
+    /// Widest decimal width (digits plus any minus sign) this integer view can
+    /// produce, used to size cells before the exact value range is known.
+    fn int_max_digits(self, stored: &str) -> usize {
+        let dt = match self {
+            // Both 4-bit views are two digits wide: 0..=15 and -8..=7.
+            Self::U4 | Self::I4 => return 2,
+            Self::Unpacked => return 5, // up to a 16-bit field (65535); range shrinks it
+            Self::As(dt) => dt,
+            Self::Stored => stored,
+        };
+        match dt {
+            "I8" | "U8" | "BOOL" => 4, // -128
+            "I16" | "U16" => 6,        // -32768
+            "I32" | "U32" => 11,       // -2147483648
+            "I64" | "U64" => 20,       // -9223372036854775808
+            _ => 10,
+        }
+    }
+}
+
+/// Decimal width of an integer-valued `f64` (digit count plus a leading minus).
+fn int_digits(v: f64) -> usize {
+    // Measured by formatting the f64, not via `as i64`: that cast saturates at 2^63,
+    // so a u64 range was measured one character too narrow and 20-digit values
+    // collided with the neighbouring cell. Capped at the widest 64-bit decimal
+    // ("18446744073709551615" / "-9223372036854775808" — both 20 chars).
+    format!("{v:.0}").len().min(20)
+}
+
+impl ViewDtype {
+    /// The logical shape under this view: the stored `shape` with its last
+    /// dimension scaled by the packing factor. Unchanged unless this is a
+    /// packed 4-bit view (which unpacks several values per stored container).
+    #[must_use]
+    pub fn logical_shape(self, shape: &[usize], stored_dtype: &str) -> Vec<usize> {
+        let packing = item_size(stored_dtype).map_or(1, |b| self.packing(b));
+        let mut shape = shape.to_vec();
+        if packing > 1
+            && let Some(last) = shape.last_mut()
+        {
+            *last *= packing;
+        }
+        shape
+    }
+
+    /// Logical shape including the codebook unmerge: for [`ViewDtype::Unpacked`]
+    /// with a schema the *first* dimension grows by `lenP` (each stored expert
+    /// unpacks into `lenP` logical experts); otherwise defers to [`logical_shape`].
+    #[must_use]
+    pub fn logical_shape_with(
+        self,
+        shape: &[usize],
+        stored_dtype: &str,
+        schema: Option<&PackingSchema>,
+    ) -> Vec<usize> {
+        if let (Self::Unpacked, Some(s)) = (self, schema) {
+            let mut shape = shape.to_vec();
+            match shape.first_mut() {
+                Some(first) => *first *= s.len_p(),
+                None => shape = vec![s.len_p()],
+            }
+            return shape;
+        }
+        self.logical_shape(shape, stored_dtype)
+    }
+}
+
+/// Whether a dtype label denotes an integer (or boolean) type.
+fn dtype_is_integer(dtype: &str) -> bool {
+    matches!(
+        dtype,
+        "I8" | "U8" | "I16" | "U16" | "I32" | "U32" | "I64" | "U64" | "BOOL"
+    )
+}
+
+fn dtype_is_signed_integer(dtype: &str) -> bool {
+    matches!(dtype, "I8" | "I16" | "I32" | "I64")
+}
+
+/// Format an integer element from its **exact** raw bits.
+///
+/// [`Sample::values`] holds `f64`, which cannot represent every 64-bit integer: past
+/// 2^53 the decode rounds, and casting the `f64` back to `i64` saturates at 2^63. So
+/// printing a wide I64/U64 tensor from `values` showed a wrong number — e.g. the U64
+/// 13816973012072644608 rendered as 9223372036854775807. The raw bits are exact, so
+/// the decimal display is derived from those instead. `width` is the element's bit
+/// width; a signed value is sign-extended from it.
+#[must_use]
+pub fn format_int_bits(raw: RawBits, signed: bool) -> String {
+    let w = u32::from(raw.width).clamp(1, 64);
+    let masked = if w >= 64 {
+        raw.bits
+    } else {
+        raw.bits & ((1u64 << w) - 1)
+    };
+    if signed {
+        // Sign-extend the w-bit two's-complement value into i64.
+        let shift = 64 - w;
+        (((masked << shift) as i64) >> shift).to_string()
+    } else {
+        masked.to_string()
+    }
+}
+
+/// The ordered list of views to choose from for a tensor of the given stored
+/// dtype: the stored dtype, then the other same-width dtypes, then the 4-bit
+/// reinterpretations.
+pub fn view_options(stored: &str) -> Vec<ViewDtype> {
+    let mut opts = vec![ViewDtype::Stored];
+    // Same-width float/int reinterpretations (excluding the stored dtype).
+    let same_width: &[&str] = match item_size(stored) {
+        Some(1) => &["I8", "U8"],
+        Some(2) => &["F16", "BF16", "I16", "U16"],
+        Some(4) => &["F32", "I32", "U32"],
+        Some(8) => &["F64", "I64", "U64"],
+        _ => &[],
+    };
+    opts.extend(
+        same_width
+            .iter()
+            .copied()
+            .filter(|&dt| dt != stored)
+            .map(ViewDtype::As),
+    );
+    opts.extend([ViewDtype::U4, ViewDtype::I4]);
+    opts
+}
+
+/// [`view_options`] plus the codebook [`ViewDtype::Unpacked`] view, offered only
+/// when the tensor actually carries a packing schema.
+#[must_use]
+pub fn view_options_for(stored: &str, has_schema: bool) -> Vec<ViewDtype> {
+    let mut opts = view_options(stored);
+    if has_schema {
+        opts.push(ViewDtype::Unpacked);
+    }
+    opts
+}
+
+/// Parse a CLI dtype-override string (e.g. `u4`, `i4`, `f16`, `stored`) into a
+/// [`ViewDtype`]. Case-insensitive; `-` and `_` are interchangeable. Used by the
+/// `--dtype` flag.
+pub fn parse_view_dtype(s: &str) -> Result<ViewDtype, String> {
+    let norm = s.trim().to_ascii_lowercase().replace('_', "-");
+    Ok(match norm.as_str() {
+        "stored" => ViewDtype::Stored,
+        "u4" => ViewDtype::U4,
+        "i4" => ViewDtype::I4,
+        "unpacked" => ViewDtype::Unpacked,
+        "f16" => ViewDtype::As("F16"),
+        "bf16" => ViewDtype::As("BF16"),
+        "f32" => ViewDtype::As("F32"),
+        "f64" => ViewDtype::As("F64"),
+        "i8" => ViewDtype::As("I8"),
+        "u8" => ViewDtype::As("U8"),
+        "i16" => ViewDtype::As("I16"),
+        "u16" => ViewDtype::As("U16"),
+        "i32" => ViewDtype::As("I32"),
+        "u32" => ViewDtype::As("U32"),
+        "i64" => ViewDtype::As("I64"),
+        "u64" => ViewDtype::As("U64"),
+        "bool" => ViewDtype::As("BOOL"),
+        _ => {
+            return Err(format!(
+                "unknown dtype view '{s}'; expected one of: stored, u4, i4, unpacked, f16, bf16, \
+                 f32, f64, i8, u8, i16, u16, i32, u32, i64, u64, bool"
+            ));
+        }
+    })
+}
+
+/// Pull a [`PackingSchema`] out of a metadata JSON value, unwrapping the known
+/// nestings: a torch `json_value` payload, or a per-tensor blob carrying a
+/// `quantization_schema`. The leaf must have a `bit_widths` array; `quant_mode`
+/// is optional. Returns `None` on anything that doesn't match or fails validation.
+fn parse_schema_json(v: &serde_json::Value) -> Option<PackingSchema> {
+    if let Some(inner) = v.get("json_value")
+        && let Some(s) = parse_schema_json(inner)
+    {
+        return Some(s);
+    }
+    if let Some(inner) = v.get("quantization_schema")
+        && let Some(s) = parse_schema_json(inner)
+    {
+        return Some(s);
+    }
+    let bit_widths: Vec<u32> = v
+        .get("bit_widths")?
+        .as_array()?
+        .iter()
+        .map(|x| x.as_u64().map(|n| n as u32))
+        .collect::<Option<Vec<_>>>()?;
+    let quant_mode = v
+        .get("quant_mode")
+        .and_then(|m| m.as_str())
+        .map(String::from);
+    PackingSchema::new(bit_widths, quant_mode).ok()
+}
+
+/// Match tensors to their fused-codebook [`PackingSchema`] from checkpoint
+/// metadata. Two storage shapes are supported, per-tensor preferred:
+/// 1. per-tensor `<tensor>.__metadata__` (or `.quantization_schema[.__metadata__]`)
+///    carrying a `quantization_schema` / `bit_widths`;
+/// 2. a top-level `codebook_packing_schema` keyed by projection segment
+///    (`down_proj` / `gate_up_proj`).
+///
+/// Only `U16` tensors (the fused-codebook storage) are matched.
+#[must_use]
+pub fn parse_packing_schemas(
+    tensors: &[TensorInfo],
+    metadata: &[MetadataInfo],
+) -> HashMap<String, PackingSchema> {
+    let mut out: HashMap<String, PackingSchema> = HashMap::new();
+    let is_u16: HashSet<&str> = tensors
+        .iter()
+        .filter(|t| t.dtype == "U16")
+        .map(|t| t.name.as_str())
+        .collect();
+
+    // (1) Per-tensor metadata (preferred).
+    for m in metadata {
+        let Some(stem) = m
+            .name
+            .strip_suffix(".quantization_schema.__metadata__")
+            .or_else(|| m.name.strip_suffix(".quantization_schema"))
+            .or_else(|| m.name.strip_suffix(".__metadata__"))
+        else {
+            continue;
+        };
+        if !is_u16.contains(stem) || out.contains_key(stem) {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&m.value)
+            && let Some(schema) = parse_schema_json(&v)
+        {
+            out.insert(stem.to_string(), schema);
+        }
+    }
+
+    // (2) Top-level `codebook_packing_schema`, keyed by projection; per-tensor wins.
+    if let Some(m) = metadata.iter().find(|m| {
+        m.name == "codebook_packing_schema" || m.name == "codebook_packing_schema.__metadata__"
+    }) && let Ok(v) = serde_json::from_str::<serde_json::Value>(&m.value)
+        && let Some(obj) = v.as_object()
+    {
+        for (proj, schema_json) in obj {
+            let Some(schema) = parse_schema_json(schema_json) else {
+                continue;
+            };
+            for t in tensors {
+                if t.dtype != "U16" || out.contains_key(&t.name) {
+                    continue;
+                }
+                // Match the projection as a path segment (`.`/`__`-separated).
+                if t.name.replace("__", ".").split('.').any(|seg| seg == proj) {
+                    out.insert(t.name.clone(), schema.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A downsampled grid of tensor values plus the original indices it came from.
+/// The raw stored bit pattern of one sampled element, for non-decimal numeral
+/// display. `bits` is the little-endian integer value of the element's bytes (a
+/// single nibble for the 4-bit views); `width` is its bit count (e.g. 32 for an
+/// `F32`, 8 for an `I8`, 4 for a packed-4-bit view). Decimal display ignores
+/// this and uses the decoded [`f64`] in `values`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawBits {
+    pub bits: u64,
+    pub width: u8,
+}
+
+pub struct Sample {
+    /// Original row indices that were sampled (logical rows).
+    pub rows: Vec<usize>,
+    /// Original column indices that were sampled.
+    pub cols: Vec<usize>,
+    /// Sampled values, `values[i][j]` for `(rows[i], cols[j])`.
+    pub values: Vec<Vec<f64>>,
+    /// Raw stored bits of each sampled element, parallel to `values`, for
+    /// hex/octal/binary display.
+    pub raw: Vec<Vec<RawBits>>,
+    pub min: f64,
+    pub max: f64,
+    /// Logical dimensions of the sampled matrix (1D is treated as `1 x n`; for
+    /// 3D this is the slice's `d1 x d2`).
+    pub total_rows: usize,
+    pub total_cols: usize,
+    /// Number of leading-index slices (`d0` for 3D, else 1).
+    pub slices: usize,
+    /// The slice index this sample is from (0 for 1D/2D).
+    pub slice: usize,
+    /// The dtype reinterpretation this sample was decoded with.
+    pub view: ViewDtype,
+    /// Whether a dtype override is available for this tensor (safetensors/HDF5).
+    pub overridable: bool,
+    /// Which sampling produced this grid (evenly-spaced vs. edges).
+    pub mode: SampleMode,
+    /// The shape the data is being viewed as — the effective (possibly
+    /// overridden) shape with the dtype packing applied to its last dimension.
+    /// The header shows it against the stored shape.
+    pub display_shape: Vec<usize>,
+    /// For the codebook [`ViewDtype::Unpacked`] view: which expert field this
+    /// slice unmerges and its schema-derived label — `Some` only for that view,
+    /// `None` for every other. The field descriptor and label always travel
+    /// together (both derived from the same packing schema), so they're one
+    /// optional rather than two that could drift apart.
+    pub unpacked: Option<UnpackedView>,
+}
+
+/// The [`ViewDtype::Unpacked`] slice's field mapping plus its display label.
+#[derive(Clone, Debug)]
+pub struct UnpackedView {
+    pub field: UnpackedField,
+    /// The schema-derived dtype label (e.g. `u3×5`), so the data-view header can
+    /// show it without re-deriving from the schema.
+    pub label: String,
+}
+
+/// Describes the field a single unpacked slice shows (see [`UnpackedView`]).
+#[derive(Clone, Copy, Debug)]
+pub struct UnpackedField {
+    pub stored_slice: usize,
+    pub field: usize,
+    pub len_p: usize,
+    pub field_bits: u32,
+}
+
+/// How [`sample_tensor`] chooses which rows/columns to show.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum SampleMode {
+    /// Evenly-spaced indices across the whole matrix (the default overview).
+    #[default]
+    Grid,
+    /// Like [`Grid`](SampleMode::Grid) but each output cell is the **maximum
+    /// absolute value** over the whole block of source elements it represents,
+    /// rather than a single sampled element. A full scan (reads every element),
+    /// so nothing is sampled away — a lone outlier still shows. The cells are
+    /// magnitudes (≥ 0) with no single stored element, so `raw` is empty.
+    GridMax,
+    /// The first and last rows and columns, contiguously — to inspect edge
+    /// padding (e.g. is a tensor zero-padded, or padded with something else).
+    /// `row_tail` / `col_tail` bias the fixed budget toward the tail: `0.0`
+    /// shows only the first rows/cols, `1.0` only the last, `0.5` is balanced.
+    Edges { row_tail: f32, col_tail: f32 },
+    /// A contiguous window into the matrix, its top-left corner at
+    /// `(row_off, col_off)` — pan it around to read the actual neighbouring
+    /// values rather than a downsample. Offsets are clamped so the window never
+    /// runs past the end.
+    Window { row_off: usize, col_off: usize },
+}
+
+/// Sample a 1D/2D/3D tensor into at most `max_rows` x `max_cols` values. For a
+/// 3D tensor `[d0, d1, d2]`, `slice` selects the leading index and the `d1 x d2`
+/// matrix at that index is sampled (clamped to a valid slice). `view` overrides
+/// how bytes are decoded (e.g. as packed 4-bit), which for a packed view
+/// expands the last dimension; it applies to safetensors and HDF5. `mode`
+/// selects an evenly-spaced grid or the first/last rows & columns (edges).
+/// A tensor's shape with size-1 dimensions removed. A dimension of length 1
+/// holds a single index, so it carries no data and contributes a no-op stride
+/// to the row-major layout — the flat byte sequence is identical with or without
+/// it. Dropping such dimensions lets an `(N, M, 1, K)` tensor preview as the 3D
+/// `(N, M, K)` it effectively is. An all-ones (or already empty) shape squeezes
+/// to a single element, returned as the empty slice.
+#[must_use]
+pub fn squeezed_shape(shape: &[usize]) -> Vec<usize> {
+    shape.iter().copied().filter(|&d| d != 1).collect()
+}
+
+/// Convenience wrapper: open a reader for `t` and sample in one call. Interactive
+/// views use [`sample_tensor_with`] with a reader cached across redraws, so in the
+/// binary this one-shot form is currently used only by tests.
+#[allow(dead_code)]
+pub fn sample_tensor(
+    t: &TensorInfo,
+    max_rows: usize,
+    max_cols: usize,
+    slice: usize,
+    view: ViewDtype,
+    mode: SampleMode,
+    schema: Option<&PackingSchema>,
+) -> Result<Sample, String> {
+    let reader = open_reader(t)?;
+    sample_tensor_with(
+        reader.as_ref(),
+        t,
+        &t.shape,
+        max_rows,
+        max_cols,
+        slice,
+        view,
+        mode,
+        schema,
+    )
+}
+
+/// Like [`sample_tensor`], but reads through a caller-supplied open reader so an
+/// interactive view can reuse one across redraws (re-opening the file each frame
+/// dominates the cost — see the `window_pan_open_cost` benchmark — and for HDF5
+/// it also throws away libhdf5's chunk cache, forcing re-decompression). The
+/// reader must be for `t` (same file and dtype/shape).
+/// `shape` is the shape to fold the flat data into for display — normally the
+/// tensor's stored shape, but a shape override (with the same element count)
+/// lets the caller reinterpret the dimensions. Region reads still go through
+/// `reader`'s real stored shape, so any reshape with a matching element count is
+/// a valid row-major reinterpretation.
+#[allow(clippy::too_many_arguments)] // distinct sampling parameters
+pub fn sample_tensor_with(
+    reader: &dyn TensorReader,
+    t: &TensorInfo,
+    shape: &[usize],
+    max_rows: usize,
+    max_cols: usize,
+    slice: usize,
+    view: ViewDtype,
+    mode: SampleMode,
+    schema: Option<&PackingSchema>,
+) -> Result<Sample, String> {
+    let ext = std::path::Path::new(&t.source_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    // Dtype overrides reinterpret raw stored bytes; supported for the formats we
+    // read byte-for-byte (safetensors, NumPy, HDF5). For any other format fall
+    // back to the stored dtype so the header never mislabels what's shown.
+    let overridable = matches!(ext, "safetensors" | "h5" | "hdf5" | "npy" | "npz");
+    let view = if overridable { view } else { ViewDtype::Stored };
+    // The codebook unmerge needs both the view and the per-tensor schema.
+    let unpack = (view == ViewDtype::Unpacked).then_some(schema).flatten();
+
+    // A packed override unpacks several 4-bit values from each stored element,
+    // expanding the innermost (last) dimension by that factor. The codebook
+    // unmerge instead expands the *first* (expert) dimension, so it keeps
+    // `packing == 1` (one value per word) and grows the slice count below.
+    let item = item_size(&t.dtype);
+    let packing = item.map_or(1, |bytes| view.packing(bytes));
+
+    // Size-1 dimensions don't change the flat layout, so we fold rows/cols/slices
+    // from the squeezed shape (region reads below still use the real shape — flat
+    // indices are layout-invariant under squeezing, and under any reshape with a
+    // matching element count).
+    let (total_rows, stored_cols, stored_slices) = match squeezed_shape(shape).as_slice() {
+        [] => (1usize, 1usize, 1usize),
+        [n] => (1usize, *n, 1usize),
+        [r, c] => (*r, *c, 1usize),
+        [d0, d1, d2] => (*d1, *d2, *d0),
+        rest => {
+            return Err(format!(
+                "data preview supports 1D, 2D and 3D tensors only (this one is {}D)",
+                rest.len()
+            ));
+        }
+    };
+    let total_cols = stored_cols * packing;
+    if total_rows == 0 || total_cols == 0 || stored_slices == 0 {
+        return Err("tensor has no elements".to_string());
+    }
+
+    // For the unmerge, each stored expert unpacks into `lenP` logical experts
+    // (slices); the requested slice picks a stored expert and a field within it.
+    let len_p = unpack.map_or(1, PackingSchema::len_p);
+    let slices = stored_slices * len_p;
+    let slice = slice.min(slices - 1);
+    let (stored_slice, field) = (slice / len_p, slice % len_p);
+    let unpacked = unpack.map(|s| UnpackedView {
+        field: UnpackedField {
+            stored_slice,
+            field,
+            len_p,
+            field_bits: s.width(field),
+        },
+        label: s.label(),
+    });
+    // Logical elements to skip to reach the chosen stored slice (0 for 1D/2D).
+    let base = stored_slice * total_rows * total_cols;
+
+    // Abs-max overview: aggregate whole blocks instead of point-sampling, so no
+    // element is skipped (a full scan). Handled here because it doesn't reduce to a
+    // set of sampled indices like the other modes.
+    if mode == SampleMode::GridMax {
+        return grid_absmax(
+            reader,
+            t,
+            total_cols,
+            base,
+            total_rows,
+            max_rows.max(1),
+            max_cols.max(1),
+            view,
+            unpack,
+            field,
+        )
+        .map(|(rows, cols, values, min, max)| Sample {
+            rows,
+            cols,
+            values,
+            raw: Vec::new(), // an aggregated cell has no single stored element
+            min,
+            max,
+            total_rows,
+            total_cols,
+            slices,
+            slice,
+            view,
+            overridable,
+            mode,
+            display_shape: view.logical_shape_with(shape, &t.dtype, unpack),
+            unpacked,
+        });
+    }
+
+    let (rows, cols) = match mode {
+        SampleMode::Grid => (
+            sample_indices(total_rows, max_rows.max(1)),
+            sample_indices(total_cols, max_cols.max(1)),
+        ),
+        SampleMode::Edges { row_tail, col_tail } => (
+            edge_indices(total_rows, max_rows.max(1), row_tail),
+            edge_indices(total_cols, max_cols.max(1), col_tail),
+        ),
+        SampleMode::Window { row_off, col_off } => (
+            window_indices(total_rows, max_rows.max(1), row_off),
+            window_indices(total_cols, max_cols.max(1), col_off),
+        ),
+        SampleMode::GridMax => unreachable!("handled above"),
+    };
+
+    let (values, raw) = read_sampled(
+        reader, t, total_cols, base, &rows, &cols, view, unpack, field,
+    )?;
+
+    let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
+    for row in &values {
+        for &v in row {
+            if v.is_finite() {
+                min = min.min(v);
+                max = max.max(v);
+            }
+        }
+    }
+    if !min.is_finite() {
+        min = 0.0;
+        max = 0.0;
+    }
+
+    Ok(Sample {
+        rows,
+        cols,
+        values,
+        raw,
+        min,
+        max,
+        total_rows,
+        total_cols,
+        slices,
+        slice,
+        view,
+        overridable,
+        mode,
+        display_shape: view.logical_shape_with(shape, &t.dtype, unpack),
+        unpacked,
+    })
+}
+
+/// Up to `k` *contiguous* indices in `0..n`, starting at `off` but clamped so
+/// the window never runs past the end (and pinned to `0` when the whole axis
+/// fits). The first returned index is the clamped offset, which the caller
+/// reads back to keep its stored pan position in bounds.
+fn window_indices(n: usize, k: usize, off: usize) -> Vec<usize> {
+    let k = k.min(n);
+    if k == 0 {
+        return Vec::new();
+    }
+    let start = off.min(n - k);
+    (start..start + k).collect()
+}
+
+/// The abs-max overview result: `(row block-start indices, col block-start
+/// indices, magnitude grid, min, max)`.
+type AbsMaxGrid = (Vec<usize>, Vec<usize>, Vec<Vec<f64>>, f64, f64);
+
+/// Overview aggregation for [`SampleMode::GridMax`]: partition the matrix into a
+/// `grid_rows x grid_cols` block grid and reduce each block to `max |v|` over every
+/// finite element it covers — so nothing is sampled away. Streams the matrix in
+/// **fixed-size row chunks** (reusing [`read_sampled`], so packed / unpacked /
+/// 3D-slice decoding is identical to the other modes), folding each element into
+/// its block, so memory stays bounded to one chunk however coarse the grid is (a
+/// 4-row overview of a huge tensor must not pull a quarter of it into memory).
+/// Returns the representative block-start indices, the magnitude grid, and its
+/// `(min, max)` — `min` is pinned to `0` so the colour ramp runs from zero
+/// magnitude to the largest, making outliers pop.
+#[allow(clippy::too_many_arguments)]
+fn grid_absmax(
+    reader: &dyn TensorReader,
+    t: &TensorInfo,
+    total_cols: usize,
+    base: usize,
+    total_rows: usize,
+    max_rows: usize,
+    max_cols: usize,
+    view: ViewDtype,
+    unpack: Option<&PackingSchema>,
+    field: usize,
+) -> Result<AbsMaxGrid, String> {
+    const CHUNK_ROWS: usize = 512;
+    let grid_rows = max_rows.min(total_rows).max(1);
+    let grid_cols = max_cols.min(total_cols).max(1);
+    // Contiguous block boundary `b` of `g` over `n` — covers `0..n` exactly.
+    let bound = |b: usize, n: usize, g: usize| b * n / g;
+    let all_cols: Vec<usize> = (0..total_cols).collect();
+    let rows_idx: Vec<usize> = (0..grid_rows)
+        .map(|i| bound(i, total_rows, grid_rows))
+        .collect();
+    let cols_idx: Vec<usize> = (0..grid_cols)
+        .map(|j| bound(j, total_cols, grid_cols))
+        .collect();
+    // Each source column's output block, precomputed so the hot loop skips a divide.
+    let col_gj: Vec<usize> = (0..total_cols)
+        .map(|c| (c * grid_cols / total_cols).min(grid_cols - 1))
+        .collect();
+
+    // NEG_INFINITY marks an untouched cell; any finite `|v|` (≥ 0) beats it.
+    let mut values = vec![vec![f64::NEG_INFINITY; grid_cols]; grid_rows];
+    let mut gmax = 0.0f64;
+    let mut r0 = 0;
+    while r0 < total_rows {
+        let r1 = (r0 + CHUNK_ROWS).min(total_rows);
+        let chunk_rows: Vec<usize> = (r0..r1).collect();
+        let (chunk, _raw) = read_sampled(
+            reader,
+            t,
+            total_cols,
+            base,
+            &chunk_rows,
+            &all_cols,
+            view,
+            unpack,
+            field,
+        )?;
+        for (bi, vrow) in chunk.iter().enumerate() {
+            let gi = ((r0 + bi) * grid_rows / total_rows).min(grid_rows - 1);
+            let Some(out) = values.get_mut(gi) else {
+                continue; // `gi` is clamped to the grid above, so this cannot be taken
+            };
+            for (c, &v) in vrow.iter().enumerate() {
+                if v.is_finite() {
+                    let a = v.abs();
+                    let Some(cell) = col_gj.get(c).and_then(|&j| out.get_mut(j)) else {
+                        continue;
+                    };
+                    if a > *cell {
+                        *cell = a;
+                    }
+                    if a > gmax {
+                        gmax = a;
+                    }
+                }
+            }
+        }
+        r0 = r1;
+    }
+    // Blocks with no finite element → NaN (drawn as a gap, not zero magnitude).
+    for row in &mut values {
+        for cell in row.iter_mut() {
+            if *cell == f64::NEG_INFINITY {
+                *cell = f64::NAN;
+            }
+        }
+    }
+    Ok((rows_idx, cols_idx, values, 0.0, gmax))
+}
+
+/// Up to `k` evenly-spaced indices in `0..n`, always including `0` and `n-1`.
+fn sample_indices(n: usize, k: usize) -> Vec<usize> {
+    if n <= k {
+        return (0..n).collect();
+    }
+    if k == 1 {
+        return vec![0];
+    }
+    let mut idx: Vec<usize> = (0..k)
+        .map(|i| (i * (n - 1) + (k - 1) / 2) / (k - 1))
+        .collect();
+    idx.dedup();
+    idx
+}
+
+/// The first and last indices of `0..n` (so padding at either end is visible),
+/// filling the available space. The total shown is `2 * ((max - 1) / 2)` (the
+/// screen budget, leaving one slot for the "⋯" / "⋮" gap the UI draws between
+/// the halves). `tail_frac` splits that budget between the head (first) and
+/// tail (last): `0.0` is all-first, `1.0` is all-last, `0.5` is balanced.
+/// Returns all of `0..n` when the budget already covers it (no gap).
+/// The total number of indices the edges view shows for one axis with `max`
+/// cells available (leaving one slot for the "⋯" / "⋮" gap). Exposed so the UI
+/// can size an arrow-key step to exactly one index (`1 / edge_total`).
+#[must_use]
+pub fn edge_total(max: usize) -> usize {
+    2 * (max.saturating_sub(1) / 2).max(1)
+}
+
+fn edge_indices(n: usize, max: usize, tail_frac: f32) -> Vec<usize> {
+    let total = edge_total(max);
+    if n <= total {
+        return (0..n).collect();
+    }
+    let tail = ((tail_frac.clamp(0.0, 1.0) * total as f32).round() as usize).min(total);
+    let head = total - tail;
+    // A window entirely at one end is contiguous (no gap); otherwise the head
+    // and tail blocks are disjoint (`head + tail = total < n`) and the UI marks
+    // the skipped middle with a gap.
+    if head == 0 {
+        return ((n - tail)..n).collect();
+    }
+    if tail == 0 {
+        return (0..head).collect();
+    }
+    let mut idx: Vec<usize> = (0..head).collect();
+    idx.extend((n - tail)..n);
+    idx
+}
+
+fn item_size(dtype: &str) -> Option<usize> {
+    Some(match dtype {
+        "F64" | "I64" | "U64" => 8,
+        "F32" | "I32" | "U32" => 4,
+        "F16" | "BF16" | "I16" | "U16" => 2,
+        "I8" | "U8" | "BOOL" => 1,
+        _ => return None,
+    })
+}
+
+/// A primitive numeric dtype, parsed once from its string label so the hot scan
+/// loop dispatches on a cheap enum instead of matching the `&str` per element.
+#[derive(Clone, Copy)]
+enum Prim {
+    F64,
+    F32,
+    F16,
+    BF16,
+    I64,
+    I32,
+    I16,
+    I8,
+    U64,
+    U32,
+    U16,
+    U8,
+}
+
+/// Parse a dtype label into a [`Prim`], or `None` for unknown labels.
+fn parse_prim(dtype: &str) -> Option<Prim> {
+    Some(match dtype {
+        "F64" => Prim::F64,
+        "F32" => Prim::F32,
+        "F16" => Prim::F16,
+        "BF16" => Prim::BF16,
+        "I64" => Prim::I64,
+        "I32" => Prim::I32,
+        "I16" => Prim::I16,
+        "I8" => Prim::I8,
+        "U64" => Prim::U64,
+        "U32" => Prim::U32,
+        "U16" => Prim::U16,
+        "U8" | "BOOL" => Prim::U8,
+        _ => return None,
+    })
+}
+
+impl Prim {
+    /// Width in bytes of one element.
+    const fn size(self) -> usize {
+        match self {
+            Self::F64 | Self::I64 | Self::U64 => 8,
+            Self::F32 | Self::I32 | Self::U32 => 4,
+            Self::F16 | Self::BF16 | Self::I16 | Self::U16 => 2,
+            Self::I8 | Self::U8 => 1,
+        }
+    }
+}
+
+/// Decode `item_size` little-endian bytes as `p` into an `f64`.
+///
+/// A short slice yields `NaN` rather than panicking. The caller's slicing is normally
+/// exact, but a **dtype override** re-reads the same bytes at a different width, and a
+/// tensor whose length isn't a whole multiple of that width leaves a partial tail — the
+/// `d` key on the wrong tensor used to abort the process there.
+// Each `try_into()` below converts a slice the line above just narrowed to exactly
+// `p.size()` bytes, which is the width `from_le_bytes` wants — so the conversion cannot
+// fail. (The *length* check that makes this true is the fix for the abort this function
+// used to cause on a dtype override; see the doc comment.)
+#[allow(clippy::unwrap_used)]
+fn decode_prim(p: Prim, b: &[u8]) -> f64 {
+    if b.len() < p.size() {
+        return f64::NAN;
+    }
+    let Some(b) = b.get(..p.size()) else {
+        return f64::NAN; // unreachable: the length was just checked
+    };
+    match p {
+        Prim::F64 => f64::from_le_bytes(b.try_into().unwrap()),
+        Prim::F32 => f32::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::F16 => f16_to_f64(u16::from_le_bytes(b.try_into().unwrap())),
+        Prim::BF16 => bf16_to_f64(u16::from_le_bytes(b.try_into().unwrap())),
+        Prim::I64 => i64::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::I32 => i32::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::I16 => i16::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::I8 => f64::from(b.first().map_or(0, |&x| x as i8)),
+        Prim::U64 => u64::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::U32 => u32::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::U16 => u16::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::U8 => f64::from(b.first().copied().unwrap_or(0)),
+    }
+}
+
+/// Decode `item_size(dtype)` little-endian bytes into an `f64`.
+fn decode(dtype: &str, b: &[u8]) -> f64 {
+    parse_prim(dtype).map_or(f64::NAN, |p| decode_prim(p, b))
+}
+
+/// Decode sub-element `sub` of a stored container `bytes` under `view`. For
+/// `Stored`/`As` this decodes the whole container; for the 4-bit views it
+/// extracts nibble `sub` of the little-endian container, sign-extending for the
+/// signed view.
+fn decode_view(view: ViewDtype, dtype: &str, bytes: &[u8], sub: usize) -> f64 {
+    match view {
+        ViewDtype::Stored => return decode(dtype, bytes),
+        // Same-width reinterpretation: decode the container as the chosen dtype.
+        ViewDtype::As(dt) => return decode(dt, bytes),
+        ViewDtype::U4 | ViewDtype::I4 | ViewDtype::Unpacked => {}
+    }
+    // Little-endian integer value of the container (up to 8 bytes).
+    let mut container: u64 = 0;
+    for (i, &b) in bytes.iter().take(8).enumerate() {
+        container |= (b as u64) << (8 * i);
+    }
+    let nibble = ((container >> (sub * 4)) & 0xF) as i64;
+    if view.is_signed() && nibble >= 8 {
+        (nibble - 16) as f64
+    } else {
+        nibble as f64
+    }
+}
+
+/// The raw stored bit pattern of sub-element `sub` of container `bytes` under
+/// `view`, for hex/octal/binary display. For `Stored`/`As` it is the whole
+/// little-endian container (the byte reinterpretation `As` applies doesn't
+/// change the bits); for the 4-bit views it is nibble `sub` (the raw
+/// two's-complement pattern, *not* sign-extended).
+fn raw_bits(view: ViewDtype, bytes: &[u8], sub: usize) -> RawBits {
+    let mut container: u64 = 0;
+    for (i, &b) in bytes.iter().take(8).enumerate() {
+        container |= (b as u64) << (8 * i);
+    }
+    match view {
+        ViewDtype::Stored | ViewDtype::As(_) => RawBits {
+            bits: container,
+            width: (bytes.len().min(8) * 8) as u8,
+        },
+        ViewDtype::U4 | ViewDtype::I4 | ViewDtype::Unpacked => RawBits {
+            bits: (container >> (sub * 4)) & 0xF,
+            width: 4,
+        },
+    }
+}
+
+/// Little-endian integer value of a stored container (up to 8 bytes).
+#[inline]
+fn container_word(bytes: &[u8]) -> u64 {
+    let mut word: u64 = 0;
+    for (i, &b) in bytes.iter().take(8).enumerate() {
+        word |= (b as u64) << (8 * i);
+    }
+    word
+}
+
+/// Unmerge codebook field `k` from a stored word as an `f64` (unsigned index).
+fn decode_field(bytes: &[u8], schema: &PackingSchema, k: usize) -> f64 {
+    schema.extract(container_word(bytes), k) as f64
+}
+
+/// The raw stored bits of codebook field `k` (zero-padded to the field width).
+fn raw_bits_field(bytes: &[u8], schema: &PackingSchema, k: usize) -> RawBits {
+    RawBits {
+        bits: schema.extract(container_word(bytes), k),
+        width: schema.width(k) as u8,
+    }
+}
+
+/// Exact whole-tensor statistics (under a given [`ViewDtype`]), computed by
+/// scanning every element once.
+#[derive(Clone, Copy, Debug)]
+pub struct Stats {
+    /// Total elements scanned.
+    pub count: u64,
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+    /// Population standard deviation.
+    pub std: f64,
+    /// Number of exactly-zero elements (sparsity).
+    pub zeros: u64,
+    /// Number of non-finite elements (NaN / ±Inf).
+    pub nonfinite: u64,
+    /// How long the scan took (set by [`tensor_stats`]).
+    pub elapsed: std::time::Duration,
+}
+
+impl Stats {
+    /// Fraction of elements that are exactly zero, in `0.0..=1.0`.
+    #[must_use]
+    pub fn zero_fraction(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.zeros as f64 / self.count as f64
+        }
+    }
+}
+
+/// Mergeable accumulator for a parallel single-pass scan. Mean and variance use
+/// Welford's algorithm (tracking the running `mean` and `m2`, the sum of squared
+/// deviations) — numerically stable and free of the catastrophic cancellation
+/// that `E[x²] − E[x]²` suffers when the mean dominates the spread. The merge
+/// rule (Chan et al.) combines two partials associatively, so rayon can reduce.
+#[derive(Clone, Copy)]
+struct Acc {
+    count: u64,
+    /// Finite elements (the `n` for mean/variance).
+    finite: u64,
+    zeros: u64,
+    nonfinite: u64,
+    min: f64,
+    max: f64,
+    mean: f64,
+    m2: f64,
+}
+
+impl Acc {
+    const ID: Self = Self {
+        count: 0,
+        finite: 0,
+        zeros: 0,
+        nonfinite: 0,
+        min: f64::INFINITY,
+        max: f64::NEG_INFINITY,
+        mean: 0.0,
+        m2: 0.0,
+    };
+
+    #[inline]
+    fn push(&mut self, v: f64) {
+        self.count += 1;
+        if !v.is_finite() {
+            self.nonfinite += 1;
+            return;
+        }
+        if v < self.min {
+            self.min = v;
+        }
+        if v > self.max {
+            self.max = v;
+        }
+        if v == 0.0 {
+            self.zeros += 1;
+        }
+        // Welford online update.
+        self.finite += 1;
+        let delta = v - self.mean;
+        self.mean += delta / self.finite as f64;
+        self.m2 = delta.mul_add(v - self.mean, self.m2);
+    }
+
+    fn merge(a: Self, b: Self) -> Self {
+        let finite = a.finite + b.finite;
+        let (mean, m2) = if finite == 0 {
+            (0.0, 0.0)
+        } else {
+            // Parallel-variance combine; the `nb/n` and `na*nb/n` factors make
+            // an empty side contribute nothing (so this also handles ID).
+            let (na, nb) = (a.finite as f64, b.finite as f64);
+            let n = na + nb;
+            let delta = b.mean - a.mean;
+            (
+                a.mean + delta * nb / n,
+                a.m2 + b.m2 + delta * delta * na * nb / n,
+            )
+        };
+        Self {
+            count: a.count + b.count,
+            finite,
+            zeros: a.zeros + b.zeros,
+            nonfinite: a.nonfinite + b.nonfinite,
+            min: a.min.min(b.min),
+            max: a.max.max(b.max),
+            mean,
+            m2,
+        }
+    }
+
+    fn finish(self) -> Stats {
+        let (min, max, mean, std) = if self.finite > 0 {
+            // Population variance is M2 / n.
+            let std = (self.m2 / self.finite as f64).sqrt();
+            (self.min, self.max, self.mean, std)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        Stats {
+            count: self.count,
+            min,
+            max,
+            mean,
+            std,
+            zeros: self.zeros,
+            nonfinite: self.nonfinite,
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+}
+
+/// Containers processed per parallel task (keeps per-task overhead low).
+const STATS_CHUNK: usize = 1 << 16;
+
+/// Build a per-container decoder for `(view, dtype)`, resolving the `&str` dtype
+/// dispatch once up front. The returned closure maps a container's bytes and a
+/// nibble index to an `f64`; it runs once per logical value in the hot scan
+/// loop (billions of times), so it must avoid string matching.
+fn view_decoder(view: ViewDtype, dtype: &str) -> impl Fn(&[u8], usize) -> f64 {
+    // For Stored / same-width `As`, decode the whole container as this primitive.
+    let prim = match view {
+        ViewDtype::As(dt) => parse_prim(dt),
+        ViewDtype::Stored | ViewDtype::U4 | ViewDtype::I4 | ViewDtype::Unpacked => {
+            parse_prim(dtype)
+        }
+    };
+    let signed = view.is_signed();
+    move |bytes: &[u8], sub: usize| match view {
+        ViewDtype::Stored | ViewDtype::As(_) => prim.map_or(f64::NAN, |p| decode_prim(p, bytes)),
+        ViewDtype::U4 | ViewDtype::I4 | ViewDtype::Unpacked => {
+            // 4-bit views: pull nibble `sub` from the little-endian container.
+            let mut container: u64 = 0;
+            for (i, &b) in bytes.iter().take(8).enumerate() {
+                container |= (b as u64) << (8 * i);
+            }
+            let nibble = ((container >> (sub * 4)) & 0xF) as i64;
+            if signed && nibble >= 8 {
+                (nibble - 16) as f64
+            } else {
+                nibble as f64
+            }
+        }
+    }
+}
+
+/// Reduce a flat little-endian byte buffer of `item`-byte containers into an
+/// [`Acc`] under `view`, decoding every logical value (a packed view yields
+/// several per container). Parallel over chunks; shared by the safetensors and
+/// HDF5 scanners so a dtype reinterpretation means the same thing in both.
+fn reduce_view_bytes(
+    bytes: &[u8],
+    item: usize,
+    view: ViewDtype,
+    dtype: &str,
+    schema: Option<&PackingSchema>,
+) -> Acc {
+    // Codebook unmerge: each word yields `lenP` field values (their multiset is
+    // exactly the u4-equivalent distribution — order is irrelevant for stats).
+    if view == ViewDtype::Unpacked
+        && let Some(s) = schema
+    {
+        let lenp = s.len_p();
+        return bytes
+            .par_chunks(item * STATS_CHUNK)
+            .map(|chunk| {
+                let mut a = Acc::ID;
+                for container in chunk.chunks_exact(item) {
+                    let word = container_word(container);
+                    for k in 0..lenp {
+                        a.push(s.extract(word, k) as f64);
+                    }
+                }
+                a
+            })
+            .reduce(|| Acc::ID, Acc::merge);
+    }
+    let packing = view.packing(item);
+    let decode = view_decoder(view, dtype);
+    bytes
+        .par_chunks(item * STATS_CHUNK)
+        .map(|chunk| {
+            let mut a = Acc::ID;
+            for container in chunk.chunks_exact(item) {
+                for sub in 0..packing {
+                    a.push(decode(container, sub));
+                }
+            }
+            a
+        })
+        .reduce(|| Acc::ID, Acc::merge)
+}
+
+/// Largest block, in elements, read at once when scanning a contiguous tensor
+/// (the default reader) for stats — keeps peak memory bounded regardless of size.
+const STATS_BLOCK_ELEMS: usize = 16 << 20; // ≈16M elements
+
+/// Target tile size, in elements, for the chunk-aligned HDF5 stats scan. Small
+/// on purpose: each tile read holds libhdf5's lock only briefly, so a concurrent
+/// foreground read stays responsive while a background scan runs. Each chunk is
+/// still decompressed once, so the total scan work is unchanged.
+#[cfg(feature = "hdf5")]
+const STATS_TILE_ELEMS: usize = 2 << 20; // ≈2M elements
+
+/// A chunk-aligned tile shape whose element count stays within `budget`, growing
+/// inner (faster-varying) dimensions first for read contiguity. Each extent is a
+/// multiple of the chunk extent (clamped to the shape), so tiles land on the
+/// chunk grid and libhdf5 decompresses each chunk exactly once. Never smaller
+/// than a single chunk (the smallest aligned read), even if that exceeds budget.
+#[cfg(feature = "hdf5")]
+fn stats_tile_shape(shape: &[usize], chunk: &[usize], budget: usize) -> Vec<usize> {
+    // `shape` and `chunk` are parallel per-dimension vectors; zipping says so, and a
+    // `chunk` shorter than `shape` (which libhdf5 shouldn't produce) then reads as 1 rather
+    // than panicking.
+    let chunk_at = |d: usize| chunk.get(d).copied().unwrap_or(1).max(1);
+    // Start at one chunk per dimension (clamped to the shape).
+    let mut tile: Vec<usize> = shape
+        .iter()
+        .enumerate()
+        .map(|(d, &s)| chunk_at(d).min(s.max(1)))
+        .collect();
+    // Grow inner dimensions first while staying within the element budget.
+    for d in (0..shape.len()).rev() {
+        let (Some(&extent), Some(&cur)) = (shape.get(d), tile.get(d)) else {
+            continue;
+        };
+        if cur >= extent {
+            continue; // already spans the whole dimension
+        }
+        let others: usize = tile
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != d)
+            .map(|(_, &t)| t)
+            .product::<usize>()
+            .max(1);
+        let c = chunk_at(d);
+        // Largest chunk-multiple for this dimension that keeps `tile` ≤ budget.
+        let grown = ((budget / others / c).max(1) * c).min(extent);
+        if let Some(slot) = tile.get_mut(d) {
+            *slot = grown;
+        }
+        if grown < extent {
+            break; // this dimension is the frontier; leave outer dims at one chunk
+        }
+    }
+    tile
+}
+
+/// Format-agnostic access to one tensor's stored bytes. An implementation opens
+/// its backing store once (a memory-mapped safetensors file, an HDF5 dataset, …)
+/// and serves the raw stored containers — little-endian, row-major, exactly as
+/// [`decode`] / [`decode_view`] expect. The sampling preview and the statistics
+/// scan are written once against this trait, so supporting a new format (e.g.
+/// remote/S3 shards) is just another implementation.
+pub trait TensorReader {
+    /// The stored shape.
+    fn shape(&self) -> &[usize];
+
+    /// Read the axis-aligned region selected by `ranges` (one half-open range
+    /// per stored dimension, empty for a 0-D scalar) as a flat row-major
+    /// little-endian buffer of stored containers.
+    fn read_region(&self, ranges: &[Range<usize>]) -> Result<Vec<u8>, String>;
+
+    /// Read several regions, one buffer each. The default reads them
+    /// independently; a format may override to fetch one enclosing block when
+    /// that is cheaper (e.g. to avoid re-decompressing shared HDF5 chunks).
+    fn read_regions(&self, regions: &[Vec<Range<usize>>]) -> Result<Vec<Vec<u8>>, String> {
+        regions.iter().map(|r| self.read_region(r)).collect()
+    }
+
+    /// Scan the whole tensor, handing each bounded block of stored bytes to `f`
+    /// in order (used by the statistics pass). The default streams the dataset
+    /// in row-blocks via [`read_region`]; formats override for a zero-copy scan.
+    /// `f` returns [`ControlFlow::Break`] to stop early (e.g. on cancellation).
+    fn fold_blocks(&self, f: &mut dyn FnMut(&[u8]) -> ControlFlow<()>) -> Result<(), String> {
+        let shape = self.shape();
+        if shape.is_empty() {
+            let bytes = self.read_region(&[])?;
+            let _ = f(&bytes);
+            return Ok(());
+        }
+        // Non-empty (checked just above), so split rather than index: `outer` is the
+        // dimension we stride over, `rest` is everything read whole.
+        let Some((&outer, rest)) = shape.split_first() else {
+            return Ok(());
+        };
+        let inner: usize = rest.iter().product::<usize>().max(1);
+        let block = (STATS_BLOCK_ELEMS / inner).max(1);
+        let mut i = 0;
+        while i < outer {
+            let hi = (i + block).min(outer);
+            let mut ranges: Vec<Range<usize>> = Vec::with_capacity(shape.len());
+            ranges.push(i..hi);
+            ranges.extend(rest.iter().map(|&d| 0..d));
+            let bytes = self.read_region(&ranges)?;
+            if f(&bytes).is_break() {
+                break;
+            }
+            i = hi;
+        }
+        Ok(())
+    }
+}
+
+/// Open the right [`TensorReader`] for a tensor, dispatching by file extension.
+pub fn open_reader(t: &TensorInfo) -> Result<Box<dyn TensorReader>, String> {
+    // Remote sources (`--ssh-proxy`: `s3://…` or scp-style `host:/path`) are
+    // metadata-only: their metadata was read on the remote, but the data views
+    // (heatmap/values/stats) read locally via mmap, so there are no bytes here.
+    // The reason comes from the capability table, keyed by what the path says the source is
+    // — so a Hugging Face tensor is told the weights aren't on the Hub side, not to
+    // "copy the checkpoint locally" as if it were an ssh proxy.
+    let location = crate::capability::Location::of_source_path(&t.source_path);
+    if let Some(note) = crate::capability::Capabilities::data_view_note(location) {
+        return Err(note.to_string());
+    }
+    let ext = std::path::Path::new(&t.source_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "safetensors" => Ok(Box::new(BlobReader::open_safetensors(t)?)),
+        "npy" => Ok(Box::new(BlobReader::open_npy(t)?)),
+        "npz" => Ok(Box::new(BlobReader::open_npz(t)?)),
+        #[cfg(feature = "hdf5")]
+        "h5" | "hdf5" => Ok(Box::new(Hdf5Reader::open(t)?)),
+        // An extensionless HDF5 checkpoint (matched by magic, as the loader does).
+        #[cfg(feature = "hdf5")]
+        _ if crate::readers::looks_like_hdf5(std::path::Path::new(&t.source_path)) => {
+            Ok(Box::new(Hdf5Reader::open(t)?))
+        }
+        _ => Err("reading tensor data is not supported for this format".to_string()),
+    }
+}
+
+/// Read a whole tensor's stored 16-bit containers as raw little-endian `u16` words,
+/// regardless of the stored dtype (F16/U16/I16) — for the repack index decode, which
+/// reinterprets the raw bits rather than the decoded value. Errors unless the
+/// container is 2 bytes.
+pub fn read_all_u16(t: &TensorInfo) -> Result<Vec<u16>, String> {
+    if item_size(&t.dtype) != Some(2) {
+        return Err(format!("expected a 16-bit dtype, got {}", t.dtype));
+    }
+    let r = open_reader(t)?;
+    let ranges: Vec<Range<usize>> = r.shape().iter().map(|&d| 0..d).collect();
+    let bytes = r.read_region(&ranges)?;
+    Ok(bytes
+        .chunks_exact(2)
+        // `chunks_exact(2)` yields exactly two bytes; matching the pair says so.
+        .filter_map(|b| match *b {
+            [lo, hi] => Some(u16::from_le_bytes([lo, hi])),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Read a whole tensor decoded to `f64` (per its stored dtype) — for comparing the
+/// small codebook / scale sibling tensors by value.
+pub fn read_all_f64(t: &TensorInfo) -> Result<Vec<f64>, String> {
+    let prim = parse_prim(&t.dtype).ok_or_else(|| format!("dtype {} not comparable", t.dtype))?;
+    let item = item_size(&t.dtype).ok_or_else(|| format!("dtype {} not comparable", t.dtype))?;
+    let r = open_reader(t)?;
+    let ranges: Vec<Range<usize>> = r.shape().iter().map(|&d| 0..d).collect();
+    let bytes = r.read_region(&ranges)?;
+    Ok(bytes
+        .chunks_exact(item)
+        .map(|c| decode_prim(prim, c))
+        .collect())
+}
+
+/// Decompose a flat row-major container index into per-dimension indices.
+fn unravel(mut flat: usize, shape: &[usize]) -> Vec<usize> {
+    // Innermost dimension first, writing each slot as it is consumed — no index into
+    // either vector, and a zero extent can't divide by zero.
+    let mut idx = vec![0usize; shape.len()];
+    for (slot, &extent) in idx.iter_mut().zip(shape).rev() {
+        let extent = extent.max(1);
+        *slot = flat % extent;
+        flat /= extent;
+    }
+    idx
+}
+
+/// The axis-aligned region covering containers `first..=last`, which must lie
+/// within a single innermost row (so every dimension but the last is a
+/// singleton). Empty `shape` (0-D) yields an empty selection.
+fn region_for_span(shape: &[usize], first: usize, last: usize) -> Vec<Range<usize>> {
+    if shape.is_empty() {
+        return Vec::new();
+    }
+    let lo = unravel(first, shape);
+    let hi = unravel(last, shape);
+    let last_dim = shape.len() - 1; // `shape` is non-empty (checked above)
+    lo.iter()
+        .zip(&hi)
+        .enumerate()
+        .map(|(d, (&l, &h))| if d == last_dim { l..h + 1 } else { l..l + 1 })
+        .collect()
+}
+
+/// Copy the sub-region `want` out of `src`, a row-major buffer of `item`-byte
+/// containers laid out over `src_ranges` (same rank, `want` ⊆ `src_ranges`;
+/// both use absolute indices). Used to slice individual rows out of a larger
+/// block read.
+fn gather_region(
+    src: &[u8],
+    src_ranges: &[Range<usize>],
+    want: &[Range<usize>],
+    item: usize,
+) -> Vec<u8> {
+    let total: usize = want.iter().map(ExactSizeIterator::len).product();
+    let n = src_ranges.len();
+    // Nothing to gather if any dimension is empty. The odometer below always copies at
+    // least one last-dim span before it can notice, so a tensor with a zero dimension —
+    // legal in safetensors, and what a truncated or hostile header can claim — would read
+    // past the end of `src` and panic.
+    if want.iter().any(Range::is_empty) {
+        return Vec::new();
+    }
+    if n == 0 {
+        return src.get(..total * item).unwrap_or_default().to_vec();
+    }
+    // Row-major container strides of the source layout, innermost first: each is the one
+    // to its right times that dimension's extent. Built by folding rather than by indexing
+    // `stride[d + 1]`, so the recurrence is visible and there is no off-by-one to get wrong.
+    let mut stride = vec![1usize; n];
+    for d in (0..n.saturating_sub(1)).rev() {
+        let right = stride.get(d + 1).copied().unwrap_or(1);
+        let extent = src_ranges.get(d + 1).map_or(1, ExactSizeIterator::len);
+        if let Some(slot) = stride.get_mut(d) {
+            *slot = right * extent;
+        }
+    }
+    let last = n - 1;
+    // The innermost span, and the byte offset of its start within a row. `want ⊆ src_ranges`
+    // and both have rank `n`, so these are present; `else return` says that structurally.
+    let (Some(want_last), Some(src_last), Some(stride_last)) =
+        (want.get(last), src_ranges.get(last), stride.get(last))
+    else {
+        return Vec::new();
+    };
+    let span = want_last.len();
+    let base = (want_last.start - src_last.start) * stride_last;
+    let mut out = Vec::with_capacity(total * item);
+    // Odometer over `want`'s leading dimensions; copy the contiguous last-dim
+    // span for each combination.
+    let mut idx: Vec<usize> = want
+        .get(..last)
+        .unwrap_or_default()
+        .iter()
+        .map(|r| r.start)
+        .collect();
+    loop {
+        // Offset of this combination: the innermost base plus each leading dimension's
+        // distance from the source origin, weighted by its stride.
+        let off = base
+            + idx
+                .iter()
+                .zip(src_ranges)
+                .zip(&stride)
+                .map(|((&i, src), &s)| (i - src.start) * s)
+                .sum::<usize>();
+        let bo = off * item;
+        let Some(chunk) = src.get(bo..bo + span * item) else {
+            // A source shorter than the ranges describe: stop with what was gathered
+            // rather than panicking mid-read.
+            return out;
+        };
+        out.extend_from_slice(chunk);
+        if last == 0 {
+            break;
+        }
+        let mut d = last;
+        loop {
+            d -= 1;
+            let (Some(slot), Some(range)) = (idx.get_mut(d), want.get(d)) else {
+                return out;
+            };
+            *slot += 1;
+            if *slot < range.end {
+                break;
+            }
+            *slot = range.start;
+            if d == 0 {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Compute exact statistics over the whole tensor under `view`, scanning every
+/// element once and decoding in parallel. Works the same for any backing format
+/// via [`TensorReader`]; a non-`Stored` view reinterprets the raw stored bytes.
+#[allow(clippy::too_many_arguments)] // distinct scan parameters
+pub fn tensor_stats(
+    t: &TensorInfo,
+    view: ViewDtype,
+    schema: Option<&PackingSchema>,
+    cancel: &AtomicBool,
+    pause: &AtomicBool,
+    progress: Option<&AtomicUsize>,
+) -> Result<Stats, String> {
+    let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+    let started = std::time::Instant::now();
+    let reader = open_reader(t)?;
+    let mut acc = Acc::ID;
+    reader.fold_blocks(&mut |bytes| {
+        acc = Acc::merge(acc, reduce_view_bytes(bytes, item, view, &t.dtype, schema));
+        // Report bytes scanned so the caller can show a progress bar. Summed over
+        // every block this equals the tensor's stored byte size (`size_bytes`).
+        if let Some(p) = progress {
+            p.fetch_add(bytes.len(), Ordering::Relaxed);
+        }
+        // Wait here while paused — this is between block reads, so the backing
+        // file's lock (libhdf5 serialises all access) is released, letting a
+        // foreground read such as the dtype menu's live preview run without
+        // contending; the scan resumes from this block when unpaused. Cancel
+        // takes priority so a paused scan still tears down promptly.
+        while pause.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        // Stop between blocks when the caller cancels (e.g. leaving the view).
+        if cancel.load(Ordering::Relaxed) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".to_string());
+    }
+    let mut stats = acc.finish();
+    stats.elapsed = started.elapsed();
+    Ok(stats)
+}
+
+/// Element-wise comparison of two equal-shape tensors, each decoded to `f64`.
+/// Used by `diff --tensor` and the full-checkpoint `diff --values`.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct ValueDiff {
+    /// Total elements compared.
+    pub elements: u64,
+    /// Elements whose values differ (two NaNs in the same slot count as equal).
+    pub differing: u64,
+    /// Largest `|a - b|` over slots where both values are finite.
+    pub max_abs: f64,
+    /// Mean `|a - b|` over all elements (finite-pair differences summed, then
+    /// divided by `elements`).
+    pub mean_abs: f64,
+    /// Differing slots where one side is non-finite (NaN/±Inf) and the other
+    /// isn't, so `|a - b|` isn't meaningful (excluded from `max_abs`/`mean_abs`).
+    pub nonfinite_mismatch: u64,
+}
+
+/// Running accumulator for [`compare_values`].
+#[derive(Default)]
+struct DiffAcc {
+    elements: u64,
+    differing: u64,
+    nonfinite_mismatch: u64,
+    max_abs: f64,
+    sum_abs: f64,
+}
+
+/// How one side's stored containers decode to `f64` under a chosen [`ViewDtype`].
+/// Each container yields `subs` logical values: 1 for `Stored`/`As`, the nibble
+/// count for `U4`/`I4`, or the packing-schema field count for `Unpacked`.
+struct Decoder<'a> {
+    item: usize,
+    subs: usize,
+    view: ViewDtype,
+    dtype: String,
+    schema: Option<&'a PackingSchema>,
+    /// Precomputed primitive for the 1-value-per-container views (`Stored`/`As`),
+    /// so the common path skips re-parsing the dtype per element.
+    prim: Option<Prim>,
+}
+
+impl<'a> Decoder<'a> {
+    fn new(
+        t: &TensorInfo,
+        view: ViewDtype,
+        schema: Option<&'a PackingSchema>,
+    ) -> Result<Self, String> {
+        let item =
+            item_size(&t.dtype).ok_or_else(|| format!("dtype {} not comparable", t.dtype))?;
+        let (subs, prim) = match view {
+            ViewDtype::Stored => (
+                1,
+                Some(
+                    parse_prim(&t.dtype)
+                        .ok_or_else(|| format!("dtype {} not comparable", t.dtype))?,
+                ),
+            ),
+            ViewDtype::As(dt) => (
+                1,
+                Some(parse_prim(dt).ok_or_else(|| format!("dtype {dt} not comparable"))?),
+            ),
+            ViewDtype::Unpacked => {
+                let s = schema.ok_or_else(|| format!("no packing schema for {}", t.name))?;
+                (s.len_p(), None)
+            }
+            ViewDtype::U4 | ViewDtype::I4 => (view.packing(item), None), // U4 / I4
+        };
+        Ok(Self {
+            item,
+            subs,
+            view,
+            dtype: t.dtype.clone(),
+            schema,
+            prim,
+        })
+    }
+
+    /// Decode logical value `sub` of container `c` from this side's block bytes.
+    fn at(&self, bytes: &[u8], c: usize, sub: usize) -> f64 {
+        // The block is sized from the same container count `c` walks, so a short read here
+        // would mean the two disagreed — NaN is what every other "no value" path returns.
+        let Some(container) = bytes.get(c * self.item..c * self.item + self.item) else {
+            return f64::NAN;
+        };
+        if let Some(prim) = self.prim {
+            return decode_prim(prim, container);
+        }
+        match (self.view, self.schema) {
+            (ViewDtype::Unpacked, Some(s)) => s.extract(container_word(container), sub) as f64,
+            _ => decode_view(self.view, &self.dtype, container, sub),
+        }
+    }
+}
+
+impl DiffAcc {
+    /// Compare `containers` matching containers from each side's block, decoding
+    /// `da.subs` (== `db.subs`) logical values from each.
+    // Exact value diff, with NaN handled explicitly on the next line.
+    #[allow(clippy::float_cmp)]
+    fn add_block(
+        &mut self,
+        a: &[u8],
+        b: &[u8],
+        da: &Decoder<'_>,
+        db: &Decoder<'_>,
+        containers: usize,
+    ) {
+        for c in 0..containers {
+            for sub in 0..da.subs {
+                let va = da.at(a, c, sub);
+                let vb = db.at(b, c, sub);
+                self.elements += 1;
+                // Bit-equal, or both NaN — treat as unchanged.
+                if va == vb || (va.is_nan() && vb.is_nan()) {
+                    continue;
+                }
+                self.differing += 1;
+                if va.is_finite() && vb.is_finite() {
+                    let d = (va - vb).abs();
+                    if d > self.max_abs {
+                        self.max_abs = d;
+                    }
+                    self.sum_abs += d;
+                } else {
+                    self.nonfinite_mismatch += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Compare two tensors' values element-by-element, decoding both under `view`
+/// (with each side's `*_schema` for `Unpacked`). Requires equal stored shapes;
+/// stored dtypes may differ (so it measures requantization drift, e.g. F16 → BF16,
+/// or compares the unpacked 3-bit fields). Streams matching row-blocks via
+/// [`TensorReader::read_region`], so memory stays bounded regardless of size.
+pub fn compare_values(
+    a: &TensorInfo,
+    a_schema: Option<&PackingSchema>,
+    b: &TensorInfo,
+    b_schema: Option<&PackingSchema>,
+    view: ViewDtype,
+) -> Result<ValueDiff, String> {
+    let ra = open_reader(a)?;
+    let rb = open_reader(b)?;
+    if ra.shape() != rb.shape() {
+        return Err("shapes differ".to_string());
+    }
+    let da = Decoder::new(a, view, a_schema)?;
+    let db = Decoder::new(b, view, b_schema)?;
+    if da.subs != db.subs {
+        return Err("incompatible packing".to_string());
+    }
+    let shape = ra.shape().to_vec();
+
+    let mut acc = DiffAcc::default();
+    if shape.is_empty() {
+        let ba = ra.read_region(&[])?;
+        let bb = rb.read_region(&[])?;
+        acc.add_block(&ba, &bb, &da, &db, 1);
+    } else if let Some((&outer, rest)) = shape.split_first() {
+        // Non-empty by the branch above, so this always binds; as an `else if` the
+        // impossible case simply contributes nothing to `acc`, and the shared return
+        // below reports an empty diff rather than needing a second exit.
+        let inner: usize = rest.iter().product::<usize>().max(1);
+        let block = (STATS_BLOCK_ELEMS / inner).max(1);
+        let mut i = 0;
+        while i < outer {
+            let hi = (i + block).min(outer);
+            let mut ranges: Vec<Range<usize>> = Vec::with_capacity(shape.len());
+            ranges.push(i..hi);
+            ranges.extend(rest.iter().map(|&d| 0..d));
+            let ba = ra.read_region(&ranges)?;
+            let bb = rb.read_region(&ranges)?;
+            acc.add_block(&ba, &bb, &da, &db, (hi - i) * inner);
+            i = hi;
+        }
+    }
+
+    let mean_abs = if acc.elements > 0 {
+        acc.sum_abs / acc.elements as f64
+    } else {
+        0.0
+    };
+    Ok(ValueDiff {
+        elements: acc.elements,
+        differing: acc.differing,
+        max_abs: acc.max_abs,
+        mean_abs,
+        nonfinite_mismatch: acc.nonfinite_mismatch,
+    })
+}
+
+/// Two tensors' value histograms over the *same* bin layout (so the bins align),
+/// for `diff --histogram`. `bins`/`n` describe the shared layout; `old`/`new` are
+/// the per-bin counts.
+#[derive(Clone, Debug)]
+pub struct HistogramDiff {
+    pub bins: HistBins,
+    pub n: usize,
+    pub old: Vec<u64>,
+    pub new: Vec<u64>,
+    pub old_total: u64,
+    pub new_total: u64,
+    pub old_nonfinite: u64,
+    pub new_nonfinite: u64,
+}
+
+impl HistogramDiff {
+    /// Total variation distance of the two normalized distributions, in `[0, 1]`:
+    /// half the summed absolute difference of the per-bin fractions. `0` = same
+    /// shape; `1` = disjoint. A compact "how much did the distribution move".
+    #[must_use]
+    pub fn tvd(&self) -> f64 {
+        match (self.old_total, self.new_total) {
+            (0, 0) => 0.0,
+            (0, _) | (_, 0) => 1.0,
+            (ot, nt) => {
+                let (ot, nt) = (ot as f64, nt as f64);
+                0.5 * self
+                    .old
+                    .iter()
+                    .zip(&self.new)
+                    .map(|(&o, &n)| (o as f64 / ot - n as f64 / nt).abs())
+                    .sum::<f64>()
+            }
+        }
+    }
+
+    /// Whether the two histograms differ at all (any bin count, or the totals).
+    #[must_use]
+    pub fn differs(&self) -> bool {
+        self.old != self.new || self.old_total != self.new_total
+    }
+}
+
+/// Compare two tensors' value *distributions*: bin both under `view` into one
+/// shared layout (spanning the combined value range) and return the per-bin
+/// counts. `bins` requests a bucket count (else the defaults). Reuses the
+/// statistics + histogram scans, so it honours `unpacked` etc.
+pub fn histogram_diff(
+    a: &TensorInfo,
+    a_schema: Option<&PackingSchema>,
+    b: &TensorInfo,
+    b_schema: Option<&PackingSchema>,
+    view: ViewDtype,
+    bins: Option<usize>,
+) -> Result<HistogramDiff, String> {
+    let cancel = AtomicBool::new(false);
+    let pause = AtomicBool::new(false);
+
+    // A range is only needed for the data-range layouts (floats, wide ints,
+    // unpacked); the 4-bit views' range is intrinsic. Compute it from both sides
+    // so the shared bins span the union.
+    let range = if histogram_bins(view, &a.dtype, None, bins).is_none() {
+        let sa = tensor_stats(a, view, a_schema, &cancel, &pause, None)?;
+        let sb = tensor_stats(b, view, b_schema, &cancel, &pause, None)?;
+        Some((sa.min.min(sb.min), sa.max.max(sb.max)))
+    } else {
+        None
+    };
+    let (hbins, n) = histogram_bins(view, &a.dtype, range, bins)
+        .ok_or_else(|| "no value range for a histogram".to_string())?;
+
+    let sa = HistShared::new(n);
+    tensor_histogram_into(a, view, a_schema, hbins, n, &sa, &cancel, &pause, None)?;
+    let sb = HistShared::new(n);
+    tensor_histogram_into(b, view, b_schema, hbins, n, &sb, &cancel, &pause, None)?;
+    let (ha, hb) = (sa.snapshot(hbins), sb.snapshot(hbins));
+
+    Ok(HistogramDiff {
+        bins: hbins,
+        n,
+        old: ha.counts,
+        new: hb.counts,
+        old_total: ha.total,
+        new_total: hb.total,
+        old_nonfinite: ha.nonfinite,
+        new_nonfinite: hb.nonfinite,
+    })
+}
+
+/// How a value histogram's bins are laid out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HistBins {
+    /// Integer bins: bin `i` covers the `step` integers starting at
+    /// `start + i * step`. `step == 1` gives one bin per value; a larger step
+    /// groups a wide integer range into whole-number buckets (never fractional).
+    IntBins { start: i64, step: i64 },
+    /// Equal-width bins spanning `[lo, hi]` (the last bin includes `hi`).
+    Range { lo: f64, hi: f64 },
+}
+
+/// A whole-tensor value histogram (a snapshot of the running scan, or final).
+#[derive(Clone, Debug)]
+pub struct Histogram {
+    pub bins: HistBins,
+    /// One count per bin.
+    pub counts: Vec<u64>,
+    /// Finite elements binned so far.
+    pub total: u64,
+    /// Non-finite elements (NaN / ±Inf), not binned.
+    pub nonfinite: u64,
+    /// How long the scan took. Zero for a running snapshot; set on the final
+    /// (cached) histogram so the heading can keep showing the time once done.
+    pub elapsed: std::time::Duration,
+}
+
+/// Live bin counts shared between the scan worker and the UI, so the histogram
+/// can be drawn filling in as it forms. The bin layout is fixed up front.
+pub struct HistShared {
+    pub counts: Vec<AtomicU64>,
+    pub total: AtomicU64,
+    pub nonfinite: AtomicU64,
+}
+
+impl HistShared {
+    #[must_use]
+    pub fn new(n: usize) -> Self {
+        Self {
+            counts: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            total: AtomicU64::new(0),
+            nonfinite: AtomicU64::new(0),
+        }
+    }
+
+    /// A consistent-enough snapshot of the running counts for one rendered frame.
+    pub fn snapshot(&self, bins: HistBins) -> Histogram {
+        Histogram {
+            bins,
+            counts: self
+                .counts
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect(),
+            total: self.total.load(Ordering::Relaxed),
+            nonfinite: self.nonfinite.load(Ordering::Relaxed),
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+}
+
+impl ViewDtype {
+    /// The full inclusive integer value range when it is small and intrinsic to
+    /// the view (the 4-bit views), so the histogram shows every possible value —
+    /// including ones absent from the data. `None` otherwise (use the data range).
+    fn small_int_span(self) -> Option<(i64, i64)> {
+        match self {
+            Self::U4 => Some((0, 15)),
+            Self::I4 => Some((-8, 7)),
+            Self::Stored | Self::As(_) | Self::Unpacked => None,
+        }
+    }
+}
+
+/// Max distinct integer values shown as one bin each; above this the histogram
+/// uses equal-width range bins instead.
+const MAX_VALUE_BINS: usize = 64;
+/// Number of equal-width bins for a range histogram (floats / wide integers).
+const RANGE_BINS: usize = 40;
+
+/// Decide a histogram's bin layout for `(view, dtype)`. `range` is the tensor's
+/// `(min, max)` from its stats — needed for range bins and data-range integer
+/// bins, but not for the 4-bit views (whose range is intrinsic). `bins` requests
+/// a specific bucket count (the `b` key / `--bins`); `None` uses the defaults.
+/// Returns the layout and bin count, or `None` when a range is required but not
+/// yet known.
+#[must_use]
+pub fn histogram_bins(
+    view: ViewDtype,
+    dtype: &str,
+    range: Option<(f64, f64)>,
+    bins: Option<usize>,
+) -> Option<(HistBins, usize)> {
+    // A requested bucket count overrides the defaults: it sets the float bin
+    // count and the wide-integer grouping target, and also caps the per-value
+    // threshold (you can't show more buckets than there are distinct values).
+    let target = bins.unwrap_or(RANGE_BINS).max(1) as u64;
+    if view.is_integer(dtype) {
+        // 4-bit views: every possible value, even absent ones — no range needed,
+        // and the count is intrinsic, so a requested count doesn't apply.
+        if let Some((lo, hi)) = view.small_int_span() {
+            return Some((
+                HistBins::IntBins { start: lo, step: 1 },
+                (hi - lo + 1) as usize,
+            ));
+        }
+        let (min, max) = range?;
+        // Integer bins are an i64 lattice (`start + i*step`), which cannot represent a
+        // full-width 64-bit span — so only take this path when the range genuinely
+        // fits, and fall back to float bins otherwise. Getting this wrong was a real
+        // bug three ways: u64 values above i64::MAX saturate the casts below, so the
+        // edge labels understated the data and everything above 2^63 piled silently
+        // into the last bucket; `hi - lo + 1` overflowed i64 (debug panic) or wrapped
+        // to 0, giving an empty count vector that panicked on first index; and the
+        // renderer's `start + i*step` overflowed while drawing the labels. At this
+        // magnitude a single bin already spans ~1e17 values, so exact integer edges
+        // buy nothing anyway.
+        if min >= i64::MIN as f64 && max <= i64::MAX as f64 {
+            let (lo, hi) = (min.floor() as i64, max.ceil() as i64);
+            if hi < lo {
+                return Some((HistBins::IntBins { start: lo, step: 1 }, 1));
+            }
+            // i128 so the span itself can't overflow while we measure it.
+            let distinct: u128 = (hi as i128 - lo as i128 + 1) as u128;
+            // One bin per value when few enough — capped by any requested count.
+            let per_value_cap = u128::from(bins.unwrap_or(MAX_VALUE_BINS).max(1) as u64);
+            if distinct <= per_value_cap {
+                return Some((HistBins::IntBins { start: lo, step: 1 }, distinct as usize));
+            }
+            // Otherwise group into ~`target` whole-number-width buckets, so the
+            // edges stay integers rather than the fractional ones a float range
+            // would produce.
+            let step_span = distinct.div_ceil(u128::from(target)).max(1);
+            let n = distinct.div_ceil(step_span).max(1) as usize;
+            // Take the lattice only if its TOP edge is representable too, since every
+            // consumer computes `start + i*step` in i64.
+            let usable = i64::try_from(step_span).ok().filter(|&step| {
+                i64::try_from(n)
+                    .ok()
+                    .and_then(|n| n.checked_mul(step))
+                    .and_then(|span| lo.checked_add(span))
+                    .is_some()
+            });
+            if let Some(step) = usable {
+                return Some((HistBins::IntBins { start: lo, step }, n));
+            }
+        }
+        // Span too wide for the integer lattice — fall through to float bins, whose
+        // edges can express the true range.
+    }
+    match range? {
+        (min, max) if min < max => Some((HistBins::Range { lo: min, hi: max }, target as usize)),
+        (min, max) => Some((HistBins::Range { lo: min, hi: max }, 1)), // all-equal: one bin
+    }
+}
+
+/// The bin a value falls in (clamped to the end bins for out-of-range values).
+fn bin_index(bins: HistBins, n: usize, v: f64) -> usize {
+    let last = n.saturating_sub(1) as i64;
+    match bins {
+        HistBins::IntBins { start, step } => {
+            // i128 for the same reason as the bin layout: `v - start` spans the whole
+            // i64 range for a wide integer tensor, which overflows i64.
+            let offset = i128::from(v.round() as i64) - i128::from(start);
+            offset
+                .div_euclid(i128::from(step.max(1)))
+                .clamp(0, i128::from(last)) as usize
+        }
+        HistBins::Range { lo, hi } => {
+            if hi <= lo {
+                return 0;
+            }
+            let frac = (v - lo) / (hi - lo);
+            ((frac * n as f64).floor() as i64).clamp(0, last) as usize
+        }
+    }
+}
+
+/// Reduce a flat byte buffer into per-bin counts (plus finite/non-finite totals)
+/// under `view`, in parallel. Mirrors [`reduce_view_bytes`] but bins instead of
+/// folding moments.
+#[allow(clippy::too_many_arguments)] // distinct scan parameters
+fn reduce_view_hist(
+    bytes: &[u8],
+    item: usize,
+    view: ViewDtype,
+    dtype: &str,
+    schema: Option<&PackingSchema>,
+    bins: HistBins,
+    n: usize,
+) -> (Vec<u64>, u64, u64) {
+    // Codebook unmerge: bin every field of every word (the u4-equivalent value
+    // multiset). A closure resolves the decode once so the hot loop stays tight.
+    let unpack = (view == ViewDtype::Unpacked).then_some(schema).flatten();
+    let packing = unpack.map_or_else(|| view.packing(item), PackingSchema::len_p);
+    let decode = view_decoder(view, dtype);
+    bytes
+        .par_chunks(item * STATS_CHUNK)
+        .map(|chunk| {
+            let mut counts = vec![0u64; n];
+            let (mut total, mut nonfinite) = (0u64, 0u64);
+            for container in chunk.chunks_exact(item) {
+                for sub in 0..packing {
+                    let v = unpack.map_or_else(
+                        || decode(container, sub),
+                        |s| s.extract(container_word(container), sub) as f64,
+                    );
+                    if v.is_finite() {
+                        // `bin_index` clamps to `0..n`, which is `counts.len()`.
+                        if let Some(slot) = counts.get_mut(bin_index(bins, n, v)) {
+                            *slot += 1;
+                        }
+                        total += 1;
+                    } else {
+                        nonfinite += 1;
+                    }
+                }
+            }
+            (counts, total, nonfinite)
+        })
+        .reduce(
+            || (vec![0u64; n], 0, 0),
+            |mut a, b| {
+                for (x, y) in a.0.iter_mut().zip(&b.0) {
+                    *x += *y;
+                }
+                (a.0, a.1 + b.1, a.2 + b.2)
+            },
+        )
+}
+
+/// Scan the whole tensor and accumulate its value histogram into `shared` (whose
+/// bin count must match `n`), so the UI can draw the bins filling in as the scan
+/// runs. `bins` is the fixed layout. Honours `pause`/`cancel` like [`tensor_stats`].
+#[allow(clippy::too_many_arguments)] // a scan driver; the params are all distinct
+pub fn tensor_histogram_into(
+    t: &TensorInfo,
+    view: ViewDtype,
+    schema: Option<&PackingSchema>,
+    bins: HistBins,
+    n: usize,
+    shared: &HistShared,
+    cancel: &AtomicBool,
+    pause: &AtomicBool,
+    progress: Option<&AtomicUsize>,
+) -> Result<(), String> {
+    let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+    let reader = open_reader(t)?;
+    reader.fold_blocks(&mut |bytes| {
+        let (counts, total, nonfinite) =
+            reduce_view_hist(bytes, item, view, &t.dtype, schema, bins, n);
+        for (slot, c) in shared.counts.iter().zip(&counts) {
+            slot.fetch_add(*c, Ordering::Relaxed);
+        }
+        shared.total.fetch_add(total, Ordering::Relaxed);
+        shared.nonfinite.fetch_add(nonfinite, Ordering::Relaxed);
+        if let Some(p) = progress {
+            p.fetch_add(bytes.len(), Ordering::Relaxed);
+        }
+        while pause.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".to_string());
+    }
+    Ok(())
+}
+
+/// Decoded values and the parallel raw stored bits for a sampled grid, each
+/// indexed `[row][col]`.
+type SampledGrid = (Vec<Vec<f64>>, Vec<Vec<RawBits>>);
+
+/// Sample the grid of `rows × cols` logical values from `reader`, decoding under
+/// `view`. Indices are logical: under a packed view a logical element `flat`
+/// lives in container `flat / packing` at nibble `flat % packing`. Reads only
+/// each sampled row's column span (never the whole tensor), so it scales to any
+/// size and any format.
+#[allow(clippy::too_many_arguments)] // distinct read parameters
+fn read_sampled(
+    reader: &dyn TensorReader,
+    t: &TensorInfo,
+    total_cols: usize,
+    base: usize,
+    rows: &[usize],
+    cols: &[usize],
+    view: ViewDtype,
+    unpack: Option<&PackingSchema>,
+    field: usize,
+) -> Result<SampledGrid, String> {
+    let dtype = t.dtype.as_str();
+    let item = item_size(dtype).ok_or_else(|| format!("unsupported dtype: {dtype}"))?;
+    let shape = reader.shape().to_vec();
+    let packing = view.packing(item);
+    // Elements per stored innermost row — used to detect when a sampled row's
+    // span crosses stored rows (only possible under a shape override).
+    let inner: usize = shape
+        .split_first()
+        .map_or(1, |(_, rest)| rest.iter().product::<usize>().max(1));
+    let (Some(&first_col), Some(&last_col)) = (cols.first(), cols.last()) else {
+        // No columns sampled (a zero-width view): an empty grid, not an error.
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let container_for = |row_base: usize, col: usize| (row_base + col) / packing;
+
+    // Per sampled row: the region to read, and the flat container index its
+    // buffer starts at. A row's column span is normally within one stored
+    // innermost row, so we read just that span; a shape override can make it
+    // straddle stored rows, so then we read the full stored rows it covers (the
+    // buffer starts at the first of them). The flat container range is the same
+    // contiguous data either way — only the read selection differs.
+    let mut regions: Vec<Vec<Range<usize>>> = Vec::with_capacity(rows.len());
+    let mut starts: Vec<usize> = Vec::with_capacity(rows.len());
+    for &r in rows {
+        let row_base = base + r * total_cols;
+        let first = container_for(row_base, first_col);
+        let last = container_for(row_base, last_col);
+        if shape.len() <= 1 || first / inner == last / inner {
+            regions.push(region_for_span(&shape, first, last));
+            starts.push(first);
+        } else {
+            let (r0, r1) = (first / inner, last / inner);
+            let mut region = Vec::with_capacity(shape.len());
+            region.push(r0..r1 + 1);
+            region.extend(
+                shape
+                    .split_first()
+                    .map(|(_, rest)| rest)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|&d| 0..d),
+            );
+            regions.push(region);
+            starts.push(r0 * inner);
+        }
+    }
+    let bufs = reader.read_regions(&regions)?;
+
+    // The unmerge decodes a single fixed field per container; its width sizes the
+    // raw-bit fallback. Otherwise the view's own element width applies.
+    let width = unpack.map_or_else(|| view.bit_width(dtype) as u8, |s| s.width(field) as u8);
+    let mut values = Vec::with_capacity(rows.len());
+    let mut raw_rows = Vec::with_capacity(rows.len());
+    for ((&r, &start), buf) in rows.iter().zip(&starts).zip(bufs) {
+        let row_base = base + r * total_cols;
+        let mut vrow = Vec::with_capacity(cols.len());
+        let mut rrow = Vec::with_capacity(cols.len());
+        for &c in cols {
+            let flat = row_base + c;
+            let off = (flat / packing - start) * item;
+            if let Some(cont) = buf.get(off..off + item) {
+                if let Some(s) = unpack {
+                    vrow.push(decode_field(cont, s, field));
+                    rrow.push(raw_bits_field(cont, s, field));
+                } else {
+                    vrow.push(decode_view(view, dtype, cont, flat % packing));
+                    rrow.push(raw_bits(view, cont, flat % packing));
+                }
+            } else {
+                vrow.push(f64::NAN);
+                rrow.push(RawBits { bits: 0, width });
+            }
+        }
+        values.push(vrow);
+        raw_rows.push(rrow);
+    }
+    Ok((values, raw_rows))
+}
+
+/// Memory-mapped reader for a safetensors tensor.
+/// Backing bytes for a tensor stored as one contiguous little-endian row-major
+/// blob: either a memory-mapped file (safetensors, `.npy`) or an owned buffer (a
+/// decompressed `.npz` entry).
+enum Backing {
+    Mmap(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl Backing {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Mmap(m) => &m[..],
+            Self::Owned(v) => v,
+        }
+    }
+}
+
+/// Reader for a tensor that is one contiguous little-endian row-major blob.
+/// Serves safetensors, `NumPy` `.npy`, and (decompressed) `.npz` entries; the
+/// region/scan logic is identical once the backing bytes and data range are set.
+struct BlobReader {
+    backing: Backing,
+    data_start: usize,
+    data_end: usize,
+    shape: Vec<usize>,
+    item: usize,
+}
+
+impl BlobReader {
+    /// safetensors: `ByteRange` is relative to the data blob, which starts after
+    /// the 8-byte header length and the JSON header.
+    fn open_safetensors(t: &TensorInfo) -> Result<Self, String> {
+        let Layout::ByteRange { start, end } = t.layout else {
+            return Err("tensor data location is unknown".to_string());
+        };
+        let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+        let mmap = mmap_file(&t.source_path)?;
+        let header_len = u64::from_le_bytes(
+            mmap.get(0..8)
+                .ok_or("file too small")?
+                .try_into()
+                .map_err(|_| "truncated safetensors header")?,
+        );
+        let data_start = (8 + header_len + start) as usize;
+        let data_end = (8 + header_len + end) as usize;
+        Self::mmapped(mmap, data_start, data_end, t, item)
+    }
+
+    /// `.npy`: `ByteRange` holds absolute file offsets — the raw data directly
+    /// follows the header, so it can be mapped in place.
+    fn open_npy(t: &TensorInfo) -> Result<Self, String> {
+        let Layout::ByteRange { start, end } = t.layout else {
+            return Err("tensor data location is unknown".to_string());
+        };
+        let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+        let mmap = mmap_file(&t.source_path)?;
+        Self::mmapped(mmap, start as usize, end as usize, t, item)
+    }
+
+    /// `.npz`: decompress the entry named `<tensor>.npy` into memory and serve
+    /// from it (compressed entries can't be mapped in place).
+    fn open_npz(t: &TensorInfo) -> Result<Self, String> {
+        use std::io::Read;
+        let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+        let file = std::fs::File::open(&t.source_path).map_err(|e| e.to_string())?;
+        let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        let entry_name = format!("{}.npy", t.name);
+        let mut entry = zip
+            .by_name(&entry_name)
+            .map_err(|e| format!("{entry_name}: {e}"))?;
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        let header = crate::npy::parse_header(&mut std::io::Cursor::new(&bytes))?;
+        let data_end = bytes.len();
+        shape_fits(t, item, data_end.saturating_sub(header.data_offset))?;
+        Ok(Self {
+            backing: Backing::Owned(bytes),
+            data_start: header.data_offset,
+            data_end,
+            shape: t.shape.clone(),
+            item,
+        })
+    }
+
+    fn mmapped(
+        mmap: memmap2::Mmap,
+        data_start: usize,
+        data_end: usize,
+        t: &TensorInfo,
+        item: usize,
+    ) -> Result<Self, String> {
+        if data_end > mmap.len() || data_start > data_end {
+            return Err("tensor data range is out of bounds".to_string());
+        }
+        shape_fits(t, item, data_end - data_start)?;
+        Ok(Self {
+            backing: Backing::Mmap(mmap),
+            data_start,
+            data_end,
+            shape: t.shape.clone(),
+            item,
+        })
+    }
+
+    fn blob(&self) -> &[u8] {
+        // `mmapped`/`open_npz` validated `data_start <= data_end <= len` before building
+        // this, so the range is an invariant of the type rather than of the caller.
+        self.backing
+            .bytes()
+            .get(self.data_start..self.data_end)
+            .unwrap_or_default()
+    }
+}
+
+/// Reject a header whose declared shape needs more bytes than the segment it points at
+/// actually holds.
+///
+/// A `data_offsets` span shorter than `shape × itemsize` means the file is corrupt,
+/// truncated, or hostile. Without this the read goes ahead: `gather_region` copies the
+/// declared last-dimension span for each row, runs off the end of the segment, and the
+/// process aborts on a slice bounds check — a crash rather than the error message the
+/// user should get. Checked at open, so every read of that tensor fails the same way.
+fn shape_fits(t: &TensorInfo, item: usize, span: usize) -> Result<(), String> {
+    let need = t.shape.iter().product::<usize>().saturating_mul(item);
+    if need > span {
+        return Err(format!(
+            "{}: header declares shape {:?} ({need} bytes) but only {span} bytes are stored",
+            t.name, t.shape
+        ));
+    }
+    Ok(())
+}
+
+/// Memory-map a file read-only. SAFETY: read-only inspection; we accept that a
+/// concurrent external write could change the mapping (standard mmap tradeoff).
+fn mmap_file(path: &str) -> Result<memmap2::Mmap, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+    // We read each tensor's contiguous range front-to-back, so bias the kernel
+    // toward large read-ahead. Over NFS this is the difference between one 4 KiB
+    // page fault per page and big streaming reads — the main cost of scanning a
+    // large uncompressed safetensors checkpoint. Best-effort (ignored on error).
+    let _ = mmap.advise(memmap2::Advice::Sequential);
+    Ok(mmap)
+}
+
+impl TensorReader for BlobReader {
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn read_region(&self, ranges: &[Range<usize>]) -> Result<Vec<u8>, String> {
+        let full: Vec<Range<usize>> = self.shape.iter().map(|&d| 0..d).collect();
+        Ok(gather_region(self.blob(), &full, ranges, self.item))
+    }
+
+    /// Zero-copy full scan: the tensor's bytes are already contiguous, so hand
+    /// them straight to `f` — but in element-aligned chunks rather than one giant
+    /// call, so the caller's per-block work (progress bar, pause, cancel) runs
+    /// incrementally instead of only after the whole tensor has been reduced.
+    /// Each chunk is still a borrowed sub-slice (no copy); the reducer itself
+    /// parallelises within a chunk, so chunking this coarsely costs nothing.
+    fn fold_blocks(&self, f: &mut dyn FnMut(&[u8]) -> ControlFlow<()>) -> Result<(), String> {
+        let blob = self.blob();
+        let chunk = STATS_BLOCK_ELEMS * self.item; // element-aligned by construction
+        let mut off = 0;
+        while off < blob.len() {
+            let hi = (off + chunk).min(blob.len());
+            let Some(block) = blob.get(off..hi) else {
+                break; // `hi` is clamped to `blob.len()` on the line above
+            };
+            if f(block).is_break() {
+                break;
+            }
+            off = hi;
+        }
+        Ok(())
+    }
+}
+
+/// Read an HDF5 dataset selection and hand its bytes (little-endian, the order
+/// `decode`/`decode_view` expect) to `f`. The memory type matches the stored
+/// dtype so libhdf5 copies the bits through without a lossy numeric conversion
+/// — this is what lets the dtype-override views (same-width reinterpretation,
+/// 4-bit nibbles) work on HDF5 too. When the read is contiguous on a
+/// little-endian host (the common case) the bytes are borrowed in place with no
+/// copy; otherwise each element is serialised in row-major logical order.
+#[cfg(feature = "hdf5")]
+fn with_hdf5_block_bytes<R>(
+    dataset: &hdf5_metno::Dataset,
+    hyper: hdf5_metno::Hyperslab,
+    dtype: &str,
+    f: impl FnOnce(&[u8]) -> R,
+) -> Result<R, String> {
+    macro_rules! run {
+        ($ty:ty) => {{
+            let a = dataset
+                .read_slice::<$ty, _, ndarray::IxDyn>(hyper)
+                .map_err(|e| e.to_string())?;
+            match a.as_slice() {
+                // Contiguous + little-endian: the native bytes already match the
+                // little-endian layout we decode, so reinterpret them in place.
+                Some(s) if cfg!(target_endian = "little") => {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            s.as_ptr().cast::<u8>(),
+                            std::mem::size_of_val(s),
+                        )
+                    };
+                    f(bytes)
+                }
+                // Non-contiguous or big-endian: serialise to little-endian first.
+                _ => {
+                    let mut buf = Vec::with_capacity(a.len() * std::mem::size_of::<$ty>());
+                    for v in a.iter() {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                    f(&buf)
+                }
+            }
+        }};
+    }
+    Ok(match dtype {
+        "F64" => run!(f64),
+        "F32" => run!(f32),
+        "F16" => run!(half::f16),
+        "I64" => run!(i64),
+        "I32" => run!(i32),
+        "I16" => run!(i16),
+        "I8" => run!(i8),
+        "U64" => run!(u64),
+        "U32" => run!(u32),
+        "U16" => run!(u16),
+        "U8" | "BOOL" => run!(u8),
+        other => return Err(format!("unsupported dtype: {other}")),
+    })
+}
+
+/// Reader for an HDF5 dataset. Holds the open file/dataset so repeated region
+/// reads (one per sampled row) don't reopen it.
+#[cfg(feature = "hdf5")]
+struct Hdf5Reader {
+    // Kept only to hold the file open for the dataset's lifetime.
+    _file: hdf5_metno::File,
+    dataset: hdf5_metno::Dataset,
+    shape: Vec<usize>,
+    dtype: String,
+    item: usize,
+}
+
+#[cfg(feature = "hdf5")]
+impl Hdf5Reader {
+    fn open(t: &TensorInfo) -> Result<Self, String> {
+        let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+        let file = hdf5_metno::File::open(&t.source_path).map_err(|e| e.to_string())?;
+        // Ensure LZ4-compressed datasets are decodable (no-op after first call).
+        crate::hdf5_lz4::register();
+        crate::hdf5_zstd::register();
+        let key = file
+            .member_names()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|k| crate::hdf5::percent_decode(k) == t.name)
+            .ok_or_else(|| "dataset not found in file".to_string())?;
+        let dataset = file.dataset(&key).map_err(|e| e.to_string())?;
+        let shape = dataset.shape();
+        Ok(Self {
+            _file: file,
+            dataset,
+            shape,
+            dtype: t.dtype.clone(),
+            item,
+        })
+    }
+
+    fn hyperslab(ranges: &[Range<usize>]) -> hdf5_metno::Hyperslab {
+        use hdf5_metno::SliceOrIndex;
+        hdf5_metno::Hyperslab::from(
+            ranges
+                .iter()
+                .cloned()
+                .map(SliceOrIndex::from)
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+#[cfg(feature = "hdf5")]
+impl TensorReader for Hdf5Reader {
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn read_region(&self, ranges: &[Range<usize>]) -> Result<Vec<u8>, String> {
+        with_hdf5_block_bytes(
+            &self.dataset,
+            Self::hyperslab(ranges),
+            &self.dtype,
+            <[u8]>::to_vec,
+        )
+    }
+
+    /// Fetch one enclosing block when it fits a memory budget: reading the
+    /// bounding box of the sampled rows decompresses each overlapping chunk once
+    /// rather than once per row. When the box is too large the tensor is huge,
+    /// so the sampled rows are spread far apart and rarely share a chunk anyway,
+    /// and per-row reads are fine.
+    fn read_regions(&self, regions: &[Vec<Range<usize>>]) -> Result<Vec<Vec<u8>>, String> {
+        const BUDGET_BYTES: usize = 256 << 20;
+        if regions.len() < 2 {
+            return regions.iter().map(|r| self.read_region(r)).collect();
+        }
+        // Every region has the tensor's rank, so the first one gives `ndim` and each
+        // dimension's extremes come from `get(d)` — a region of the wrong rank contributes
+        // nothing instead of panicking.
+        let ndim = regions.first().map_or(0, Vec::len);
+        let bbox: Vec<Range<usize>> = (0..ndim)
+            .map(|d| {
+                let lo = regions
+                    .iter()
+                    .filter_map(|r| r.get(d))
+                    .map(|r| r.start)
+                    .min()
+                    .unwrap_or(0);
+                let hi = regions
+                    .iter()
+                    .filter_map(|r| r.get(d))
+                    .map(|r| r.end)
+                    .max()
+                    .unwrap_or(0);
+                lo..hi
+            })
+            .collect();
+        let bbox_elems: usize = bbox.iter().map(ExactSizeIterator::len).product();
+        if bbox_elems.saturating_mul(self.item) > BUDGET_BYTES {
+            return regions.iter().map(|r| self.read_region(r)).collect();
+        }
+        let buf = self.read_region(&bbox)?;
+        Ok(regions
+            .iter()
+            .map(|r| gather_region(&buf, &bbox, r, self.item))
+            .collect())
+    }
+
+    fn fold_blocks(&self, f: &mut dyn FnMut(&[u8]) -> ControlFlow<()>) -> Result<(), String> {
+        let shape = &self.shape;
+        if shape.is_empty() {
+            return with_hdf5_block_bytes(&self.dataset, Self::hyperslab(&[]), &self.dtype, |b| {
+                f(b)
+            })
+            .map(|_| ());
+        }
+        // Walk the tensor in chunk-aligned tiles bounded by a small element
+        // budget. Aligning to the chunk grid means libhdf5 decompresses each
+        // chunk exactly once (a tile that split a chunk would re-decompress it);
+        // keeping the tiles small means the dataset lock — libhdf5 serialises all
+        // access — is released between reads, so a concurrent foreground read
+        // (e.g. re-sampling the data view while this scan runs in the background)
+        // isn't stuck behind a big block. A contiguous dataset has no chunks, so
+        // we tile on a unit grid (any split is free without compression).
+        let ndim = shape.len();
+        let chunk = self.dataset.chunk().unwrap_or_else(|| vec![1; ndim]);
+        let tile = stats_tile_shape(shape, &chunk, STATS_TILE_ELEMS);
+        let mut origin = vec![0usize; ndim];
+        loop {
+            // `origin`, `tile` and `shape` are parallel per-dimension vectors — zip them
+            // rather than indexing all three by the same `d`.
+            let ranges: Vec<Range<usize>> = origin
+                .iter()
+                .zip(&tile)
+                .zip(shape)
+                .map(|((&o, &t), &s)| o..(o + t).min(s))
+                .collect();
+            let flow =
+                with_hdf5_block_bytes(&self.dataset, Self::hyperslab(&ranges), &self.dtype, |b| {
+                    f(b)
+                })?;
+            if flow.is_break() {
+                return Ok(());
+            }
+            // Advance the tile odometer, innermost dimension first.
+            let mut d = ndim - 1;
+            loop {
+                // All three vectors have rank `ndim`, so this binds; `else return` makes
+                // that structural instead of three indexes that assume it.
+                let (Some(start), Some(&step), Some(&extent)) =
+                    (origin.get_mut(d), tile.get(d), shape.get(d))
+                else {
+                    return Ok(());
+                };
+                *start += step;
+                if *start < extent {
+                    break;
+                }
+                *start = 0;
+                if d == 0 {
+                    return Ok(());
+                }
+                d -= 1;
+            }
+        }
+    }
+}
+
+/// Scan a safetensors tensor's bytes into an [`Acc`], either with the rayon
+/// `par_chunks` reduce (as production does) or a plain sequential `chunks` fold
+/// over the same chunking and decode. Used by the seq-vs-parallel benchmark to
+/// compare timing and results fairly. Returns `(stats, scan_time)` (timing the
+/// reduce only, not the mmap/header parse).
+#[cfg(test)]
+fn bench_scan(t: &TensorInfo, view: ViewDtype, parallel: bool) -> (Stats, std::time::Duration) {
+    let Layout::ByteRange { start, end } = t.layout else {
+        panic!("benchmark expects a safetensors ByteRange tensor");
+    };
+    let item = item_size(&t.dtype).expect("known dtype");
+    let packing = view.packing(item);
+    let file = std::fs::File::open(&t.source_path).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap());
+    let bytes = &mmap[(8 + header_len + start) as usize..(8 + header_len + end) as usize];
+    let dtype = t.dtype.as_str();
+
+    let chunk_acc = |chunk: &[u8]| {
+        let mut a = Acc::ID;
+        for container in chunk.chunks_exact(item) {
+            for sub in 0..packing {
+                a.push(decode_view(view, dtype, container, sub));
+            }
+        }
+        a
+    };
+
+    let started = std::time::Instant::now();
+    let acc = if parallel {
+        bytes
+            .par_chunks(item * STATS_CHUNK)
+            .map(chunk_acc)
+            .reduce(|| Acc::ID, Acc::merge)
+    } else {
+        bytes
+            .chunks(item * STATS_CHUNK)
+            .map(chunk_acc)
+            .fold(Acc::ID, Acc::merge)
+    };
+    (acc.finish(), started.elapsed())
+}
+
+/// bf16 is just the high 16 bits of an f32.
+fn bf16_to_f64(bits: u16) -> f64 {
+    f32::from_bits((bits as u32) << 16) as f64
+}
+
+/// IEEE-754 half precision -> f64.
+fn f16_to_f64(bits: u16) -> f64 {
+    let sign = (bits >> 15) & 1;
+    let exp = (bits >> 10) & 0x1f;
+    let frac = bits & 0x3ff;
+    let val: f32 = if exp == 0 {
+        (frac as f32) * 2f32.powi(-24) // subnormal
+    } else if exp == 0x1f {
+        if frac == 0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        (1.0 + (frac as f32) / 1024.0) * 2f32.powi(exp as i32 - 15)
+    };
+    let signed = if sign == 1 { -val } else { val };
+    signed as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Manual benchmark for the window-pan hot path: compares re-opening the
+    /// reader on every pan (current `sample_tensor` behaviour) against reusing a
+    /// single open reader. Run with:
+    /// `cargo test --features hdf5 --release -- --ignored --nocapture window_pan_open_cost`
+    #[cfg(feature = "hdf5")]
+    #[test]
+    #[ignore = "manual benchmark"]
+    fn window_pan_open_cost() {
+        const ITERS: usize = 60;
+        use std::time::Instant;
+        let dir = std::env::temp_dir().join("checkpoint_studio_bench_pan");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bench.h5");
+        let _ = std::fs::remove_file(&path);
+        let (r, c) = (1500usize, 1500usize);
+        {
+            let file = hdf5_metno::File::create(&path).unwrap();
+            // Many small datasets so `member_names()` is realistically long, like
+            // a real checkpoint with hundreds of tensors.
+            for i in 0..400 {
+                let _ = file
+                    .new_dataset::<f32>()
+                    .shape([4, 4])
+                    .create(format!("layer.{i}.weight").as_str())
+                    .unwrap();
+            }
+            // One big gzip-compressed, chunked tensor we pan over.
+            let data: Vec<f32> = (0..r * c).map(|i| (i % 997) as f32).collect();
+            let ds = file
+                .new_dataset::<f32>()
+                .shape([r, c])
+                .chunk([128, 128])
+                .deflate(4)
+                .create("big.weight")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+        }
+        let t = TensorInfo {
+            name: "big.weight".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![r, c],
+            size_bytes: r * c * 4,
+            num_elements: r * c,
+            storage: crate::tree::Storage::Unknown,
+            source_path: path.to_string_lossy().into_owned(),
+            layout: Layout::None,
+        };
+
+        // (A) open-only, to isolate File::open + member_names + dataset open.
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            let _r = open_reader(&t).unwrap();
+        }
+        let open_only = t0.elapsed();
+
+        // (B) current behaviour: a full window sample per pan (reopens each time).
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            let _ = sample_tensor(
+                &t,
+                40,
+                40,
+                0,
+                ViewDtype::Stored,
+                SampleMode::Window {
+                    row_off: i,
+                    col_off: 0,
+                },
+                None,
+            )
+            .unwrap();
+        }
+        let reopen_each = t0.elapsed();
+
+        // (C) proposed behaviour: open once, read the window region each pan.
+        let reader = open_reader(&t).unwrap();
+        let shape = reader.shape().to_vec();
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            let regions: Vec<Vec<Range<usize>>> =
+                (i..i + 40).map(|row| vec![row..row + 1, 0..40]).collect();
+            let _ = reader.read_regions(&regions).unwrap();
+        }
+        let reuse = t0.elapsed();
+        let _ = shape;
+
+        eprintln!("--- window pan, {ITERS} iters ---");
+        eprintln!(
+            "open-only (reopen each):   {open_only:?}  ({:?}/pan)",
+            open_only / ITERS as u32
+        );
+        eprintln!(
+            "sample_tensor (reopens):   {reopen_each:?}  ({:?}/pan)",
+            reopen_each / ITERS as u32
+        );
+        eprintln!(
+            "reused reader (read only): {reuse:?}  ({:?}/pan)",
+            reuse / ITERS as u32
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sample_indices_includes_edges_and_is_bounded() {
+        assert_eq!(sample_indices(3, 10), vec![0, 1, 2]); // n <= k: all
+        let idx = sample_indices(100, 5);
+        assert_eq!(idx.first(), Some(&0));
+        assert_eq!(idx.last(), Some(&99));
+        assert!(idx.len() <= 5);
+        assert!(idx.windows(2).all(|w| w[0] < w[1])); // strictly increasing
+    }
+
+    #[test]
+    fn edge_indices_takes_first_and_last() {
+        // Small enough to show whole (n <= total): no gap.
+        assert_eq!(edge_indices(5, 100, 0.5), vec![0, 1, 2, 3, 4]);
+        // Balanced (tail_frac = 0.5) fills the screen: total = 2*((max-1)/2),
+        // split evenly. With max = 100 that's 49 first and 49 last of 1000.
+        let e = edge_indices(1000, 100, 0.5);
+        assert_eq!(e.len(), 2 * 49);
+        assert_eq!(&e[..3], &[0, 1, 2]);
+        assert_eq!(e[48], 48);
+        assert_eq!(e[49], 951);
+        assert_eq!(e.last(), Some(&999));
+        // Tight budget: total = 2*((8-1)/2) = 6, balanced = 3 + 3.
+        assert_eq!(edge_indices(100, 8, 0.5), vec![0, 1, 2, 97, 98, 99]);
+        // All-tail (tail_frac = 1.0): only the last `total` indices, contiguous.
+        assert_eq!(edge_indices(100, 8, 1.0), vec![94, 95, 96, 97, 98, 99]);
+        // All-head (tail_frac = 0.0): only the first `total`, contiguous.
+        assert_eq!(edge_indices(100, 8, 0.0), vec![0, 1, 2, 3, 4, 5]);
+        // Biased toward the tail: fewer first, more last (still a gap).
+        let b = edge_indices(100, 14, 0.75); // total = 12 -> 3 first, 9 last
+        assert_eq!(&b[..3], &[0, 1, 2]);
+        assert_eq!(b.len(), 12);
+        assert_eq!(&b[3..], &[91, 92, 93, 94, 95, 96, 97, 98, 99]);
+    }
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn stats_tile_shape_is_chunk_aligned_and_bounded() {
+        // Monolith case: fill the innermost dim fully, then one chunk of the next.
+        assert_eq!(
+            stats_tile_shape(&[128, 3088, 1, 2992], &[4, 97, 1, 187], 2 << 20),
+            vec![4, 97, 1, 2992]
+        );
+        // Contiguous (unit chunks): inner dim fills, outer dim is the frontier.
+        let c = stats_tile_shape(&[100, 50], &[1, 1], 1000);
+        assert_eq!(c, vec![20, 50]);
+        assert!(c.iter().product::<usize>() <= 1000);
+        // A single chunk already over budget → tile is exactly one chunk.
+        assert_eq!(stats_tile_shape(&[10, 10], &[10, 10], 4), vec![10, 10]);
+    }
+
+    #[test]
+    fn window_indices_is_contiguous_and_clamped() {
+        // Whole axis fits: the offset is ignored, starts at 0.
+        assert_eq!(window_indices(5, 10, 3), vec![0, 1, 2, 3, 4]);
+        // A k-wide window at an in-range offset is contiguous.
+        assert_eq!(window_indices(100, 4, 10), vec![10, 11, 12, 13]);
+        // Offset past the end clamps so the window still shows k indices ending
+        // at n-1 (this is what keeps panning stuck-to-the-edge well-behaved).
+        assert_eq!(window_indices(100, 4, 999), vec![96, 97, 98, 99]);
+        // Exactly at the last valid offset.
+        assert_eq!(window_indices(10, 3, 7), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn samples_a_contiguous_window_at_an_offset() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_win");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // 6x6 f32, value[r][c] = r*6 + c.
+        let header = br#"{"w":{"dtype":"F32","shape":[6,6],"data_offsets":[0,144]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for i in 0..36u32 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        let t = fixture(&path, "w", &[6, 6], (0, 144));
+        // A 3x3 window with its corner at (2, 1) is the contiguous block
+        // rows 2..5, cols 1..4 — no downsampling.
+        let mode = SampleMode::Window {
+            row_off: 2,
+            col_off: 1,
+        };
+        let s = sample_tensor(&t, 3, 3, 0, ViewDtype::Stored, mode, None).unwrap();
+        assert_eq!(s.rows, vec![2, 3, 4]);
+        assert_eq!(s.cols, vec![1, 2, 3]);
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (r * 6 + c) as f64);
+            }
+        }
+        // An offset past the end clamps so the window stays in bounds (its first
+        // index is the clamped corner the UI reads back).
+        let clamped = sample_tensor(
+            &t,
+            3,
+            3,
+            0,
+            ViewDtype::Stored,
+            SampleMode::Window {
+                row_off: 99,
+                col_off: 99,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(clamped.rows, vec![3, 4, 5]);
+        assert_eq!(clamped.cols, vec![3, 4, 5]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn decodes_float_dtypes() {
+        assert_eq!(decode("F32", &1.5f32.to_le_bytes()), 1.5);
+        assert_eq!(decode("F64", &(-2.25f64).to_le_bytes()), -2.25);
+        // bf16 of 1.0 is 0x3F80; f16 of 1.0 is 0x3C00.
+        assert_eq!(decode("BF16", &0x3F80u16.to_le_bytes()), 1.0);
+        assert_eq!(decode("F16", &0x3C00u16.to_le_bytes()), 1.0);
+        assert_eq!(decode("I16", &(-5i16).to_le_bytes()), -5.0);
+    }
+
+    fn fixture(
+        path: &std::path::Path,
+        name: &str,
+        shape: &[usize],
+        offsets: (u64, u64),
+    ) -> TensorInfo {
+        fixture_dtype(path, name, "F32", shape, offsets)
+    }
+
+    fn fixture_dtype(
+        path: &std::path::Path,
+        name: &str,
+        dtype: &str,
+        shape: &[usize],
+        offsets: (u64, u64),
+    ) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            dtype: dtype.to_string(),
+            shape: shape.to_vec(),
+            size_bytes: (offsets.1 - offsets.0) as usize,
+            num_elements: shape.iter().product(),
+            storage: crate::tree::Storage::Unknown,
+            source_path: path.to_string_lossy().into_owned(),
+            layout: Layout::ByteRange {
+                start: offsets.0,
+                end: offsets.1,
+            },
+        }
+    }
+
+    #[test]
+    fn samples_a_safetensors_tensor_by_value() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_st");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // 4x5 f32, value[r][c] = r*5 + c
+        let header = br#"{"w":{"dtype":"F32","shape":[4,5],"data_offsets":[0,80]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for i in 0..20u32 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        let t = fixture(&path, "w", &[4, 5], (0, 80));
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        assert_eq!((s.total_rows, s.total_cols), (4, 5));
+        assert_eq!((s.slices, s.slice), (1, 0));
+        assert!(s.overridable && s.view == ViewDtype::Stored);
+        assert_eq!(s.min, 0.0);
+        assert_eq!(s.max, 19.0);
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (r * 5 + c) as f64);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn grid_max_aggregates_blocks_and_catches_off_grid_outliers() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_gridmax");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // 8x8 f32, all 1.0 except a -100.0 outlier at (3,3) — deliberately off the
+        // strided sample grid so the plain overview can't see it.
+        let header = br#"{"w":{"dtype":"F32","shape":[8,8],"data_offsets":[0,256]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for r in 0..8u32 {
+            for c in 0..8u32 {
+                let v: f32 = if (r, c) == (3, 3) { -100.0 } else { 1.0 };
+                f.write_all(&v.to_le_bytes()).unwrap();
+            }
+        }
+        drop(f);
+        let t = fixture(&path, "w", &[8, 8], (0, 256));
+
+        // Strided 2x2 overview samples rows/cols {0,7} → misses the (3,3) outlier.
+        let g = sample_tensor(&t, 2, 2, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        assert_eq!(g.max, 1.0, "subsample misses the off-grid outlier");
+
+        // Abs-max 2x2 reduces each 4x4 block by max|v| → the top-left block catches it.
+        let m = sample_tensor(&t, 2, 2, 0, ViewDtype::Stored, SampleMode::GridMax, None).unwrap();
+        assert_eq!((m.total_rows, m.total_cols), (8, 8));
+        assert_eq!(m.values, vec![vec![100.0, 1.0], vec![1.0, 1.0]]);
+        assert_eq!((m.min, m.max), (0.0, 100.0));
+        assert!(
+            m.raw.is_empty(),
+            "aggregated cells have no single stored element"
+        );
+        assert_eq!(m.rows, vec![0, 4]); // representative block-start indices
+        assert_eq!(m.cols, vec![0, 4]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Build a `.npy` byte image (v1.0 header + row-major f32 data) and return
+    /// it with the data offset, for the reader tests below.
+    fn npy_image(shape_dict: &str, values: &[f32]) -> (Vec<u8>, usize) {
+        let dict = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_dict}, }}");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x93NUMPY\x01\x00");
+        bytes.extend_from_slice(&(dict.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(dict.as_bytes());
+        let data_offset = bytes.len();
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        (bytes, data_offset)
+    }
+
+    #[test]
+    fn samples_a_npy_array() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_npy");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.npy");
+        // 3x4 f32, value[r][c] = r*4 + c.
+        let vals: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let (bytes, data_offset) = npy_image("(3, 4)", &vals);
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+
+        let t = TensorInfo {
+            name: "w".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![3, 4],
+            size_bytes: 48,
+            num_elements: 12,
+            storage: crate::tree::Storage::Unknown,
+            source_path: path.to_string_lossy().into_owned(),
+            layout: Layout::ByteRange {
+                start: data_offset as u64,
+                end: bytes.len() as u64,
+            },
+        };
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        assert_eq!((s.total_rows, s.total_cols), (3, 4));
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (r * 4 + c) as f64);
+            }
+        }
+        // Stats scan reads the same contiguous blob.
+        let st = tensor_stats(
+            &t,
+            ViewDtype::Stored,
+            None,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        assert_eq!((st.count, st.min, st.max), (12, 0.0, 11.0));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn samples_a_deflated_npz_entry() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_npz");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("a.npz");
+        // A 2x3 f32 array stored as a DEFLATE-compressed `w.npy` entry, to
+        // exercise the decompress-into-memory reader path.
+        let vals: Vec<f32> = (0..6).map(|i| i as f32).collect();
+        let (npy, _) = npy_image("(2, 3)", &vals);
+        let f = std::fs::File::create(&path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("w.npy", opts).unwrap();
+        zw.write_all(&npy).unwrap();
+        zw.finish().unwrap();
+
+        let t = TensorInfo {
+            name: "w".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![2, 3],
+            size_bytes: 24,
+            num_elements: 6,
+            storage: crate::tree::Storage::Unknown,
+            source_path: path.to_string_lossy().into_owned(),
+            layout: Layout::None,
+        };
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        assert_eq!((s.total_rows, s.total_cols), (2, 3));
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (r * 3 + c) as f64);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reshape_across_stored_rows() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_reshape");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // 4x5 f32 (value = flat index), reshaped to 5x4 — the override rows
+        // straddle the stored (4,5) rows, which used to read back as NaN.
+        let header = br#"{"w":{"dtype":"F32","shape":[4,5],"data_offsets":[0,80]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for i in 0..20u32 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        let t = fixture(&path, "w", &[4, 5], (0, 80));
+        let reader = open_reader(&t).unwrap();
+        let s = sample_tensor_with(
+            reader.as_ref(),
+            &t,
+            &[5, 4], // shape override
+            10,
+            10,
+            0,
+            ViewDtype::Stored,
+            SampleMode::Grid,
+            None,
+        )
+        .unwrap();
+        assert_eq!((s.total_rows, s.total_cols), (5, 4));
+        assert_eq!(s.display_shape, vec![5, 4]);
+        // Every cell is the flat index r*4 + c — no NaNs from row-straddling.
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (r * 4 + c) as f64);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Manual benchmark: `BENCH_FILE=... BENCH_TENSOR=... cargo test --release
+    /// -- --ignored --nocapture seq_vs_parallel`. Compares the rayon reduce
+    /// against a sequential fold (same decode + accumulator) on a real tensor.
+    #[test]
+    #[ignore = "manual benchmark; set BENCH_FILE and BENCH_TENSOR"]
+    fn seq_vs_parallel_accumulation() {
+        use std::io::Read as _;
+        let path = std::env::var("BENCH_FILE").expect("set BENCH_FILE");
+        let name = std::env::var("BENCH_TENSOR").expect("set BENCH_TENSOR");
+
+        // Parse the safetensors header to build a TensorInfo for `name`.
+        let mut f = std::fs::File::open(&path).unwrap();
+        let mut len = [0u8; 8];
+        f.read_exact(&mut len).unwrap();
+        let mut hb = vec![0u8; u64::from_le_bytes(len) as usize];
+        f.read_exact(&mut hb).unwrap();
+        let hdr: serde_json::Value = serde_json::from_slice(&hb).unwrap();
+        let info = &hdr[&name];
+        let dtype = info["dtype"].as_str().unwrap().to_string();
+        let shape: Vec<usize> = info["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let off = info["data_offsets"].as_array().unwrap();
+        let (s, e) = (off[0].as_u64().unwrap(), off[1].as_u64().unwrap());
+        let t = TensorInfo {
+            name: name.clone(),
+            dtype,
+            shape: shape.clone(),
+            size_bytes: (e - s) as usize,
+            num_elements: shape.iter().product(),
+            storage: crate::tree::Storage::Unknown,
+            source_path: path,
+            layout: Layout::ByteRange { start: s, end: e },
+        };
+
+        let view = ViewDtype::Stored;
+        // First sequential run is cold (it faults in the whole tensor); the next
+        // two run from the warmed page cache, isolating accumulation cost.
+        let (_, t_cold) = bench_scan(&t, view, false);
+        let (seq, t_seq) = bench_scan(&t, view, false);
+        let (par, t_par) = bench_scan(&t, view, true);
+
+        eprintln!("tensor {name} — {} elements, {}", t.num_elements, t.dtype);
+        eprintln!("sequential (cold, incl I/O): {t_cold:?}");
+        eprintln!("sequential (warm):           {t_seq:?}");
+        eprintln!("parallel   (warm):           {t_par:?}");
+        eprintln!(
+            "speedup (seq/par, warm):     {:.2}x",
+            t_seq.as_secs_f64() / t_par.as_secs_f64()
+        );
+        eprintln!("seq stats: {seq:?}");
+        eprintln!("par stats: {par:?}");
+
+        // min/max are order-independent (exact); mean/std differ only by
+        // floating-point summation order, so allow a tiny relative slack.
+        assert_eq!((seq.min, seq.max), (par.min, par.max));
+        assert!((seq.mean - par.mean).abs() <= seq.mean.abs().mul_add(1e-9, 1e-12));
+        assert!((seq.std - par.std).abs() <= seq.std.abs().mul_add(1e-9, 1e-12));
+    }
+
+    #[test]
+    fn computes_exact_whole_tensor_stats() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_stats");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // 4x5 f32, values 0..=19 (so one exact zero, mean 9.5).
+        let header = br#"{"w":{"dtype":"F32","shape":[4,5],"data_offsets":[0,80]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for i in 0..20u32 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        let t = fixture(&path, "w", &[4, 5], (0, 80));
+        let s = tensor_stats(
+            &t,
+            ViewDtype::Stored,
+            None,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.count, 20);
+        assert_eq!((s.min, s.max), (0.0, 19.0));
+        assert!((s.mean - 9.5).abs() < 1e-9);
+        // Population std of 0..=19 is sqrt(33.25) ≈ 5.76628.
+        assert!((s.std - 5.766_281_3).abs() < 1e-5);
+        assert_eq!(s.zeros, 1);
+        assert_eq!(s.nonfinite, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn samples_a_3d_safetensors_slice() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_3d");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // [2, 3, 4] f32, value[s][r][c] = s*12 + r*4 + c
+        let header = br#"{"w":{"dtype":"F32","shape":[2,3,4],"data_offsets":[0,96]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for i in 0..24u32 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        let t = fixture(&path, "w", &[2, 3, 4], (0, 96));
+        // Slice 1 is the matrix [[12..16],[16..20],[20..24]].
+        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        assert_eq!((s.total_rows, s.total_cols), (3, 4));
+        assert_eq!((s.slices, s.slice), (2, 1));
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (12 + r * 4 + c) as f64);
+            }
+        }
+        // An out-of-range slice clamps to the last one.
+        assert_eq!(
+            sample_tensor(&t, 10, 10, 99, ViewDtype::Stored, SampleMode::Grid, None)
+                .unwrap()
+                .slice,
+            1
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn squeezes_size_one_dimensions() {
+        // Pure shape logic: size-1 dims drop out, anything left is unchanged.
+        assert_eq!(squeezed_shape(&[128, 3088, 1, 748]), vec![128, 3088, 748]);
+        assert_eq!(squeezed_shape(&[1, 5]), vec![5]);
+        assert_eq!(squeezed_shape(&[128, 1, 748]), vec![128, 748]);
+        assert_eq!(squeezed_shape(&[2, 3, 4]), vec![2, 3, 4]);
+        assert_eq!(squeezed_shape(&[1, 1, 1]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn previews_a_4d_tensor_with_a_unit_dim_as_3d() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_4d1");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // [2, 1, 3, 4] f32 — same 24 bytes as the [2, 3, 4] case, with an inert
+        // size-1 dim wedged in the middle. value[s][r][c] = s*12 + r*4 + c.
+        let header = br#"{"w":{"dtype":"F32","shape":[2,1,3,4],"data_offsets":[0,96]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for i in 0..24u32 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        // Squeezed to (2, 3, 4): 2 slices, each a 3×4 matrix. Slice 1 is
+        // [[12..16],[16..20],[20..24]] — identical to the plain 3D case, proving
+        // the reads are layout-correct (not just the row/col/slice counts).
+        let t = fixture(&path, "w", &[2, 1, 3, 4], (0, 96));
+        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        assert_eq!((s.total_rows, s.total_cols), (3, 4));
+        assert_eq!((s.slices, s.slice), (2, 1));
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (12 + r * 4 + c) as f64);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn previews_a_leading_unit_dim_as_lower_rank() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_1xn");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // [1, 5] f32 → squeezes to a single row of 5.
+        let header = br#"{"w":{"dtype":"F32","shape":[1,5],"data_offsets":[0,20]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for i in 0..5u32 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        let t = fixture(&path, "w", &[1, 5], (0, 20));
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        assert_eq!((s.total_rows, s.total_cols, s.slices), (1, 5, 1));
+        assert_eq!(s.values[0], vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reinterprets_packed_4bit_views() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_u4");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // Shape [2] of F16 (2-byte containers): u16 values 0x1234 and 0x00AB.
+        let header = br#"{"w":{"dtype":"F16","shape":[2],"data_offsets":[0,4]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        f.write_all(&0x1234u16.to_le_bytes()).unwrap();
+        f.write_all(&0x00ABu16.to_le_bytes()).unwrap();
+        drop(f);
+
+        let t = fixture_dtype(&path, "w", "F16", &[2], (0, 4));
+
+        // u4: four nibbles per 16-bit container, last dim ×4 -> 8 values.
+        // 0x1234 -> [4,3,2,1]; 0x00AB -> [11,10,0,0].
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4, SampleMode::Grid, None).unwrap();
+        assert_eq!(s.total_cols, 8);
+        assert_eq!(s.values[0], vec![4.0, 3.0, 2.0, 1.0, 11.0, 10.0, 0.0, 0.0]);
+
+        // Signed: nibbles >= 8 are negative (0xB->-5, 0xA->-6).
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::I4, SampleMode::Grid, None).unwrap();
+        assert_eq!(s.values[0], vec![4.0, 3.0, 2.0, 1.0, -5.0, -6.0, 0.0, 0.0]);
+
+        // Raw bits are the individual nibbles, 4 bits wide.
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4, SampleMode::Grid, None).unwrap();
+        let bits: Vec<u64> = s.raw[0].iter().map(|r| r.bits).collect();
+        assert_eq!(bits, vec![0x4, 0x3, 0x2, 0x1, 0xB, 0xA, 0x0, 0x0]);
+        assert!(s.raw[0].iter().all(|r| r.width == 4));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn raw_bits_capture_the_stored_pattern() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_rawbits");
+        let _ = std::fs::create_dir_all(&dir);
+
+        // F32 [1,3] = 1.0, 2.0, -1.0 → IEEE-754 bits 0x3f800000 / 0x40000000 /
+        // 0xbf800000, each 32 bits wide.
+        let path = dir.join("f32.safetensors");
+        let header = br#"{"w":{"dtype":"F32","shape":[1,3],"data_offsets":[0,12]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for v in [1.0f32, 2.0, -1.0] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        drop(f);
+        let t = fixture(&path, "w", &[1, 3], (0, 12));
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        let bits: Vec<u64> = s.raw[0].iter().map(|r| r.bits).collect();
+        assert_eq!(bits, vec![0x3f80_0000, 0x4000_0000, 0xbf80_0000]);
+        assert!(s.raw[0].iter().all(|r| r.width == 32));
+        let _ = std::fs::remove_file(&path);
+
+        // I8 [1,3] = 1, -1, -128 → raw two's-complement bytes 0x01 / 0xFF / 0x80,
+        // 8 bits wide, while the decoded values stay signed.
+        let path = dir.join("i8.safetensors");
+        let header = br#"{"w":{"dtype":"I8","shape":[1,3],"data_offsets":[0,3]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        f.write_all(&[0x01, 0xFF, 0x80]).unwrap();
+        drop(f);
+        let t = fixture_dtype(&path, "w", "I8", &[1, 3], (0, 3));
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        let bits: Vec<u64> = s.raw[0].iter().map(|r| r.bits).collect();
+        assert_eq!(bits, vec![0x01, 0xFF, 0x80]);
+        assert!(s.raw[0].iter().all(|r| r.width == 8));
+        assert_eq!(s.values[0], vec![1.0, -1.0, -128.0]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn packing_schema_bit_math_and_validation() {
+        let u = PackingSchema::new(vec![4, 4, 4, 4], None).unwrap();
+        assert_eq!(u.len_p(), 4);
+        assert_eq!(
+            (u.offset(0), u.offset(1), u.offset(2), u.offset(3)),
+            (0, 4, 8, 12)
+        );
+        // 0xDCBA → fields A, B, C, D (least-significant first).
+        let w = 0xDCBA;
+        assert_eq!(
+            [
+                u.extract(w, 0),
+                u.extract(w, 1),
+                u.extract(w, 2),
+                u.extract(w, 3)
+            ],
+            [0xA, 0xB, 0xC, 0xD]
+        );
+
+        // Non-uniform [4,3,3,6]: offsets 0,4,7,10; fields 10, 5, 3, 42.
+        let nu = PackingSchema::new(vec![4, 3, 3, 6], None).unwrap();
+        assert_eq!(
+            (nu.offset(0), nu.offset(1), nu.offset(2), nu.offset(3)),
+            (0, 4, 7, 10)
+        );
+        let word = 0xA | (5 << 4) | (3 << 7) | (42 << 10);
+        assert_eq!(
+            [
+                nu.extract(word, 0),
+                nu.extract(word, 1),
+                nu.extract(word, 2),
+                nu.extract(word, 3)
+            ],
+            [10, 5, 3, 42]
+        );
+
+        // Validation: non-empty, every width > 0, sum ≤ 16.
+        assert!(PackingSchema::new(vec![], None).is_err());
+        assert!(PackingSchema::new(vec![4, 0, 4], None).is_err());
+        assert!(PackingSchema::new(vec![8, 9], None).is_err()); // sum 17
+        assert!(PackingSchema::new(vec![8, 8], None).is_ok()); // sum 16
+        assert!(PackingSchema::new(vec![3, 3, 3, 3, 3], None).is_ok()); // sum 15
+    }
+
+    #[test]
+    fn packing_schema_uniform_and_label() {
+        let uni = PackingSchema::new(vec![3, 3, 3, 3, 3], None).unwrap();
+        assert_eq!(uni.uniform_width(), Some(3));
+        assert_eq!(uni.max_width(), 3);
+        assert_eq!(uni.label(), "u3×5");
+        let nu = PackingSchema::new(vec![4, 3, 3, 6], None).unwrap();
+        assert_eq!(nu.uniform_width(), None);
+        assert_eq!(nu.max_width(), 6);
+        assert_eq!(nu.label(), "[4,3,3,6]");
+    }
+
+    #[test]
+    fn parse_packing_schemas_per_tensor_and_top_level() {
+        let p = std::path::Path::new("/x");
+        let tensors = vec![
+            fixture_dtype(p, "m.experts.down_proj.weight", "U16", &[4, 4, 4], (0, 0)),
+            fixture_dtype(
+                p,
+                "m.experts.gate_up_proj.weight",
+                "U16",
+                &[4, 4, 4],
+                (0, 0),
+            ),
+            // A matching name but non-U16 dtype must be skipped.
+            fixture_dtype(p, "m.experts.down_proj.qscale", "F16", &[4, 4], (0, 0)),
+        ];
+        let meta = vec![
+            // Per-tensor (preferred), nested `json_value` wrapper.
+            MetadataInfo {
+                name: "m.experts.down_proj.weight.quantization_schema.__metadata__".to_string(),
+                value: r#"{"json_value":{"bit_widths":[4,4,4,4],"quant_mode":"4bit"}}"#.to_string(),
+                value_type: "json".to_string(),
+            },
+            // Top-level, projection-keyed.
+            MetadataInfo {
+                name: "codebook_packing_schema.__metadata__".to_string(),
+                value: r#"{"gate_up_proj":{"bit_widths":[3,3,3,3,3],"quant_mode":"3bit"},
+                          "down_proj":{"bit_widths":[9,9,9],"quant_mode":"x"}}"#
+                    .to_string(),
+                value_type: "string".to_string(),
+            },
+        ];
+        let map = parse_packing_schemas(&tensors, &meta);
+        // Per-tensor wins for down_proj (4-bit, not the bogus top-level 9-bit).
+        assert_eq!(
+            map["m.experts.down_proj.weight"].bit_widths(),
+            &[4, 4, 4, 4]
+        );
+        // gate_up_proj matched by the top-level projection key.
+        assert_eq!(
+            map["m.experts.gate_up_proj.weight"].bit_widths(),
+            &[3, 3, 3, 3, 3]
+        );
+        // The non-U16 qscale is never attached.
+        assert!(!map.contains_key("m.experts.down_proj.qscale"));
+    }
+
+    #[test]
+    fn logical_shape_unmerges_first_dim() {
+        let s = PackingSchema::new(vec![3, 3, 3, 3, 3], None).unwrap();
+        let v = ViewDtype::Unpacked;
+        assert_eq!(
+            v.logical_shape_with(&[26, 2057, 770], "U16", Some(&s)),
+            vec![130, 2057, 770]
+        );
+        assert_eq!(
+            v.logical_shape_with(&[64, 2880], "U16", Some(&s)),
+            vec![320, 2880]
+        );
+        assert_eq!(v.logical_shape_with(&[100], "U16", Some(&s)), vec![500]);
+        // Without a schema it is unchanged.
+        assert_eq!(
+            ViewDtype::Stored.logical_shape_with(&[26, 2057, 770], "U16", None),
+            vec![26, 2057, 770]
+        );
+    }
+
+    #[test]
+    fn parse_view_dtype_round_trips_unpacked() {
+        assert_eq!(parse_view_dtype("unpacked").unwrap(), ViewDtype::Unpacked);
+        assert_eq!(
+            ViewDtype::Unpacked.cli_value(),
+            Some("unpacked".to_string())
+        );
+        assert_eq!(ViewDtype::Unpacked.label(), Some("unpacked"));
+    }
+
+    #[test]
+    fn unpacked_unmerges_fields_along_first_dim() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_studio_unpacked");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // U16 [2,2,2]: word at flat index f packs field0=f (low nibble) and
+        // field1=f+8 (high nibble), so all 16 codebook values 0..15 appear once.
+        let header = br#"{"w":{"dtype":"U16","shape":[2,2,2],"data_offsets":[0,16]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for flat in 0u16..8 {
+            let word = flat | ((flat + 8) << 4);
+            f.write_all(&word.to_le_bytes()).unwrap();
+        }
+        drop(f);
+        let t = fixture_dtype(&path, "w", "U16", &[2, 2, 2], (0, 16));
+        let schema = PackingSchema::new(vec![4, 4], None).unwrap();
+        let get = |slice| {
+            sample_tensor(
+                &t,
+                10,
+                10,
+                slice,
+                ViewDtype::Unpacked,
+                SampleMode::Grid,
+                Some(&schema),
+            )
+            .unwrap()
+        };
+
+        let s0 = get(0);
+        assert_eq!(s0.slices, 4); // 2 stored experts × lenP 2
+        assert_eq!(s0.total_cols, 2); // columns are NOT expanded
+        assert_eq!(s0.display_shape, vec![4, 2, 2]); // first dim × lenP
+        assert!(s0.raw[0].iter().all(|r| r.width == 4)); // field-width raw bits
+        // slice s → (stored s/lenP, field s%lenP).
+        assert_eq!(get(0).values, vec![vec![0.0, 1.0], vec![2.0, 3.0]]); // expert0 field0
+        assert_eq!(get(1).values, vec![vec![8.0, 9.0], vec![10.0, 11.0]]); // expert0 field1
+        assert_eq!(get(2).values, vec![vec![4.0, 5.0], vec![6.0, 7.0]]); // expert1 field0
+        assert_eq!(get(3).values, vec![vec![12.0, 13.0], vec![14.0, 15.0]]); // expert1 field1
+
+        // Whole-tensor stats see every field (the u4-equivalent value multiset).
+        let st = tensor_stats(
+            &t,
+            ViewDtype::Unpacked,
+            Some(&schema),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        assert_eq!(st.count, 16); // 8 words × lenP 2
+        assert_eq!((st.min, st.max), (0.0, 15.0));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn histogram_bins_per_value_for_4bit_views() {
+        // The 4-bit views bin every possible value with no range needed.
+        assert_eq!(
+            histogram_bins(ViewDtype::U4, "I16", None, None),
+            Some((HistBins::IntBins { start: 0, step: 1 }, 16))
+        );
+        assert_eq!(
+            histogram_bins(ViewDtype::I4, "I16", None, None),
+            Some((HistBins::IntBins { start: -8, step: 1 }, 16))
+        );
+    }
+
+    #[test]
+    fn histogram_bins_use_range_for_floats_and_wide_ints() {
+        // Floats need the range; without it, undecidable.
+        assert_eq!(histogram_bins(ViewDtype::Stored, "F32", None, None), None);
+        let (bins, n) = histogram_bins(ViewDtype::Stored, "F32", Some((-1.0, 1.0)), None).unwrap();
+        assert!(matches!(bins, HistBins::Range { .. }));
+        assert_eq!(n, RANGE_BINS);
+        // A small integer data span bins per value.
+        assert_eq!(
+            histogram_bins(ViewDtype::Stored, "I8", Some((0.0, 5.0)), None),
+            Some((HistBins::IntBins { start: 0, step: 1 }, 6))
+        );
+    }
+
+    #[test]
+    fn histogram_bins_keep_integer_edges_for_wide_int_spans() {
+        // A wide integer span must use whole-number-width bins, not a float
+        // range — the bucket edges stay integers (start + i*step).
+        let (bins, n) =
+            histogram_bins(ViewDtype::Stored, "U16", Some((0.0, 65_535.0)), None).unwrap();
+        let HistBins::IntBins { start, step } = bins else {
+            panic!("wide integer span should produce integer bins, got {bins:?}");
+        };
+        assert_eq!(start, 0);
+        assert!(step > 1, "wide span should group multiple integers per bin");
+        assert!(n <= RANGE_BINS, "no more than {RANGE_BINS} bins");
+        // The bins must cover the whole span.
+        assert!(start + (n as i64) * step > 65_535);
+    }
+
+    /// A 64-bit integer tensor whose values exceed 2^63 used to break the bin layout:
+    /// the f64->i64 casts saturate, and the span arithmetic then overflowed i64 (debug
+    /// panic) or wrapped (release). A full-width I64 span wrapped to 0 bins, and the
+    /// first index into the empty count vector panicked; a U64 span wrapped to 2^63,
+    /// silently dumping everything above it into the last bucket. Reachable from the
+    /// TUI, `/api/histogram`, and `diff --histogram`, so it must stay covered.
+    /// A 64-bit integer element must display EXACTLY. The decoded f64 rounds past 2^53
+    /// and `as i64` saturates at 2^63, so the decimal cell is printed from the raw bits
+    /// instead — otherwise a U64 of 13816973012072644608 showed 9223372036854775807.
+    #[test]
+    fn integers_format_exactly_from_raw_bits() {
+        let bits = |bits: u64, width: u8| RawBits { bits, width };
+        // Unsigned, above i64::MAX (used to saturate).
+        assert_eq!(
+            format_int_bits(bits(13_816_973_012_072_644_608, 64), false),
+            "13816973012072644608"
+        );
+        assert_eq!(
+            format_int_bits(bits(u64::MAX, 64), false),
+            "18446744073709551615"
+        );
+        // Signed extremes and a value above 2^53 (used to round).
+        assert_eq!(
+            format_int_bits(bits(i64::MIN as u64, 64), true),
+            "-9223372036854775808"
+        );
+        assert_eq!(
+            format_int_bits(bits(i64::MAX as u64, 64), true),
+            "9223372036854775807"
+        );
+        assert_eq!(
+            format_int_bits(bits(9_007_199_254_740_993, 64), true),
+            "9007199254740993"
+        );
+        assert_eq!(
+            format_int_bits(bits(-1_234_567_890_123_456_789_i64 as u64, 64), true),
+            "-1234567890123456789"
+        );
+        // Narrower widths sign-extend from their own width, not from 64.
+        assert_eq!(format_int_bits(bits(0xFF, 8), true), "-1");
+        assert_eq!(format_int_bits(bits(0xFF, 8), false), "255");
+        assert_eq!(format_int_bits(bits(0xF, 4), true), "-1");
+        assert_eq!(format_int_bits(bits(0x7, 4), true), "7");
+        // Cell sizing must fit the widest exact value (it used to measure via
+        // `as i64`, coming up a char short for u64 and colliding with the next cell).
+        assert_eq!(int_digits(u64::MAX as f64), 20);
+        assert_eq!(int_digits(i64::MIN as f64), 20);
+    }
+
+    #[test]
+    fn histogram_bins_survive_full_width_64bit_spans() {
+        for (dtype, lo, hi) in [
+            ("U64", 0.0, 13_816_973_012_072_645_000_f64),
+            ("U64", 0.0, u64::MAX as f64),
+            ("I64", i64::MIN as f64, i64::MAX as f64),
+        ] {
+            let (bins, n) = histogram_bins(ViewDtype::Stored, dtype, Some((lo, hi)), None)
+                .unwrap_or_else(|| panic!("{dtype} span {lo}..{hi} should produce bins"));
+            assert!(n > 0, "{dtype}: bin count must never be 0 (was {n})");
+            assert!(n <= RANGE_BINS, "{dtype}: {n} bins exceeds {RANGE_BINS}");
+            // Every value in the span must land inside the bins — including the
+            // extremes, which is what used to index out of bounds.
+            for v in [lo, hi, (lo / 2.0) + (hi / 2.0)] {
+                let i = bin_index(bins, n, v);
+                assert!(i < n, "{dtype}: value {v} binned to {i} of {n} ({bins:?})");
+            }
+            // The bins must COVER the data, and every edge must be computable without
+            // overflowing i64 — the integer lattice can't do either at this width, so
+            // a float range is expected rather than saturated integer edges that
+            // understate the true maximum.
+            match bins {
+                HistBins::Range { lo: blo, hi: bhi } => {
+                    assert!(
+                        blo <= lo && bhi >= hi,
+                        "{dtype}: bins {blo}..{bhi} must cover {lo}..{hi}"
+                    );
+                }
+                HistBins::IntBins { start, step } => {
+                    let top = i64::try_from(n)
+                        .ok()
+                        .and_then(|n| n.checked_mul(step))
+                        .and_then(|s| start.checked_add(s));
+                    let top = top
+                        .unwrap_or_else(|| panic!("{dtype}: top edge start+n*step overflows i64"));
+                    assert!(
+                        top as f64 >= hi,
+                        "{dtype}: bins stop at {top}, below the max {hi}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn histogram_bins_honour_a_requested_count() {
+        // Floats: the requested count is the bin count exactly.
+        let (_, n) = histogram_bins(ViewDtype::Stored, "F32", Some((-1.0, 1.0)), Some(12)).unwrap();
+        assert_eq!(n, 12);
+        // Wide integers: grouped into about the requested number of whole-number
+        // buckets (never more, since the step is a whole number).
+        let (bins, n) =
+            histogram_bins(ViewDtype::Stored, "U16", Some((0.0, 65_535.0)), Some(16)).unwrap();
+        assert!(matches!(bins, HistBins::IntBins { step, .. } if step > 1));
+        assert!(n <= 16, "grouped to at most the requested count, got {n}");
+        // A count larger than the distinct integer span still shows one bin per
+        // value (you can't have more buckets than values).
+        assert_eq!(
+            histogram_bins(ViewDtype::Stored, "I8", Some((0.0, 5.0)), Some(40)),
+            Some((HistBins::IntBins { start: 0, step: 1 }, 6))
+        );
+        // A small count groups an otherwise per-value integer span.
+        let (bins, n) =
+            histogram_bins(ViewDtype::Stored, "I16", Some((0.0, 19.0)), Some(5)).unwrap();
+        assert!(matches!(bins, HistBins::IntBins { step, .. } if step > 1));
+        assert!(n <= 5);
+    }
+
+    #[test]
+    fn bin_index_maps_and_clamps() {
+        let pv = HistBins::IntBins { start: -8, step: 1 };
+        assert_eq!(bin_index(pv, 16, -8.0), 0);
+        assert_eq!(bin_index(pv, 16, 7.0), 15);
+        assert_eq!(bin_index(pv, 16, 99.0), 15); // clamped to the last bin
+        // Stepped integer bins: each bin spans `step` values.
+        let iv = HistBins::IntBins {
+            start: 0,
+            step: 100,
+        };
+        assert_eq!(bin_index(iv, 10, 0.0), 0);
+        assert_eq!(bin_index(iv, 10, 99.0), 0);
+        assert_eq!(bin_index(iv, 10, 100.0), 1);
+        assert_eq!(bin_index(iv, 10, 250.0), 2);
+        assert_eq!(bin_index(iv, 10, 9_999.0), 9); // clamped to the last bin
+        let rg = HistBins::Range { lo: 0.0, hi: 10.0 };
+        assert_eq!(bin_index(rg, 10, 0.0), 0);
+        assert_eq!(bin_index(rg, 10, 9.999), 9);
+        assert_eq!(bin_index(rg, 10, 10.0), 9); // the max lands in the last bin
+        assert_eq!(bin_index(rg, 10, -5.0), 0); // clamped
+    }
+}
+
+#[cfg(all(test, feature = "hdf5"))]
+mod hdf5_tests {
+    use super::*;
+    use crate::tree::{Layout, Storage};
+
+    /// Manual: `BENCH_FILE=<.hdf5> BENCH_TENSOR=<name> cargo test --release
+    /// --features hdf5 -- --ignored --nocapture hdf5_stats_timing`.
+    #[test]
+    #[ignore = "manual; set BENCH_FILE and BENCH_TENSOR"]
+    fn hdf5_stats_timing() {
+        let path = std::env::var("BENCH_FILE").expect("set BENCH_FILE");
+        let name = std::env::var("BENCH_TENSOR").expect("set BENCH_TENSOR");
+        let (tensors, _metadata) = crate::hdf5::read(std::path::Path::new(&path)).unwrap();
+        let t = tensors
+            .into_iter()
+            .find(|t| t.name == name)
+            .expect("tensor");
+        eprintln!("tensor {} dtype={} shape={:?}", t.name, t.dtype, t.shape);
+        let started = std::time::Instant::now();
+        match tensor_stats(
+            &t,
+            ViewDtype::Stored,
+            None,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            None,
+        ) {
+            Ok(s) => eprintln!("ok in {:?}: {s:?}", started.elapsed()),
+            Err(e) => eprintln!("ERR in {:?}: {e}", started.elapsed()),
+        }
+    }
+
+    #[test]
+    fn samples_an_hdf5_dataset_by_value() {
+        let dir = std::env::temp_dir().join("checkpoint_studio_sample_h5");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("d.h5");
+        let _ = std::fs::remove_file(&path);
+        {
+            let file = hdf5_metno::File::create(&path).unwrap();
+            let data: Vec<f32> = (0..20).map(|i| i as f32).collect();
+            let ds = file.new_dataset::<f32>().shape([4, 5]).create("w").unwrap();
+            ds.write_raw(&data).unwrap();
+        }
+
+        let t = TensorInfo {
+            name: "w".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![4, 5],
+            size_bytes: 80,
+            num_elements: 20,
+            storage: Storage::Unknown,
+            source_path: path.to_string_lossy().into_owned(),
+            layout: Layout::None,
+        };
+        // Read the stored f32 bytes back, decoding under the stored view.
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        assert_eq!((s.total_rows, s.total_cols), (4, 5));
+        // HDF5 reads raw stored bytes now, so dtype overrides are available.
+        assert!(s.overridable);
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (r * 5 + c) as f64);
+            }
+        }
+
+        // Exact stats over the whole dataset (raw byte read + streaming scan).
+        // Values 0..=19, so mean 9.5 and one zero.
+        let st = tensor_stats(
+            &t,
+            ViewDtype::Stored,
+            None,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        assert_eq!(st.count, 20);
+        assert_eq!((st.min, st.max), (0.0, 19.0));
+        assert!((st.mean - 9.5).abs() < 1e-9);
+        assert_eq!(st.zeros, 1);
+        assert_eq!(st.nonfinite, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reinterprets_hdf5_dtype_bytes() {
+        // A small I16 dataset whose values pack two 4-bit nibbles each, so the
+        // packed-u4 view should unpack them — proving HDF5 reads honour overrides
+        // by reinterpreting the stored bytes (not libhdf5's converted values).
+        let dir = std::env::temp_dir().join("checkpoint_studio_reinterp_h5");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("q.h5");
+        let _ = std::fs::remove_file(&path);
+        // 0x21, 0x43 → low/high nibbles (1,2) and (3,4).
+        let data: Vec<i16> = vec![0x21, 0x43];
+        {
+            let file = hdf5_metno::File::create(&path).unwrap();
+            let ds = file.new_dataset::<i16>().shape([1, 2]).create("w").unwrap();
+            ds.write_raw(&data).unwrap();
+        }
+        let t = TensorInfo {
+            name: "w".to_string(),
+            dtype: "I16".to_string(),
+            shape: vec![1, 2],
+            size_bytes: 4,
+            num_elements: 2,
+            storage: Storage::Unknown,
+            source_path: path.to_string_lossy().into_owned(),
+            layout: Layout::None,
+        };
+
+        // Stored view: the raw signed 16-bit values.
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        assert_eq!(s.values[0], vec![0x21 as f64, 0x43 as f64]);
+
+        // Packed u4: each 16-bit slot yields four nibbles, last dim ×4.
+        let p = sample_tensor(&t, 10, 10, 0, ViewDtype::U4, SampleMode::Grid, None).unwrap();
+        assert_eq!(p.total_cols, 8);
+        assert_eq!(p.values[0], vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0]);
+
+        // Stats under the packed view see all eight unpacked nibbles.
+        let st = tensor_stats(
+            &t,
+            ViewDtype::U4,
+            None,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        assert_eq!(st.count, 8);
+        assert_eq!((st.min, st.max), (0.0, 4.0));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn samples_a_3d_hdf5_slice() {
+        // A 3D dataset [d0=2, d1=3, d2=4] of values v = d0*100 + d1*10 + d2, so
+        // each element identifies its own (slice, row, col). Verifies the reader
+        // maps a sampled (slice, row, col) to the right dataset element.
+        let dir = std::env::temp_dir().join("checkpoint_studio_3d_h5");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("v3.h5");
+        let _ = std::fs::remove_file(&path);
+        let data: Vec<f32> = (0..2)
+            .flat_map(|d0| {
+                (0..3).flat_map(move |d1| (0..4).map(move |d2| (d0 * 100 + d1 * 10 + d2) as f32))
+            })
+            .collect();
+        {
+            let file = hdf5_metno::File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<f32>()
+                .shape([2, 3, 4])
+                .create("w")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+        }
+        let t = TensorInfo {
+            name: "w".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![2, 3, 4],
+            size_bytes: 24 * 4,
+            num_elements: 24,
+            storage: Storage::Unknown,
+            source_path: path.to_string_lossy().into_owned(),
+            layout: Layout::None,
+        };
+
+        // Slice 1: every value should read as 100 + row*10 + col.
+        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
+        assert_eq!((s.total_rows, s.total_cols, s.slices), (3, 4, 2));
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (100 + r * 10 + c) as f64);
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Sampling a real file through the public entry points: every mode, dtype view and
+/// rank, plus the whole-tensor scans. The unit tests above cover the maths on
+/// synthetic input; these read the checked-in fixture, which is what the data views do.
+#[cfg(test)]
+mod fixture_sampling {
+    use super::*;
+    use crate::tree::TensorInfo;
+
+    fn checkpoint() -> Vec<TensorInfo> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .join("tests/fixtures/tiny.safetensors");
+        let ck = crate::readers::read_local(&[path]).expect("the fixture reads");
+        ck.shards.into_iter().flat_map(|s| s.tensors).collect()
+    }
+
+    fn pick(tensors: &[TensorInfo], rank: usize) -> &TensorInfo {
+        tensors
+            .iter()
+            .find(|t| t.shape.len() == rank)
+            .unwrap_or_else(|| panic!("the fixture has no rank-{rank} tensor"))
+    }
+
+    #[test]
+    fn every_sample_mode_produces_a_grid_of_the_right_shape() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        for mode in [
+            SampleMode::Grid,
+            SampleMode::GridMax,
+            SampleMode::Edges {
+                row_tail: 0.5,
+                col_tail: 0.5,
+            },
+            SampleMode::Window {
+                row_off: 0,
+                col_off: 0,
+            },
+        ] {
+            let s = sample_tensor(t, 4, 4, 0, ViewDtype::Stored, mode, None)
+                .unwrap_or_else(|e| panic!("{mode:?} failed: {e}"));
+            assert!(!s.values.is_empty(), "{mode:?} sampled nothing");
+            assert_eq!(s.values.len(), s.rows.len(), "{mode:?} rows disagree");
+            assert!(
+                s.values.iter().all(|r| r.len() == s.cols.len()),
+                "{mode:?} produced a ragged grid"
+            );
+            assert!(s.min <= s.max, "{mode:?} range inverted");
+            // GridMax reports magnitudes, so it never goes below zero.
+            if matches!(mode, SampleMode::GridMax) {
+                assert!(s.min >= 0.0, "abs-max produced a negative: {}", s.min);
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_is_clamped_so_it_never_runs_off_the_edge() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        let far = sample_tensor(
+            t,
+            2,
+            2,
+            0,
+            ViewDtype::Stored,
+            SampleMode::Window {
+                row_off: 9_999,
+                col_off: 9_999,
+            },
+            None,
+        )
+        .expect("a far window still samples");
+        assert!(
+            far.rows.iter().all(|r| *r < t.shape[0]),
+            "rows ran past the end: {:?}",
+            far.rows
+        );
+    }
+
+    #[test]
+    fn a_three_d_tensor_reports_its_slices_and_samples_each() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 3);
+        let first = sample_tensor(t, 4, 4, 0, ViewDtype::Stored, SampleMode::Grid, None)
+            .expect("slice 0 samples");
+        assert_eq!(first.slices, t.shape[0], "every leading index is a slice");
+        assert_eq!(first.slice, 0);
+        let last = sample_tensor(
+            t,
+            4,
+            4,
+            t.shape[0] - 1,
+            ViewDtype::Stored,
+            SampleMode::Grid,
+            None,
+        )
+        .expect("the last slice samples");
+        assert_eq!(last.slice, t.shape[0] - 1);
+        assert_ne!(
+            first.values, last.values,
+            "different slices should hold different data"
+        );
+        // An out-of-range slice is clamped to the last one rather than refused — the
+        // `[`/`]` keys and `--slice` can both overshoot, and showing the end beats an
+        // error.
+        let clamped = sample_tensor(t, 4, 4, 9_999, ViewDtype::Stored, SampleMode::Grid, None)
+            .expect("an overshooting slice is clamped");
+        assert_eq!(clamped.slice, t.shape[0] - 1);
+    }
+
+    #[test]
+    fn a_one_d_tensor_is_shown_as_a_single_row() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 1);
+        let s = sample_tensor(t, 4, 8, 0, ViewDtype::Stored, SampleMode::Grid, None)
+            .expect("1-D samples");
+        assert_eq!(s.total_rows, 1, "1-D is one row of n");
+        assert_eq!(s.values.len(), 1);
+        assert_eq!(s.slices, 1);
+    }
+
+    #[test]
+    fn a_dtype_override_reinterprets_the_same_bytes() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        let stored = sample_tensor(t, 4, 4, 0, ViewDtype::Stored, SampleMode::Grid, None)
+            .expect("stored view");
+        // Same width, different interpretation: the numbers must change, the geometry
+        // must not.
+        let as_u16 = sample_tensor(t, 4, 4, 0, ViewDtype::As("U16"), SampleMode::Grid, None);
+        if let Ok(other) = as_u16 {
+            assert_eq!(other.values.len(), stored.values.len());
+            assert_eq!(other.view, ViewDtype::As("U16"));
+        }
+        // The 4-bit views unpack two values per byte, so the last dimension grows.
+        for view in [ViewDtype::U4, ViewDtype::I4] {
+            if let Ok(nibbles) = sample_tensor(t, 4, 16, 0, view, SampleMode::Grid, None) {
+                assert!(
+                    nibbles.display_shape.last() >= t.shape.last(),
+                    "{view:?} should widen the last dimension: {:?} vs {:?}",
+                    nibbles.display_shape,
+                    t.shape
+                );
+                assert!(nibbles.raw.iter().flatten().all(|b| b.width == 4));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_bits_accompany_every_sampled_value_for_the_hex_view() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        let s = sample_tensor(t, 3, 3, 0, ViewDtype::Stored, SampleMode::Grid, None).expect("ok");
+        assert_eq!(s.raw.len(), s.values.len(), "one raw row per value row");
+        for (row, raws) in s.values.iter().zip(&s.raw) {
+            assert_eq!(row.len(), raws.len());
+            assert!(raws.iter().all(|b| b.width > 0), "a zero-width raw bit");
+        }
+    }
+
+    #[test]
+    fn a_whole_tensor_scan_agrees_with_the_values_it_scanned() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        let go = AtomicBool::new(false);
+        let stats =
+            tensor_stats(t, ViewDtype::Stored, None, &go, &go, None).expect("the scan runs");
+        assert_eq!(
+            stats.count, t.num_elements as u64,
+            "every element is scanned"
+        );
+        assert!(stats.min <= stats.max);
+        assert!(
+            stats.mean >= stats.min && stats.mean <= stats.max,
+            "{stats:?}"
+        );
+        assert!(stats.std >= 0.0);
+        assert!(stats.zeros <= stats.count);
+        assert_eq!(stats.nonfinite, 0, "the fixture holds no NaN/inf");
+        // The sampled range must sit inside the exact range the scan found.
+        let s = sample_tensor(t, 4, 4, 0, ViewDtype::Stored, SampleMode::Grid, None).expect("ok");
+        assert!(
+            s.min >= stats.min && s.max <= stats.max,
+            "sample outside scan"
+        );
+    }
+
+    #[test]
+    fn a_histogram_bins_the_whole_tensor() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        let go = AtomicBool::new(false);
+        let stats = tensor_stats(t, ViewDtype::Stored, None, &go, &go, None).expect("scan");
+        let (bins, n) = histogram_bins(
+            ViewDtype::Stored,
+            &t.dtype,
+            Some((stats.min, stats.max)),
+            Some(8),
+        )
+        .expect("a bin layout");
+        assert_eq!(n, 8, "the requested bucket count is honoured");
+
+        let shared = HistShared::new(n);
+        let cancel = AtomicBool::new(false);
+        let pause = AtomicBool::new(false);
+        tensor_histogram_into(
+            t,
+            ViewDtype::Stored,
+            None,
+            bins,
+            n,
+            &shared,
+            &cancel,
+            &pause,
+            None,
+        )
+        .expect("the histogram runs");
+        let hist = shared.snapshot(bins);
+        assert_eq!(hist.counts.len(), n, "one count per bucket");
+        assert_eq!(
+            hist.counts.iter().sum::<u64>() + hist.nonfinite,
+            t.num_elements as u64,
+            "every element lands in a bucket"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_scan_stops_instead_of_finishing() {
+        let tensors = checkpoint();
+        let t = pick(&tensors, 2);
+        let (bins, n) =
+            histogram_bins(ViewDtype::Stored, &t.dtype, Some((0.0, 1.0)), Some(4)).expect("bins");
+        let shared = HistShared::new(n);
+        let cancel = AtomicBool::new(true); // already cancelled
+        let pause = AtomicBool::new(false);
+        let _ = tensor_histogram_into(
+            t,
+            ViewDtype::Stored,
+            None,
+            bins,
+            n,
+            &shared,
+            &cancel,
+            &pause,
+            None,
+        );
+        // Whether it returns an error or an empty result, it must not report a full scan.
+        let hist = shared.snapshot(bins);
+        assert!(
+            hist.counts.iter().sum::<u64>() <= t.num_elements as u64,
+            "a cancelled scan counted more than the tensor holds"
+        );
+    }
+
+    #[test]
+    fn opening_a_missing_file_is_an_error_not_a_panic() {
+        let mut t = checkpoint()[0].clone();
+        t.source_path = "/no/such/file.safetensors".into();
+        assert!(open_reader(&t).is_err());
+        assert!(sample_tensor(&t, 2, 2, 0, ViewDtype::Stored, SampleMode::Grid, None).is_err());
+        let go = AtomicBool::new(false);
+        assert!(tensor_stats(&t, ViewDtype::Stored, None, &go, &go, None).is_err());
+    }
+
+    /// A header that claims a bigger shape than its `data_offsets` span — corrupt,
+    /// truncated, or hostile — must be refused at open. Reading it went ahead and ran off
+    /// the end of the segment, aborting the process on a slice bounds check instead of
+    /// printing an error.
+    #[test]
+    fn a_header_claiming_more_than_it_stores_is_refused_at_open() {
+        let mut t = checkpoint()[0].clone();
+        let real = t.shape.clone();
+        t.shape = vec![real.iter().product::<usize>() * 4]; // 4× the stored bytes
+        let Err(e) = open_reader(&t) else {
+            panic!("a segment shorter than the declared shape must not open");
+        };
+        assert!(
+            e.contains("but only") && e.contains("bytes are stored"),
+            "{e}"
+        );
+        // Every read of that tensor fails the same way, rather than one path crashing.
+        assert!(sample_tensor(&t, 2, 2, 0, ViewDtype::Stored, SampleMode::Grid, None).is_err());
+        assert!(read_all_f64(&t).is_err());
+        // A shape that fits is still fine — the check is a bound, not an equality.
+        t.shape = vec![1];
+        assert!(open_reader(&t).is_ok());
+    }
+
+    /// A zero-length dimension is legal on disk; reading it yields nothing. The region
+    /// gather always copied one last-dimension span before it could notice, so it read
+    /// past the end of an empty segment and panicked.
+    #[test]
+    fn a_zero_dimension_reads_as_empty_rather_than_panicking() {
+        let mut t = checkpoint()[0].clone();
+        t.shape = vec![0, 4];
+        t.num_elements = 0;
+        let Ok(r) = open_reader(&t) else {
+            panic!("a zero-element tensor still opens");
+        };
+        assert!(r.read_region(&[0..0, 0..4]).unwrap().is_empty());
+        assert!(read_all_f64(&t).is_ok_and(|v| v.is_empty()));
+    }
+}

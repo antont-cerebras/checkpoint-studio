@@ -1,0 +1,187 @@
+"""Read an `s3://…` cstorch checkpoint's tensor metadata (names/dtypes/shapes).
+
+Runs on the ssh proxy inside the cstorch venv, driven by `remote.rs::dump_script`.
+`cstorch.load` is lazy, so no tensor data is read; each tensor is emitted as one
+sentinel-tagged JSON line, optionally followed by per-object S3 metadata.
+
+Read-only: this only *loads* (lazily) and writes to stdout — it never opens a file
+for writing, calls `cstorch.save`/`torch.save`, or otherwise mutates the checkpoint.
+"""
+# Annotations are lazy (PEP 563) so they never execute at import time on the
+# cluster's interpreter, and modern syntax works on our 3.9 floor.
+from __future__ import annotations
+
+import json
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+# Concurrency for the per-object S3 metadata phase (`want_s3`, i.e. `diff`). Every
+# request there is latency, not work, so a modest pool turns ~2300 serial round trips
+# into ~2300/16. Kept small deliberately: this runs on a shared login node.
+S3_WORKERS = 16
+
+# Parameters from the Rust caller: the single `__PARAMS__` slot is replaced with a
+# JSON object (see `remote.rs::with_params`). One substitution point keeps the rest
+# of this file ordinary Python that ruff and pyright can check.
+PARAMS = json.loads("__PARAMS__")
+SRC = PARAMS["uri"]
+WANT_S3 = PARAMS["want_s3"]
+S = PARAMS["sentinel"]
+P = PARAMS["progress"]
+def emit(obj: dict[str, Any]) -> None:
+    sys.stdout.write(S + json.dumps(obj) + "\n")
+    sys.stdout.flush()
+def prog(done: int, total: int, unit: str | None = None) -> None:
+    tail = ("/" + unit) if unit else ""
+    sys.stdout.write("%s%d/%d%s\n" % (P, done, total, tail))
+    sys.stdout.flush()
+def probe_s3(src: str) -> dict[str, Any]:
+    # Best-effort, LIST-ONLY diagnosis of a load failure: enumerate the objects
+    # under the prefix and report how many are empty (0 bytes) plus whether the
+    # cstorch metadata object itself is empty, so the caller can explain *why*
+    # cstorch.load failed (empty checkpoint / missing metadata / wrong prefix)
+    # instead of surfacing only the raw dill traceback. Read-only; never mutates.
+    if not src.startswith("s3://"):
+        return {}
+    try:
+        from urllib.parse import urlparse
+
+        import boto3
+        u = urlparse(src)
+        bucket, prefix = u.netloc, u.path.lstrip("/")
+        cli = boto3.client("s3")
+        total = empty = nbytes = 0
+        meta_key = None; meta_empty = False; sample = []; tok = None
+        while True:
+            kw: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+            if tok: kw["ContinuationToken"] = tok
+            resp = cli.list_objects_v2(**kw)
+            for it in resp.get("Contents", []):
+                k = it["Key"]; sz = int(it.get("Size", 0))
+                rel = k[len(prefix):].lstrip("/") if k.startswith(prefix) else k
+                if not rel:
+                    continue
+                total += 1; nbytes += sz
+                if sz == 0: empty += 1
+                if rel.rsplit("/", 1)[-1] == "__METADATA__":
+                    meta_key = rel; meta_empty = (sz == 0)
+                if len(sample) < 12: sample.append([rel, sz])
+            if resp.get("IsTruncated"): tok = resp.get("NextContinuationToken")
+            else: break
+    except Exception as e:
+        return {"s3_probe_error": "%r" % (e,)}
+    else:
+        return {"s3_probe": {"prefix": prefix, "total": total, "empty": empty,
+                             "bytes": nbytes, "metadata_key": meta_key,
+                             "metadata_empty": meta_empty, "sample": sample}}
+try:
+    import cerebras.pytorch as cstorch
+except Exception as e:
+    emit({"error": "import cerebras.pytorch failed: %r" % (e,)}); sys.exit(0)
+try:
+    sd = cstorch.load(SRC, map_location=None)   # lazy: metadata only, no data
+except Exception as e:
+    emit(dict({"error": "cstorch.load failed: %r" % (e,)}, **probe_s3(SRC))); sys.exit(0)
+keys = list(sd.keys())
+total = len(keys)
+prog(0, total)                                  # total known → bar goes determinate
+step = max(1, total // 100)                     # ~100 updates, not one per tensor
+tensors = []
+for i, name in enumerate(keys):
+    try:
+        t = sd[name]
+        it = int(t.element_size()) if hasattr(t, "element_size") else 0
+        tensors.append({"name": str(name), "dtype": str(getattr(t, "dtype", "")), "shape": [int(d) for d in t.shape], "itemsize": it})
+    except Exception:
+        pass
+    if (i + 1) % step == 0 or i + 1 == total:
+        prog(i + 1, total)
+# S3 object metadata (best-effort, read-only): list the objects under the prefix
+# and HEAD each for size/etag/checksum/last-modified/user-metadata; tags need a
+# separate (often ungranted) permission, so they're tried per object and a single
+# warning is emitted if denied. Any failure degrades to fewer objects + a warning.
+s3_objects = []
+s3_warnings = []
+if WANT_S3:
+    try:
+        from urllib.parse import urlparse
+
+        import boto3
+        from botocore.config import Config
+        u = urlparse(SRC)
+        bucket, prefix = u.netloc, u.path.lstrip("/")
+        # botocore pools 10 connections by default; below that, the workers would just
+        # queue on the pool instead of overlapping their round trips.
+        cli = boto3.client("s3", config=Config(max_pool_connections=S3_WORKERS + 4))
+        keys, tok = [], None
+        while True:
+            kw: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+            if tok: kw["ContinuationToken"] = tok
+            resp = cli.list_objects_v2(**kw)
+            keys.extend(it["Key"] for it in resp.get("Contents", []))
+            if resp.get("IsTruncated"): tok = resp.get("NextContinuationToken")
+            else: break
+        # Second progress phase: the per-object requests are the slow part, so drive
+        # the bar off them (relabelled "S3 objects") instead of sitting at 100%
+        # tensors. Each object costs a HEAD plus a tagging call, and both are pure
+        # latency — a 1155-object checkpoint is ~2300 round trips. They're independent,
+        # so run them on a small pool: order is preserved by `map`, so the emitted
+        # listing stays in LIST order, and the pool is sized to the connection pool
+        # below (botocore's default of 10 would otherwise throttle the workers).
+        nkeys = len(keys)
+        s3_step = max(1, nkeys // 100)
+        prog(0, nkeys, "s3")
+
+        # `s3:GetObjectTagging` is granted per bucket, not per object, so the first
+        # denial settles it for the rest: stop asking instead of spending another
+        # ~1100 round trips to be told the same thing. Objects after that carry no
+        # `tags` key, which the reader already reads as "not available".
+        denied_flag = threading.Event()
+
+        def describe(k: str) -> tuple[dict[str, Any] | None, str | None, bool]:
+            """`(object, warning, tags_denied)` for one key.
+
+            Never raises: a failed HEAD drops the object with a warning, missing tags
+            drop just the tags.
+            """
+            try:
+                h = cli.head_object(Bucket=bucket, Key=k, ChecksumMode="ENABLED")
+            except Exception as e:
+                return None, "head_object failed for %s: %r" % (k, e), False
+            rel = k[len(prefix):].lstrip("/") if k.startswith(prefix) else k
+            lm = h.get("LastModified")
+            obj = {"key": rel, "size": int(h.get("ContentLength", 0)),
+                   "etag": str(h.get("ETag", "")).strip('"'),
+                   "last_modified": lm.isoformat() if lm else "",
+                   "metadata": {mk: str(mv) for mk, mv in (h.get("Metadata") or {}).items()}}
+            for algo in ("CRC32", "CRC32C", "SHA1", "SHA256"):
+                cv = h.get("Checksum" + algo)
+                if cv:
+                    obj["checksum"] = [algo.lower(), str(cv)]; break
+            if not denied_flag.is_set():
+                try:
+                    tg = cli.get_object_tagging(Bucket=bucket, Key=k)
+                    obj["tags"] = {t["Key"]: t["Value"] for t in tg.get("TagSet", [])}
+                except Exception as e:
+                    denied_flag.set()
+                    return obj, "tags unavailable (needs s3:GetObjectTagging): %r" % (e,), True
+            return obj, None, False
+
+        tags_denied = False
+        with ThreadPoolExecutor(max_workers=S3_WORKERS) as pool:
+            for i, (obj, warn, denied) in enumerate(pool.map(describe, keys)):
+                if i % s3_step == 0:
+                    prog(i, nkeys, "s3")
+                # The tagging permission is per bucket, not per object: warn once.
+                if warn and not (denied and tags_denied):
+                    s3_warnings.append(warn)
+                if denied:
+                    tags_denied = True
+                if obj is not None:
+                    s3_objects.append(obj)
+        prog(nkeys, nkeys, "s3")
+    except Exception as e:
+        s3_warnings.append("s3 metadata unavailable: %r" % (e,))
+emit({"tensors": tensors, "metadata": [], "s3_objects": s3_objects, "s3_warnings": s3_warnings})

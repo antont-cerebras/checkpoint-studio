@@ -1,0 +1,59 @@
+# Codecov: the cross-commit coverage ratchet.
+#
+# `target: auto` compares each commit with its parent, and `threshold: 0%` means a drop
+# fails the check — "coverage must not decrease" without a hard-coded number anywhere.
+# The per-tool floors in the build (cargo-llvm-cov's --fail-under-lines, vitest's
+# coverage.thresholds, coverage.py's fail_under) are the offline backstop: they catch a
+# regression locally and in forks where the upload can't run.
+#
+# Three languages arrive as three uploads (flags), so a Rust change can't be masked by
+# the web bundle's numbers or vice versa.
+
+coverage:
+  precision: 2
+  round: down
+  range: "70...90"
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 0%       # no decrease, at all
+        if_ci_failed: error
+      rust:
+        target: auto
+        threshold: 0%
+        flags: [rust]
+      web:
+        target: auto
+        threshold: 0%
+        flags: [web]
+      python:
+        target: auto
+        threshold: 0%
+        flags: [python]
+    # New/changed lines must themselves be covered — this is what stops a feature from
+    # landing untested while the project percentage stays flat.
+    patch:
+      default:
+        target: 80%
+        threshold: 0%
+
+flag_management:
+  individual_flags:
+    - name: rust
+      paths: [src/, crates/]
+    - name: web
+      paths: [web/src/]
+    - name: python
+      paths: [crates/core/src/python/]
+
+comment:
+  layout: "condensed_header, diff, flags, components"
+  require_changes: true
+
+# The generated bundle, the fixtures and the tests themselves aren't product code.
+ignore:
+  - "web/dist/**"
+  - "tests/**"
+  - "crates/core/tests/**"
+  - "**/*.test.ts"

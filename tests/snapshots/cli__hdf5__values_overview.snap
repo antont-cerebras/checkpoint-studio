@@ -39,6 +39,6 @@ expert 0 of 30 — stored word 0, field 0/5 (3-bit) — ← → step · Shift+�
 
 
 
-m heatmap · ← → step · Shift+← → jump 5% · / index or % · d dtype · r reshape · e edges · z zebra: rows · b base: dec
+m heatmap · ← → step · Shift+← → jump 5% · / index or % · d dtype · r reshape · e abs-max · z zebra: rows · b base: dec
 c copy screen · y copy cmd · l legend · Space/: commands · ⌫/\ back/fwd
                                                                                                               read-only
