@@ -118,6 +118,15 @@ impl Mode for FilesMode {
                 }
             }
         }
+        // Land on the file the tree's selected tensor lives in — the other half of the
+        // cross-link (`t` in here narrows the tree to a file; `Tab` out of there shows
+        // you which file). Only when a *tensor* is selected: a group spans files, and
+        // `--files` at startup has no selection to follow. A file inside a collapsed
+        // directory isn't among the visible rows, so the selection simply stays put
+        // rather than jumping somewhere that isn't on screen.
+        if let Some(source) = ex.selected_tensor_source() {
+            ex.file_state.select_by_source(&source);
+        }
         Ok(Outcome::Stay)
     }
 
@@ -3165,6 +3174,90 @@ mod tests {
                 .is_some_and(|(msg, _)| msg.contains("not in the open checkpoint")),
             "the reason is on screen: {:?}",
             ex.copied_flash
+        );
+    }
+
+    #[test]
+    fn the_file_browser_and_the_tree_point_at_each_other() {
+        let (mut ex, mut term) = loaded();
+        let mut files = FilesMode::new();
+        files
+            .on_enter(&mut ex, &mut term)
+            .expect("the browser opens");
+
+        // Put the cursor on the fixture's own checkpoint file, then `t`.
+        let shard = ex
+            .file_state
+            .rows
+            .iter()
+            .position(|r| r.name.ends_with(".safetensors") && r.name.starts_with("tiny"))
+            .expect("the fixture's shard is listed");
+        ex.file_state.selected = shard;
+        let name = ex.file_state.rows[shard].name.clone();
+        assert_eq!(
+            outcome(
+                &files
+                    .handle_key(&mut ex, &mut term, code(KeyCode::Char('t')))
+                    .unwrap()
+            ),
+            "tree",
+            "it goes to the tree"
+        );
+        // …narrowed by a `shard:` filter, which is the same state `--filter` sets — so the
+        // title says so and `y` reproduces it.
+        assert_eq!(
+            ex.tree_state.filter_query(),
+            format!("shard:{name}"),
+            "narrowed to that file"
+        );
+        assert!(
+            ex.command_for_tree().contains("--filter shard:"),
+            "and it round-trips: {}",
+            ex.command_for_tree()
+        );
+
+        // A file with no tensors in it says so instead of filtering to nothing.
+        let json = ex
+            .file_state
+            .rows
+            .iter()
+            .position(|r| r.file_kind() == Some(crate::filetree::FileKind::Json));
+        if let Some(json) = json {
+            ex.file_state.selected = json;
+            ex.copied_flash = None;
+            assert_eq!(
+                outcome(
+                    &files
+                        .handle_key(&mut ex, &mut term, code(KeyCode::Char('t')))
+                        .unwrap()
+                ),
+                "stay"
+            );
+            assert!(
+                ex.copied_flash
+                    .as_ref()
+                    .is_some_and(|(m, _)| m.contains("no tensors")),
+                "{:?}",
+                ex.copied_flash
+            );
+        }
+
+        // The other direction: with a tensor selected in the tree, entering the browser
+        // lands on the file that tensor lives in.
+        ex.tree_state.clear_filter();
+        let tensor = ex.tensors()[0].clone();
+        ex.tree_state.reveal(&tensor.name);
+        ex.file_state.selected = 0; // the root row, deliberately somewhere else
+        let mut files = FilesMode::new();
+        files
+            .on_enter(&mut ex, &mut term)
+            .expect("the browser opens");
+        let landed = &ex.file_state.rows[ex.file_state.selected];
+        assert!(
+            tensor.source_path.ends_with(&landed.name),
+            "landed on {} for a tensor from {}",
+            landed.name,
+            tensor.source_path
         );
     }
 

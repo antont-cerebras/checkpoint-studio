@@ -3,7 +3,7 @@
   import { api } from '../lib/api';
   import type { FileNode } from '../lib/types';
   import { humanSize, shardNote } from '../lib/format';
-  import { openFile } from '../stores/view';
+  import { filterToShard, openFile, selectedSource } from '../stores/view';
   import { flattenFiles, toggleDir } from '../lib/filerows';
 
   let root: FileNode | null = null;
@@ -57,6 +57,14 @@
     return node.kind === 'file' ? (node.read_error ?? '') : '';
   }
 
+  /** Whether this row is the file the tree's selected tensor lives in. Matched on the
+      file name: the browser's paths are checkpoint-relative and a `source_path` is
+      absolute, which is the same reason the terminal's lookup falls back to the name. */
+  function isCurrent(node: FileNode, source: string | null): boolean {
+    if (node.kind !== 'file' || !source) return false;
+    return source.split(/[/\\]/).pop() === node.name;
+  }
+
   function activate(node: FileNode) {
     if (node.kind === 'dir') {
       expanded = toggleDir(expanded, node.path);
@@ -75,6 +83,7 @@
     {#each rows as { node, depth } (node.path + node.name)}
       <div
         class="row {node.kind}"
+        class:current={isCurrent(node, $selectedSource)}
         style="padding-left:{8 + depth * 16}px"
         role="button"
         tabindex="-1"
@@ -91,6 +100,18 @@
           >{node.kind === 'dir' ? '📁' : fileIcon(node.file_kind)}</span
         >
         <span class="name">{node.name}</span>
+        <!-- The cross-link: narrow the tree to this file's tensors, as `t` does in the
+         terminal. Its own column so the ones after it don't move from row to row, and
+         `stopPropagation` so it doesn't also open the layout map. -->
+        <span class="link-col">
+          {#if node.kind === 'file' && node.file_kind === 'Checkpoint'}
+            <button
+              class="chip"
+              title="Show this file's tensors in the tree (a shard: filter)"
+              on:click|stopPropagation={() => filterToShard(node.name)}>tensors</button
+            >
+          {/if}
+        </span>
         <!-- The size and the bar are fixed-width columns, so they line up down the
          listing however long the names are — only the name absorbs the slack. -->
         <span class="size dim">{humanSize(node.size)}</span>
@@ -158,6 +179,28 @@
   }
   .row:hover {
     background: var(--bg-hover);
+  }
+  /* The file the tree's selected tensor lives in — the same selection colour a selected
+     row gets elsewhere, since that is what this is. */
+  .row.current {
+    background: var(--bg-sel);
+  }
+  .link-col {
+    flex: 0 0 9ch;
+  }
+  .chip {
+    padding: 0 6px;
+    border: 0;
+    border-radius: 3px;
+    background: var(--bg-elev);
+    color: var(--fg-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .chip:hover {
+    background: var(--bg-hover);
+    color: var(--accent);
   }
   .caret {
     flex: 0 0 12px;

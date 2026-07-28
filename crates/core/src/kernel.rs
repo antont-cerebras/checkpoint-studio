@@ -439,6 +439,25 @@ impl FileState {
         self.selected = self.selected.min(n.saturating_sub(1));
     }
 
+    /// Select the visible row for `source` — a tensor's `source_path`. Matched on the
+    /// whole path, falling back to the file name, because the browse tree and the tensor
+    /// list come from different producers and can disagree about the path while agreeing
+    /// about the file (the same reasoning as `filetree::FileNode::attribute_tensors`).
+    ///
+    /// Leaves the selection alone when no visible row matches — a file inside a collapsed
+    /// directory is not somewhere the cursor should silently go.
+    pub fn select_by_source(&mut self, source: &str) {
+        let name = source.rsplit(['/', '\\']).next().unwrap_or(source);
+        let found = self
+            .rows
+            .iter()
+            .position(|r| r.path.to_string_lossy() == source)
+            .or_else(|| self.rows.iter().position(|r| r.name == name));
+        if let Some(idx) = found {
+            self.selected = idx;
+        }
+    }
+
     /// Move the cursor by `delta` rows within the file list, clamped.
     pub fn move_selection(&mut self, delta: i32) {
         let len = self.rows.len();

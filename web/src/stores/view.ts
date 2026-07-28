@@ -151,6 +151,14 @@ export const visibleRows = derived(
   },
 );
 
+/** The `source_path` of the tensor the tree has selected, or null when the selection is a
+ * group, a metadata entry, or nothing — what the file browser highlights, so switching to
+ * it shows which file the tensor you were looking at lives in. */
+export const selectedSource = derived([visibleRows, selectedId], ([$rows, $id]) => {
+  const row = $rows.find((r) => r.id === $id);
+  return row && row.node.kind === 'tensor' ? row.node.info.source_path : null;
+});
+
 /** Total tensors matching the current fuzzy search, untruncated — so the search
  * label can be honest when the row list is capped ("showing 1000 of N"). Only
  * the fuzzy path is capped; the server-side filter returns every match. */
@@ -272,6 +280,17 @@ export function openDetail(tensor: string): void {
 export function openFile(path: string, name: string, fileKind: string): void {
   if (fileKind === 'Checkpoint') navigate({ kind: 'layout', file: name });
   else navigate({ kind: 'preview', path, name });
+}
+
+/** Narrow the tensor tree to one shard's tensors and go there — the file browser's
+ * cross-link, and the terminal's `t`.
+ *
+ * A `shard:` filter rather than a mode of its own, so it is the same state the filter box
+ * sets: the box shows the query and the match count, it can be edited or cleared from
+ * there, and the URL carries it. */
+export function filterToShard(name: string): void {
+  filterQuery.set(`shard:${name}`);
+  navigate({ kind: 'tree' });
 }
 export function setTab(tab: DataTab): void {
   const s = get(screen);
