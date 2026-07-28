@@ -625,6 +625,15 @@ pub struct HeaderInputs<'a> {
     pub index: &'a [crate::model::IndexEntry],
     /// Checkpoint files the read skipped past because their headers wouldn't parse.
     pub unreadable: &'a [crate::model::UnreadableShard],
+    /// What the source can do — [`crate::capability::Capabilities::reread_header`] decides
+    /// whether the header text can be read back for the repeated-key check.
+    ///
+    /// Asked rather than inferred from a path's shape, which is the whole point of that
+    /// module: a Hub shard's `ShardHeader.path` is a bare repo-relative name, so a
+    /// "does this look remote" test calls it local and the check goes looking for it in the
+    /// working directory. `None` when no source was supplied (a unit test) — the
+    /// pessimistic reading, so nothing is attempted.
+    pub caps: Option<crate::capability::Capabilities>,
 }
 
 impl<'a> From<&'a crate::model::Checkpoint> for HeaderInputs<'a> {
@@ -633,6 +642,7 @@ impl<'a> From<&'a crate::model::Checkpoint> for HeaderInputs<'a> {
             shards: &cp.shards,
             index: &cp.index,
             unreadable: &cp.unreadable,
+            caps: Some(cp.capabilities()),
         }
     }
 }
@@ -832,11 +842,12 @@ fn check_headers(
 
     // --- a name the raw header declares twice ---
     //
-    // Local only: it needs the header text, and a remote read doesn't keep it. Reading
-    // it is the point — `sh.tensors` went through `serde_json`, which already folded the
-    // repeats away (see `stheader::duplicate_keys`).
+    // Only where the header text can be read back — `sh.tensors` went through
+    // `serde_json`, which already folded the repeats away (see `stheader::duplicate_keys`).
+    // The capability answers that; a path's shape does not (see `HeaderInputs::caps`).
+    let can_reread = headers.caps.is_some_and(|c| c.reread_header);
     for sh in &safetensors {
-        if sh.header_len == 0 || crate::remote::is_remote_source(&sh.path) {
+        if !can_reread || sh.header_len == 0 {
             continue;
         }
         match read_header_json(&sh.path, sh.header_len) {
@@ -2025,6 +2036,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let one = r#"{"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#;
+        // A local safetensors source — the pair whose `reread_header` is true.
+        let local = Some(crate::capability::Capabilities::of(
+            crate::capability::Format::Safetensors,
+            crate::capability::Location::Local,
+        ));
 
         // The reference serializer pads the header so the blob starts 8-byte aligned.
         // Nothing breaks without it — which is why it needs saying.
@@ -2034,6 +2050,7 @@ mod tests {
             &[],
             HeaderInputs {
                 shards: &aligned,
+                caps: local,
                 ..Default::default()
             },
         );
@@ -2045,6 +2062,7 @@ mod tests {
             &[],
             HeaderInputs {
                 shards: &skewed,
+                caps: local,
                 ..Default::default()
             },
         );
@@ -2066,6 +2084,7 @@ mod tests {
             &[],
             HeaderInputs {
                 shards: &dupe,
+                caps: local,
                 ..Default::default()
             },
         );
@@ -2088,6 +2107,7 @@ mod tests {
             &[],
             HeaderInputs {
                 shards: &unknown,
+                caps: local,
                 ..Default::default()
             },
         );
@@ -2102,6 +2122,7 @@ mod tests {
             &[],
             HeaderInputs {
                 shards: &gone,
+                caps: local,
                 ..Default::default()
             },
         );
@@ -2111,6 +2132,31 @@ mod tests {
                 .message
                 .contains("could not re-read the header"),
             "{:?}",
+            r.findings()
+        );
+
+        // The gate itself: a source whose header text ISN'T here is not looked for. A Hub
+        // shard's path is a bare repo-relative name, so the old "does this look remote"
+        // test called it local and every shard warned that it couldn't be re-read.
+        let hub = [crate::model::ShardHeader {
+            path: "model-00001-of-00002.safetensors".into(),
+            ..shard_file(&dir, "onhub.safetensors", 136, twice)
+        }];
+        let r = check_headers(
+            &[ti("w", "F16", &[8])],
+            &[],
+            HeaderInputs {
+                shards: &hub,
+                caps: Some(crate::capability::Capabilities::of(
+                    crate::capability::Format::Safetensors,
+                    crate::capability::Location::Hf,
+                )),
+                ..Default::default()
+            },
+        );
+        assert!(
+            r.findings().is_empty(),
+            "nothing is read, and nothing is claimed: {:?}",
             r.findings()
         );
 

@@ -199,6 +199,15 @@ pub struct Capabilities {
     pub object_metadata: bool,
     /// Per-dataset compression codec and stored-vs-logical size — HDF5 only.
     pub codec_info: bool,
+    /// Re-read a shard's **header text**, to see what parsing it folds away — a tensor
+    /// name the header declares twice survives only in the raw bytes, because
+    /// `serde_json` keeps the last of two identical keys.
+    ///
+    /// Needs a header in the format *and* the file within this process's reach. A separate
+    /// row from [`Self::read_bytes`] because it is a different operation on a different
+    /// scale — a few kilobytes at a known offset, not gigabytes of tensor data — so the
+    /// Hub could serve it by `Range` long before it serves weights.
+    pub reread_header: bool,
     /// How the source is reached — whether this machine can open it directly at all.
     /// Carried alongside the capabilities so a frontend gets one answer, not two lookups.
     pub reach: Reach,
@@ -225,6 +234,7 @@ impl Capabilities {
             browse_files: true,
             object_metadata: matches!(location, Location::S3),
             codec_info: matches!(format, Format::Hdf5),
+            reread_header: local && format.has_byte_ranges(),
             reach: location.reach(),
         }
     }
@@ -328,6 +338,17 @@ mod tests {
         // Location-specific extras.
         assert!(st_s3.object_metadata && !st_hf.object_metadata);
         assert!(h5_local.codec_info && !st_local.codec_info);
+
+        // Re-reading a header needs both halves too, and is the row that stops a check
+        // from sniffing a path's shape: a Hub shard's `ShardHeader.path` is a bare
+        // repo-relative name, which *looks* local and isn't.
+        assert!(st_local.reread_header);
+        assert!(!st_hf.reread_header, "the header is on the Hub, not here");
+        assert!(!st_s3.reread_header);
+        assert!(
+            !h5_local.reread_header,
+            "hdf5 has no header text to re-read"
+        );
     }
 
     /// A tensor's path tells core which reason to give — the sampler holds a tensor, not a
