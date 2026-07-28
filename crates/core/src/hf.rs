@@ -404,22 +404,55 @@ pub fn read_checkpoint(repo: &RepoRef, progress: &ReadProgress) -> Result<Checkp
         .num_threads(PARALLEL_READS)
         .build()
         .context("building the header-read pool")?;
-    let headers: Result<Vec<ShardHeader>> = pool.install(|| {
-        shards
-            .par_iter()
-            .map(|f| {
-                let h = fetch_header(&agent, repo, f);
-                progress
-                    .done
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                h
-            })
-            .collect()
-    });
-    let mut headers = headers?;
+    // Per shard: its header, or why it couldn't be fetched. A torn shard doesn't sink the
+    // repo — the rest are worth showing and the bad one is named, exactly as for a local
+    // directory (`readers::read_local`) and an `--ssh-proxy` one (`remote::read`).
+    let outcomes: Vec<std::result::Result<ShardHeader, crate::model::UnreadableShard>> = pool
+        .install(|| {
+            shards
+                .par_iter()
+                .map(|f| {
+                    let h = fetch_header(&agent, repo, f).map_err(|e| {
+                        crate::model::UnreadableShard {
+                            // The `hf://…` form, so what's reported names the shard the way
+                            // the rest of the UI does.
+                            path: format!("{}/{}", repo.spec(), f.path),
+                            error: format!("{e:#}"),
+                        }
+                    });
+                    progress
+                        .done
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    h
+                })
+                .collect()
+        });
+    let (mut headers, mut unreadable): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
+    for outcome in outcomes {
+        match outcome {
+            Ok(h) => headers.push(h),
+            Err(bad) => unreadable.push(bad),
+        }
+    }
     // Listing order, so the tree and the layout map read in shard order rather than in
-    // whatever order the parallel reads happened to finish.
+    // whatever order the parallel reads happened to finish — and so two reads of the same
+    // broken repo report the same failures.
     headers.sort_by(|a, b| a.path.cmp(&b.path));
+    unreadable.sort_by(|a, b| a.path.cmp(&b.path));
+    // Nothing fetched: the reason is the answer, not an empty repo.
+    if headers.is_empty()
+        && let Some(first) = unreadable.first()
+    {
+        anyhow::bail!(
+            "{}{}",
+            first.error,
+            if unreadable.len() > 1 {
+                format!(" (and {} more shard(s) unreadable)", unreadable.len() - 1)
+            } else {
+                String::new()
+            }
+        );
+    }
 
     let config = fetch_text(&agent, repo, "config.json", 4 << 20)
         .and_then(|t| crate::config::ModelConfig::parse(&t))
@@ -440,9 +473,7 @@ pub fn read_checkpoint(repo: &RepoRef, progress: &ReadProgress) -> Result<Checkp
         config,
         index,
         s3: None,
-        // A Hub read downloads each shard's header individually and propagates a failure
-        // (a partial download is a retry, not a checkpoint to browse around).
-        unreadable: Vec::new(),
+        unreadable,
     })
 }
 
