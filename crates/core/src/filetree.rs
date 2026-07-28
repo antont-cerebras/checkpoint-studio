@@ -3,9 +3,10 @@
 //! [`crate::tree::TreeNode`] so the mature tensor paths stay untouched — this
 //! models only what a file explorer needs (name, path, size, kind, expansion).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::tree::natural_sort_key;
+use crate::tree::{TensorInfo, natural_sort_key};
 
 /// How much of a sidecar either frontend previews.
 ///
@@ -53,6 +54,53 @@ impl FileKind {
     }
 }
 
+/// What a checkpoint file contributes to the model: the tensors read out of it and
+/// their share of the parameters.
+///
+/// Without this a sharded checkpoint browses as sixteen identical-looking rows —
+/// `model-000NN-of-00016.safetensors  3.7 GiB` — while the shards are not alike at
+/// all: one carries the embedding, one the odd tail of layers, one nothing but
+/// codebooks. Every shard's header is already parsed when the checkpoint is opened,
+/// so this is a projection of what we know, not extra I/O.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct ShardTensors {
+    /// Tensors the model read from this file.
+    pub tensors: usize,
+    /// Parameters (elements) those tensors hold.
+    pub params: usize,
+    /// Fraction of the whole checkpoint's parameters, `0.0..=1.0`. Carried rather
+    /// than computed per frontend because a row knows its own numbers but not the
+    /// checkpoint's total — and because two independent divisions are two chances
+    /// for the terminal and the browser to disagree.
+    pub params_share: f64,
+}
+
+impl ShardTensors {
+    /// The file-browser row's suffix: `1062 tensors · 6.4% of params`.
+    ///
+    /// The share is what finds the odd file out — in a uniformly sharded checkpoint it
+    /// tracks the size, but a codebook or embedding-only shard is large on disk and
+    /// small in parameters (or the reverse), and the two disagreeing is the point.
+    /// Rendered by the shared [`crate::utils::format_percent`], so a share too small
+    /// for one decimal reads as scientific notation rather than a misleading `0.0%`.
+    ///
+    /// In core rather than in either frontend because both write this row, so the
+    /// wording is contracted in `shared/parity/format.json` — see that harness.
+    #[must_use]
+    pub fn note(&self) -> String {
+        format!(
+            "{} {} · {} of params",
+            self.tensors,
+            if self.tensors == 1 {
+                "tensor"
+            } else {
+                "tensors"
+            },
+            crate::utils::format_percent(self.params_share, self.params == 0),
+        )
+    }
+}
+
 /// A node in the file-browser tree.
 #[derive(Debug, Clone)]
 pub enum FileNode {
@@ -70,6 +118,11 @@ pub enum FileNode {
         path: PathBuf,
         size: u64,
         kind: FileKind,
+        /// The tensors this file contributes, once [`FileNode::attribute_tensors`]
+        /// has run. `None` for a file the model reads nothing from (a README, a
+        /// tokenizer, a shard belonging to some *other* checkpoint in the same
+        /// directory) and for a tree nobody attributed.
+        shard: Option<ShardTensors>,
     },
 }
 
@@ -86,6 +139,81 @@ impl FileNode {
         match self {
             Self::Dir { name, .. } | Self::File { name, .. } => name,
         }
+    }
+
+    /// Annotate every file the model read tensors from with its [`ShardTensors`].
+    ///
+    /// A pass over an already-built tree rather than an argument to [`build`]: the
+    /// tree has four producers (a local walk, an SFTP listing, S3 keys, the cached
+    /// model walk) and threading a tensor list through all of them — including the
+    /// ones that browse a directory holding no checkpoint at all — would put the
+    /// same `Option` in four signatures instead of one field.
+    ///
+    /// Tensors are attributed by their `source_path`. When that doesn't match a
+    /// node's path, an unambiguous file *name* is the fallback: the tree and the
+    /// tensor list come from different producers, so they can disagree about the
+    /// path while agreeing about the file (a Hub snapshot's symlink into the blob
+    /// store, or a remote listing rooted differently from the proxy's own paths).
+    pub fn attribute_tensors(&mut self, tensors: &[TensorInfo]) {
+        let mut by_path: HashMap<&str, (usize, usize)> = HashMap::new();
+        let mut total = 0usize;
+        for t in tensors {
+            let e = by_path.entry(t.source_path.as_str()).or_default();
+            e.0 += 1;
+            e.1 += t.num_elements;
+            total += t.num_elements;
+        }
+        // `None` marks a name more than one source file shares, so the fallback
+        // stays off for it rather than picking one of them.
+        let mut by_name: HashMap<&str, Option<&str>> = HashMap::new();
+        for key in by_path.keys() {
+            let name = key.rsplit(['/', '\\']).next().unwrap_or(key);
+            by_name
+                .entry(name)
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(key));
+        }
+        self.annotate(&by_path, &by_name, total);
+    }
+
+    fn annotate(
+        &mut self,
+        by_path: &HashMap<&str, (usize, usize)>,
+        by_name: &HashMap<&str, Option<&str>>,
+        total: usize,
+    ) {
+        match self {
+            Self::Dir { children, .. } => {
+                for child in children {
+                    child.annotate(by_path, by_name, total);
+                }
+            }
+            Self::File {
+                name, path, shard, ..
+            } => {
+                let hit = by_path.get(path.to_string_lossy().as_ref()).or_else(|| {
+                    by_name
+                        .get(name.as_str())
+                        .and_then(|slot| slot.as_ref())
+                        .and_then(|key| by_path.get(*key))
+                });
+                *shard = hit.map(|&(tensors, params)| ShardTensors {
+                    tensors,
+                    params,
+                    params_share: share(params, total),
+                });
+            }
+        }
+    }
+}
+
+/// `params / total` as a fraction, `0.0` for an empty checkpoint.
+#[allow(clippy::cast_precision_loss)] // a display ratio; f64 covers any real param count
+fn share(params: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        params as f64 / total as f64
     }
 }
 
@@ -263,6 +391,8 @@ fn build_dir(
                     path,
                     size,
                     kind,
+                    // Filled in by `attribute_tensors`, which needs the tensor list.
+                    shard: None,
                 });
             }
         }
@@ -307,11 +437,19 @@ pub struct FileRow {
 }
 
 /// A flattened row is either a directory (with its fold state + child count) or a
-/// file (with its content kind) — the two carry disjoint data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// file (with its content kind and, for a shard, what it contributes) — the two
+/// carry disjoint data.
+// No `Eq`: `ShardTensors` holds a display ratio, and a float has no total equality.
+#[derive(Debug, Clone, PartialEq)]
 pub enum FileRowKind {
-    Dir { expanded: bool, files: usize },
-    File { kind: FileKind },
+    Dir {
+        expanded: bool,
+        files: usize,
+    },
+    File {
+        kind: FileKind,
+        shard: Option<ShardTensors>,
+    },
 }
 
 impl FileRow {
@@ -337,7 +475,7 @@ impl FileRow {
     #[must_use]
     pub fn file_kind(&self) -> Option<FileKind> {
         match self.kind {
-            FileRowKind::File { kind } => Some(kind),
+            FileRowKind::File { kind, .. } => Some(kind),
             FileRowKind::Dir { .. } => None,
         }
     }
@@ -383,12 +521,16 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
             path,
             size,
             kind,
+            shard,
         } => out.push(FileRow {
             depth,
             name: name.clone(),
             path: path.clone(),
             size: *size,
-            kind: FileRowKind::File { kind: *kind },
+            kind: FileRowKind::File {
+                kind: *kind,
+                shard: *shard,
+            },
         }),
     }
 }
@@ -613,6 +755,124 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A tensor of `elements` parameters read from `source_path`.
+    fn tensor(name: &str, source_path: &str, elements: usize) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            dtype: "F16".to_string(),
+            shape: vec![elements],
+            size_bytes: elements * 2,
+            num_elements: elements,
+            storage: crate::tree::Storage::Raw,
+            source_path: source_path.to_string(),
+            layout: crate::tree::Layout::None,
+        }
+    }
+
+    /// A two-shard checkpoint plus a sidecar, as `build_from` would produce it.
+    fn two_shard_tree() -> FileNode {
+        let list = |dir: &Path| -> Vec<DirEntry> {
+            if dir == Path::new("/ckpt") {
+                vec![
+                    DirEntry::File {
+                        name: "model-00001.safetensors".into(),
+                        size: 600,
+                    },
+                    DirEntry::File {
+                        name: "model-00002.safetensors".into(),
+                        size: 400,
+                    },
+                    DirEntry::File {
+                        name: "config.json".into(),
+                        size: 2,
+                    },
+                ]
+            } else {
+                Vec::new()
+            }
+        };
+        build_from(&list, Path::new("/ckpt"), 8)
+    }
+
+    /// The annotated files of a tree, by name.
+    fn shards_of(root: &FileNode) -> HashMap<String, Option<ShardTensors>> {
+        flatten(root)
+            .into_iter()
+            .filter_map(|r| match r.kind {
+                FileRowKind::File { shard, .. } => Some((r.name, shard)),
+                FileRowKind::Dir { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn attribute_tensors_counts_per_shard_and_shares_the_params() {
+        let mut root = two_shard_tree();
+        root.attribute_tensors(&[
+            tensor("a", "/ckpt/model-00001.safetensors", 200),
+            tensor("b", "/ckpt/model-00001.safetensors", 100),
+            tensor("c", "/ckpt/model-00002.safetensors", 100),
+        ]);
+
+        let shards = shards_of(&root);
+        let first = shards["model-00001.safetensors"].expect("first shard attributed");
+        assert_eq!((first.tensors, first.params), (2, 300));
+        // 300 of 400 params — and 0.75 is exactly representable, so compare it exactly.
+        assert!(
+            (first.params_share - 0.75).abs() < f64::EPSILON,
+            "{first:?}"
+        );
+        let second = shards["model-00002.safetensors"].expect("second shard attributed");
+        assert_eq!((second.tensors, second.params), (1, 100));
+        // A file the model reads nothing from stays unannotated — not "0 tensors".
+        assert!(shards["config.json"].is_none(), "{shards:?}");
+    }
+
+    #[test]
+    fn attribute_tensors_falls_back_to_an_unambiguous_file_name() {
+        // The tensor list is rooted somewhere else than the browsed tree — a Hub
+        // snapshot's symlink into the blob store, or a remote listing vs the proxy's
+        // own paths. A name only one source file carries still attributes.
+        let mut root = two_shard_tree();
+        root.attribute_tensors(&[
+            tensor("a", "/blobs/deadbeef/model-00001.safetensors", 10),
+            tensor("b", "/blobs/cafe/model-00002.safetensors", 10),
+        ]);
+        let shards = shards_of(&root);
+        assert_eq!(
+            shards["model-00001.safetensors"].map(|s| s.tensors),
+            Some(1)
+        );
+        assert_eq!(
+            shards["model-00002.safetensors"].map(|s| s.tensors),
+            Some(1)
+        );
+
+        // Ambiguous names don't guess: two source files called the same thing leave
+        // the row unannotated rather than crediting it with one of them.
+        let mut root = two_shard_tree();
+        root.attribute_tensors(&[
+            tensor("a", "/x/model-00001.safetensors", 10),
+            tensor("b", "/y/model-00001.safetensors", 10),
+        ]);
+        assert!(
+            shards_of(&root)["model-00001.safetensors"].is_none(),
+            "an ambiguous name is not attributed"
+        );
+    }
+
+    #[test]
+    fn attribute_tensors_survives_an_empty_checkpoint() {
+        let mut root = two_shard_tree();
+        root.attribute_tensors(&[]);
+        assert!(shards_of(&root).values().all(Option::is_none));
+        // A zero-parameter tensor list divides by no total.
+        root.attribute_tensors(&[tensor("a", "/ckpt/model-00001.safetensors", 0)]);
+        let first = shards_of(&root)["model-00001.safetensors"].expect("attributed");
+        assert_eq!((first.tensors, first.params), (1, 0));
+        assert!(first.params_share.abs() < f64::EPSILON);
     }
 
     #[test]

@@ -3391,6 +3391,16 @@ impl Explorer {
     /// one [`crate::filetree::FileNode`] either way. Returns a readable error
     /// string (shown as a popup) when a remote listing fails.
     fn build_browse_tree(&self) -> std::result::Result<crate::filetree::FileNode, String> {
+        let mut tree = self.build_browse_listing()?;
+        // Say what each shard contributes, so sixteen same-sized shards are
+        // distinguishable (see `filetree::ShardTensors`). A browse root that isn't the
+        // open checkpoint simply matches nothing.
+        tree.attribute_tensors(self.tensors());
+        Ok(tree)
+    }
+
+    /// The directory listing behind [`Self::build_browse_tree`], before annotation.
+    fn build_browse_listing(&self) -> std::result::Result<crate::filetree::FileNode, String> {
         match self.remote_browse() {
             // Local: assemble the browser from the cached directory walk in the
             // model (no `readdir`/`stat` on `Tab`). Falls back to a fresh walk only

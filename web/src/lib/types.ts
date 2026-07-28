@@ -51,7 +51,24 @@ export type FileNode =
       files: number;
       children: FileNode[];
     }
-  | { kind: 'file'; name: string; path: string; size: number; file_kind: string };
+  | {
+      kind: 'file';
+      name: string;
+      path: string;
+      size: number;
+      file_kind: string;
+      /** What the model reads out of this file; null for anything that isn't a shard. */
+      shard: ShardTensors | null;
+    };
+
+/** A shard's contribution to the model (`filetree::ShardTensors`). */
+export interface ShardTensors {
+  tensors: number;
+  params: number;
+  /** Fraction of the checkpoint's parameters, 0–1. Served rather than divided here, so
+   * the browser and the terminal cannot disagree about it. */
+  params_share: number;
+}
 
 export interface StatsDto {
   count: number;

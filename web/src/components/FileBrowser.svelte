@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { api } from '../lib/api';
   import type { FileNode } from '../lib/types';
-  import { humanSize } from '../lib/format';
+  import { humanSize, shardNote } from '../lib/format';
   import { openFile } from '../stores/view';
   import { flattenFiles, toggleDir } from '../lib/filerows';
 
@@ -21,6 +21,14 @@
 
   // Both arguments are named here so the compiler sees the fold set as a dependency.
   $: rows = flattenFiles(root, expanded);
+
+  /** What the model reads out of this shard: sixteen equal-sized shards are otherwise
+      sixteen indistinguishable rows. Empty for a sidecar, and for a listing nobody
+      attributed (a remote browse root that isn't the open checkpoint). Narrowed here
+      rather than in the markup, where the compiler's narrowing doesn't reach. */
+  function shardSuffix(node: FileNode): string {
+    return node.kind === 'file' && node.shard ? ` · ${shardNote(node.shard)}` : '';
+  }
 
   function activate(node: FileNode) {
     if (node.kind === 'dir') {
@@ -56,7 +64,7 @@
         <span class="name">{node.name}</span>
         <span class="meta dim">
           {#if node.kind === 'dir'}{node.files} files · {humanSize(node.size)}
-          {:else}{node.file_kind} · {humanSize(node.size)}{/if}
+          {:else}{node.file_kind} · {humanSize(node.size)}{shardSuffix(node)}{/if}
         </span>
       </div>
     {/each}

@@ -241,7 +241,7 @@ fn file_row_line(row: &crate::filetree::FileRow, selected: bool) -> Line<'static
                 ),
             ));
         }
-        FileRowKind::File { kind } => {
+        FileRowKind::File { kind, shard } => {
             // A checkpoint gets the tensor glyph (it opens into the tree) and the
             // amber dtype accent; JSON/text/other stay quiet, so the openable ones
             // stand out.
@@ -259,6 +259,16 @@ fn file_row_line(row: &crate::filetree::FileRow, selected: bool) -> Line<'static
                 palette::DIM,
                 format!("  {}", format_size(row.size as usize)),
             ));
+            // What the model reads out of this shard: sixteen equal-sized shards are
+            // otherwise sixteen indistinguishable rows. The wording is core's, shared
+            // with the browser's row through `shared/parity/format.json`.
+            if let Some(sh) = shard {
+                s.push(tree_span(
+                    selected,
+                    palette::DIM,
+                    format!(" · {}", sh.note()),
+                ));
+            }
         }
     }
     Line::from(s)
@@ -290,6 +300,7 @@ mod tests {
                 size: 90,
                 kind: FileRowKind::File {
                     kind: FileKind::Checkpoint,
+                    shard: None,
                 },
             },
             FileRow {
@@ -299,6 +310,7 @@ mod tests {
                 size: 10,
                 kind: FileRowKind::File {
                     kind: FileKind::Json,
+                    shard: None,
                 },
             },
         ];
@@ -318,5 +330,59 @@ mod tests {
         );
         // Footer advertises the Tab toggle back to the tensor tree.
         assert!(out.contains("tensor tree"), "footer hint:\n{out}");
+    }
+
+    #[test]
+    fn a_shard_row_says_what_it_holds() {
+        use crate::filetree::{FileKind, FileRow, FileRowKind, ShardTensors};
+        let row = |name: &str, shard: Option<ShardTensors>| FileRow {
+            depth: 0,
+            name: name.into(),
+            path: format!("/ckpt/{name}").into(),
+            size: 3_900_000_000,
+            kind: FileRowKind::File {
+                kind: FileKind::Checkpoint,
+                shard,
+            },
+        };
+        let rows = vec![
+            row(
+                "model-00001-of-00016.safetensors",
+                Some(ShardTensors {
+                    tensors: 1062,
+                    params: 641,
+                    params_share: 0.0641,
+                }),
+            ),
+            row(
+                "codebooks.safetensors",
+                Some(ShardTensors {
+                    tensors: 1,
+                    params: 1,
+                    params_share: 0.0001,
+                }),
+            ),
+            // Unattributed (a shard of some other checkpoint, or an unmatched tree):
+            // the row keeps its old shape rather than claiming zero tensors.
+            row("stranger.safetensors", None),
+        ];
+        let badges = status_badges(AccessBadge::ReadOnly, None, false);
+        let out = crate::tui::headless_render(110, 12, |f| {
+            UI::render_files(f, "/ckpt", &rows, 0, 0, None, true, &badges, None);
+        })
+        .unwrap();
+        assert!(
+            out.contains("1062 tensors · 6.4% of params"),
+            "shard:\n{out}"
+        );
+        // Singular, and a share too small for one decimal — scientific, not "0.0%".
+        assert!(
+            out.contains("1 tensor · 1.0e-2% of params"),
+            "codebooks:\n{out}"
+        );
+        assert!(
+            !out.contains("0 tensors"),
+            "an unattributed row claims nothing:\n{out}"
+        );
     }
 }

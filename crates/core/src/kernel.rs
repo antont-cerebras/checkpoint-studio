@@ -955,6 +955,7 @@ mod tests {
                 size: 20,
                 kind: crate::filetree::FileRowKind::File {
                     kind: crate::filetree::FileKind::Json,
+                    shard: None,
                 },
             }],
             ..Default::default()
