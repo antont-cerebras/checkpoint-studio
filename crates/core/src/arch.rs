@@ -33,6 +33,12 @@ pub struct Fact {
     pub value: String,
     /// The tensor evidence it came from, so a reader can check it rather than trust it.
     pub from: String,
+    /// A keyboard shortcut this fact points at, when one is relevant — carried as data, not
+    /// spelled into `from`, so each frontend renders it in its own idiom (the terminal as a
+    /// key chip like every other hint, the browser however it shows keys). Prose containing
+    /// `` `k` `` looked like markdown and rendered literally in both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 impl Fact {
@@ -40,7 +46,14 @@ impl Fact {
         Self {
             value: value.into(),
             from: from.into(),
+            key: None,
         }
+    }
+
+    /// The shortcut this fact points at.
+    fn with_key(mut self, key: &str) -> Self {
+        self.key = Some(key.to_string());
+        self
     }
 }
 
@@ -173,6 +186,26 @@ pub fn infer(tensors: &[TensorInfo], packed_bits: Option<u32>) -> Architecture {
                 crate::utils::format_parameters(logical as usize),
                 format!("packed weights hold more than one value per stored element — {assumed}"),
             ),
+        );
+    }
+
+    // ---- how much of the checkpoint is repetition ------------------------------------
+    // The question "what does 31.3K tensors in 19 families mean?" belongs where there is
+    // room to answer it, so the number carries its explanation here rather than only in the
+    // compact view's header.
+    let families = crate::compact::compact_tree(tensors).counts.len();
+    if families > 0 && families < tensors.len() {
+        a.push(
+            "Tensor families",
+            Fact::new(
+                format!(
+                    "{families} kinds across {} tensors",
+                    crate::utils::format_parameters(tensors.len())
+                ),
+                "tensors whose names differ only by an index — a layer or expert number — \
+                 are one kind repeated; the compact view shows each as a single row",
+            )
+            .with_key("k"),
         );
     }
 
@@ -607,6 +640,42 @@ mod tests {
             comp.from.contains("not in the tensors"),
             "it admits it cannot name them: {}",
             comp.from
+        );
+    }
+
+    /// The families fact answers "what does N tensors in M families mean" in place, and only
+    /// appears when folding actually saves something — for a checkpoint where every tensor is
+    /// its own kind, "7 kinds across 7 tensors" is noise.
+    #[test]
+    fn the_family_count_explains_itself_and_is_omitted_when_useless() {
+        let mut tensors = Vec::new();
+        for l in 0..4 {
+            tensors.push(t(&format!("model.layers.{l}.mlp.w"), "BF16", &[4, 4]));
+        }
+        let a = infer(&tensors, None);
+        let fact = a.get("Tensor families").expect("a families fact");
+        assert!(fact.value.contains("across"), "{}", fact.value);
+        assert!(
+            fact.from.contains("differ only by an index"),
+            "it should say what a family IS: {}",
+            fact.from
+        );
+        assert_eq!(
+            fact.key.as_deref(),
+            Some("k"),
+            "the shortcut is data, so each frontend can style it as a key"
+        );
+        assert!(
+            !fact.from.contains('`'),
+            "no markdown in prose that renders literally: {}",
+            fact.from
+        );
+
+        // Nothing folds here, so the row would say "1 kinds across 1 tensors".
+        let single = infer(&[t("lone.weight", "BF16", &[2])], None);
+        assert!(
+            single.get("Tensor families").is_none(),
+            "no repetition, nothing worth reporting"
         );
     }
 

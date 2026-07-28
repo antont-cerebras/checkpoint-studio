@@ -13,7 +13,7 @@ use super::UI;
 use super::hints::{chip_regions, close_button, stats_hint_lines};
 use super::palette;
 use super::scroll::VScrollbar;
-use super::theme::dim_span;
+use super::theme::{dim_span, key_span};
 
 impl UI {
     /// The overall-checkpoint stats popup (the `s` key on the tree). Returns the
@@ -442,6 +442,42 @@ impl UI {
                             )),
                         ]));
                     }
+                }
+            }
+        }
+
+        // ── Inferred architecture (last, because it is supplementary) ─────────
+        // Each fact carries an evidence line, so this block is twice as tall as its row
+        // count. At the top of the report it pushed the tensor and layer sections off the
+        // first screen — the stats snapshots caught that by losing rows, which is exactly
+        // what a fixed-viewport snapshot is good for.
+        // Derived from the tensors alone (`crate::arch`), so it works for a checkpoint with
+        // no model card — and disagrees when a card is stale. Each row is followed by the
+        // evidence it came from, dimmed, because a derived number the reader can't check is
+        // just an assertion.
+        if !s.arch.facts.is_empty() {
+            lines.push(Line::from(sty(String::new(), Style::default())));
+            lines.push(header("Inferred from tensors"));
+            for (label, fact) in &s.arch.facts {
+                lines.push(row(label, vec![plain(fact.value.clone())]));
+                // The evidence, and any shortcut it points at rendered as a key chip — the
+                // same `key_span` every footer hint uses, so it looks like a key rather than
+                // like punctuation in a sentence.
+                let mut evidence = vec![dim(format!("      ← {}", fact.from))];
+                if let Some(k) = &fact.key {
+                    evidence.push(dim(" — press ".to_string()));
+                    evidence.push(key_span(k));
+                }
+                lines.push(Line::from(evidence));
+            }
+            // What a model card lists that the tensors cannot supply — named, so the
+            // absence reads as a limit rather than an oversight.
+            if !s.arch.not_in_tensors.is_empty() {
+                lines.push(Line::from(dim(
+                    "    not in the tensors (config-only):".to_string()
+                )));
+                for (label, why) in &s.arch.not_in_tensors {
+                    lines.push(Line::from(dim(format!("      {label} — {why}"))));
                 }
             }
         }

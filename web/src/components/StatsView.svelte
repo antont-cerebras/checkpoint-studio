@@ -54,6 +54,14 @@
       object_detail: Record<string, string>;
       warnings: string[];
     };
+    /** The architecture inferred from the tensors alone, each fact with the evidence it
+     * came from, plus the summary rows tensors cannot supply. Same data the terminal's
+     * stats screen shows — it rides on `/api/stats` so there is no second fetch and no
+     * chance of the two surfaces disagreeing. */
+    arch?: {
+      facts: [string, { value: string; from: string; key?: string }][];
+      not_in_tensors: [string, string][];
+    };
   }
 
   let s: Stats | null = null;
@@ -94,6 +102,34 @@
       {#if s.layers}<div class="card"><span class="k">Layers</span><span class="v">{s.layers.count}</span></div>{/if}
       {#if s.model_type}<div class="card"><span class="k">Model</span><span class="v small">{s.model_type}</span></div>{/if}
     </div>
+
+    {#if s.arch?.facts.length}
+      <section>
+        <h3>Inferred from tensors</h3>
+        <p class="note">
+          Derived from the tensor names, shapes and dtypes — not from a model card, so it
+          works for a checkpoint that has none and disagrees when one is stale.
+        </p>
+        <dl class="arch">
+          {#each s.arch.facts as [label, fact] (label)}
+            <dt>{label}</dt>
+            <dd>
+              <span class="v">{fact.value}</span>
+              <span class="from">← {fact.from}</span>
+              {#if fact.key}<kbd>{fact.key}</kbd>{/if}
+            </dd>
+          {/each}
+        </dl>
+        {#if s.arch.not_in_tensors.length}
+          <p class="note">Not in the tensors (a model card reads these from the config):</p>
+          <ul class="gaps">
+            {#each s.arch.not_in_tensors as [label, why] (label)}
+              <li><strong>{label}</strong> — {why}</li>
+            {/each}
+          </ul>
+        {/if}
+      </section>
+    {/if}
 
     <section>
       <h3>Data types</h3>
@@ -217,6 +253,54 @@
 </div>
 
 <style>
+  /* One row per inferred fact, with its evidence under it — a derived number the reader
+     cannot check is only an assertion. */
+  .arch {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 2px 12px;
+    margin: 6px 0 0;
+    font-size: 12.5px;
+  }
+  .arch dt {
+    color: var(--fg-dim);
+  }
+  .arch dd {
+    margin: 0;
+  }
+  /* Smaller than the label: several of these values are long sentences ("packed weights
+     with codebook, qscale, weight_packed"), and at label size they read as headings rather
+     than as data. The weight, not the size, is what marks them as the answer. */
+  .arch .v {
+    font-size: 11.5px;
+    font-weight: 600;
+  }
+  .arch .from {
+    margin-left: 8px;
+    color: var(--fg-dim);
+  }
+  /* A shortcut the fact points at, styled as a key rather than written into the prose —
+     the evidence text used to say `` `k` ``, which rendered the backticks literally. */
+  .arch kbd {
+    margin-left: 6px;
+    padding: 0 4px;
+    font: inherit;
+    font-size: 11px;
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+  }
+  .note {
+    margin: 4px 0 0;
+    font-size: 12px;
+    color: var(--fg-dim);
+  }
+  .gaps {
+    margin: 4px 0 0;
+    padding-left: 18px;
+    font-size: 12px;
+    color: var(--fg-dim);
+  }
   .stats {
     height: 100%;
     overflow: auto;

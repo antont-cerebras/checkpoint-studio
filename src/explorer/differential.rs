@@ -928,3 +928,50 @@ fn the_compact_view_round_trips_through_the_reopen_command() {
         "the reopen command should carry the fold: {folded}"
     );
 }
+
+/// **The inferred architecture** must be the same facts in all three surfaces. It rides on
+/// `CheckpointStats`, so `/api/stats` and the terminal's stats screen read one computation —
+/// this pins that, and that the terminal actually *renders* it rather than merely holding it.
+#[test]
+fn the_inferred_architecture_agrees_across_the_surfaces() {
+    let s = web();
+    let served = body(handlers::stats(&s));
+    let facts = served["arch"]["facts"]
+        .as_array()
+        .expect("the served stats carry the inferred architecture");
+    assert!(!facts.is_empty(), "the fixture should yield some facts");
+
+    // The same computation the core did, so the endpoint is not projecting its own.
+    let computed = crate::arch::infer(&s.tensors, None);
+    assert_eq!(
+        facts.len(),
+        computed.facts.len(),
+        "the served facts are not the computed ones"
+    );
+
+    // And the terminal's stats screen shows each value, with its evidence line.
+    let rendered = crate::tui::headless_render(160, 80, |f| {
+        UI::render_stats_frame(f, &s.stats, 0, false);
+    })
+    .expect("the stats screen renders headless");
+    assert!(
+        rendered.contains("Inferred from tensors"),
+        "the section should be on screen:\n{rendered}"
+    );
+    for (label, fact) in &computed.facts {
+        assert!(
+            rendered.contains(label),
+            "'{label}' is inferred but not shown in the terminal:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&fact.value),
+            "'{label}' shows no value in the terminal (expected '{}'):\n{rendered}",
+            fact.value
+        );
+    }
+    // The gaps are named, not silently omitted.
+    assert!(
+        rendered.contains("not in the tensors"),
+        "the config-only rows should be admitted on screen:\n{rendered}"
+    );
+}

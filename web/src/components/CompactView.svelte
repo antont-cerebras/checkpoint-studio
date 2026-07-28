@@ -56,7 +56,9 @@
     <p class="dim">folding…</p>
   {:else if data}
     <div class="hdr">
-      <span>
+      <span
+        title="A family is a set of tensors whose names differ only by an index — a layer or expert number — and which are structurally alike. One row here can stand for thousands of real tensors, so this says how much of the checkpoint is repetition. The Stats screen carries the same figure with its explanation."
+      >
         {humanCount(data.tensor_count)} tensors in <strong>{familyCount}</strong>
         {familyCount === 1 ? 'family' : 'families'}
       </span>

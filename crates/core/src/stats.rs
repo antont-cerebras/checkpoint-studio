@@ -578,6 +578,10 @@ pub struct CheckpointStats {
     pub experts: Option<ExpertStats>,
     /// `config.json`'s `model_type`, when a config was found.
     pub model_type: Option<String>,
+    /// The architecture inferred from the tensors alone — layer and expert counts, the
+    /// vocabulary, quantization, and the stored-vs-logical parameter split, each with its
+    /// evidence. See [`crate::arch`], including what it deliberately will not guess.
+    pub arch: crate::arch::Architecture,
     /// The checkpoint's storage footprint — a local/SFTP filesystem measurement or
     /// the s3:// object listing, but **never both** (an s3 source has no local
     /// filesystem). One tagged optional instead of two mutually-exclusive
@@ -696,6 +700,11 @@ impl CheckpointStats {
             experts: expert_stats(tensors, config),
             model_type: config.and_then(|c| c.model_type.clone()),
             footprint: disk.map(StorageFootprint::Disk),
+            // The architecture inferred from the same tensors. It lives here rather than
+            // behind its own report because it *is* checkpoint statistics — and because
+            // that means the TUI's stats screen and `/api/stats` both get it without a
+            // signature change or a second fetch.
+            arch: crate::arch::infer(tensors, None),
         }
     }
 
