@@ -746,6 +746,11 @@ fn is_safetensors_dtype(dtype: &str) -> bool {
 /// Only applies to safetensors; the per-shard `header_len` is 0 for other formats and
 /// for a remote read (whose listing doesn't keep it), which reads as "not known" and is
 /// skipped rather than reported as misaligned.
+///
+/// A remote read merges its shards as it goes and keeps no individual headers, so over
+/// `--ssh-proxy` only the index-based invariants above can run. That is a fact about the
+/// read, not about the checkpoint, so the note says which parts applied instead of a bare
+/// pass implying all of them did.
 fn check_headers(
     tensors: &[TensorInfo],
     metadata: &[MetadataInfo],
@@ -755,6 +760,10 @@ fn check_headers(
     const TITLE: &str = "Header consistency";
     const NOTE: &str =
         "every header read, data 8-byte aligned, no tensor in two shards, index total right";
+    /// What can be said when the per-shard headers weren't kept — a remote read.
+    const INDEX_ONLY_NOTE: &str = "every header read, index total right (no per-shard \
+                                   headers from a remote read: alignment and repeated \
+                                   keys not checked)";
 
     // A file the read couldn't parse at all. First, because it's the loudest thing the
     // header check can say: the tensors it would have contributed are missing from
@@ -946,7 +955,14 @@ fn check_headers(
     }
 
     findings.sort_by(sort_key);
-    CheckResult::done(ID, TITLE, NOTE, findings)
+    // Say which invariants actually applied: a pass that silently covered half of them
+    // claims more than it checked.
+    let note = if safetensors.iter().all(|s| s.header_len == 0) && !headers.index.is_empty() {
+        INDEX_ONLY_NOTE
+    } else {
+        NOTE
+    };
+    CheckResult::done(ID, TITLE, note, findings)
 }
 
 /// safetensors byte-layout integrity: every tensor's byte span matches its

@@ -563,9 +563,47 @@ Press `Enter` to open the highlighted result's details (you stay in search), and
 
 Press `Tab` to swap the tensor tree for a **file browser** of the checkpoint's
 directory — the shards alongside their sidecars (`config.json`, tokenizer files,
-`README`, …), each with its size, directories folding with `←` / `→`. `Tab`
-again (or `Backspace`) returns to the tensor tree; launch straight into it with
-`--files`, or run `View: File browser` from the command palette.
+`README`, …), directories folding with `←` / `→`. `Tab` again (or `Backspace`)
+returns to the tensor tree; launch straight into it with `--files`, or run
+`View: File browser` from the command palette.
+
+Every row says what the file *is*, not just how big it is:
+
+```
+File browser - Qwen3-Coder-30B-A3B-lut-3bit
+────────────────────────────────────────────────────────────────────────────
+▾ Qwen3-Coder-30B-A3B-lut-3bit/         57.6 GiB  29 files · 26 hardlinked
+  · README.md                            5.3 KiB  ⧉ 2 names
+  ▦ codebooks.safetensors               42.2 MiB  96 tensors · 7.2e-2% of params · ✚ not in the index
+  ▦ model-00001-of-00016.safetensors     3.7 GiB ━━━━━━━━━━━━  1062 tensors · 6.5% of params · ⧉ 2 names
+  ▦ model-00016-of-00016.safetensors     1.0 GiB ━━━╌╌╌╌╌╌╌╌╌  152 tensors · 1.8% of params · ⧉ 2 names
+  ▦ qscales.safetensors                676.5 MiB ━━╌╌╌╌╌╌╌╌╌╌  12288 tensors · 1.1% of params · ✚ not in the index
+```
+
+- **sizes are a column**, right-aligned, so a listing reads down instead of
+  trailing each name wherever it happens to end.
+- the **bar** is each file against the *largest file here* — not against the
+  directory total, which for a 57 GiB checkpoint would draw twenty identical
+  slivers. Against the biggest, the shards fill it and the sidecars are visibly
+  nothing, which is the true shape of a checkpoint. (Colour carries filled-vs-empty,
+  so `--plain` shows the aligned column without the bar rather than the same twelve
+  cells on every row.)
+- **`N tensors · X% of params`** — what the model reads out of this file. Sixteen
+  equal-sized shards are otherwise sixteen identical rows; the parameter share is
+  what finds the odd file out, since a codebook or scale file is large on disk and
+  tiny in parameters. Every shard's header is already parsed at open, so this costs
+  nothing.
+- **`✚ not in the index`** — a checkpoint file `model.safetensors.index.json`
+  doesn't name. Not an error, and often expected (a LUT-quantized checkpoint ships
+  codebooks and scales the index never mentions), but a loader that follows only the
+  index will not read it. Same mark and colour the tensor tree uses for an extra
+  tensor.
+- **`⧉ N names`** — the file is hardlinked, so its bytes are shared: deleting this
+  name frees nothing, and the sizes down the column add up to more than the
+  checkpoint occupies. The directory row totals them (`29 files · 26 hardlinked`),
+  which is the question a 57 GiB listing actually raises. A count, not a byte total:
+  shared bytes aren't free, someone pays for them once.
+- **`✗ unreadable`** — this file's header wouldn't parse; see below.
 
 `Enter` acts on the selected entry:
 
@@ -590,9 +628,27 @@ again (or `Backspace`) returns to the tensor tree; launch straight into it with
   `<style>` blocks don't survive, and links open in a new tab with `noopener`.
 - anything else shows a short info pop-up (no preview).
 
+`t` on a shard **narrows the tensor tree to that file's tensors** and goes there.
+It is expressed as the filter query `shard:<name>`, which is the same state
+`--filter` sets — so the title shows the query and the match count, the filter bar
+can edit or clear it, and `y` reproduces it. Coming back the other way, entering
+the browser lands on the file the tree's **selected tensor** lives in, so the two
+views answer each other's questions.
+
 The file view has the same command palette (`Space` / `:`), `l` legend, `c` /
 `f` / `y` copies (screen / file path / command), and `y` round-trips through
 `--files`, like the tree.
+
+<a id="a-shard-that-wont-read"></a>
+
+**A shard that won't read doesn't sink the checkpoint.** A truncated download or
+an interrupted conversion leaves fifteen good shards and one bad one, and showing
+the fifteen with the sixteenth named beats showing nothing: the readable shards
+load, the tree holds their tensors, the bad file's row reads `✗ unreadable`, and
+the [`check` report](#checking-checkpoints-check) names it with the parse error and
+fails. This holds for a local directory, an `--ssh-proxy` one, and a Hub repo.
+When *nothing* reads, the error is the answer — there is no checkpoint to show, and
+"0 tensors" tells you less than why.
 
 **Remote checkpoints too** (`--ssh-proxy`) — the browser adapts to the source,
 reading only metadata (no tensor data leaves the host):
@@ -619,7 +675,8 @@ safetensors file is built:
 
 ```
 Layout - model-00001.safetensors
-2.3 GiB · 291 tensors · header 42.0 KiB · 3 metadata
+2.3 GiB · 291 tensors · header 42.0 KiB · 3 metadata · 2 gaps 8.0 KiB
+BF16 1.8 GiB · F16 480.0 MiB · U8 24.0 MiB
 ────────────────────────────────────────────────────────────
 0x00000000000a ┬ █  header (8 B length + JSON metadata)  42.0 KiB
                │ █  † format  pt
@@ -635,12 +692,25 @@ data laid out back-to-back. The map shows one band per region in file order —
 the header first, then every tensor by offset — each band's **height
 proportional to its share of the file** and its block shaded by size, with the
 absolute byte offset on the left. The header band lists the file's
-`__metadata__` entries tree-like. Move the selection with `↑↓` / `PgUp`/`PgDn`
-(or click a band); `Enter` on the header previews the raw JSON (with its 8-byte
-length; `c` copies it), or on a tensor jumps to its place in the tree; `l`
-explains the glyphs; `y` copies the reopen command including the selected tensor
-(`--layout … --layout-select <name>`); `Backspace` (or `Tab`) returns to the
-browser (and back again lands on the same segment).
+`__metadata__` entries tree-like.
+
+**Bands are coloured by dtype family** — one colour per family rather than per
+dtype name, because "is this shard half-precision weights or 8-bit quantized" is a
+question about the family, and a dozen-entry palette stops being readable. Half
+precision keeps the app's own amber, since that is what most published weights
+are. The header line carries the **per-file dtype tally** with byte totals, so you
+can see the file's composition without reading 291 rows, and any **unaccounted
+gaps** (alignment padding) as a count and a total. `l` opens the legend, which
+lists each family in its own colour with its share of the file.
+
+Move the selection with `↑↓` / `PgUp`/`PgDn` (or click a band). `Enter` on the
+header previews the raw JSON (with its 8-byte length; `c` copies it); on a tensor
+it opens that tensor's **detail screen** — dtype, shape, values, statistics — which
+is what `Enter` does on a tree row and what clicking a band does in the web UI.
+Finding the tensor among its *siblings* is the other question a band raises, and
+its underlined name still links to the tree for that. `y` copies the reopen command
+including the selected tensor (`--layout … --layout-select <name>`); `Backspace`
+(or `Tab`) returns to the browser (and back again lands on the same segment).
 
 **Clickable names, everywhere.** Names are links across the app: a concrete
 **tensor name** (underlined) jumps to it in the tree — the tensor bands here, and
@@ -1181,6 +1251,37 @@ The **structural** checks read only headers, so they're cheap and work over
   their dtype/shape, packed contiguously from offset 0 with no gaps or overlaps,
   and the file is neither **truncated** (a classic interrupted download) nor
   padded with trailing data.
+- **Header consistency** — the invariants a safetensors *header* carries beyond
+  its byte spans:
+  - the **data blob starts on an 8-byte boundary**. The reference serializer pads
+    the JSON header with spaces to make it so. Nothing breaks without it, which is
+    why it goes unnoticed — but a zero-copy reader that maps the blob into aligned
+    types has to fall back to copying, and some refuse outright.
+  - the index's **`total_size` matches the tensors it lists**. It is written once
+    by whatever produced the checkpoint and not recomputed when a shard is
+    re-quantized, so a stale value is common and a loader that pre-allocates from
+    it gets it wrong. Only the weight map's own tensors count — a quantized
+    checkpoint's codebooks and scales aren't in the index and aren't in its total.
+  - **no tensor is claimed by two shards** — which value loads then depends on read
+    order. Caught from the per-shard headers, because everything downstream reads a
+    tensor list that is deduplicated by name.
+  - **no name declared twice in one header**. Parsing keeps the last of two
+    identical JSON keys, so the first declaration — its dtype, shape and byte span
+    — is discarded silently. Seen by re-reading the header text, so it needs the
+    file within reach (a local checkpoint; a Hub or `--ssh-proxy` one reports the
+    rest of this check and skips this part).
+  - the **shards agree about `__metadata__`** (one `format` per checkpoint; two
+    answers means mixed provenance), and its values are **strings**, as the format
+    defines.
+  - **every header actually read** — see [partial reads](#a-shard-that-wont-read)
+    below; the file that was skipped is named here, because its tensors are absent
+    from everything else.
+
+  Over `--ssh-proxy` the index-based parts run (the `total_size` claim, which found a
+  real 9.5 MiB overstatement in a production 1.0T checkpoint) and the ones needing the
+  **per-shard headers** — alignment, repeated keys, two shards claiming one tensor,
+  metadata agreement — do not: a remote read merges the shards as it goes and doesn't
+  keep their individual headers. The row says so rather than passing silently.
 - **HDF5 integrity** — the `.hdf5` equivalent (HDF5 stores chunked, filtered
   datasets rather than a flat blob): each dataset's chunk shape matches its
   tensor rank, the stored chunk count doesn't exceed the chunk grid, and its
@@ -1190,11 +1291,15 @@ The **structural** checks read only headers, so they're cheap and work over
   contiguous `0..=max`, and every layer carries the same set of sub-tensors
   (catches a dropped shard or a partial checkpoint).
 - **Shape / dtype sanity** — no duplicate tensor names, no zero-element tensors,
-  and a heads-up when a tensor's dtype is inconsistent *within its role* (a stray
-  F32 among a role's F16s — the signature of a partial cast). Tensors are grouped
-  by role (the name with layer/expert indices blanked), so a checkpoint's
-  legitimate mix of dtypes-by-role — weights BF16, quant scales F16, codebooks
-  F32 — is **not** flagged; only a within-role outlier is.
+  every dtype one the format actually defines, and a heads-up when a tensor's
+  dtype is inconsistent *within its role* (a stray F32 among a role's F16s — the
+  signature of a partial cast). Tensors are grouped by role (the name with
+  layer/expert indices blanked), so a checkpoint's legitimate mix of
+  dtypes-by-role — weights BF16, quant scales F16, codebooks F32 — is **not**
+  flagged; only a within-role outlier is. An undefined dtype (a typo, or a header
+  entry with no `dtype` at all) is named here rather than left to degrade quietly:
+  it classifies as "other" everywhere, the data views can't decode it, and the
+  byte-span check can't tell whether its span is right.
 - **Config consistency** — cross-checks `config.json` (read from beside the
   checkpoint, or fetched over `--ssh-proxy`) against the tensor tree: the
   **layer count** (`num_hidden_layers`), **experts per layer** (`num_experts`),

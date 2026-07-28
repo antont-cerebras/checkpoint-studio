@@ -43,6 +43,9 @@ pub struct ShardListing {
     /// The index's `weight_map` (tensor name -> shard file basename); empty without
     /// a usable index.
     pub weight_map: HashMap<String, String>,
+    /// The index's own `metadata.total_size`, when it declares one — free here, since
+    /// this pass already parses the whole index, and it is a claim `check` can test.
+    pub total_size: Option<u64>,
     /// The `.safetensors` file basenames actually present in the directory.
     pub actual: BTreeSet<String>,
 }
@@ -704,6 +707,7 @@ fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<ShardListing> {
             files: vec![path.to_string()],
             index_path: None,
             weight_map: HashMap::new(),
+            total_size: None,
             actual: BTreeSet::new(),
         });
     }
@@ -730,12 +734,17 @@ fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<ShardListing> {
     let mut indexed: Vec<String> = Vec::new();
     let mut weight_map: HashMap<String, String> = HashMap::new();
     let mut index_path = None;
+    let mut total_size = None;
     let index = format!("{base}/model.safetensors.index.json");
     if let Ok(bytes) = read_all(sftp, &index)
         && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
         && let Some(wm) = v.get("weight_map").and_then(|w| w.as_object())
     {
         index_path = Some(index);
+        total_size = v
+            .get("metadata")
+            .and_then(|m| m.get("total_size"))
+            .and_then(serde_json::Value::as_u64);
         for (tensor, file) in wm {
             if let Some(f) = file.as_str() {
                 weight_map.insert(tensor.clone(), f.to_string());
@@ -750,6 +759,7 @@ fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<ShardListing> {
         files: merge_shard_lists(&indexed, &on_disk, listed),
         index_path,
         weight_map,
+        total_size,
         actual,
     })
 }

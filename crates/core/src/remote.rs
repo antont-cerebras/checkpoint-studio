@@ -632,6 +632,7 @@ impl RemoteRead {
             files,
             index_path,
             weight_map,
+            total_size,
             actual,
         } = session.list_shards(path)?;
         if files.is_empty() {
@@ -738,9 +739,9 @@ impl RemoteRead {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
-                // The remote listing parses the weight map only, so the declared total
-                // is unknown here and the check reports n/a rather than guessing.
-                total_size: None,
+                // The same parse that produced the weight map — so the declared total is
+                // checkable over ssh exactly as it is locally.
+                total_size,
             })
             .into_iter()
             .collect::<Vec<_>>();
