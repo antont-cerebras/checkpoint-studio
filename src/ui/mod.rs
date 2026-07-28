@@ -380,6 +380,7 @@ mod small_terminal {
                     params: 3_000_000_000,
                     params_share: 0.0641,
                 }),
+                size_share: 1.0,
             },
         }];
         let badges = status_badges(AccessBadge::ReadOnly, None, false);

@@ -27,7 +27,13 @@
       attributed (a remote browse root that isn't the open checkpoint). Narrowed here
       rather than in the markup, where the compiler's narrowing doesn't reach. */
   function shardSuffix(node: FileNode): string {
-    return node.kind === 'file' && node.shard ? ` · ${shardNote(node.shard)}` : '';
+    return node.kind === 'file' && node.shard ? shardNote(node.shard) : '';
+  }
+
+  /** This file's share of the largest file, for the proportional bar; 0 for a
+      directory, whose aggregate isn't a size to compare against its children. */
+  function sizeShare(node: FileNode): number {
+    return node.kind === 'file' ? node.size_share : 0;
   }
 
   function activate(node: FileNode) {
@@ -60,11 +66,24 @@
         }}
       >
         <span class="caret">{node.kind === 'dir' ? (expanded.has(node.path) ? '▾' : '▸') : ''}</span>
-        <span class="icon">{node.kind === 'dir' ? '📁' : fileIcon(node.file_kind)}</span>
+        <span class="icon" title={node.kind === 'dir' ? 'Directory' : node.file_kind}
+          >{node.kind === 'dir' ? '📁' : fileIcon(node.file_kind)}</span
+        >
         <span class="name">{node.name}</span>
-        <span class="meta dim">
-          {#if node.kind === 'dir'}{node.files} files · {humanSize(node.size)}
-          {:else}{node.file_kind} · {humanSize(node.size)}{shardSuffix(node)}{/if}
+        <!-- The size and the bar are fixed-width columns, so they line up down the
+         listing however long the names are — only the name absorbs the slack. -->
+        <span class="size dim">{humanSize(node.size)}</span>
+        <!-- Files only: a directory's size is its children's total, so a rail beside
+         it would invite comparing it with them. The terminal leaves the column blank
+         for a directory too. -->
+        <span class="bar" class:rail={node.kind === 'file'} aria-hidden="true">
+          {#if sizeShare(node) > 0}
+            <i style="width:{(sizeShare(node) * 100).toFixed(2)}%"></i>
+          {/if}
+        </span>
+        <span class="note dim">
+          {#if node.kind === 'dir'}{node.files} {node.files === 1 ? 'file' : 'files'}
+          {:else}{shardSuffix(node)}{/if}
         </span>
       </div>
     {/each}
@@ -113,17 +132,45 @@
   .icon {
     flex: 0 0 auto;
   }
+  /* The name is the only elastic column, so everything after it lines up down the
+     listing — including across depths, since the row's indent eats into the name
+     rather than shifting the columns. Mirrors the TUI's shared size column. */
   .name {
-    flex: 0 1 auto;
+    flex: 1 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .row.dir .name {
     color: var(--group);
   }
-  .meta {
-    flex: 1 1 auto;
+  .size {
+    flex: 0 0 76px;
     text-align: right;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  /* Each file's size against the largest file in the tree (`size_share`, served so
+     both UIs draw the same bar). The empty rail stays visible on a small file: that
+     it has almost nothing filled in IS the reading. */
+  .bar {
+    flex: 0 0 84px;
+    height: 4px;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .bar.rail {
+    background: var(--border);
+  }
+  .bar i {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+  }
+  /* Fixed, though it's the last column: a note whose width varied would change how
+     much slack the name gets, and the columns before it would wander per row. */
+  .note {
+    flex: 0 0 32ch;
     font-size: 12px;
   }
   .err {

@@ -123,6 +123,17 @@ pub enum FileNode {
         /// tokenizer, a shard belonging to some *other* checkpoint in the same
         /// directory) and for a tree nobody attributed.
         shard: Option<ShardTensors>,
+        /// This file's size as a fraction of the **largest file in the tree**, for the
+        /// proportional bar beside the size — so a listing shows at a glance which
+        /// files carry the weight, without reading twenty numbers.
+        ///
+        /// Relative to the biggest file rather than to the directory total: shares of
+        /// a 57 GiB checkpoint are all a couple of percent, which draws twenty
+        /// identical slivers. Relative to the biggest, the shards fill the bar and the
+        /// sidecars are visibly nothing — which is the true shape of a checkpoint.
+        /// Computed by [`build_from`], so it is the same number in both frontends and
+        /// doesn't drift as the tree is folded.
+        size_share: f64,
     },
 }
 
@@ -267,7 +278,43 @@ pub fn build_from(
     if let FileNode::Dir { expanded, .. } = &mut node {
         *expanded = true;
     }
+    // Size shares are derivable from the tree alone, so they're part of building it —
+    // not a pass every one of the four producers has to remember to run.
+    set_size_shares(&mut node);
     node
+}
+
+/// Fill in every file's [`FileNode::File::size_share`], relative to the largest file.
+fn set_size_shares(node: &mut FileNode) {
+    let max = largest_file(node);
+    apply_size_shares(node, max);
+}
+
+fn largest_file(node: &FileNode) -> u64 {
+    match node {
+        FileNode::Dir { children, .. } => children.iter().map(largest_file).max().unwrap_or(0),
+        FileNode::File { size, .. } => *size,
+    }
+}
+
+#[allow(clippy::cast_precision_loss)] // a display ratio over file sizes
+fn apply_size_shares(node: &mut FileNode, max: u64) {
+    match node {
+        FileNode::Dir { children, .. } => {
+            for child in children {
+                apply_size_shares(child, max);
+            }
+        }
+        FileNode::File {
+            size, size_share, ..
+        } => {
+            *size_share = if max == 0 {
+                0.0
+            } else {
+                *size as f64 / max as f64
+            }
+        }
+    }
 }
 
 /// Build an **s3-native** browse tree from a flat object listing (prefix-relative
@@ -393,6 +440,8 @@ fn build_dir(
                     kind,
                     // Filled in by `attribute_tensors`, which needs the tensor list.
                     shard: None,
+                    // Filled in by `build_from`, which can see the whole tree.
+                    size_share: 0.0,
                 });
             }
         }
@@ -449,6 +498,8 @@ pub enum FileRowKind {
     File {
         kind: FileKind,
         shard: Option<ShardTensors>,
+        /// Fraction of the largest file's size — see [`FileNode::File::size_share`].
+        size_share: f64,
     },
 }
 
@@ -476,6 +527,16 @@ impl FileRow {
     pub fn file_kind(&self) -> Option<FileKind> {
         match self.kind {
             FileRowKind::File { kind, .. } => Some(kind),
+            FileRowKind::Dir { .. } => None,
+        }
+    }
+
+    /// This file's share of the largest file's size, or `None` for a directory —
+    /// whose aggregate is its children's total, not a size to compare against them.
+    #[must_use]
+    pub fn size_share(&self) -> Option<f64> {
+        match self.kind {
+            FileRowKind::File { size_share, .. } => Some(size_share),
             FileRowKind::Dir { .. } => None,
         }
     }
@@ -522,6 +583,7 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
             size,
             kind,
             shard,
+            size_share,
         } => out.push(FileRow {
             depth,
             name: name.clone(),
@@ -530,6 +592,7 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
             kind: FileRowKind::File {
                 kind: *kind,
                 shard: *shard,
+                size_share: *size_share,
             },
         }),
     }
