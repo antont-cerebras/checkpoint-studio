@@ -56,6 +56,18 @@ const SORT_KEYS: readonly string[] = ['name', 'size', 'params', 'dtype', 'rank']
 /** The screen-independent view state every hash carries, so any state is
  * reproducible from the URL regardless of which screen is open. */
 export interface Globals {
+  /**
+   * Which checkpoint the view is of.
+   *
+   * A URL that named a screen, a filter and a selection but not the *checkpoint* described a
+   * view of whatever happened to be loaded — so a link, a bookmark or a restored tab could
+   * land you on the same screen of a different checkpoint and look right. Carrying it makes
+   * the URL the whole answer, the way the terminal's `y` command emits a complete invocation.
+   *
+   * Empty before the first tree lands (there is nothing to name yet), and omitted from the
+   * hash then.
+   */
+  ckpt: string;
   filter: string;
   sortKey: SortKey;
   sortDir: 'asc' | 'desc';
@@ -154,6 +166,9 @@ export function parseScreen(hash: string): Screen {
  * plain view stays a plain URL. */
 export function globalQuery(g: Globals): string {
   const p = new URLSearchParams();
+  // First, so a shared link reads as "this checkpoint, this view" rather than burying which
+  // checkpoint behind the view parameters.
+  if (g.ckpt) p.set('ckpt', g.ckpt);
   const f = g.filter.trim();
   if (f) p.set('filter', f);
   if (g.sortKey !== 'none') p.set('sort', `${g.sortKey}.${g.sortDir}`);
@@ -169,6 +184,7 @@ export function parseGlobals(hash: string): Globals {
   const [k, d] = sort ? sort.split('.') : [];
   const qs = q.get('q');
   return {
+    ckpt: q.get('ckpt') ?? '',
     filter: q.get('filter') ?? '',
     sortKey: (SORT_KEYS.includes(k ?? '') ? k : 'none') as SortKey,
     sortDir: d === 'desc' ? 'desc' : 'asc',

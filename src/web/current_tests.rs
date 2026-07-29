@@ -35,7 +35,15 @@ fn serving(name: &str) -> Current {
         .expect("fixture resolves")
         .read(Want::Model, &crate::hf::ReadProgress::default())
         .expect("fixture reads");
-    Current::new(opened, None, Options::default(), LOOPBACK).expect("state builds")
+    // An in-memory recents list: these tests must not read or write the user's config directory.
+    Current::new(
+        opened,
+        None,
+        Options::default(),
+        LOOPBACK,
+        Recents::default(),
+    )
+    .expect("state builds")
 }
 
 /// Write a one-tensor checkpoint with a distinctive name, so a test can tell which

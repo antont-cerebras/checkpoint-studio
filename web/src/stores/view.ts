@@ -32,7 +32,7 @@ import {
   sortRows,
 } from '../lib/rows';
 import { SEARCH_LIMIT, searchTree } from '../lib/search';
-import { compactTree, tree as treeData } from './server';
+import { compactTree, loadCompact, tree as treeData } from './server';
 import type { TreeNode } from '../lib/types';
 
 export { DV_KEYS };
@@ -223,6 +223,38 @@ export function resetViewForNewCheckpoint(): void {
   sortDir.set('asc');
 }
 
+/**
+ * Fetch the folded tree whenever the compact view is on — and re-fetch when the filter that
+ * scopes it changes.
+ *
+ * Driven by state, not by a component mounting. `CompactView` used to trigger this itself,
+ * which broke as soon as anything rendered *instead of* it while the fold was in flight: the
+ * shared loading screen did exactly that, so the fetch never started and the wait never ended.
+ * A load that only happens when a particular component is on screen cannot be shown a loading
+ * screen — so the load moved here instead.
+ */
+function foldWhenCompact(): void {
+  let last: string | null = null;
+  const maybe = () => {
+    if (!get(compact) || !get(treeData)) {
+      last = null; // so re-entering compact mode fetches again
+      return;
+    }
+    const q = get(filterQuery);
+    if (q === last) return; // already have (or are getting) this one
+    last = q;
+    void loadCompact(q).then((t) => {
+      // Seed the fold state from what landed, so the view opens at the depth the server sent —
+      // the same thing the tree view does. After that the user owns folding.
+      if (t) expanded.set(expandedIds(t.tree));
+    });
+  };
+  compact.subscribe(maybe);
+  filterQuery.subscribe(maybe);
+  treeData.subscribe(maybe);
+}
+foldWhenCompact();
+
 // Seed the fold state from the tree the server sent, so the first screen matches the
 // terminal UI's (see `expandedIds`). After this the client owns folding.
 let seededExpand = false;
@@ -239,6 +271,15 @@ treeData.subscribe((t) => {
 /** The screen-independent view state, read off the stores for `globalQuery`. */
 function globals(): Globals {
   return {
+    // From the served tree, not a store of its own: the checkpoint is the *server's* state, and
+    // a second copy of it here could disagree with what is actually loaded.
+    //
+    // Falling back to what the URL already says is not belt-and-braces — it is the fix for a
+    // real bug. `syncHash` runs on every store's first subscription, which happens before the
+    // tree lands; with `?? ''` it rewrote the hash without a `ckpt`, erasing the parameter a
+    // shared link carried before startup could read it. A sync must never destroy information
+    // it merely doesn't have yet.
+    ckpt: get(treeData)?.root ?? parseGlobals(location.hash).ckpt,
     filter: get(filterQuery),
     sortKey: get(sortKey),
     sortDir: get(sortDir),
@@ -250,16 +291,32 @@ function globals(): Globals {
 
 let restoring = false;
 
-/** Restore the global stores from the current hash (initial load + back/forward). */
-function restoreGlobals(): void {
-  restoring = true;
-  const g = parseGlobals(location.hash);
+/** The checkpoint a link names, or '' when it names none — read by the app on startup, which
+ * is the only thing that can act on it (opening one is the server's business, not a store's). */
+export function hashCheckpoint(): string {
+  return parseGlobals(location.hash).ckpt;
+}
+
+/** The view state as it stands, for a caller that has to put it back afterwards — restoring a
+ * link whose checkpoint has to be opened first, since opening one drops position state. */
+export function currentGlobals(): Globals {
+  return globals();
+}
+
+/** Put back what [`currentGlobals`] captured. */
+export function applyGlobals(g: Globals): void {
   filterQuery.set(g.filter);
   sortKey.set(g.sortKey);
   sortDir.set(g.sortDir);
   compact.set(g.compact);
   searching.set(g.searching);
   search.set(g.search);
+}
+
+/** Restore the global stores from the current hash (initial load + back/forward). */
+function restoreGlobals(): void {
+  restoring = true;
+  applyGlobals(parseGlobals(location.hash));
   restoring = false;
 }
 
@@ -287,6 +344,10 @@ export function navigate(s: Screen, replace = false): void {
 // hash. Order matters: restore first so the subscriptions' initial fire doesn't
 // stomp the link's params before they're read.
 restoreGlobals();
+// The served root is part of the hash, so the hash has to be rewritten when it changes — on the
+// first load and after every switch. Without this the link would name no checkpoint until some
+// other view change happened to trigger a sync.
+treeData.subscribe(syncHash);
 filterQuery.subscribe(syncHash);
 sortKey.subscribe(syncHash);
 sortDir.subscribe(syncHash);

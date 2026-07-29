@@ -62,13 +62,15 @@ impl Current {
     /// no-access-control caution the UI shows, and every state built by a later switch needs
     /// it too. Taking it here (instead of a `with_exposure` afterwards) means there is never
     /// a moment where the served state has the wrong answer about its own exposure.
+    /// `recents` is passed in rather than built here so a test can hold an in-memory list while
+    /// the real server holds the user's persistent one.
     pub(crate) fn new(
         opened: Opened,
         remote: Option<crate::remote::RemoteRead>,
         opts: opening::Options,
         host: IpAddr,
+        mut recents: opening::Recents,
     ) -> Result<Self> {
-        let mut recents = opening::Recents::default();
         recents.record(&opened.target.spec());
         Ok(Self {
             state: RwLock::new(Arc::new(state_from(opened, host)?)),
@@ -96,7 +98,6 @@ impl Current {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .list()
-            .to_vec()
     }
 
     /// Read the checkpoint at `spec` and make it the one being served.

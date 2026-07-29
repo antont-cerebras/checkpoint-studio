@@ -12,14 +12,12 @@
   import {
     loadRecents,
     openCheckpoint,
-    openProgress,
     proxied,
     recents,
     reloadCheckpoint,
     tree,
   } from '../stores/server';
   import { navigate, resetViewForNewCheckpoint } from '../stores/view';
-  import LoadingBar from './LoadingBar.svelte';
 
   let draft = '';
   let error: string | null = null;
@@ -82,11 +80,9 @@
     <button type="submit" disabled={!draft.trim() || busy}>Open</button>
   </form>
 
-  {#if busy}
-    <!-- Timer only: the server reads shard headers and *then* answers, so a byte bar would
-         sit at zero and jump. Same rule as the tensor scan. -->
-    <LoadingBar label="reading the checkpoint" progress={$openProgress} />
-  {:else if error}
+  <!-- No wait shown here: an open in flight is owned by the shared loading screen (App.svelte),
+       which takes over the whole pane and names the step. This screen only reports failures. -->
+  {#if error}
     <p class="err" role="alert">{error}</p>
   {/if}
 

@@ -3440,7 +3440,9 @@ fn run_web(
     // "open another checkpoint" go through one rule (see `crate::opening`).
     let opened = opening::Target::from_paths(paths, remote.clone(), &opts)?
         .read(opening::Want::Model, &hf::ReadProgress::default())?;
-    let current = web::Current::new(opened, remote, opts, host)?;
+    // The user's list, kept across restarts — so an `hf://` repo typed once is still offered
+    // after the server is restarted, which is the case a session-only list loses.
+    let current = web::Current::new(opened, remote, opts, host, opening::Recents::persistent())?;
     web::serve_on(server, std::sync::Arc::new(current), host)
 }
 
@@ -3711,14 +3713,17 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
 
     // Carry the read switches into the session: the palette's "Open another checkpoint…"
     // reads the next one with the same `--recursive` / `--no-health-check` as this one.
-    let mut explorer = Explorer::new(files, index_specs, open, !args.no_preload).with_read_options(
-        opening::Options {
+    let mut explorer = Explorer::new(files, index_specs, open, !args.no_preload)
+        .with_read_options(opening::Options {
             recursive: args.recursive,
             no_health_check: args.no_health_check,
             proxy: None,
             venv: None,
-        },
-    );
+        })
+        // The same persisted list the web server offers, so the two surfaces remember the same
+        // checkpoints. Installed here rather than in `Explorer::new` so the many explorers built
+        // for tests and one-shot exports never touch the user's config directory.
+        .with_persistent_recents();
     if let Some(host) = args.ssh_proxy {
         let venv = args.ssh_venv.unwrap_or_else(|| "~/venv".to_string());
         explorer.set_remote_read(host, venv);

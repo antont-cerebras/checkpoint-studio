@@ -178,8 +178,20 @@ fn ensure_moe_fixture() {
 }
 
 /// Run the binary with exactly `args` and return its stdout.
+/// A throwaway config directory for every spawned binary, so the test suite never reads or
+/// writes the real `~/.config/checkpoint-studio/` — the recents list is persisted there now, and
+/// a test run was appending its fixtures to the user's own list.
+///
+/// `XDG_CONFIG_HOME` is what `CliConfig::path` prefers, so this needs no production hook.
+fn scratch_config() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("cs_test_config_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 fn run_bin(args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+        .env("XDG_CONFIG_HOME", scratch_config())
         .args(args)
         .output()
         .expect("run checkpoint-studio");
@@ -195,6 +207,7 @@ fn run_bin(args: &[&str]) -> String {
 /// `check` / `diff` use a nonzero exit to signal findings, not failure.
 fn run_bin_status(args: &[&str]) -> (String, i32) {
     let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+        .env("XDG_CONFIG_HOME", scratch_config())
         .args(args)
         .output()
         .expect("run checkpoint-studio");
@@ -561,6 +574,7 @@ fn run_plain_err(extra_args: &[&str]) -> String {
     args.extend_from_slice(extra_args);
     args.push("--plain");
     let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+        .env("XDG_CONFIG_HOME", scratch_config())
         .args(&args)
         .output()
         .expect("run checkpoint-studio");
@@ -608,6 +622,7 @@ fn hdf5_without_feature_errors() {
         let mut args = vec![H5];
         args.extend_from_slice(extra);
         let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+            .env("XDG_CONFIG_HOME", scratch_config())
             .args(&args)
             .output()
             .expect("run checkpoint-studio");
@@ -918,6 +933,7 @@ fn run_diff(args: &[&str]) -> (String, i32) {
     let mut full = vec!["diff"];
     full.extend_from_slice(args);
     let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+        .env("XDG_CONFIG_HOME", scratch_config())
         .args(&full)
         .output()
         .expect("run diff");
@@ -1198,6 +1214,7 @@ fn diff_parallel_matches_sequential_and_reports_time() {
     assert_eq!(seq, par, "parallel diff must match sequential");
     // Elapsed time is reported by default (on stderr, so stdout stays clean).
     let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+        .env("XDG_CONFIG_HOME", scratch_config())
         .args(["diff", DIFF_OLD, DIFF_NEW, "--values"])
         .output()
         .expect("run diff");
@@ -1214,6 +1231,7 @@ fn diff_filter_reports_matched_schema_on_stderr() {
     // The filter context goes to stderr: "matched M of N" plus the matched names
     // collapsed into their index-templated schema (which layers/experts matched).
     let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+        .env("XDG_CONFIG_HOME", scratch_config())
         .args([
             "diff",
             DIFF_GROUP_OLD,
@@ -1320,6 +1338,7 @@ fn diff_map_collision_warns_on_stderr() {
     ensure_map_fixtures();
     // A rule that drops the layer index collapses all three layers onto one name.
     let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+        .env("XDG_CONFIG_HOME", scratch_config())
         .args([
             "diff",
             MAP_OLD,

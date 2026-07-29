@@ -45,6 +45,7 @@ impl Tui {
         // The child gets the slave as all three streams, so crossterm sees a tty and
         // takes the interactive path.
         let child = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+            .env("XDG_CONFIG_HOME", scratch_config())
             .args(args)
             .stdin(Stdio::from(slave.try_clone().expect("dup slave")))
             .stdout(Stdio::from(slave.try_clone().expect("dup slave")))
@@ -225,11 +226,23 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// A throwaway config directory for every spawned binary, so the test suite never reads or
+/// writes the real `~/.config/checkpoint-studio/` — the recents list is persisted there now, and
+/// a test run was appending its fixtures to the user's own list.
+///
+/// `XDG_CONFIG_HOME` is what `CliConfig::path` prefers, so this needs no production hook.
+fn scratch_config() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("cs_test_config_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 fn fixture() -> String {
     // `tests/cli.rs` generates this; make sure it exists for a standalone run of this
     // file (`cargo test --test pty`).
     if !std::path::Path::new(FIXTURE).exists() {
         let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+            .env("XDG_CONFIG_HOME", scratch_config())
             .args(["--help"])
             .output();
         assert!(out.is_ok(), "the binary runs");

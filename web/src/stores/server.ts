@@ -22,6 +22,10 @@ export const tree = writable<TreeResponse | null>(null);
 export const compactTree = writable<CompactTree | null>(null);
 export const compactError = writable<string>('');
 
+/** How long the current fold has been running; null when none is. Timer only — the response is
+ * ~7 KB, so a byte bar would be theatre (see the fold's own measurements). */
+export const compactProgress = writable<Progress | null>(null);
+
 let compactSeq = 0;
 /** Fetch the compact tree for `q`, ignoring a response a later call superseded. Returns
  * the tree it stored — so a caller can seed fold state from exactly the trees that
@@ -29,6 +33,7 @@ let compactSeq = 0;
 export async function loadCompact(q: string): Promise<CompactTree | null> {
   const s = ++compactSeq;
   compactError.set('');
+  compactProgress.set(startedNow());
   try {
     const r = await api.compact(q);
     if (s !== compactSeq) return null; // superseded
@@ -39,6 +44,10 @@ export async function loadCompact(q: string): Promise<CompactTree | null> {
     compactTree.set(null);
     compactError.set(e instanceof Error ? e.message : String(e));
     return null;
+  } finally {
+    // Only the newest fetch owns the indicator; a superseded one clearing it would hide the
+    // wait that is still running.
+    if (s === compactSeq) compactProgress.set(null);
   }
 }
 export const treeError = writable<string | null>(null);
@@ -143,6 +152,9 @@ export const proxied = writable<boolean>(false);
  * reads shard headers and *then* answers, so there is no fraction to show (the same rule the
  * scan and histogram waits follow). */
 export const openProgress = writable<Progress | null>(null);
+/** What the in-flight open is reading — the loading screen names it, since during an open the
+ * tree still on screen belongs to the checkpoint being replaced. */
+export const openingSpec = writable<string>('');
 
 export async function loadRecents(): Promise<void> {
   try {
@@ -191,6 +203,7 @@ function forgetCheckpoint(): void {
  * matters (see [`reloadCheckpoint`]).
  */
 export async function openCheckpoint(spec: string): Promise<string> {
+  openingSpec.set(spec);
   openProgress.set(startedNow());
   try {
     const r = await api.open(spec);

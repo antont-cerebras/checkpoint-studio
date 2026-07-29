@@ -757,8 +757,15 @@ mod tests {
                 &crate::hf::ReadProgress::default(),
             )
             .expect("the fixture reads");
-        Current::new(opened, None, opts, std::net::IpAddr::from([127, 0, 0, 1]))
-            .expect("the served state builds")
+        Current::new(
+            opened,
+            None,
+            opts,
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            // In-memory: the request-layer tests must not touch the user's config directory.
+            crate::opening::Recents::default(),
+        )
+        .expect("the served state builds")
     }
 
     /// A GET, which is what every route but `/api/open` takes.
