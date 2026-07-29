@@ -94,6 +94,42 @@ fn opening_another_checkpoint_replaces_what_every_endpoint_answers() {
     );
 }
 
+/// The address a client shows must be the thing that was opened, not the display root.
+///
+/// A single-file checkpoint's `root` is its *containing directory* — which can hold several other
+/// checkpoints. Showing that in the address bar offered a path that, on Enter, would have opened
+/// something else; and a link carrying it would have restored a different checkpoint.
+#[test]
+fn the_served_address_is_the_file_that_was_opened_not_its_directory() {
+    let dir = scratch("address");
+    let other = write_checkpoint(&dir, "switched.weight");
+    let current = serving("tiny.safetensors");
+
+    current.open(&other.to_string_lossy()).expect("opens");
+    let state = current.snapshot();
+
+    assert_eq!(
+        state.spec,
+        other.to_string_lossy(),
+        "the address should name the file that was opened"
+    );
+    assert_ne!(
+        state.spec, state.root,
+        "and differ from the display root, which is the containing directory"
+    );
+    assert_eq!(
+        state.root,
+        dir.to_string_lossy(),
+        "root stays the directory — it is a label, not an address"
+    );
+
+    // And it is what the client is told, so the bar and the `?ckpt=` link agree with the server.
+    let body = String::from_utf8_lossy(&super::handlers::tree(&state).1).into_owned();
+    let json: serde_json::Value = serde_json::from_str(&body).expect("tree is JSON");
+    assert_eq!(json["spec"], other.to_string_lossy().as_ref());
+    assert_ne!(json["spec"], json["root"]);
+}
+
 #[test]
 fn a_failed_open_changes_nothing() {
     let current = serving("tiny.safetensors");

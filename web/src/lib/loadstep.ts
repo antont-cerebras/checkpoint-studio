@@ -65,11 +65,11 @@ export function currentStep(i: LoadInputs): LoadStep | null {
   return null;
 }
 
-/** The step, said plainly — one line naming the actor and the work. */
+/** The step, said plainly — one line naming the work. */
 export function stepLabel(s: LoadStep): string {
   switch (s.kind) {
     case 'opening':
-      return 'reading the checkpoint';
+      return 'reading shard headers';
     case 'tree':
       return 'reading the tensor tree';
     case 'folding':
@@ -78,24 +78,60 @@ export function stepLabel(s: LoadStep): string {
 }
 
 /**
- * The detail under the label: *who* is doing the work and *why* it takes as long as it does.
+ * The detail under the label: for the two *downloads*, which way the bytes are going.
  *
- * Worth a second line because these three waits fail and drag for entirely different reasons —
- * a slow disk on the server, a slow link to the browser, or a big tally — and a wait you can
- * attribute is one you can act on.
+ * Opening a Hub repo shows two waits in a row, and they are not the same wait twice: the first
+ * pulls shard headers from Hugging Face **to the server**, over the server's network; the second
+ * pulls the assembled list from the server **to the browser**, over yours. They fail and drag for
+ * unrelated reasons, and which one you are watching decides what you would do about it — so each
+ * says its endpoints rather than both saying "downloading".
  */
-export function stepDetail(s: LoadStep): string {
+export function stepDetail(s: LoadStep, proxyHost = ''): string {
   switch (s.kind) {
     case 'opening':
-      return 'the server is reading every shard header';
+      return `${sourceName(s.spec, proxyHost)} → this server`;
     case 'tree':
-      return 'downloading the tensor list from the server';
+      return 'this server → your browser';
     case 'folding':
       return 'grouping tensors whose names differ only by an index';
   }
 }
 
-/** What the step applies to, when that isn't obvious: the path being opened. */
-export function stepSubject(s: LoadStep): string {
-  return s.kind === 'opening' ? s.spec : '';
+/**
+ * Where an open is pulling from, named the way the person who typed the spec would name it.
+ *
+ * Derived from the spec rather than asked of the server, because this is shown *while* the open
+ * is in flight — the server cannot answer about a checkpoint it has not finished reading.
+ */
+function sourceName(spec: string, proxyHost = ''): string {
+  const s = spec.trim();
+  if (s.startsWith('hf://') || s.startsWith('https://huggingface.co/')) return 'Hugging Face';
+  if (s.startsWith('s3://')) return 'S3';
+  // `:/path` is the configured ssh proxy; `[user@]host:/path` names its own host. A colon before
+  // any slash is what distinguishes both from a local path (the same rule `split_scp` uses).
+  const colon = s.indexOf(':');
+  // Name the host when the server has told us which one it is — "the ssh proxy" is only as
+  // informative as the reader's memory of their config file.
+  if (colon === 0) return proxyHost || 'the ssh proxy';
+  if (colon > 0 && !s.slice(0, colon).includes('/')) return s.slice(0, colon);
+  return "this server's disk";
+}
+
+/**
+ * The spec as the address it resolves to: `:/path` shown as `host:/path`.
+ *
+ * The `:` shorthand means "on whatever `ssh_proxy` names", which is a fact about the *server's*
+ * config — so the browser is told the host (`/api/recents`) rather than guessing. Showing the
+ * shorthand back while a checkpoint reads names it only to someone who already remembers what
+ * their config says; the resolved form names it to anyone.
+ */
+export function resolvedSpec(spec: string, proxyHost = ''): string {
+  const s = spec.trim();
+  return proxyHost && s.startsWith(':') ? `${proxyHost}:${s.slice(1)}` : s;
+}
+
+/** What the step applies to, when that isn't obvious: the checkpoint being opened, as the
+ * address it resolves to. */
+export function stepSubject(s: LoadStep, proxyHost = ''): string {
+  return s.kind === 'opening' ? resolvedSpec(s.spec, proxyHost) : '';
 }

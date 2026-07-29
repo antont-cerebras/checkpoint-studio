@@ -30,7 +30,9 @@
   // Trailing slashes stripped on both sides: a recents entry is the spec as typed
   // (`…/Qwen3-Coder-30B-A3B-lut-3bit/`) while the root is the resolved directory (no slash),
   // so comparing them raw never matched and the badge never appeared.
-  $: current = trim($tree?.root ?? '');
+  // Compared against the *address*, not the display root — a single-file checkpoint's root is
+  // its directory, which no recents entry equals.
+  $: current = trim($tree?.spec ?? $tree?.root ?? '');
   const trim = (s: string) => s.replace(/\/+$/, '');
 
   async function open(spec: string) {

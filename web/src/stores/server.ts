@@ -148,6 +148,9 @@ export function cachedCheckpointStats(): Promise<Record<string, unknown>> {
 export const recents = writable<string[]>([]);
 /** Whether the server reads over an ssh proxy, which decides what paths it can open. */
 export const proxied = writable<boolean>(false);
+/** Which host that proxy is, so `:/path` can be shown as the address it resolves to. Empty when
+ * there is no proxy — only the server knows this, since `:` resolves against its config. */
+export const proxyHost = writable<string>('');
 /** How long the current open has been running; null when none is. Timer only — the server
  * reads shard headers and *then* answers, so there is no fraction to show (the same rule the
  * scan and histogram waits follow). */
@@ -161,6 +164,7 @@ export async function loadRecents(): Promise<void> {
     const r = await api.recents();
     recents.set(r.recents);
     proxied.set(r.proxied);
+    proxyHost.set(r.proxy_host ?? '');
   } catch {
     // A recents list is a convenience; failing to fetch it must not stop the prompt from
     // accepting a typed path.
@@ -190,6 +194,18 @@ function forgetCheckpoint(): void {
   statsCache.clear();
   sampleCache.clear();
   histCache.clear();
+}
+
+/**
+ * Forget a checkpoint — remove it from the recents list, leaving the checkpoint itself and the one
+ * being served untouched.
+ *
+ * The server answers with the list without it, so the UI updates from the server's own state
+ * rather than guessing what the removal did.
+ */
+export async function forgetRecent(spec: string): Promise<void> {
+  const r = await api.forgetRecent(spec);
+  recents.set(r.recents);
 }
 
 /**

@@ -14,7 +14,7 @@
   // which is what the terminal offers. An always-live editable address bar is a browser idiom
   // (it *is* the URL bar's affordance); the terminal's equivalent is its prompt with `↑` history.
   import { onMount } from 'svelte';
-  import { loadRecents, proxied, recents, tree } from '../stores/server';
+  import { forgetRecent, loadRecents, proxied, recents, tree } from '../stores/server';
   import { switchCheckpoint } from '../stores/open';
   import Spinner from './Spinner.svelte';
 
@@ -29,10 +29,15 @@
   let cursor = -1;
   let busy = false;
   let error = '';
+  /** Which entry is asking "forget this?"; one at a time, so the answer is never ambiguous. */
+  let confirming: string | null = null;
 
   onMount(loadRecents);
 
-  $: root = $tree?.root ?? '';
+  // The *address*, not the display root: for a single-file checkpoint the root is its containing
+  // directory, and opening that would read a different checkpoint (a directory of three HDF5
+  // files has one root and three addresses).
+  $: root = $tree?.spec ?? $tree?.root ?? '';
   // Follow the served checkpoint unless the box is being edited — otherwise a switch made
   // somewhere else (the open screen, another tab's doing) would leave the header lying.
   $: if (!dirty && !busy) draft = root;
@@ -79,9 +84,11 @@
         return;
       case 'Escape':
         e.preventDefault();
-        // Close the list first, revert second — two states, two presses, so Escape never
-        // discards typing that the user only meant to un-list.
-        if (listOpen) {
+        // Innermost state first: a pending "forget this?" is what Escape should answer, before it
+        // starts closing the list or discarding what was typed.
+        if (confirming !== null) {
+          confirming = null;
+        } else if (listOpen) {
           listOpen = false;
           cursor = -1;
         } else {
@@ -112,8 +119,40 @@
     }
   }
 
+  /** Remove one entry from the list. The checkpoint itself, and the one being served, are
+   * untouched — forgetting the open one is allowed and leaves you looking at it. */
+  async function forget(spec: string) {
+    confirming = null;
+    try {
+      await forgetRecent(spec);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
   function onInput() {
     dirty = draft !== root;
+  }
+
+  /**
+   * Escape while the menu is open, wherever focus is.
+   *
+   * The input's own handler only fires when the caret is in it — and after clicking a cross, focus
+   * is on that button, so a pending "forget this?" could not be dismissed with the keyboard. The
+   * input stops propagation, so this never double-handles.
+   */
+  function onWindowKeydown(e: KeyboardEvent) {
+    if (e.key !== 'Escape') return;
+    if (confirming !== null) {
+      e.preventDefault();
+      e.stopPropagation();
+      confirming = null;
+    } else if (listOpen) {
+      e.preventDefault();
+      e.stopPropagation();
+      listOpen = false;
+      cursor = -1;
+    }
   }
 
   /** Click anywhere else closes the dropdown — the same dismiss rule the palette follows. */
@@ -121,13 +160,15 @@
     if (listOpen && box && !box.contains(e.target as Node)) {
       listOpen = false;
       cursor = -1;
+      // An unanswered question does not survive the menu it was asked in.
+      confirming = null;
     }
   }
 
   const short = (s: string) => s.replace(/\/+$/, '').split('/').pop() || s;
 </script>
 
-<svelte:window on:pointerdown={onWindowPointerDown} />
+<svelte:window on:pointerdown={onWindowPointerDown} on:keydown|capture={onWindowKeydown} />
 
 <div class="bar" bind:this={box}>
   <input
@@ -167,6 +208,7 @@
       on:click={() => {
         listOpen = !listOpen;
         cursor = -1;
+        confirming = null;
       }}>▾</button
     >
   {/if}
@@ -176,19 +218,36 @@
          builder, rather than a second idea of what a popup looks like. -->
     <ul class="menu" role="listbox" aria-label="Recently opened checkpoints">
       {#each options as spec, i (spec)}
-        <li>
-          <button
-            type="button"
-            role="option"
-            aria-selected={i === cursor}
-            class:on={i === cursor}
-            title={spec}
-            on:click={() => void submit(spec)}
-            on:mouseenter={() => (cursor = i)}
-          >
-            <span class="name">{short(spec)}</span>
-            <span class="path dim">{spec}</span>
-          </button>
+        <li class="row" class:on={i === cursor}>
+          {#if confirming === spec}
+            <!-- Confirmation in the row itself, not a browser dialog: it keeps the path you are
+                 about to forget in front of you, and the dropdown open behind it. -->
+            <span class="ask">Forget <b>{short(spec)}</b>?</span>
+            <button class="danger" type="button" on:click={() => void forget(spec)}>Forget</button>
+            <button class="quiet" type="button" on:click={() => (confirming = null)}>Cancel</button>
+          {:else}
+            <button
+              class="pick"
+              type="button"
+              role="option"
+              aria-selected={i === cursor}
+              title={spec}
+              on:click={() => void submit(spec)}
+              on:mouseenter={() => (cursor = i)}
+            >
+              <span class="name">{short(spec)}</span>
+              <span class="path dim">{spec}</span>
+            </button>
+            <!-- A sibling button, not nested in the row's: nested buttons are invalid, and a click
+                 on the cross must not also open the checkpoint. -->
+            <button
+              class="drop"
+              type="button"
+              title="Forget this checkpoint (removes it from the list only)"
+              aria-label="Forget {short(spec)}"
+              on:click={() => (confirming = spec)}>×</button
+            >
+          {/if}
         </li>
       {/each}
     </ul>
@@ -285,25 +344,72 @@
     border-radius: 6px;
     box-shadow: 0 6px 20px rgb(0 0 0 / 35%);
   }
-  .menu button {
+  .row {
     display: flex;
-    align-items: baseline;
-    gap: 10px;
-    width: 100%;
-    text-align: left;
+    align-items: center;
+    gap: 4px;
+    border-radius: 4px;
+  }
+  .row.on,
+  .row:hover {
+    background: var(--bg-hover);
+  }
+  .menu button {
     font: inherit;
     font-size: 12px;
     color: var(--fg);
     background: none;
     border: none;
     border-radius: 4px;
-    padding: 4px 8px;
     cursor: pointer;
     white-space: nowrap;
   }
-  .menu button.on,
-  .menu button:hover {
-    background: var(--bg-hover);
+  .menu .pick {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex: 1 1 auto;
+    min-width: 0;
+    text-align: left;
+    padding: 4px 8px;
+  }
+  /* Dim until the row is under the cursor: a row of crosses reads as a list of delete buttons
+     rather than a list of checkpoints. */
+  .menu .drop {
+    flex: 0 0 auto;
+    padding: 2px 7px;
+    color: transparent;
+  }
+  .row:hover .drop,
+  .row.on .drop {
+    color: var(--fg-dim);
+  }
+  .menu .drop:hover {
+    color: var(--danger);
+    background: var(--bg-elev);
+  }
+  .ask {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+  .menu .danger {
+    flex: 0 0 auto;
+    color: var(--bg);
+    background: var(--danger);
+    padding: 2px 8px;
+  }
+  .menu .quiet {
+    flex: 0 0 auto;
+    color: var(--fg-dim);
+    padding: 2px 8px;
+  }
+  .menu .quiet:hover {
+    color: var(--fg);
+    background: var(--bg-elev);
   }
   .menu .name {
     color: var(--accent);

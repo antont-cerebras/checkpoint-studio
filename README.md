@@ -204,6 +204,12 @@ text field, so select, copy and paste all work — and `Enter` opens what you ty
 link carries the checkpoint too (`#tree?ckpt=…`), so opening someone's link puts you on *their*
 checkpoint and their view of it, rather than the same screen of whatever happened to be loaded.
 
+Entries are stored in the spelling that still means the same checkpoint later: a local path is
+made **absolute** (so `./model` is not a note to nobody), and a remote one is stored **scp-style**
+as `host:/path` rather than `:/path` — the short form resolves against a config file that can
+change, while the long form carries its host, which makes it the remote equivalent of an absolute
+path. A `hf://` or `s3://` URI is stored as typed; it already names one thing from anywhere.
+
 The list is kept in **`recents.toml`** beside the config file
 (`$XDG_CONFIG_HOME/checkpoint-studio/`, else `~/.config/checkpoint-studio/`), so an
 `hf://owner/repo` you typed once is still offered after a restart. It is meant to be edited —
@@ -215,6 +221,11 @@ recent = [
   "/models/checkpoint_1000",
 ]
 ```
+
+In the browser, each entry in the address bar's dropdown has a `×` that drops it from the list —
+after confirming in the row itself, so the path you are about to forget stays in front of you.
+Only the list is touched: nothing is deleted on disk, and forgetting the checkpoint you are
+looking at leaves you looking at it.
 
 The file is the source of truth, not the process: an edit made while the app is running shows up
 in the prompt without a restart, and the next open merges into it rather than overwriting it.
@@ -234,10 +245,18 @@ that produced it while the checkpoint you were reading is still fully loaded. Po
 (selection, expansion, search, filter) is dropped, because it names rows that may not exist in
 the new checkpoint; display preferences like the compact fold are kept.
 
-While a checkpoint is being read, one screen says so and what step it is on — `reading the
-checkpoint` (the server reading shard headers), `reading the tensor tree` (the download, with a
-byte bar), or `folding uniform layers into families` — because those three drag for entirely
-unrelated reasons and a wait you can attribute is one you can act on.
+While a checkpoint is being read, one screen says so and names the step — and, for the two
+transfers, which way the bytes are going. Opening a Hub repo shows both in a row, and they are not
+the same wait twice:
+
+```
+⠋ reading shard headers        Hugging Face → this server
+⠋ reading the tensor tree      this server → your browser
+```
+
+One crosses the *server's* network, the other crosses *yours*; they drag for unrelated reasons,
+and which one you are watching decides what you would do about it. The third step,
+`folding uniform layers into families`, is the compact view's tally.
 
 In the web UI it is the *server's* checkpoint that changes, so this affects every browser tab
 connected to it — the server holds one checkpoint at a time. Long-running requests are

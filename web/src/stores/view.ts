@@ -279,7 +279,7 @@ function globals(): Globals {
     // tree lands; with `?? ''` it rewrote the hash without a `ckpt`, erasing the parameter a
     // shared link carried before startup could read it. A sync must never destroy information
     // it merely doesn't have yet.
-    ckpt: get(treeData)?.root ?? parseGlobals(location.hash).ckpt,
+    ckpt: get(treeData)?.spec ?? parseGlobals(location.hash).ckpt,
     filter: get(filterQuery),
     sortKey: get(sortKey),
     sortDir: get(sortDir),

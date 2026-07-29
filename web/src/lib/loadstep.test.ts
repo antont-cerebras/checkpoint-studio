@@ -3,7 +3,14 @@
 // error, not a wait that never ends.
 
 import { describe, expect, it } from 'vitest';
-import { currentStep, stepDetail, stepLabel, stepSubject, type LoadInputs } from './loadstep';
+import {
+  currentStep,
+  resolvedSpec,
+  stepDetail,
+  stepLabel,
+  stepSubject,
+  type LoadInputs,
+} from './loadstep';
 import { startedNow } from './progress';
 
 const IDLE: LoadInputs = {
@@ -70,17 +77,53 @@ describe('what each step says', () => {
     for (const l of labels) expect(l).not.toBe('');
   });
 
-  it('attributes the work, since the three drag for unrelated reasons', () => {
-    // A slow disk on the server, a slow link to the browser, or a big tally — "loading…" would
-    // leave the reader unable to tell which.
-    expect(stepDetail(steps[0])).toContain('server');
-    expect(stepDetail(steps[1])).toContain('downloading');
+  it('says which way the bytes are going, for each of the two downloads', () => {
+    // Opening a Hub repo shows both in a row, and they are not the same wait twice: one crosses
+    // the server's network, the other crosses yours.
+    expect(stepDetail({ kind: 'opening', spec: 'hf://owner/name', progress: null })).toBe(
+      'Hugging Face → this server',
+    );
+    expect(stepDetail(steps[1])).toBe('this server → your browser');
     expect(stepDetail(steps[2])).toContain('index');
+  });
+
+  it.each([
+    ['hf://owner/name', 'Hugging Face'],
+    ['https://huggingface.co/owner/name', 'Hugging Face'],
+    ['s3://bucket/prefix/', 'S3'],
+    [':/opt/models/m', 'the ssh proxy'],
+    ['lab@net004:/opt/models/m', 'lab@net004'],
+    ['/models/local', "this server's disk"],
+    ['./relative', "this server's disk"],
+  ])('names %s as coming from %s', (spec, from) => {
+    expect(stepDetail({ kind: 'opening', spec, progress: null })).toBe(`${from} → this server`);
   });
 
   it('names the checkpoint only while opening one', () => {
     expect(stepSubject(steps[0])).toBe('/models/x');
     expect(stepSubject(steps[1])).toBe('');
     expect(stepSubject(steps[2])).toBe('');
+  });
+
+  it('shows the `:` shorthand as the address it resolves to', () => {
+    // `:/path` means "on whatever ssh_proxy names" — a fact about the *server's* config, which the
+    // browser is told rather than guessing. Echoing the `:` back names the checkpoint only to
+    // someone who already remembers what their config says.
+    const step = { kind: 'opening', spec: ':/opt/models/Kimi', progress: null } as const;
+    expect(stepSubject(step, 'lab@net004')).toBe('lab@net004:/opt/models/Kimi');
+    expect(stepDetail(step, 'lab@net004')).toBe('lab@net004 → this server');
+    // Without a known host it still says something true, just less specific.
+    expect(stepSubject(step)).toBe(':/opt/models/Kimi');
+    expect(stepDetail(step)).toBe('the ssh proxy → this server');
+  });
+
+  it.each([
+    [':/opt/m', 'host', 'host:/opt/m'],
+    ['/local/m', 'host', '/local/m'],
+    ['hf://owner/name', 'host', 'hf://owner/name'],
+    ['other@box:/opt/m', 'host', 'other@box:/opt/m'],
+    [':/opt/m', '', ':/opt/m'],
+  ])('resolves %s with proxy %s to %s', (spec, host, want) => {
+    expect(resolvedSpec(spec, host)).toBe(want);
   });
 });

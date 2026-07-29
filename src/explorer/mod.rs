@@ -1464,8 +1464,16 @@ impl Explorer {
     /// not write to the user's config directory.
     pub(crate) fn with_persistent_recents(mut self) -> Self {
         let mut recents = crate::opening::Recents::persistent();
-        // The checkpoint on the command line is the most recent by definition.
-        recents.record(&crate::opening::spec_of_paths(&self.files));
+        // The checkpoint on the command line is the most recent by definition — recorded in the
+        // durable spelling, since `checkpoint-studio ./model` is common and `./model` would be
+        // useless to whoever picks it later.
+        let typed = crate::opening::spec_of_paths(&self.files);
+        let source = self
+            .remote_read()
+            .map_or(crate::opening::SpecSource::Local, |r| {
+                crate::opening::SpecSource::Remote(r.host.clone())
+            });
+        recents.record(&crate::opening::recorded_spec(&self.files, &typed, source));
         self.recents = recents;
         self
     }
@@ -5955,17 +5963,20 @@ impl Explorer {
             String::new(),
             &recents,
             |_| {},
+            // The typed string is carried alongside the target: it is the only form that
+            // records a `hf://`/`s3://` URI as the person wrote it.
             |input| match self.resolve_open(input) {
-                Ok(t) => Submit::Accept(t),
+                Ok(t) => Submit::Accept((t, input.to_string())),
                 Err(e) => Submit::Reject(format!("{e:#}")),
             },
         );
-        let Some(target) = target else {
+        let Some((target, typed)) = target else {
             return; // cancelled (Esc)
         };
-        // Record what was asked for, not the walked file list — that is what a person
-        // recognises in the list, and what they would type again.
-        let spec = target.spec();
+        // The durable spelling, not the typed one: a relative path is absolutised and a
+        // proxied path becomes `host:/path`, so the entry still resolves next time (see
+        // `opening::recorded_spec`).
+        let spec = target.recorded_spec(&typed);
         if let Err(e) = self.switch_to(target) {
             // The switch already dropped the old checkpoint, so there is nothing to fall back
             // to: say what failed and leave the (now empty) tree, rather than pretending the
