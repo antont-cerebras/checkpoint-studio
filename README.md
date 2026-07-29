@@ -198,7 +198,31 @@ The UI is a Svelte single-page app **embedded in the binary**, so a released
 
 #### Switching checkpoints without a restart
 
-Both frontends can change checkpoint in place — the command palette's
+**In the browser, the path in the header is the address bar.** Click it and type — it is a real
+text field, so select, copy and paste all work — and `Enter` opens what you typed. `↓` (or the
+`▾`) drops down the checkpoints opened this run; `Esc` puts back the one being served. A shared
+link carries the checkpoint too (`#tree?ckpt=…`), so opening someone's link puts you on *their*
+checkpoint and their view of it, rather than the same screen of whatever happened to be loaded.
+
+The list is kept in **`recents.toml`** beside the config file
+(`$XDG_CONFIG_HOME/checkpoint-studio/`, else `~/.config/checkpoint-studio/`), so an
+`hf://owner/repo` you typed once is still offered after a restart. It is meant to be edited —
+one array, most recent first, reorder or delete freely:
+
+```toml
+recent = [
+  "hf://moonshotai/Kimi-K3",
+  "/models/checkpoint_1000",
+]
+```
+
+The file is the source of truth, not the process: an edit made while the app is running shows up
+in the prompt without a restart, and the next open merges into it rather than overwriting it.
+It is its own file rather than a section of `config.toml` because it is rewritten on every open,
+and `config.toml` is yours to maintain. A missing or malformed file reads as an empty list —
+never an error.
+
+Both frontends also offer it from the command palette —
 **`Open another checkpoint…`** (`Space` or `:` in the terminal, `:` in the browser). It accepts
 everything the command line does: a file, a directory, a glob, `hf://owner/repo`, and
 `:/path/on/the/proxy` on a run that has an ssh proxy configured. The checkpoints opened this
@@ -209,6 +233,11 @@ The path is **resolved before anything is replaced**, so a typo is reported next
 that produced it while the checkpoint you were reading is still fully loaded. Position state
 (selection, expansion, search, filter) is dropped, because it names rows that may not exist in
 the new checkpoint; display preferences like the compact fold are kept.
+
+While a checkpoint is being read, one screen says so and what step it is on — `reading the
+checkpoint` (the server reading shard headers), `reading the tensor tree` (the download, with a
+byte bar), or `folding uniform layers into families` — because those three drag for entirely
+unrelated reasons and a wait you can attribute is one you can act on.
 
 In the web UI it is the *server's* checkpoint that changes, so this affects every browser tab
 connected to it — the server holds one checkpoint at a time. Long-running requests are

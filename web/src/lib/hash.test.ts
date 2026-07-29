@@ -16,6 +16,7 @@ import {
 } from './hash';
 
 const DEFAULTS: Globals = {
+  ckpt: '',
   filter: '',
   sortKey: 'none',
   sortDir: 'asc',
@@ -121,6 +122,7 @@ describe('global state round-trip', () => {
 
   it('round-trips filter, sort, compact and search together', () => {
     const g: Globals = {
+      ckpt: '/models/checkpoint_1000',
       filter: 'dtype:BF16 shape:(2048,2048)',
       sortKey: 'size',
       sortDir: 'desc',
@@ -173,6 +175,34 @@ describe('hashFor', () => {
     const full = `#${hashFor(s, g)}`;
     expect(parseScreen(full)).toEqual(s);
     expect(parseGlobals(full)).toEqual(g);
+  });
+});
+
+describe('the checkpoint a link names', () => {
+  // A URL that named a screen and a filter but not the checkpoint described a view of whatever
+  // happened to be loaded — the same link could look right on a different checkpoint.
+  it('rides in the hash and comes back out', () => {
+    const g: Globals = { ...DEFAULTS, ckpt: '/models/ckpt-1000' };
+    expect(globalQuery(g)).toContain('ckpt=%2Fmodels%2Fckpt-1000');
+    expect(parseGlobals(`#tree?${globalQuery(g)}`)).toEqual(g);
+  });
+
+  it('is omitted while nothing is loaded, so a bare view stays a bare URL', () => {
+    expect(globalQuery(DEFAULTS)).toBe('');
+    expect(parseGlobals('#tree')).toMatchObject({ ckpt: '' });
+  });
+
+  // Paths carry spaces, `#`, `&` and `?`; each has to survive one round of encoding or the
+  // link opens the wrong checkpoint (or nothing).
+  it.each([
+    '/models/a b/ckpt',
+    '/models/ckpt#2',
+    '/models/a&b?c',
+    'hf://owner/name',
+    's3://bucket/prefix/',
+  ])('survives the awkward path %s', (ckpt) => {
+    const parsed = parseGlobals(`#tree?${globalQuery({ ...DEFAULTS, ckpt })}`);
+    expect(parsed.ckpt).toBe(ckpt);
   });
 });
 

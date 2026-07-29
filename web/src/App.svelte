@@ -1,7 +1,19 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
-  import { tree, treeError, ensureTree, treeProgress } from './stores/server';
+  import {
+    tree,
+    treeError,
+    ensureTree,
+    treeProgress,
+    openProgress,
+    openingSpec,
+    compactTree,
+    compactError,
+    compactProgress,
+  } from './stores/server';
+  import { currentStep } from './lib/loadstep';
+  import { switchCheckpoint } from './stores/open';
   import { warningDismissed } from './stores/warning';
   import {
     screen,
@@ -32,6 +44,9 @@
     setSort,
     compact,
     paletteOpen,
+    hashCheckpoint,
+    currentGlobals,
+    applyGlobals,
   } from './stores/view';
   import type { SortKey } from './stores/view';
   import TreeView from './components/TreeView.svelte';
@@ -44,7 +59,8 @@
   import FilePreview from './components/FilePreview.svelte';
   import StatusBar from './components/StatusBar.svelte';
   import Footer from './components/Footer.svelte';
-  import LoadingBar from './components/LoadingBar.svelte';
+  import LoadingScreen from './components/LoadingScreen.svelte';
+  import CheckpointBar from './components/CheckpointBar.svelte';
   import OpenView from './components/OpenView.svelte';
   import Palette from './components/Palette.svelte';
   import FilterBuilder from './components/FilterBuilder.svelte';
@@ -56,7 +72,29 @@
 
   let builderOpen = false;
 
-  onMount(ensureTree);
+  onMount(async () => {
+    // A link can name a checkpoint (`#tree?ckpt=…`). If it names one the server is not serving,
+    // open it — otherwise the link would restore the screen, the filter and the selection of a
+    // view *of a different checkpoint*, which is the one thing a shared view must not do.
+    //
+    // Read FIRST, before the tree is fetched: the first tree to land triggers a hash sync that
+    // replaces `ckpt` with the served root, so reading afterwards reads our own overwrite and
+    // never sees what the link asked for.
+    const wanted = hashCheckpoint();
+    // The view state the link carries is captured too, because switching deliberately drops
+    // position state (it names rows the new checkpoint may not have) and has to be put back.
+    const restore = { screen: get(screen), globals: currentGlobals() };
+    await ensureTree();
+    if (!wanted || wanted === get(tree)?.root) return;
+    try {
+      await switchCheckpoint(wanted);
+      applyGlobals(restore.globals);
+      navigate(restore.screen, true);
+    } catch {
+      // A link to a checkpoint that no longer resolves: stay on the one that is loaded rather
+      // than emptying the screen. The address bar shows what is actually served.
+    }
+  });
 
   function onSortChange(e: Event) {
     setSort((e.currentTarget as HTMLSelectElement).value as SortKey);
@@ -66,6 +104,20 @@
   // text differs from the query `filterMatches`/`filterError` reflect). Derived so it
   // repaints reliably from the async-set stores — see `filterResolvedFor`.
   $: filtering = $filterQuery.trim().length > 0 && $filterQuery.trim() !== $filterResolvedFor;
+
+  // One wait, one screen. Three components used to each render their own version of "waiting
+  // for this checkpoint"; now they contribute inputs and this decides which step is showing.
+  $: step = currentStep({
+    opening: $openProgress,
+    openingSpec: $openingSpec,
+    tree: $treeProgress,
+    haveTree: !!$tree,
+    treeError: !!$treeError,
+    compact: $compact,
+    haveCompact: !!$compactTree,
+    folding: $compactProgress,
+    compactError: !!$compactError,
+  });
 
   function crumb(s: Screen): string {
     switch (s.kind) {
@@ -364,7 +416,9 @@
       <!-- Truncates at narrow widths, so carry the full text in a tooltip. -->
       <span class="crumb dim" title={crumb($screen)}>{crumb($screen)}</span>
     {/if}
-    <span class="root" title={$tree?.root ?? ''}>{$tree?.root ?? '…'}</span>
+    <!-- The checkpoint address: a real input, so copy/paste/select work, with the recents
+         list on `↓`. Editing it opens another checkpoint (see CheckpointBar). -->
+    <CheckpointBar />
     {#if $searching && $screen.kind === 'tree'}
       <span class="search">
         /
@@ -460,7 +514,12 @@
          that works without a loaded checkpoint, and it is how you recover from a checkpoint
          that failed to load. Behind those guards it would have been unreachable in exactly the
          situation you most need it. -->
-    {#if $screen.kind === 'open'}
+    {#if step}
+      <!-- Before the screen dispatch, and before the `open` screen: while a checkpoint is being
+           read there is nothing truthful any screen can show, and the pane you were on would be
+           showing the checkpoint that is being replaced. -->
+      <LoadingScreen {step} />
+    {:else if $screen.kind === 'open'}
       <OpenView />
     {:else if $treeError}
       <div class="error">
@@ -470,9 +529,9 @@
         </button>
       </div>
     {:else if !$tree}
-      <div class="loading">
-        <LoadingBar label="reading checkpoint structure" progress={$treeProgress} />
-      </div>
+      <!-- No tree, no error, no step in flight: not a state that should occur, and the honest
+           thing to show for it is the wait we are still in rather than a blank pane. -->
+      <LoadingScreen step={{ kind: 'tree', progress: $treeProgress }} />
     {:else if $screen.kind === 'tree'}
       {#if $compact}<CompactView />{:else}<TreeView />{/if}
     {:else if $screen.kind === 'detail'}
@@ -565,14 +624,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-  .root {
-    flex: 0 1 auto;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--fg-dim);
-    font-size: 12px;
   }
   .search {
     flex: 1 1 auto;
@@ -691,9 +742,6 @@
   .error {
     padding: 16px;
     color: var(--danger);
-  }
-  .loading {
-    padding: 24px;
   }
   /* The way out of a checkpoint that didn't load: without it the error screen is a dead end
      that only a restart clears. */

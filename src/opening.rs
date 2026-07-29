@@ -22,7 +22,7 @@
 //! [`crate::remote::RemoteRead`] (and, deliberately, two different `ObjectMeta` costs), so
 //! the caller says which it wants and this module owns the difference.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
@@ -263,16 +263,66 @@ pub(crate) fn spec_of_paths(paths: &[PathBuf]) -> String {
         .join(" ")
 }
 
-/// The checkpoints opened this run, most recent first.
+/// The checkpoints opened recently, most recent first.
 ///
-/// Offered by both frontends' open prompt, so switching back to where you were is a pick
-/// rather than a retype. Deliberately *not* persisted to disk: it is a within-session
-/// convenience, and a file of recently-read paths is a surprising thing for a read-only
-/// browser to start writing to a user's home directory.
+/// Offered by both frontends' open prompt, so switching back to where you were is a pick rather
+/// than a retype — and **kept across restarts**, because a within-session list loses exactly
+/// what it is for: an `hf://owner/repo` you typed once and would have to retype from memory
+/// after the server restarts. A local path can be tab-completed in a shell; a Hub URI or an
+/// `s3://` prefix cannot.
+///
+/// ## Meant to be edited by hand
+///
+/// So it is TOML, in the directory this app already owns — `recents.toml` beside `config.toml`.
+/// One array, most recent first, one entry per line:
+///
+/// ```toml
+/// recent = [
+///   "hf://moonshotai/Kimi-K3",
+///   "/models/checkpoint_1000",
+/// ]
+/// ```
+///
+/// Its own file rather than a section of `config.toml`, because this list is *rewritten* every
+/// time a checkpoint is opened. `config.toml` is hand-maintained — rewriting it would put the
+/// user's comments and layout at the mercy of a serializer, for no gain.
+///
+/// The file — not this struct — is the source of truth for a persistent list. Every read goes
+/// back to disk and every write merges into what is on disk, so an edit made while the app is
+/// running is picked up rather than overwritten by whatever the process happened to remember.
+/// The file is tiny, so re-reading it per use costs nothing worth measuring.
+///
+/// Persistence is opt-in ([`Self::persistent`]) rather than automatic, so a list built in a test
+/// or a one-shot export never writes to the user's config directory.
 #[derive(Debug, Clone)]
 pub(crate) struct Recents {
+    /// The in-memory list. For a persistent one this is a fallback for when the file cannot be
+    /// read, not the authority — see the type docs.
     specs: Vec<String>,
     cap: usize,
+    /// The file this list lives in; `None` keeps it in memory only.
+    store: Option<PathBuf>,
+}
+
+/// Written at the top of the file on every save, so the file explains itself to whoever opens
+/// it — including that it gets rewritten, which is the one thing a hand-editor needs to know.
+const RECENTS_HEADER: &str = "\
+# checkpoint-studio — recently opened checkpoints, most recent first.
+#
+# Edit this freely: a path, a glob, `hf://owner/repo`, an `s3://` prefix, or `:/path` for the
+# configured ssh proxy. Reorder to change what the open prompt offers first.
+#
+# Opening a checkpoint rewrites this file (newest first, capped), which drops any comments you
+# add below. Your entries survive: a write merges with whatever the file holds at the time, so
+# an edit made while the app is running is not lost.
+";
+
+/// The file's shape. One array, so a hand-editor has one thing to get right — and
+/// `#[serde(default)]` so an empty or partial file reads as "no entries" rather than an error.
+#[derive(serde::Deserialize, Default)]
+struct RecentsFile {
+    #[serde(default)]
+    recent: Vec<String>,
 }
 
 impl Default for Recents {
@@ -282,29 +332,122 @@ impl Default for Recents {
 }
 
 impl Recents {
+    /// An in-memory list — nothing is read from or written to disk.
     pub(crate) fn with_cap(cap: usize) -> Self {
         Self {
             specs: Vec::new(),
             cap: cap.max(1),
+            store: None,
         }
     }
 
-    /// Record a spec as the most recent, moving it up rather than duplicating it. Reopening
-    /// the same checkpoint is the common case, and a list that grew a second identical row
-    /// each time would push the others out for no reason.
+    /// The user's list, in a file that is re-read on use and merged into on change.
+    ///
+    /// Best-effort throughout: a missing, unreadable or malformed file reads as an empty list,
+    /// and a failed write is dropped. A convenience list is never worth failing a checkpoint
+    /// read over.
+    pub(crate) fn persistent() -> Self {
+        let store = Self::store_path();
+        let specs = store.as_deref().map(Self::read_file).unwrap_or_default();
+        Self {
+            specs,
+            cap: 10,
+            store,
+        }
+    }
+
+    /// A persistent list kept in `path` — for tests, which must not touch the real config dir.
+    #[cfg(test)]
+    pub(crate) fn persistent_at(path: PathBuf, cap: usize) -> Self {
+        let specs = Self::read_file(&path);
+        Self {
+            specs,
+            cap: cap.max(1),
+            store: Some(path),
+        }
+    }
+
+    /// `recents.toml` beside the config file — the directory this app already owns
+    /// (`$XDG_CONFIG_HOME/checkpoint-studio/`, else `$HOME/.config/checkpoint-studio/`).
+    fn store_path() -> Option<PathBuf> {
+        cli_config::CliConfig::path().map(|p| p.with_file_name("recents.toml"))
+    }
+
+    /// Read the file's `recent` array: blanks dropped, duplicates collapsed keeping the first
+    /// (topmost = most recent). Tolerant by design — this is a file people edit, so a syntax
+    /// error reads as "no entries" rather than breaking an open.
+    fn read_file(path: &Path) -> Vec<String> {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let parsed: RecentsFile = toml::from_str(&text).unwrap_or_default();
+        let mut out: Vec<String> = Vec::new();
+        for spec in parsed.recent {
+            let spec = spec.trim();
+            if !spec.is_empty() && !out.iter().any(|s| s == spec) {
+                out.push(spec.to_string());
+            }
+        }
+        out
+    }
+
+    /// Record a spec as the most recent, moving it up rather than duplicating it. Reopening the
+    /// same checkpoint is the common case, and a list that grew a second identical row each time
+    /// would push the others out for no reason.
+    ///
+    /// For a persistent list this merges with the file as it stands, so a hand edit made since
+    /// the process started survives.
     pub(crate) fn record(&mut self, spec: &str) {
         let spec = spec.trim();
         if spec.is_empty() {
             return;
         }
-        self.specs.retain(|s| s != spec);
-        self.specs.insert(0, spec.to_string());
-        self.specs.truncate(self.cap);
+        let mut specs = self.list();
+        specs.retain(|s| s != spec);
+        specs.insert(0, spec.to_string());
+        specs.truncate(self.cap);
+        self.specs = specs;
+        self.save();
     }
 
-    /// Most recent first.
-    pub(crate) fn list(&self) -> &[String] {
-        &self.specs
+    /// Most recent first. Reads the file for a persistent list, so a hand edit shows up without
+    /// a restart; falls back to what is in memory if the file cannot be read.
+    pub(crate) fn list(&self) -> Vec<String> {
+        self.store.as_deref().map_or_else(
+            || self.specs.clone(),
+            |path| {
+                let from_file = Self::read_file(path);
+                // Fall back to memory only when the file gives nothing: a file that has been
+                // emptied on purpose should read as empty, but one that has gone missing or
+                // unreadable should not silently discard what this process knows.
+                if from_file.is_empty() {
+                    self.specs.clone()
+                } else {
+                    from_file
+                }
+            },
+        )
+    }
+
+    /// Write the list, if this one is persistent. Silent on failure — see [`Self::persistent`].
+    fn save(&self) {
+        let Some(path) = &self.store else {
+            return;
+        };
+        let mut text = String::from(RECENTS_HEADER);
+        text.push_str("\nrecent = [\n");
+        for s in &self.specs {
+            // TOML's own quoting, so a path containing a quote, a backslash or a `#` survives
+            // the round trip instead of corrupting the entry (or the rest of the file).
+            text.push_str("  ");
+            text.push_str(&toml::Value::String(s.clone()).to_string());
+            text.push_str(",\n");
+        }
+        text.push_str("]\n");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, text);
     }
 }
 
@@ -323,6 +466,112 @@ mod tests {
             ["/a", "/b"],
             "reopening /a should move it, not duplicate it"
         );
+    }
+
+    /// A scratch file unique to this process and test — never the user's real config dir.
+    fn recents_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cs_recents_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir.join("recents.toml")
+    }
+
+    #[test]
+    fn a_persisted_list_survives_a_restart() {
+        // The whole point: an `hf://` repo typed once is still offered after the process is
+        // gone, which is what a session-only list loses.
+        let path = recents_file("survives");
+        let mut first = Recents::persistent_at(path.clone(), 10);
+        first.record("hf://moonshotai/Kimi-K3");
+        first.record("/models/checkpoint_1000");
+
+        let reopened = Recents::persistent_at(path, 10);
+        assert_eq!(
+            reopened.list(),
+            ["/models/checkpoint_1000", "hf://moonshotai/Kimi-K3"],
+            "a new process should see the list the last one wrote, most recent first"
+        );
+    }
+
+    #[test]
+    fn the_file_is_toml_a_person_can_edit() {
+        let path = recents_file("editable");
+        let mut r = Recents::persistent_at(path.clone(), 10);
+        r.record("/models/a");
+        let text = std::fs::read_to_string(&path).expect("the file was written");
+        // A header that explains itself, and one entry per line so a diff of a hand edit is
+        // readable.
+        assert!(
+            text.starts_with("# checkpoint-studio"),
+            "header missing: {text}"
+        );
+        assert!(
+            text.contains("recent = [\n  \"/models/a\",\n]"),
+            "layout: {text}"
+        );
+        // And it parses as TOML, which is the point of choosing it.
+        let back: toml::Value = toml::from_str(&text).expect("valid TOML");
+        assert!(back.get("recent").is_some());
+    }
+
+    #[test]
+    fn a_hand_edit_is_read_back_and_not_overwritten() {
+        // The file is the source of truth, so an edit made while the app is running has to
+        // survive the next open rather than being clobbered by what the process remembered.
+        let path = recents_file("hand_edit");
+        let mut r = Recents::persistent_at(path.clone(), 10);
+        r.record("/models/a");
+        std::fs::write(
+            &path,
+            "# my own note\nrecent = [\n  \"/models/hand-added\",\n  \"/models/a\",\n]\n",
+        )
+        .expect("write by hand");
+
+        assert_eq!(
+            r.list(),
+            ["/models/hand-added", "/models/a"],
+            "the list should be read back from the file, not from memory"
+        );
+        r.record("/models/b");
+        assert_eq!(
+            r.list(),
+            ["/models/b", "/models/hand-added", "/models/a"],
+            "a later open should merge into the hand-edited list, not replace it"
+        );
+    }
+
+    #[test]
+    fn a_broken_or_missing_file_is_not_an_error() {
+        // A convenience list is never worth failing a checkpoint read over.
+        let path = recents_file("broken");
+        assert!(
+            Recents::persistent_at(path.clone(), 10).list().is_empty(),
+            "a missing file reads as an empty list"
+        );
+        std::fs::write(&path, "recent = [ this is not toml").expect("write junk");
+        assert!(
+            Recents::persistent_at(path.clone(), 10).list().is_empty(),
+            "a malformed file reads as an empty list"
+        );
+        // And it recovers: a record over the junk writes a valid file.
+        let mut r = Recents::persistent_at(path.clone(), 10);
+        r.record("/models/a");
+        assert_eq!(Recents::persistent_at(path, 10).list(), ["/models/a"]);
+    }
+
+    #[test]
+    fn a_path_with_awkward_characters_round_trips() {
+        // TOML's quoting is why this is not hand-rolled: a `#` would start a comment and a
+        // backslash or quote would end the string early.
+        let path = recents_file("awkward");
+        let awkward = ["/models/a b/ckpt", "/models/has#hash", "/models/has\"quote"];
+        let mut r = Recents::persistent_at(path.clone(), 10);
+        for a in awkward {
+            r.record(a);
+        }
+        let mut expected: Vec<&str> = awkward.to_vec();
+        expected.reverse(); // most recent first
+        assert_eq!(Recents::persistent_at(path, 10).list(), expected);
     }
 
     #[test]

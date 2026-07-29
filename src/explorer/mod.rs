@@ -1459,6 +1459,17 @@ impl Explorer {
         self
     }
 
+    /// Use the recents list that persists across runs — the interactive session's choice. Kept
+    /// out of [`Self::new`] on purpose: an explorer built for a test or a one-shot export must
+    /// not write to the user's config directory.
+    pub(crate) fn with_persistent_recents(mut self) -> Self {
+        let mut recents = crate::opening::Recents::persistent();
+        // The checkpoint on the command line is the most recent by definition.
+        recents.record(&crate::opening::spec_of_paths(&self.files));
+        self.recents = recents;
+        self
+    }
+
     /// Update the hovered-shortcut help from a mouse position: the footer chip
     /// under `(col, row)` on screen `ctx` (with a help string), else `None`.
     /// Feeds the help bubble drawn by the render paths.
@@ -5937,7 +5948,7 @@ impl Explorer {
     /// this run is offered as the prompt's history, so switching back is a keypress rather
     /// than a retype.
     fn run_open_prompt(&mut self, term: &mut crate::tui::LiveTerminal) {
-        let recents = self.recents.list().to_vec();
+        let recents = self.recents.list();
         let target = run_text_prompt_with_history(
             term,
             "Open checkpoint (file, directory, glob, hf://repo, :path-on-proxy)",

@@ -207,6 +207,12 @@ crossterm = "0.28"
 # rename (`convert --map`) rewrites a safetensors header without reshuffling its
 # entries (a `BTreeMap` would sort them), and index.json round-trips unchanged.
 serde_json = { version = "1.0", features = ["preserve_order"] }
+
+# The recents list is a TOML file people edit by hand, so it is parsed and quoted by a real
+# TOML implementation rather than by another hand-rolled subset: a checkpoint path can contain
+# a quote, a backslash or a `#`, and getting the escaping wrong would corrupt the entry on the
+# next write. `toml_edit`/`toml_datetime` were already in the lock file, so this is a facade.
+toml = "0.9"
 # The central checkpoint model + reports serialize to JSON (and other formats)
 # via derive — the backbone of the "read once into one serializable datatype"
 # architecture.

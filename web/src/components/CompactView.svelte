@@ -11,12 +11,10 @@
   //
   // The folding is `crate::compact::compact_tree`, which is `diff`'s own family
   // collapsing — so a "family" means the same thing here and in a diff.
-  import { expandedIds, flatten, type Row } from '../lib/flatten';
+  import { flatten, type Row } from '../lib/flatten';
   import { humanCount, humanSize } from '../lib/format';
-  import { expanded, filterQuery, toggle } from '../stores/view';
-  import { compactError, compactTree, loadCompact } from '../stores/server';
-  import LoadingBar from './LoadingBar.svelte';
-  import { startedNow, type Progress } from '../lib/progress';
+  import { expanded, toggle } from '../stores/view';
+  import { compactError, compactTree } from '../stores/server';
   import Dtype from './Dtype.svelte';
   import Shape from './Shape.svelte';
 
@@ -28,20 +26,13 @@
   // tree it returns is families rather than tensors, so there is little to render. No byte
   // bar, then: the response is a few kilobytes and a bar would be theatre. What it needs is
   // the elapsed time, for the case where it *isn't* quick — a slow link, or a checkpoint
-  // with far more families than this one.
-  let waitStarted: Progress | null = null;
+  // The fetch is NOT triggered here. It used to be — and that deadlocked the moment the
+  // shared loading screen started replacing this component while the fold was in flight:
+  // the screen hid the only thing that asked the server, so nothing ever did, and the
+  // spinner ran forever. Fetching is now driven by compact mode being *on* (see
+  // `foldWhenCompact` in stores/view.ts), which is true whether or not this is mounted.
   $: data = $compactTree;
   $: err = $compactError;
-  $: void refresh($filterQuery);
-
-  /** Load, then seed the fold state from what actually landed — so the view opens at the
-   * depth the server sent, the way the tree view does. After that the user owns folding,
-   * so this runs once per loaded tree rather than on every store change. */
-  async function refresh(q: string) {
-    waitStarted = startedNow();
-    const t = await loadCompact(q);
-    if (t) expanded.set(expandedIds(t.tree));
-  }
 
   $: rows = data ? flatten(data.tree, $expanded) : ([] as Row[]);
   $: familyCount = data ? Object.keys(data.counts).length : 0;
@@ -61,8 +52,6 @@
 <div class="compact">
   {#if err}
     <p class="err">{err}</p>
-  {:else if !data}
-    <LoadingBar label="folding the tree" progress={waitStarted} />
   {:else if data}
     <div class="hdr">
       <span
