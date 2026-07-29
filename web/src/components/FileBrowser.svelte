@@ -5,12 +5,18 @@
   import { humanSize, shardNote } from '../lib/format';
   import { filterToShard, openFile, selectedSource } from '../stores/view';
   import { flattenFiles, toggleDir } from '../lib/filerows';
+  import LoadingBar from './LoadingBar.svelte';
+  import { startedNow, type Progress } from '../lib/progress';
 
   let root: FileNode | null = null;
   let err = '';
   let expanded = new Set<string>();
+  // A directory listing is small, so there is nothing to measure — but the wait still has
+  // a length, which is the half of the terminal's load screen that always applies.
+  let waitStarted: Progress | null = null;
 
   onMount(async () => {
+    waitStarted = startedNow();
     try {
       root = await api.files();
       if (root) expanded = toggleDir(expanded, root.path);
@@ -78,7 +84,7 @@
   {#if err}
     <p class="err">{err}</p>
   {:else if !root}
-    <p class="dim">loading…</p>
+    <LoadingBar label="reading the directory" progress={waitStarted} />
   {:else}
     {#each rows as { node, depth } (node.path + node.name)}
       <div

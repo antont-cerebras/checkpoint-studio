@@ -2,7 +2,9 @@
   import { onMount } from 'svelte';
   import { cachedCheckpointStats } from '../stores/server';
   import { humanCount, humanSize } from '../lib/format';
-  import Spinner from './Spinner.svelte';
+  import LoadingBar from './LoadingBar.svelte';
+  import { startedNow, type Progress } from '../lib/progress';
+  let waitStarted: Progress | null = null;
   import Dtype from './Dtype.svelte';
   import Ref from './Ref.svelte';
 
@@ -68,6 +70,7 @@
   let err = '';
 
   onMount(async () => {
+    waitStarted = startedNow();
     try {
       s = (await cachedCheckpointStats()) as unknown as Stats;
     } catch (e) {
@@ -91,7 +94,7 @@
   {#if err}
     <p class="err">{err}</p>
   {:else if !s}
-    <Spinner label="loading stats…" />
+    <LoadingBar label="reading the statistics" progress={waitStarted} />
   {:else}
     <div class="cards">
       <div class="card"><span class="k">Parameters</span><span class="v">{humanCount(s.params)}</span></div>

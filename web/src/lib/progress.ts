@@ -19,6 +19,19 @@ export interface Progress {
 }
 
 /**
+ * A wait that has just begun, with no measurable total.
+ *
+ * For the waits where byte progress would be a lie: the server scanning a 593 MiB tensor,
+ * or the browser rendering a model card. The bytes arrive instantly *after* the work, so a
+ * download bar would sit at zero and then jump — less honest than the spinner it replaced.
+ * What these still get is the elapsed time, which is the half of the terminal's load screen
+ * that always applies.
+ */
+export function startedNow(): Progress {
+  return { received: 0, total: null, startedAt: performance.now() };
+}
+
+/**
  * The body's length before encoding, from the server's headers.
  *
  * `Content-Length` is no use on its own: when the response is gzipped it describes the

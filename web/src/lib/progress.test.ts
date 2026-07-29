@@ -1,10 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { elapsedSeconds, fraction, totalBytes, type Progress } from './progress';
+import { elapsedSeconds, fraction, startedNow, totalBytes, type Progress } from './progress';
 
 const at = (received: number, total: number | null): Progress => ({
   received,
   total,
   startedAt: 1000,
+});
+
+describe('a wait with nothing to measure', () => {
+  it('starts at zero with no total, so the bar stays indeterminate', () => {
+    const before = performance.now();
+    const p = startedNow();
+    expect(p.received).toBe(0);
+    // The server scans and *then* answers, so a byte total would be a fiction. Null is
+    // what makes the component show a spinner and a timer instead of a bar at 0%.
+    expect(p.total).toBeNull();
+    expect(fraction(p)).toBeNull();
+    expect(p.startedAt).toBeGreaterThanOrEqual(before);
+  });
 });
 
 describe('the announced total', () => {

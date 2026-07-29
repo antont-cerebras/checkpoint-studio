@@ -7,7 +7,8 @@
   import HistogramView from './HistogramView.svelte';
   import Dtype from './Dtype.svelte';
   import Shape from './Shape.svelte';
-  import Spinner from './Spinner.svelte';
+  import LoadingBar from './LoadingBar.svelte';
+  import { startedNow, type Progress } from '../lib/progress';
 
   export let tensor: string;
   export let tab: DataTab;
@@ -47,6 +48,11 @@
   // structure, so offering a heatmap that 400s teaches the user nothing: the tabs are
   // disabled and the server's own sentence says why.
   $: canReadBytes = $caps?.read_bytes ?? false;
+  // A new wait each time a scan is started; tied to the promise so a re-render doesn't
+  // restart the clock. No fraction: the server scans and then answers, so bytes received
+  // would be 0 until the moment it finishes.
+  let scanStarted: Progress | null;
+  $: scanStarted = statsPromise ? startedNow() : null;
   $: isExtra = info !== null && info !== undefined && $unindexed.has(info.source_path);
   $: hasByteLayout = info ? offsets(info.layout) != null : false;
 
@@ -122,7 +128,7 @@
           <span class="dim">reads the whole tensor's values</span>
         {:else}
           {#await statsPromise}
-            <Spinner label="scanning tensor…" />
+            <LoadingBar label="scanning the tensor" progress={scanStarted} />
           {:then st}
             <table>
               <tbody>

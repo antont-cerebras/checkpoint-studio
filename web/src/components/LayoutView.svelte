@@ -7,7 +7,8 @@
   import { gapSummary, dtypeVar, dtypeTally } from '../lib/layout';
   import { cssVar } from '../lib/color';
   import { theme } from '../stores/theme';
-  import Spinner from './Spinner.svelte';
+  import LoadingBar from './LoadingBar.svelte';
+  import type { Progress } from '../lib/progress';
   import Dtype from './Dtype.svelte';
   import Shape from './Shape.svelte';
 
@@ -19,6 +20,7 @@
   let canvas: HTMLCanvasElement;
   let barH = 640;
   let hover = '';
+  let load_: Progress | null = null;
 
   $: shards = collect($tree?.tree ?? []);
   $: wanted = $screen.kind === 'layout' ? $screen.file : undefined;
@@ -47,8 +49,12 @@
   async function load(f: string) {
     loading = true;
     err = '';
+    const startedAt = performance.now();
+    load_ = { received: 0, total: null, startedAt };
     try {
-      map = await api.layout(f);
+      // A 12k-tensor shard's segment list is megabytes, so the wait is a download and the
+      // bar can measure it.
+      map = await api.layout(f, (received, total) => (load_ = { received, total, startedAt }));
     } catch (e) {
       err = e instanceof Error ? e.message : String(e);
       map = null;
@@ -121,7 +127,7 @@
   </div>
 
   {#if loading}
-    <Spinner label="parsing layout…" />
+    <LoadingBar label="reading the shard's layout" progress={load_} />
   {:else if err}
     <p class="err">{err}</p>
   {:else if map}
