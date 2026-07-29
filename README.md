@@ -193,6 +193,33 @@ The UI is a Svelte single-page app **embedded in the binary**, so a released
 > the structure of **any checkpoint path the serving user can read**. Pass
 > `--host 127.0.0.1` to restrict it to your own machine. When the bind is not loopback,
 > the startup banner says so in the terminal and the page carries a strip saying the same.
+> The same applies to `POST /api/open?path=…` below: it will read any checkpoint path the
+> serving user can read.
+
+#### Switching checkpoints without a restart
+
+Both frontends can change checkpoint in place — the command palette's
+**`Open another checkpoint…`** (`Space` or `:` in the terminal, `:` in the browser). It accepts
+everything the command line does: a file, a directory, a glob, `hf://owner/repo`, and
+`:/path/on/the/proxy` on a run that has an ssh proxy configured. The checkpoints opened this
+run are offered back — as a clickable list in the browser, on `↑`/`↓` in the terminal's
+prompt — so going back to where you were is a pick rather than a retype.
+
+The path is **resolved before anything is replaced**, so a typo is reported next to the box
+that produced it while the checkpoint you were reading is still fully loaded. Position state
+(selection, expansion, search, filter) is dropped, because it names rows that may not exist in
+the new checkpoint; display preferences like the compact fold are kept.
+
+In the web UI it is the *server's* checkpoint that changes, so this affects every browser tab
+connected to it — the server holds one checkpoint at a time. Long-running requests are
+unaffected: each request works from the checkpoint it started on, so a tensor scan that
+overlaps a switch still answers about the checkpoint it was asked about.
+
+```bash
+# The same thing over the API (a POST, because it changes what every endpoint answers):
+curl -X POST 'http://localhost:8080/api/open?path=/models/other-checkpoint'
+curl 'http://localhost:8080/api/recents'    # what has been opened this run
+```
 
 **Reverse parity — what the browser has that the terminal deliberately doesn't.** The
 terminal now has the compact (family-folded) tree (`k` / `--compact`) and flat-list sorting

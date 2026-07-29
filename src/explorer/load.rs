@@ -206,6 +206,75 @@ impl Explorer {
         self.remote.as_ref().map(|r| &r.read)
     }
 
+    /// Point this session at a different checkpoint and read it — the terminal half of
+    /// "switchable checkpoints".
+    ///
+    /// Everything derived from the old checkpoint is dropped rather than adjusted: the
+    /// session, the health reports, the cached check/stats/group-file reports, the tree and
+    /// its selection. Tensor names, shard paths and even the source *kind* can all change, so
+    /// there is nothing here worth carrying over — and a stale expansion set or a selection
+    /// index into a tree that no longer exists is exactly the kind of state that survives a
+    /// switch and then misreports.
+    ///
+    /// The read itself goes through the ordinary animated load ([`Self::load_all_files`]), so
+    /// a switch shows the same spinner, elapsed timer and shards gauge the initial open does —
+    /// on a worker thread, with `q` still able to quit. That is why this resolves the target
+    /// without reading it: reading here would freeze the UI for the duration.
+    pub(super) fn switch_to(&mut self, target: crate::opening::Target) -> Result<()> {
+        self.files = target.requested.clone();
+        self.index_specs = target.index_specs;
+        match &target.remote {
+            // A remote target rebuilds the whole remote context, which re-derives the file
+            // browser's source from the new path and drops the old SSH session — the next
+            // remote read opens one for the checkpoint we are actually on now.
+            Some(r) => self.set_remote_read(r.host.clone(), r.venv.clone()),
+            None => self.remote = None,
+        }
+        self.session = None;
+        self.health_reports.clear();
+        self.unindexed.clear();
+        // The per-tensor reader cache is keyed by source path + name, and a new checkpoint can
+        // reuse both at a different offset — so it is dropped, not trusted to miss.
+        *self.reader_cache.borrow_mut() = None;
+        self.tree_state = crate::kernel::TreeState::default();
+        self.full_loaded = false;
+        // The same choice `run_explore` makes for the first load: the animated read when there
+        // is a terminal to animate, the quiet one otherwise. `load_all_files` polls for a
+        // cancel key, which needs a tty — so a headless caller (a test, `--plain`) must not go
+        // through it.
+        if self.terminal.is_some() {
+            self.load_all_files()
+        } else {
+            self.load_quiet()
+        }
+    }
+
+    /// Resolve a spec the way the command line would (see [`crate::opening`]), for the
+    /// interactive open. Separate from [`Self::switch_to`] so the prompt can report a bad
+    /// path *before* anything about the current session has been touched.
+    pub(super) fn resolve_open(&self, spec: &str) -> Result<crate::opening::Target> {
+        crate::opening::resolve(spec, &self.open_options())
+    }
+
+    /// The read switches this session was started with, so a checkpoint opened later is read
+    /// the same way the one on the command line was.
+    ///
+    /// The proxy is taken from the *live* session rather than re-read from the config file: a
+    /// run started with an explicit `--ssh-proxy` must keep using that host, and a local run
+    /// must not silently start routing a typed path through a proxy the config happens to
+    /// name. A `:PATH` spec still opts in explicitly — [`crate::opening::resolve`] honours the
+    /// same prefix rule the CLI does.
+    fn open_options(&self) -> crate::opening::Options {
+        let (proxy, venv) = self.remote_read().map_or((None, None), |r| {
+            (Some(r.host.clone()), Some(r.venv.clone()))
+        });
+        crate::opening::Options {
+            proxy,
+            venv,
+            ..self.read_opts.clone()
+        }
+    }
+
     /// The file browser's remote source kind, when browsing a remote checkpoint.
     pub(super) fn remote_browse(&self) -> Option<&RemoteBrowse> {
         self.remote.as_ref().and_then(|r| r.browse.as_ref())
@@ -693,9 +762,16 @@ impl Explorer {
         remote: Option<&crate::remote::RemoteRead>,
         progress: &crate::hf::ReadProgress,
     ) -> Result<(CheckpointParts, Option<crate::model::Checkpoint>)> {
-        // One line, because the choice of source and the reading of it live behind the
-        // `crate::source::Source` trait — see that module for why the chain of `if`s that
-        // used to be here was the thing making a new data source expensive.
-        crate::source::resolve(files, remote)?.read(progress)
+        // Through `crate::opening`, which is the one place either frontend reads a
+        // checkpoint — so the terminal and the web server cannot drift on what a given spec
+        // means. `Want::Parts` is the terminal's half: the flat parts, with the remote reader
+        // left to assemble the model in a later step (and no per-object HEADs paid for here).
+        //
+        // The paths arrive already resolved: `run_explore` walked them at startup, and the
+        // interactive open resolved them before re-pointing. `Target::already_resolved`
+        // therefore takes them as-is rather than walking the directory a second time.
+        let opened = crate::opening::Target::already_resolved(files, remote.cloned())
+            .read(crate::opening::Want::Parts, progress)?;
+        Ok((opened.parts, opened.checkpoint))
     }
 }

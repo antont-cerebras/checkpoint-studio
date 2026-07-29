@@ -81,6 +81,7 @@ impl HealthReport {
 /// tensors the loader parses — so the shard headers are read a single time (by the
 /// loader) rather than again here. Built by [`parse_index_spec`]; consumed by
 /// [`check_loaded`].
+#[derive(Debug, Clone)]
 pub struct IndexSpec {
     /// The directory the index and its shards live in.
     pub dir: PathBuf,

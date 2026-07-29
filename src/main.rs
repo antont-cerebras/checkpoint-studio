@@ -32,6 +32,9 @@ mod cli_config;
 /// screen and the web's `/api/diff` — see the module docs for which side is which.
 mod compare;
 mod explorer;
+/// The one path from a typed spec to a read checkpoint, shared by the terminal and the
+/// web server so both accept the same spellings when changing checkpoint at runtime.
+mod opening;
 /// Data sources behind one trait — a new kind is an impl plus an arm in
 /// [`source::resolve`], not another branch in the loader.
 mod source;
@@ -3419,51 +3422,26 @@ fn run_web(
     port: u16,
     ssh: Option<(String, String)>,
 ) -> Result<()> {
-    // Remote: read the structure over SSH (metadata only) into the same model a
-    // local read produces, then serve it. No local files/index, so the on-disk
-    // stats and data-value views (heatmap/values/histogram/scan) are unavailable —
-    // the tree, per-tensor info, stats, and layout are.
-    if let Some((rhost, venv)) = ssh {
-        let src = match paths {
-            [one] => one.to_string_lossy().into_owned(),
-            _ => anyhow::bail!(
-                "web --ssh-proxy serves a single remote checkpoint; give one s3://… URI or remote path"
-            ),
-        };
-        // Reserve the port *before* the read (5–10 s over SSH): a clash is reported
-        // immediately, and if the requested port is taken we land on a free one and
-        // hold it while the read runs — so the wait is never wasted.
-        let server = web::bind(host, port)?;
-        let remote = remote::RemoteRead::new(rhost, venv);
-        // Fetch the S3 object metadata: the browser shows the same stats S3 section
-        // and health cross-check the TUI does, and this is a one-off at server start.
-        let model = remote.read_checkpoint(&src, remote::ObjectMeta::Fetch)?;
-        let state = std::sync::Arc::new(web::WebState::build(model, &[], &[]).with_exposure(host));
-        return web::serve_on(server, state, host);
-    }
-    // A Hugging Face repo is a URI, not a path: it must not be globbed or stat'd, and the
-    // source trait already knows how to read one. This is the case the seam removes — the
-    // web entry path needed no per-source branch of its own.
-    if paths.iter().any(|p| hf::is_uri(&p.to_string_lossy())) {
-        let source = source::resolve(paths, None)?;
-        let progress = hf::ReadProgress::default();
-        let (_, model) = source.read(&progress)?;
-        let model =
-            model.ok_or_else(|| anyhow::anyhow!("{}: no model to serve", source.describe()))?;
-        // Pass the paths: the tree's root label comes from them (`model::root_label`), so an
-        // empty list heads the tree "checkpoint" instead of naming the repo.
-        let state =
-            std::sync::Arc::new(web::WebState::build(model, paths, &[]).with_exposure(host));
-        return web::serve(state, host, port);
-    }
-    let (files, index_specs) = collect_safetensors_files(paths, recursive, no_health_check)?;
-    if files.is_empty() {
-        anyhow::bail!("No checkpoint files found in the specified paths.");
-    }
-    let model = readers::read_local(&files)?;
-    let state =
-        std::sync::Arc::new(web::WebState::build(model, &files, &index_specs).with_exposure(host));
-    web::serve(state, host, port)
+    // Reserve the port *before* the read (5–10 s over SSH, seconds for a 31k-tensor local
+    // checkpoint): a clash is reported immediately, and if the requested port is taken we
+    // land on a free one and hold it while the read runs — so the wait is never wasted.
+    let server = web::bind(host, port)?;
+    let opts = opening::Options {
+        recursive,
+        no_health_check,
+        // Already resolved by the caller, and re-resolving here would let a config file
+        // override the flags the process was started with.
+        proxy: None,
+        venv: None,
+    };
+    let remote = ssh.map(|(rhost, venv)| remote::RemoteRead::new(rhost, venv));
+    // One call for every source — local, Hub, ssh proxy. The three branches this replaced
+    // each spelled the same read slightly differently; now `--web` and the browser's own
+    // "open another checkpoint" go through one rule (see `crate::opening`).
+    let opened = opening::Target::from_paths(paths, remote.clone(), &opts)?
+        .read(opening::Want::Model, &hf::ReadProgress::default())?;
+    let current = web::Current::new(opened, remote, opts, host)?;
+    web::serve_on(server, std::sync::Arc::new(current), host)
 }
 
 fn run_explore(mut args: ExploreArgs) -> Result<()> {
@@ -3731,7 +3709,16 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         return Ok(());
     }
 
-    let mut explorer = Explorer::new(files, index_specs, open, !args.no_preload);
+    // Carry the read switches into the session: the palette's "Open another checkpoint…"
+    // reads the next one with the same `--recursive` / `--no-health-check` as this one.
+    let mut explorer = Explorer::new(files, index_specs, open, !args.no_preload).with_read_options(
+        opening::Options {
+            recursive: args.recursive,
+            no_health_check: args.no_health_check,
+            proxy: None,
+            venv: None,
+        },
+    );
     if let Some(host) = args.ssh_proxy {
         let venv = args.ssh_venv.unwrap_or_else(|| "~/venv".to_string());
         explorer.set_remote_read(host, venv);

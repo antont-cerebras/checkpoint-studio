@@ -267,7 +267,7 @@ mod tests {
         /// make it unpastable, which is worse than one wide line.
         #[test]
         fn an_unbreakable_word_is_not_split() {
-            let uri = "s3://inference-testing/moonlight-16b-a3b-instruct/260717/fp16";
+            let uri = "s3://bucket/example-model-16b-instruct/rev-000001/fp16";
             let lines = wrap_note("", &format!("reading {uri} now"), 30);
             assert!(
                 lines.iter().any(|l| l.contains(uri)),

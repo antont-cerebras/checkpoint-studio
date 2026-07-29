@@ -40,7 +40,12 @@ export type Screen =
   | { kind: 'stats' }
   | { kind: 'health' }
   | { kind: 'diff'; against: string }
-  | { kind: 'preview'; path: string; name: string };
+  | { kind: 'preview'; path: string; name: string }
+  // The open prompt carries no state of its own: what it does is change the *server*, and a
+  // URL cannot capture that. It round-trips as a bare `open` so a reload lands on the prompt
+  // rather than on a blank screen — deliberately without the typed path, because a bookmark
+  // that silently re-pointed the server on load would be a URL with a side effect.
+  | { kind: 'open' };
 
 /** Sorting for the flat (filter / search) tensor list. `none` keeps the natural
  * order (fuzzy-score for search, tree order for a filter); the tree view is never
@@ -94,6 +99,8 @@ export function screenToHash(s: Screen): string {
       return `diff?against=${enc(s.against)}`;
     case 'preview':
       return `preview?path=${enc(s.path)}&name=${enc(s.name)}`;
+    case 'open':
+      return 'open';
   }
 }
 
@@ -137,6 +144,8 @@ export function parseScreen(hash: string): Screen {
       if (path) return { kind: 'preview', path, name: q.get('name') ?? path };
       break;
     }
+    case 'open':
+      return { kind: 'open' };
   }
   return { kind: 'tree' };
 }

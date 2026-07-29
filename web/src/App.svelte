@@ -45,6 +45,7 @@
   import StatusBar from './components/StatusBar.svelte';
   import Footer from './components/Footer.svelte';
   import LoadingBar from './components/LoadingBar.svelte';
+  import OpenView from './components/OpenView.svelte';
   import Palette from './components/Palette.svelte';
   import FilterBuilder from './components/FilterBuilder.svelte';
   import CompactView from './components/CompactView.svelte';
@@ -84,6 +85,8 @@
         return s.against ? `› Compare: ${s.against}` : '› Compare';
       case 'preview':
         return `› ${s.name}`;
+      case 'open':
+        return '› Open';
     }
   }
 
@@ -453,8 +456,19 @@
   {/if}
 
   <main>
-    {#if $treeError}
-      <div class="error">Failed to load checkpoint: {$treeError}</div>
+    <!-- The open screen comes FIRST, before the no-tree and error guards: it is the one screen
+         that works without a loaded checkpoint, and it is how you recover from a checkpoint
+         that failed to load. Behind those guards it would have been unreachable in exactly the
+         situation you most need it. -->
+    {#if $screen.kind === 'open'}
+      <OpenView />
+    {:else if $treeError}
+      <div class="error">
+        Failed to load checkpoint: {$treeError}
+        <button type="button" class="recover" on:click={() => navigate({ kind: 'open' })}>
+          Open another checkpoint…
+        </button>
+      </div>
     {:else if !$tree}
       <div class="loading">
         <LoadingBar label="reading checkpoint structure" progress={$treeProgress} />
@@ -680,6 +694,19 @@
   }
   .loading {
     padding: 24px;
+  }
+  /* The way out of a checkpoint that didn't load: without it the error screen is a dead end
+     that only a restart clears. */
+  .recover {
+    display: block;
+    margin-top: 10px;
+    font: inherit;
+    color: var(--accent);
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 10px;
+    cursor: pointer;
   }
   .listflash {
     position: fixed;

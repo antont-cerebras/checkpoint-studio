@@ -58,6 +58,56 @@ fn require_bytes(s: &WebState) -> Option<Reply> {
     ))
 }
 
+// ---- changing which checkpoint is served ----
+
+/// `POST /api/open?path=SPEC` — read another checkpoint and serve it instead.
+///
+/// Synchronous: the response comes back when the new checkpoint is *ready*, which is what
+/// lets the client treat "this resolved" and "the data is there" as one thing rather than
+/// polling for a state it then has to reconcile. The read can take seconds (longer over ssh),
+/// and the browser shows its elapsed timer meanwhile; every other request keeps being served
+/// from the previous checkpoint until the swap lands (see `crate::web::current`).
+///
+/// The reply is deliberately small — the client refetches from the ordinary endpoints once
+/// this returns, rather than this one trying to bundle a new tree, files and stats into a
+/// response that would duplicate four routes.
+pub(crate) fn open(current: &super::Current, q: &Query) -> Reply {
+    let Some(spec) = q.get("path").map(String::as_str).filter(|p| !p.is_empty()) else {
+        return err(
+            400,
+            "open needs ?path=SPEC (a checkpoint file, directory, glob, hf:// repo, or a \
+             path on the ssh proxy)",
+        );
+    };
+    match current.open(spec) {
+        Ok(state) => ok(json!({
+            "root": state.root,
+            "tensor_count": state.tensors.len(),
+            // What opened, as typed — so the client can show the recents list without a
+            // second request, and see its own entry in it.
+            "opened": spec,
+            "recents": current.recents(),
+        })),
+        // A spec that doesn't resolve is a client mistake, not a server fault: this message
+        // is what the open prompt shows inline, so it carries the whole `anyhow` chain
+        // (`opening /nope: no checkpoint files found at …`).
+        Err(e) => err(400, format!("{e:#}")),
+    }
+}
+
+/// `GET /api/recents` — the checkpoints opened this run, most recent first.
+///
+/// Not folded into `/api/tree`: that body is encoded once per checkpoint and cached, so a
+/// list that grows with each open would be served stale from it.
+pub(crate) fn recents(current: &super::Current) -> Reply {
+    ok(json!({
+        "recents": current.recents(),
+        // Whether this server reads over an ssh proxy, so the prompt can say which kind of
+        // path it takes: a `--ssh-proxy` server opens remote paths, a local one local ones.
+        "proxied": current.is_proxied(),
+    }))
+}
+
 // ---- metadata / derived-view routes (served from precomputed state) ----
 
 pub(crate) fn tree(s: &WebState) -> Reply {

@@ -212,15 +212,43 @@ fn run_text_prompt<T>(
     title: &str,
     initial: String,
     background: impl Fn(&mut ratatui::Frame),
+    submit: impl FnMut(&str) -> Submit<T>,
+) -> Option<T> {
+    run_text_prompt_with_history(term, title, initial, &[], background, submit)
+}
+
+#[allow(clippy::wildcard_enum_match_arm)] // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
+/// [`run_text_prompt`] with recallable entries on `↑`/`↓`.
+///
+/// For the open prompt, whose useful inputs are the checkpoints already opened this run:
+/// retyping a path to go back to where you were is the kind of friction that makes a
+/// switchable checkpoint not feel switchable. `↑` walks towards older entries, `↓` back
+/// towards what was typed — and what was typed is *kept*, so browsing away from a
+/// half-finished path and back doesn't lose it.
+fn run_text_prompt_with_history<T>(
+    term: &mut crate::tui::LiveTerminal,
+    title: &str,
+    initial: String,
+    history: &[String],
+    background: impl Fn(&mut ratatui::Frame),
     mut submit: impl FnMut(&str) -> Submit<T>,
 ) -> Option<T> {
+    // Say the keys exist, but only when they do something.
+    let title = if history.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}  ↑↓ recent")
+    };
     let mut input = initial;
     let mut error: Option<String> = None;
+    // Where `↑` has walked to; `None` = still on what was typed.
+    let mut recalled: Option<usize> = None;
+    let mut typed = input.clone();
     loop {
         if term
             .draw(|f| {
                 background(f);
-                UI::render_text_prompt(f, title, &input, error.as_deref());
+                UI::render_text_prompt(f, &title, &input, error.as_deref());
             })
             .is_err()
         {
@@ -229,19 +257,47 @@ fn run_text_prompt<T>(
         match event::read() {
             Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
             Ok(Event::Key(KeyEvent { code, .. })) => match code {
-                #[allow(clippy::wildcard_enum_match_arm)]
-                // a foreign key/mouse enum; see FOREIGN_ENUM_WILDCARDS
                 KeyCode::Enter => match submit(input.trim()) {
                     Submit::Accept(value) => return Some(value),
                     Submit::Reject(message) => error = Some(message),
                 },
                 KeyCode::Esc => return None,
+                KeyCode::Up if !history.is_empty() => {
+                    // Index 0 is the most recent, so the first `↑` offers it and each further
+                    // press goes older, stopping at the oldest rather than wrapping (a list
+                    // that wraps makes you read to know where you are).
+                    let next = recalled.map_or(0, |i| i.saturating_add(1));
+                    // `get`, not `[]`: the clamp above is correct, but a prompt is not worth a
+                    // panic if it ever isn't.
+                    if let Some(entry) = history.get(next) {
+                        recalled = Some(next);
+                        input.clone_from(entry);
+                        error = None;
+                    }
+                }
+                KeyCode::Down if recalled.is_some() => {
+                    recalled = match recalled {
+                        Some(0) | None => None,
+                        Some(i) => Some(i - 1),
+                    };
+                    match recalled.and_then(|i| history.get(i)) {
+                        Some(entry) => input.clone_from(entry),
+                        None => input.clone_from(&typed),
+                    }
+                    error = None;
+                }
                 KeyCode::Backspace => {
                     input.pop();
+                    // Editing a recalled entry makes it the text being typed, so `↓` returns
+                    // here rather than to whatever was in the field before the recall.
+                    recalled = None;
+                    typed.clone_from(&input);
                     error = None;
                 }
                 KeyCode::Char(c) => {
                     input.push(c);
+                    recalled = None;
+                    typed.clone_from(&input);
                     error = None;
                 }
                 _ => {}
@@ -543,6 +599,8 @@ enum Cmd {
     Search,
     Filter,
     Diff,
+    /// Read a different checkpoint into this session, without restarting.
+    Open,
     /// Fold uniform layer / expert stacks (the compact tree).
     CompactToggle,
     /// Cycle which facet the flat (search / filter) list is ordered by.
@@ -700,6 +758,11 @@ const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
     (Cmd::CollapseAll, "Tree", "Collapse all groups", '\u{0}'),
     (Cmd::ViewFiles, "View", "File browser", '\t'),
     (Cmd::Diff, "View", "Compare with another checkpoint…", 'd'),
+    // Palette-only (blank-label sentinel → no footer chip / hotkey), like `Cmd::Filter`.
+    // Changing checkpoint is a deliberate, occasional act; giving it a single letter would
+    // mean one fat-finger away from throwing out the tree you were reading — and the tree's
+    // letters are all spoken for anyway.
+    (Cmd::Open, "View", "Open another checkpoint…", '\u{0}'),
     (Cmd::Stats, "View", "Checkpoint stats", 's'),
     (Cmd::Health, "View", "Health report", 'h'),
     (Cmd::Legend, "View", "Legend", 'l'),
@@ -1324,6 +1387,14 @@ pub(crate) struct Explorer {
     /// The file-browser state (directory tree + flattened rows + selection/scroll)
     /// — kernel-owned, built lazily on first `Tab` and driven by the file screen.
     file_state: crate::kernel::FileState,
+    /// The read switches this session was started with (`--recursive`,
+    /// `--no-health-check`), kept so a checkpoint opened later from the palette is read the
+    /// same way the one on the command line was. They used to be consumed at startup and
+    /// forgotten, which was fine while the checkpoint could never change.
+    read_opts: crate::opening::Options,
+    /// The checkpoints opened this run, offered as the open prompt's `↑` history — the same
+    /// list the web UI shows, from the same type (see [`crate::opening::Recents`]).
+    recents: crate::opening::Recents,
 }
 
 impl Explorer {
@@ -1336,6 +1407,10 @@ impl Explorer {
         // `health_reports` / `unindexed` are computed in `finalize_load`, once the
         // tensors are read, from `index_specs` — so no shard header is read twice.
         let browse_root = browse_root_of(&files);
+        // The checkpoint on the command line is the first recent, so the open prompt can
+        // offer it back after you have switched away.
+        let mut recents = crate::opening::Recents::default();
+        recents.record(&crate::opening::spec_of_paths(&files));
         Self {
             files,
             session: None,
@@ -1371,7 +1446,17 @@ impl Explorer {
             cached_group_files: RefCell::new(None),
             browse_root,
             file_state: crate::kernel::FileState::default(),
+            read_opts: crate::opening::Options::default(),
+            recents,
         }
+    }
+
+    /// Record the read switches this run was started with, for a later interactive open.
+    /// Separate from [`Self::new`] so the many call sites that build an explorer for a test
+    /// or a one-shot export keep the defaults.
+    pub(crate) fn with_read_options(mut self, opts: crate::opening::Options) -> Self {
+        self.read_opts = opts;
+        self
     }
 
     /// Update the hovered-shortcut help from a mouse position: the footer chip
@@ -3106,6 +3191,7 @@ impl Explorer {
             Cmd::Search => self.enter_search_mode(),
             Cmd::Filter => self.run_filter_prompt(term),
             Cmd::Diff => return Self::run_diff_prompt(term).map(Nav::Open),
+            Cmd::Open => self.run_open_prompt(term),
             Cmd::CompactToggle => {
                 self.set_compact(!self.compact);
                 self.copied_flash = Some((
@@ -3202,6 +3288,7 @@ impl Explorer {
                 Cmd::Search
                 | Cmd::Filter
                 | Cmd::Diff
+                | Cmd::Open
                 | Cmd::CompactToggle
                 | Cmd::ExpandToggle
                 | Cmd::ExpandAll
@@ -5839,6 +5926,50 @@ impl Explorer {
         self.refresh_filter();
     }
 
+    /// Prompt for a checkpoint to open, then read it into this session.
+    ///
+    /// The spec is *resolved* on Enter — the path walked, the index parsed, `:PATH` routed to
+    /// the proxy — so a typo is rejected in the prompt, where it can be corrected, while the
+    /// current checkpoint is still fully intact. Only once that succeeds is anything replaced,
+    /// and the read that follows draws the ordinary loading screen.
+    ///
+    /// Accepts what the command line accepts (see [`crate::opening`]); the recents list from
+    /// this run is offered as the prompt's history, so switching back is a keypress rather
+    /// than a retype.
+    fn run_open_prompt(&mut self, term: &mut crate::tui::LiveTerminal) {
+        let recents = self.recents.list().to_vec();
+        let target = run_text_prompt_with_history(
+            term,
+            "Open checkpoint (file, directory, glob, hf://repo, :path-on-proxy)",
+            String::new(),
+            &recents,
+            |_| {},
+            |input| match self.resolve_open(input) {
+                Ok(t) => Submit::Accept(t),
+                Err(e) => Submit::Reject(format!("{e:#}")),
+            },
+        );
+        let Some(target) = target else {
+            return; // cancelled (Esc)
+        };
+        // Record what was asked for, not the walked file list — that is what a person
+        // recognises in the list, and what they would type again.
+        let spec = target.spec();
+        if let Err(e) = self.switch_to(target) {
+            // The switch already dropped the old checkpoint, so there is nothing to fall back
+            // to: say what failed and leave the (now empty) tree, rather than pretending the
+            // previous checkpoint is still loaded.
+            let msg = format!("{e:#}");
+            self.float_until_dismissed(term, |f| {
+                self.render_tree_frame(f, true);
+                UI::render_notice(f, &msg);
+            });
+            return;
+        }
+        self.recents.record(&spec);
+        self.copied_flash = Some((format!("opened {spec}"), std::time::Instant::now()));
+    }
+
     /// Prompt for a checkpoint to compare against, then open the compare screen. The
     /// path is validated on Enter by actually reading it, so a typo is reported in the
     /// prompt (where it can be corrected) rather than on a screen that has to explain
@@ -7480,6 +7611,71 @@ fn copy_to_clipboard(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Switching checkpoint in the terminal: the new data replaces the old, and the position
+    /// state that named the old checkpoint's rows is gone.
+    ///
+    /// This is the terminal half of the same feature the web server exposes over
+    /// `POST /api/open`; both read through [`crate::opening`], so what is pinned here is the
+    /// *installation* — which is where a switch goes wrong (state that survives it).
+    #[test]
+    fn switching_checkpoint_replaces_the_data_and_drops_the_old_position() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let first = fixtures.join("tiny.safetensors");
+        let second = fixtures.join("diff_new.safetensors");
+
+        let mut ex = Explorer::new(vec![first], Vec::new(), None, false);
+        ex.load_quiet().expect("the first fixture loads");
+        let before: Vec<String> = ex.tensors().iter().map(|t| t.name.clone()).collect();
+        assert!(!before.is_empty(), "the fixture has tensors");
+
+        // Position state that must not survive: a filter written against the checkpoint being
+        // replaced, whose matched rows name tensors the new one may not have.
+        ex.tree_state
+            .set_filter("dtype:F32".to_string(), Vec::new());
+
+        let target = ex
+            .resolve_open(&second.to_string_lossy())
+            .expect("the second fixture resolves");
+        ex.switch_to(target).expect("the switch reads it");
+
+        let after: Vec<String> = ex.tensors().iter().map(|t| t.name.clone()).collect();
+        assert_ne!(before, after, "the tensors should be the new checkpoint's");
+        assert_eq!(
+            ex.files,
+            vec![second],
+            "and `files` should name what to re-read now"
+        );
+        assert!(
+            ex.tree_state.filter_query().is_empty(),
+            "a filter written for the old checkpoint must not carry over"
+        );
+        assert!(ex.full_loaded, "the new checkpoint is fully read");
+    }
+
+    /// A spec that resolves to nothing is refused *before* anything is replaced — which is why
+    /// the prompt resolves first and switches second.
+    #[test]
+    fn a_bad_spec_is_refused_without_touching_the_open_checkpoint() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.safetensors");
+        let mut ex = Explorer::new(vec![fixture.clone()], Vec::new(), None, false);
+        ex.load_quiet().expect("the fixture loads");
+        let before: Vec<String> = ex.tensors().iter().map(|t| t.name.clone()).collect();
+
+        let err = ex
+            .resolve_open("/definitely/not/a/checkpoint")
+            .expect_err("a missing path resolves to nothing");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("/definitely/not/a/checkpoint"),
+            "the prompt needs the path in the message, got: {msg}"
+        );
+
+        let after: Vec<String> = ex.tensors().iter().map(|t| t.name.clone()).collect();
+        assert_eq!(before, after, "nothing should have changed");
+        assert_eq!(ex.files, vec![fixture]);
+    }
 
     #[test]
     fn browse_root_is_the_checkpoints_directory() {

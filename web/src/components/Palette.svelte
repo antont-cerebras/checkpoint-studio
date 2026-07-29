@@ -37,6 +37,13 @@
         navigate({ kind: 'diff', against: s.kind === 'diff' ? s.against : '' });
       },
     },
+    {
+      group: 'Go',
+      // Same wording as the terminal's palette entry, so the two are recognisably one
+      // feature (see `TREE_COMMANDS` in src/explorer/mod.rs).
+      label: 'Open another checkpoint…',
+      run: () => navigate({ kind: 'open' }),
+    },
     { group: 'Tree', label: 'Expand all groups', run: () => setAllExpanded(true) },
     { group: 'Tree', label: 'Collapse all groups', run: () => setAllExpanded(false) },
     { group: 'Tree', label: 'Search tensors', run: () => { navigate({ kind: 'tree' }); startSearch(); } },

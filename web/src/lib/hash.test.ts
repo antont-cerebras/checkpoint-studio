@@ -35,6 +35,7 @@ const SCREENS: Screen[] = [
   { kind: 'detail', tensor: 'lm_head.weight', tab: 'heatmap' },
   { kind: 'preview', path: '/ckpt/config.json', name: 'config.json' },
   { kind: 'diff', against: '/models/checkpoint_1000' },
+  { kind: 'open' },
   // A path with characters that must survive percent-encoding in the hash.
   { kind: 'diff', against: '/models/a b/model-00001-of-00002.safetensors' },
 ];
@@ -172,6 +173,21 @@ describe('hashFor', () => {
     const full = `#${hashFor(s, g)}`;
     expect(parseScreen(full)).toEqual(s);
     expect(parseGlobals(full)).toEqual(g);
+  });
+});
+
+describe('the open screen', () => {
+  // Deliberately state-free. What the screen *does* is change the server, and a URL cannot
+  // capture that — a bookmark that re-pointed the server on load would be a link with a side
+  // effect. So the hash records only "the prompt was open", and a reload lands back on the
+  // prompt rather than on a blank screen.
+  it('round-trips as a bare kind, carrying no path', () => {
+    expect(screenToHash({ kind: 'open' })).toBe('open');
+    expect(parseScreen('#open')).toEqual({ kind: 'open' });
+  });
+
+  it('ignores a path someone appends by hand, rather than opening it', () => {
+    expect(parseScreen('#open?path=/somewhere/else')).toEqual({ kind: 'open' });
   });
 });
 

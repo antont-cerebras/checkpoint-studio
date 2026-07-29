@@ -266,3 +266,106 @@ describe('cachedCheckpointStats', () => {
     expect(calls.filter((u) => u === '/api/stats')).toHaveLength(1);
   });
 });
+
+describe('switching checkpoint', () => {
+  /** A second checkpoint's tree, distinguishable from `TREE`. */
+  const OTHER: TreeResponse = {
+    tree: [leaf('switched.weight', '/other/model.safetensors')],
+  } as TreeResponse;
+
+  it('drops every cached answer, so nothing from the old checkpoint survives', async () => {
+    // Warm all three caches, then switch. Each of these would otherwise keep answering about
+    // the checkpoint that is no longer being served — and a stale answer here doesn't look
+    // stale, it looks like an answer.
+    const calls = stubFetch([
+      { body: TREE }, // ensureTree
+      { body: { n_tensors: 2 } }, // the warm-up /api/stats
+      { body: { min: 0, max: 1 } }, // cachedStats
+      { body: { root: '/other', tensor_count: 1, opened: '/other', recents: ['/other'] } },
+      { body: OTHER }, // the refetched tree
+      { body: { n_tensors: 1 } }, // the new warm-up
+    ]);
+    const s = await load();
+    await s.ensureTree();
+    await s.cachedStats('a.weight');
+    expect(get(s.tree)).toEqual(TREE);
+
+    await s.openCheckpoint('/other');
+    await s.reloadCheckpoint();
+
+    expect(get(s.tree)).toEqual(OTHER);
+    // `ensureTree` fetches once per checkpoint: a second `/api/tree` proves the once-only
+    // guard was cleared, which is what makes the reload happen at all.
+    expect(calls.filter((u) => u === '/api/tree')).toHaveLength(2);
+    // And the memo caches were emptied — the same key refetches instead of replaying.
+    const before = calls.length;
+    await s.cachedStats('a.weight');
+    expect(calls.length).toBeGreaterThan(before);
+  });
+
+  it('leaves everything alone when the path does not resolve', async () => {
+    const calls = stubFetch([
+      { body: TREE },
+      { body: { n_tensors: 2 } },
+      { status: 400, body: { error: 'no checkpoint files found at /nope' } },
+    ]);
+    const s = await load();
+    await s.ensureTree();
+
+    await expect(s.openCheckpoint('/nope')).rejects.toThrow('no checkpoint files found at /nope');
+
+    // The tree the user was reading is still there: the server only swaps after a successful
+    // read, and the client only forgets after a successful response.
+    expect(get(s.tree)).toEqual(TREE);
+    expect(calls.filter((u) => u === '/api/tree')).toHaveLength(1);
+  });
+
+  it('posts to open, because opening changes what the server serves', async () => {
+    const methods: (string | undefined)[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string, init?: { method?: string }) => {
+        methods.push(init?.method);
+        const body = { root: '/x', tensor_count: 0, opened: '/x', recents: [] };
+        const text = JSON.stringify(body);
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'Content-Length': String(text.length) }),
+          json: () => Promise.resolve(body),
+          text: () => Promise.resolve(text),
+        });
+      }),
+    );
+    const s = await load();
+    await s.openCheckpoint('/x');
+    expect(methods).toEqual(['POST']);
+  });
+
+  it('keeps the timer running for the length of the open, then clears it', async () => {
+    stubFetch([{ body: { root: '/x', tensor_count: 0, opened: '/x', recents: ['/x'] } }]);
+    const s = await load();
+    expect(get(s.openProgress)).toBeNull();
+    const inFlight = s.openCheckpoint('/x');
+    // Timer only: the server reads and *then* answers, so there is no total to divide by.
+    expect(get(s.openProgress)?.total).toBeNull();
+    await inFlight;
+    expect(get(s.openProgress)).toBeNull();
+    expect(get(s.recents)).toEqual(['/x']);
+  });
+
+  it('records the proxy flag, so the prompt can say what paths it takes', async () => {
+    stubFetch([{ body: { recents: ['/a'], proxied: true } }]);
+    const s = await load();
+    await s.loadRecents();
+    expect(get(s.recents)).toEqual(['/a']);
+    expect(get(s.proxied)).toBe(true);
+  });
+
+  it('survives a recents fetch that fails, since the box still works without it', async () => {
+    stubFetch([{ status: 500, body: { error: 'nope' } }]);
+    const s = await load();
+    await expect(s.loadRecents()).resolves.toBeUndefined();
+    expect(get(s.recents)).toEqual([]);
+  });
+});
