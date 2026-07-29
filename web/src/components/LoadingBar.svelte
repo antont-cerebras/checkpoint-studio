@@ -49,7 +49,15 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
-    min-width: 34ch;
+    /* Capped, not stretched. A column flex fills its container, which on the full-screen
+       load put a hairline bar across the whole window — the width said "this will take a
+       while" while the bar itself was 4px tall. The TUI caps the same gauge at 30 cells
+       for the same reason (`max_line` in ui::detail::render_line_gauge), and clamps it to
+       the pane; `max-width` is that clamp. 40ch is measured, not guessed: the longest
+       label and its timer — `⠋ reading checkpoint structure (12.4s)` — is 38 characters,
+       and at 34ch it wrapped mid-phrase. */
+    width: 40ch;
+    max-width: 100%;
   }
   .head {
     display: flex;
