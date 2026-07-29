@@ -133,6 +133,14 @@ async function postJson<T>(url: string): Promise<T> {
   return body as T;
 }
 
+/** Drop one entry from the recents list. `DELETE`, because it removes one identified thing. */
+async function deleteJson<T>(url: string): Promise<T> {
+  const res = await fetch(url, { method: 'DELETE' });
+  const body: unknown = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(serverError(body, res.status));
+  return body as T;
+}
+
 /** What `POST /api/open` answers with. */
 export interface OpenResponse {
   root: string;
@@ -168,7 +176,11 @@ export const api = {
   open: (spec: string) => postJson<OpenResponse>(`/api/open?path=${enc(spec)}`),
   /** The checkpoints opened this run, most recent first, and whether this server reads over
    * an ssh proxy (which decides what kind of path the prompt accepts). */
-  recents: () => getJson<{ recents: string[]; proxied: boolean }>('/api/recents'),
+  recents: () =>
+    getJson<{ recents: string[]; proxied: boolean; proxy_host: string | null }>('/api/recents'),
+  /** Forget one checkpoint. Returns the list without it; rejects with a 404 if it wasn't there. */
+  forgetRecent: (spec: string) =>
+    deleteJson<{ forgot: string; recents: string[] }>(`/api/recents?path=${enc(spec)}`),
   stats: () => getJson<Record<string, unknown>>('/api/stats'),
   health: () => getJson<unknown[]>('/api/health'),
   check: () => getJson<Record<string, unknown> | null>('/api/check'),

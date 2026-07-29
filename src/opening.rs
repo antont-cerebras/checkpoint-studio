@@ -106,6 +106,23 @@ pub(crate) fn resolve(spec: &str, opts: &Options) -> Result<Target> {
         bail!("no checkpoint given");
     }
     let cfg = cli_config::CliConfig::load();
+    // scp-style `[user@]host:/path` carries its own host, so it needs no configured proxy — the
+    // command line has accepted this since before there was a config file, and an interactive
+    // open has to accept what the command line does. It is also the form a remote open is
+    // *recorded* as (see `recorded_spec`), so a recents entry must resolve here.
+    //
+    // Checked before the proxy rules below: `:PATH` has its colon at index 0 and a URI contains
+    // `://`, so `split_scp` declines both and cannot shadow them.
+    if let Some((host, path)) = crate::split_scp(spec) {
+        let venv = opts
+            .venv
+            .clone()
+            .or_else(|| cfg.ssh_venv.clone())
+            .unwrap_or_else(|| "~/venv".to_string());
+        let remote = remote::RemoteRead::new(host, venv);
+        return Target::from_paths(&[PathBuf::from(path)], Some(remote), opts)
+            .map_err(|e| e.context(format!("opening {spec}")));
+    }
     // The same resolution the command line performs, so `:PATH` reaches the configured
     // proxy and a bare `s3://` URI is routed to it rather than failing locally.
     let (requested, proxy) = crate::resolve_remote_sources(
@@ -192,6 +209,25 @@ impl Target {
         spec_of_paths(&self.requested)
     }
 
+    /// Which kind of spec this is, for [`recorded_spec`].
+    ///
+    /// A URI wins over the proxy: an `s3://` prefix read *through* a proxy is still named by its
+    /// URI, and `host:s3://…` would be nonsense.
+    pub(crate) fn source(&self) -> SpecSource {
+        if self.requested.iter().any(|p| is_uri(p)) {
+            return SpecSource::Uri;
+        }
+        self.remote
+            .as_ref()
+            .map_or(SpecSource::Local, |r| SpecSource::Remote(r.host.clone()))
+    }
+
+    /// How this open should be remembered — see [`recorded_spec`]. `typed` is what the person
+    /// entered, which is the only form that carries a `:PATH` proxy prefix.
+    pub(crate) fn recorded_spec(&self, typed: &str) -> String {
+        recorded_spec(&self.requested, typed, self.source())
+    }
+
     /// Read the checkpoint. The single place a read happens for either frontend.
     pub(crate) fn read(self, want: Want, progress: &ReadProgress) -> Result<Opened> {
         if let Some(r) = self.remote.clone() {
@@ -263,6 +299,94 @@ pub(crate) fn spec_of_paths(paths: &[PathBuf]) -> String {
         .join(" ")
 }
 
+/// Whether a path is a URI rather than a filesystem path — `hf://…`, `s3://…`, or anything else
+/// with a scheme. Those already name one thing from anywhere.
+fn is_uri(p: &Path) -> bool {
+    p.to_string_lossy().contains("://")
+}
+
+/// Drop trailing slashes, so one checkpoint has one spelling.
+///
+/// `…/lut-3bit/` and `…/lut-3bit` name the same directory, and the app produced both: a path is
+/// typed (or tab-completed) with the slash, while the resolved root has none. Two spellings of one
+/// checkpoint meant two recents entries for it, and a "this is the open one" badge that never
+/// matched.
+///
+/// URIs are left alone: `s3://bucket/prefix/` is how a prefix is conventionally written, and its
+/// trailing slash is not this function's to judge.
+fn normalise_spec(spec: &str) -> String {
+    let spec = spec.trim();
+    if spec.contains("://") {
+        return spec.to_string();
+    }
+    let trimmed = spec.trim_end_matches('/');
+    // Never strip a bare root away to nothing.
+    if trimmed.is_empty() {
+        spec.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// A local spec made absolute, for something that will be stored and reopened later.
+///
+/// A recents entry is retyped verbatim, from whatever directory the next process happens to
+/// start in — so `./model` or `model.safetensors` is a note to nobody. `~` is expanded for the
+/// same reason: an absolute path needs no interpreter.
+///
+/// Lexical only ([`std::path::absolute`]), not [`Path::canonicalize`]: this has to work for a
+/// glob (`ckpt/*.safetensors` names no single file) and for a path whose target may be
+/// recreated, and resolving symlinks would record a location the user did not name.
+fn absolutise(path: &Path) -> PathBuf {
+    let expanded = crate::utils::expand_tilde(&path.to_string_lossy());
+    let absolute = std::path::absolute(&expanded).unwrap_or(expanded);
+    PathBuf::from(normalise_spec(&absolute.to_string_lossy()))
+}
+
+/// Which spelling an open should be *remembered* as.
+///
+/// One rule behind all three: a stored entry has to name the same checkpoint later, from a
+/// different working directory and possibly a different config file. Anything that depends on
+/// ambient state is rewritten into a form that doesn't.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SpecSource {
+    /// A path or glob on this filesystem — recorded absolute, since a relative path means
+    /// whatever the next process's working directory happens to be.
+    Local,
+    /// A path on an ssh host — recorded scp-style, `host:/path`.
+    ///
+    /// A remote path has two spellings: the full `[user@]host:/path`, and `:/path`, which means
+    /// "on whatever `ssh_proxy` names". The short form is the nicer thing to *type* and the wrong
+    /// thing to *store*: it resolves against a config file that can change, so the same entry
+    /// would later point at a different host — or at nothing, on a machine with no proxy
+    /// configured. The scp form carries its host, which makes it the remote equivalent of an
+    /// absolute path.
+    Remote(String),
+    /// A `hf://` or `s3://` URI — already names one thing from anywhere, so it is stored as
+    /// typed. (An `s3://` prefix still needs a proxy to *read*, exactly as it did the first
+    /// time; that is a property of the source, not of how it was written down.)
+    Uri,
+}
+
+/// How an open should be remembered — see [`SpecSource`] for why each form.
+pub(crate) fn recorded_spec(paths: &[PathBuf], typed: &str, source: SpecSource) -> String {
+    match source {
+        SpecSource::Local => {
+            let absolute: Vec<PathBuf> = paths.iter().map(|p| absolutise(p)).collect();
+            spec_of_paths(&absolute)
+        }
+        SpecSource::Remote(host) => {
+            // The remote paths as the reader gets them, prefixed with the host that serves them.
+            paths
+                .iter()
+                .map(|p| format!("{host}:{}", normalise_spec(&p.to_string_lossy())))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        SpecSource::Uri => normalise_spec(typed),
+    }
+}
+
 /// The checkpoints opened recently, most recent first.
 ///
 /// Offered by both frontends' open prompt, so switching back to where you were is a pick rather
@@ -302,6 +426,9 @@ pub(crate) struct Recents {
     cap: usize,
     /// The file this list lives in; `None` keeps it in memory only.
     store: Option<PathBuf>,
+    /// Set once this process has emptied the list on purpose, so [`Self::list`] stops treating an
+    /// empty file as "unreadable, use memory instead".
+    emptied: bool,
 }
 
 /// Written at the top of the file on every save, so the file explains itself to whoever opens
@@ -338,6 +465,7 @@ impl Recents {
             specs: Vec::new(),
             cap: cap.max(1),
             store: None,
+            emptied: false,
         }
     }
 
@@ -353,6 +481,7 @@ impl Recents {
             specs,
             cap: 10,
             store,
+            emptied: false,
         }
     }
 
@@ -364,6 +493,7 @@ impl Recents {
             specs,
             cap: cap.max(1),
             store: Some(path),
+            emptied: false,
         }
     }
 
@@ -383,9 +513,12 @@ impl Recents {
         let parsed: RecentsFile = toml::from_str(&text).unwrap_or_default();
         let mut out: Vec<String> = Vec::new();
         for spec in parsed.recent {
-            let spec = spec.trim();
-            if !spec.is_empty() && !out.iter().any(|s| s == spec) {
-                out.push(spec.to_string());
+            // Normalised on the way in as well as on the way out, so an entry written before this
+            // rule (or added by hand with a trailing slash) collapses onto the same one line
+            // instead of sitting beside its twin.
+            let spec = normalise_spec(&spec);
+            if !spec.is_empty() && !out.contains(&spec) {
+                out.push(spec);
             }
         }
         out
@@ -398,16 +531,34 @@ impl Recents {
     /// For a persistent list this merges with the file as it stands, so a hand edit made since
     /// the process started survives.
     pub(crate) fn record(&mut self, spec: &str) {
-        let spec = spec.trim();
+        let spec = normalise_spec(spec);
         if spec.is_empty() {
             return;
         }
         let mut specs = self.list();
-        specs.retain(|s| s != spec);
-        specs.insert(0, spec.to_string());
+        specs.retain(|s| *s != spec);
+        specs.insert(0, spec);
         specs.truncate(self.cap);
         self.specs = specs;
         self.save();
+    }
+
+    /// Drop a spec from the list. Returns whether it was there.
+    ///
+    /// Merges with the file first, like [`Self::record`], so removing one entry does not quietly
+    /// revert someone else's edit — and so removing the *last* one leaves an empty list rather
+    /// than falling back to what this process happened to remember.
+    pub(crate) fn forget(&mut self, spec: &str) -> bool {
+        let spec = normalise_spec(spec);
+        let mut specs = self.list();
+        let before = specs.len();
+        specs.retain(|s| *s != spec);
+        let removed = specs.len() != before;
+        self.specs = specs;
+        // Written even when nothing matched: harmless, and it keeps "the file now reflects the
+        // list" true without a second code path.
+        self.save_allowing_empty();
+        removed
     }
 
     /// Most recent first. Reads the file for a persistent list, so a hand edit shows up without
@@ -417,16 +568,22 @@ impl Recents {
             || self.specs.clone(),
             |path| {
                 let from_file = Self::read_file(path);
-                // Fall back to memory only when the file gives nothing: a file that has been
-                // emptied on purpose should read as empty, but one that has gone missing or
-                // unreadable should not silently discard what this process knows.
-                if from_file.is_empty() {
+                // Fall back to memory only when the file gives nothing *and* this process has not
+                // deliberately emptied it: a missing or unreadable file should not discard what we
+                // know, but a list the user just cleared must stay cleared.
+                if from_file.is_empty() && !self.emptied {
                     self.specs.clone()
                 } else {
                     from_file
                 }
             },
         )
+    }
+
+    /// [`Self::save`], and remember when the list has been emptied deliberately.
+    fn save_allowing_empty(&mut self) {
+        self.emptied = self.specs.is_empty();
+        self.save();
     }
 
     /// Write the list, if this one is persistent. Silent on failure — see [`Self::persistent`].
@@ -572,6 +729,181 @@ mod tests {
         let mut expected: Vec<&str> = awkward.to_vec();
         expected.reverse(); // most recent first
         assert_eq!(Recents::persistent_at(path, 10).list(), expected);
+    }
+
+    #[test]
+    fn a_local_spec_is_recorded_absolute_so_it_reopens_from_anywhere() {
+        // `checkpoint-studio ./model` is the common way to open one, and `./model` in a stored
+        // list means whatever the *next* process's working directory happens to be.
+        let rel = PathBuf::from("tests/fixtures/tiny.safetensors");
+        let got = recorded_spec(&[rel], "tests/fixtures/tiny.safetensors", SpecSource::Local);
+        assert!(
+            Path::new(&got).is_absolute(),
+            "a recorded local spec must be absolute, got {got}"
+        );
+        assert!(got.ends_with("tests/fixtures/tiny.safetensors"), "{got}");
+    }
+
+    #[test]
+    fn a_glob_stays_a_glob_when_it_is_absolutised() {
+        // Lexical, not `canonicalize`: a glob names no single file, so resolving it would fail —
+        // and resolving symlinks would record a path the user never named.
+        let got = recorded_spec(
+            &[PathBuf::from("ckpt/*.safetensors")],
+            "ckpt/*.safetensors",
+            SpecSource::Local,
+        );
+        assert!(got.ends_with("ckpt/*.safetensors"), "{got}");
+        assert!(Path::new(&got).is_absolute(), "{got}");
+    }
+
+    #[test]
+    fn one_checkpoint_has_one_spelling_whatever_the_trailing_slashes() {
+        // The app produced both: a directory is typed (or tab-completed) with a slash, while the
+        // resolved root has none. Two spellings meant two recents entries for one checkpoint.
+        let with = recorded_spec(
+            &[PathBuf::from("/models/ckpt/")],
+            "/models/ckpt/",
+            SpecSource::Local,
+        );
+        let without = recorded_spec(
+            &[PathBuf::from("/models/ckpt")],
+            "/models/ckpt",
+            SpecSource::Local,
+        );
+        assert_eq!(with, without, "the slash must not make a second address");
+        assert_eq!(with, "/models/ckpt");
+
+        // A remote path too, where the slash rides inside the scp form.
+        assert_eq!(
+            recorded_spec(
+                &[PathBuf::from("/opt/models/m/")],
+                ":/opt/models/m/",
+                SpecSource::Remote("host".to_string()),
+            ),
+            "host:/opt/models/m"
+        );
+
+        // But a URI keeps what was typed: `s3://bucket/prefix/` is how a prefix is written, and
+        // that trailing slash is not ours to judge.
+        assert_eq!(
+            recorded_spec(
+                &[PathBuf::from("s3://bucket/prefix/")],
+                "s3://bucket/prefix/",
+                SpecSource::Uri,
+            ),
+            "s3://bucket/prefix/"
+        );
+    }
+
+    #[test]
+    fn an_entry_written_before_the_rule_collapses_onto_its_twin() {
+        // A file written by an older build — or edited by hand with a trailing slash — must not
+        // leave the same checkpoint listed twice.
+        let path = recents_file("collapse");
+        std::fs::write(
+            &path,
+            "recent = [\n  \"/models/ckpt/\",\n  \"/models/ckpt\",\n]\n",
+        )
+        .expect("write by hand");
+        assert_eq!(
+            Recents::persistent_at(path, 10).list(),
+            ["/models/ckpt"],
+            "the two spellings should read back as one entry"
+        );
+    }
+
+    #[test]
+    fn forgetting_an_entry_removes_it_from_the_file() {
+        let path = recents_file("forget");
+        let mut r = Recents::persistent_at(path.clone(), 10);
+        r.record("/models/a");
+        r.record("/models/b");
+
+        assert!(r.forget("/models/a"), "it was in the list");
+        assert_eq!(r.list(), ["/models/b"]);
+        // Persisted, not just dropped in memory — the next process must not see it again.
+        assert_eq!(Recents::persistent_at(path, 10).list(), ["/models/b"]);
+    }
+
+    #[test]
+    fn forgetting_something_absent_says_so_rather_than_pretending() {
+        let path = recents_file("forget_absent");
+        let mut r = Recents::persistent_at(path, 10);
+        r.record("/models/a");
+        assert!(!r.forget("/models/never-there"));
+        assert_eq!(r.list(), ["/models/a"], "and changes nothing");
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_hide_an_entry_from_removal() {
+        // The list is normalised, so a client that asks with the slash must still hit the entry.
+        let path = recents_file("forget_slash");
+        let mut r = Recents::persistent_at(path, 10);
+        r.record("/models/ckpt");
+        assert!(r.forget("/models/ckpt/"), "the slash must not miss");
+        assert!(r.list().is_empty());
+    }
+
+    #[test]
+    fn clearing_the_list_completely_stays_cleared() {
+        // `list()` falls back to memory when the file reads empty (so an unreadable file does not
+        // discard what we know) — which would have resurrected the entry the user just removed.
+        let path = recents_file("forget_all");
+        let mut r = Recents::persistent_at(path.clone(), 10);
+        r.record("/models/only");
+        assert!(r.forget("/models/only"));
+        assert!(r.list().is_empty(), "an emptied list must read as empty");
+        assert!(Recents::persistent_at(path, 10).list().is_empty());
+    }
+
+    #[test]
+    fn the_root_directory_is_not_normalised_away() {
+        assert_eq!(
+            recorded_spec(&[PathBuf::from("/")], "/", SpecSource::Local),
+            "/",
+            "stripping the only slash would leave no path at all"
+        );
+    }
+
+    #[test]
+    fn a_remote_spec_is_recorded_scp_style_with_its_host() {
+        // The two spellings of a remote path: `:/path` (whatever `ssh_proxy` currently names) and
+        // `host:/path`. Only the second still means this checkpoint after the config changes, so
+        // that is the one that gets stored — the remote equivalent of an absolute path.
+        let got = recorded_spec(
+            &[PathBuf::from("/opt/models/m")],
+            ":/opt/models/m",
+            SpecSource::Remote("lab@net004".to_string()),
+        );
+        assert_eq!(got, "lab@net004:/opt/models/m");
+    }
+
+    #[test]
+    fn a_uri_is_recorded_as_typed() {
+        // Already names one thing from anywhere; absolutising it against the local filesystem
+        // would turn it into nonsense.
+        for uri in ["hf://moonshotai/Kimi-K3", "s3://bucket/prefix/"] {
+            assert_eq!(
+                recorded_spec(&[PathBuf::from(uri)], uri, SpecSource::Uri),
+                uri
+            );
+        }
+    }
+
+    /// The classification, which is what decides the spelling above.
+    #[test]
+    fn a_target_knows_which_spelling_it_needs() {
+        let local = Target::already_resolved(&[PathBuf::from("/models/m")], None);
+        assert_eq!(local.source(), SpecSource::Local);
+
+        let proxy = remote::RemoteRead::new("host".to_string(), "~/venv".to_string());
+        let remote_t = Target::already_resolved(&[PathBuf::from("/opt/m")], Some(proxy.clone()));
+        assert_eq!(remote_t.source(), SpecSource::Remote("host".to_string()));
+
+        // A URI read *through* a proxy is still named by its URI — `host:s3://…` is nonsense.
+        let s3 = Target::already_resolved(&[PathBuf::from("s3://bucket/x")], Some(proxy));
+        assert_eq!(s3.source(), SpecSource::Uri);
     }
 
     #[test]

@@ -36,7 +36,17 @@ use handlers::{Query, Reply};
 
 /// Everything the API serves, computed once from a local read. Shared read-only.
 pub(crate) struct WebState {
+    /// The checkpoint's **display** root: the containing directory for a single-file
+    /// checkpoint. Good for a tree label; wrong as an address.
     pub root: String,
+    /// What was **opened** to get this checkpoint, in the durable spelling
+    /// ([`crate::opening::recorded_spec`]) — an absolute path, `host:/path`, or a URI.
+    ///
+    /// Distinct from `root`, and it has to be: a directory of three HDF5 checkpoints has one
+    /// `root` and three specs. The browser's address bar and the `?ckpt=` a link carries are both
+    /// *addresses*, so they need this — showing `root` there offered a path that, on Enter, would
+    /// have opened something else.
+    pub spec: String,
     /// The no-access-control caution to show in the UI, or `None` when the server is
     /// bound to loopback and so only reachable from this machine. Set by
     /// [`Self::with_exposure`] from the bind address; the *same string* the startup
@@ -221,6 +231,9 @@ impl WebState {
 
         Self {
             root,
+            // Set by `with_spec`; the display root until then, which is right for the callers
+            // that have no separate spec (a test building a state directly).
+            spec: String::new(),
             // Loopback until told otherwise, so a state built in a test or a headless
             // context never claims to be exposed.
             access_warning: None,
@@ -239,6 +252,12 @@ impl WebState {
             stats_cache: Mutex::new(HashMap::new()),
             static_bodies: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record what was opened to produce this state — see [`Self::spec`].
+    pub(crate) fn with_spec(mut self, spec: String) -> Self {
+        self.spec = spec;
+        self
     }
 
     /// Record how the server is bound. A non-loopback bind means anyone who can reach
@@ -564,8 +583,23 @@ fn route_api(
             )
         };
     }
+    // The recents list is read with GET and pruned with DELETE; anything else on it is a 405, so
+    // a mistyped method cannot fall through to the read and look like it worked.
+    if path == "recents" {
+        // A wildcard over `tiny_http::Method` — a foreign enum with a dozen variants that gains
+        // more between releases, and every one of them means the same thing here: not a method
+        // this endpoint answers. Same reasoning as FOREIGN_ENUM_WILDCARDS in `explorer::mod`.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        return match *method {
+            tiny_http::Method::Get => handlers::recents(current),
+            tiny_http::Method::Delete => handlers::forget_recent(current, q),
+            _ => handlers::err(
+                405,
+                "GET /api/recents to read the list, DELETE /api/recents?path=… to drop an entry",
+            ),
+        };
+    }
     match path {
-        "recents" => handlers::recents(current),
         "tree" => handlers::tree(s),
         "files" => handlers::files(s),
         "filter" => handlers::filter(s, q),

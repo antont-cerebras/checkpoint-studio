@@ -95,6 +95,25 @@ pub(crate) fn open(current: &super::Current, q: &Query) -> Reply {
     }
 }
 
+/// `DELETE /api/recents?path=SPEC` — drop one checkpoint from the list.
+///
+/// A `DELETE`, not another `POST`: it removes one identified thing, which is what the verb is
+/// for, and it keeps the "anything that changes server state is not a GET" rule intact.
+///
+/// Removing something that is not in the list is a 404 rather than a silent success: the client
+/// shows the list it is deleting from, so a miss means the two disagree and saying so is more
+/// useful than pretending.
+pub(crate) fn forget_recent(current: &super::Current, q: &Query) -> Reply {
+    let Some(spec) = q.get("path").map(String::as_str).filter(|p| !p.is_empty()) else {
+        return err(400, "forgetting a checkpoint needs ?path=SPEC");
+    };
+    if current.forget_recent(spec) {
+        ok(json!({ "forgot": spec, "recents": current.recents() }))
+    } else {
+        err(404, format!("not in the recents list: {spec}"))
+    }
+}
+
 /// `GET /api/recents` — the checkpoints opened this run, most recent first.
 ///
 /// Not folded into `/api/tree`: that body is encoded once per checkpoint and cached, so a
@@ -105,6 +124,8 @@ pub(crate) fn recents(current: &super::Current) -> Reply {
         // Whether this server reads over an ssh proxy, so the prompt can say which kind of
         // path it takes: a `--ssh-proxy` server opens remote paths, a local one local ones.
         "proxied": current.is_proxied(),
+        // And *which* host, so the client can show `:/path` as the address it resolves to.
+        "proxy_host": current.proxy_host(),
     }))
 }
 
@@ -113,6 +134,9 @@ pub(crate) fn recents(current: &super::Current) -> Reply {
 pub(crate) fn tree(s: &WebState) -> Reply {
     ok(json!({
         "root": s.root,
+        // What to *address* this checkpoint by, which is not always its display root — see
+        // `WebState::spec`. Falls back to the root for a state built without one.
+        "spec": if s.spec.is_empty() { &s.root } else { &s.spec },
         "tensor_count": s.tensors.len(),
         // What this source can do, so the client asks a capability instead of guessing from
         // the source's shape (see `crate::capability`).

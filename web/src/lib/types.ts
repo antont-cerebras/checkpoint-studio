@@ -50,7 +50,12 @@ export interface Capabilities {
 }
 
 export interface TreeResponse {
+  /** The checkpoint's display root — a directory, even for a single-file checkpoint. */
   root: string;
+  /** What to *address* this checkpoint by: what was opened, in a spelling that reopens it.
+   * Distinct from `root`, which for a single file is its containing directory — and that
+   * directory can hold several checkpoints. */
+  spec: string;
   tensor_count: number;
   tree: TreeNode[];
   /** What this source can do — see [[Capabilities]]. */

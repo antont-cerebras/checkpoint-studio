@@ -71,9 +71,12 @@ impl Current {
         host: IpAddr,
         mut recents: opening::Recents,
     ) -> Result<Self> {
-        recents.record(&opened.target.spec());
+        // The durable spelling of what was opened: recorded in the list *and* served as the
+        // checkpoint's address, which is not the same string as its display root.
+        let remembered = opened.target.recorded_spec(&opened.target.spec());
+        recents.record(&remembered);
         Ok(Self {
-            state: RwLock::new(Arc::new(state_from(opened, host)?)),
+            state: RwLock::new(Arc::new(state_from(opened, host, remembered)?)),
             opening: Mutex::new(()),
             recents: Mutex::new(recents),
             remote,
@@ -114,12 +117,16 @@ impl Current {
         };
         let opened = opening::resolve(spec, &self.opts)?
             .read(opening::Want::Model, &crate::hf::ReadProgress::default())?;
-        let state = Arc::new(state_from(opened, self.host)?);
+        // Record the durable spelling of what opened, not the string typed: a relative path
+        // becomes absolute and a proxied path becomes `host:/path`, so the entry still names
+        // this checkpoint from another directory or another config (see `recorded_spec`).
+        let remembered = opened.target.recorded_spec(spec);
+        let state = Arc::new(state_from(opened, self.host, remembered.clone())?);
         // Record only what actually opened, so the list can't fill with typos.
         self.recents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record(spec);
+            .record(&remembered);
         *self
             .state
             .write()
@@ -127,10 +134,31 @@ impl Current {
         Ok(state)
     }
 
+    /// Drop a checkpoint from the recents list. Returns whether it was there.
+    ///
+    /// Only the list is touched: the checkpoint itself is not, and neither is what is being
+    /// served — forgetting the one you are looking at is allowed, and leaves you looking at it.
+    pub(crate) fn forget_recent(&self, spec: &str) -> bool {
+        self.recents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .forget(spec)
+    }
+
     /// Whether this server reads over an ssh proxy — which is what a client needs to know to
     /// say what kind of path its open prompt accepts.
     pub(crate) fn is_proxied(&self) -> bool {
         self.remote.is_some()
+    }
+
+    /// The proxy host, when there is one.
+    ///
+    /// Served because the client cannot work it out: `:/path` means "on whatever `ssh_proxy`
+    /// names", and only this side has read the config. Without it the loading screen could only
+    /// echo the `:` back, which names the checkpoint to nobody who does not already know the
+    /// config's contents.
+    pub(crate) fn proxy_host(&self) -> Option<&str> {
+        self.remote.as_ref().map(|r| r.host.as_str())
     }
 }
 
@@ -139,7 +167,7 @@ impl Current {
 /// [`opening::Want::Model`] promises one, so `None` here is a broken contract rather than a
 /// user error — but it is still reported instead of unwrapped, because the alternative is a
 /// panicking worker thread.
-fn state_from(opened: Opened, host: IpAddr) -> Result<WebState> {
+fn state_from(opened: Opened, host: IpAddr, spec: String) -> Result<WebState> {
     let Some(model) = opened.checkpoint else {
         bail!(
             "{}: read produced no model to serve",
@@ -148,6 +176,7 @@ fn state_from(opened: Opened, host: IpAddr) -> Result<WebState> {
     };
     Ok(
         WebState::build(model, &opened.target.resolved, &opened.target.index_specs)
-            .with_exposure(host),
+            .with_exposure(host)
+            .with_spec(spec),
     )
 }
