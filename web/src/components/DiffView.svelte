@@ -97,7 +97,12 @@
   </form>
 
   {#if loading}
-    <LoadingBar label="reading {against}" progress={waitStarted} />
+    <!-- Not `reading {against}`: that puts an unbounded filesystem path into a label sized
+         for a phrase, so a 48-char path wrapped to three lines and stranded the timer alone
+         on the first. Nothing is lost — the path is on screen twice already, in the
+         breadcrumb and the box directly above — and "baseline" is what the TUI's legend
+         calls this side of a diff. -->
+    <LoadingBar label="reading the baseline" progress={waitStarted} />
   {:else if error}
     <p class="error" role="alert">{error}</p>
   {:else if result && report}

@@ -26,12 +26,8 @@
     <!-- With a known denominator the bar carries the progress and the spinner would be
          redundant motion; without one it is the only sign of life. Same rule as the
          terminal's load screen. -->
-    {#if frac === null}
-      <Spinner {label} />
-    {:else}
-      <span class="lbl">{label}</span>
-    {/if}
-    {#if elapsed}<span class="dim">({elapsed})</span>{/if}
+    <span class="lbl">{#if frac === null}<Spinner {label} />{:else}{label}{/if}</span>
+    {#if elapsed}<span class="dim time">({elapsed})</span>{/if}
   </div>
 
   {#if progress && frac !== null && progress.total !== null}
@@ -64,8 +60,22 @@
     align-items: baseline;
     gap: 8px;
   }
+  /* One element in both states, so the truncation rule below covers the spinner branch too
+     (the spinner renders the label inside itself). */
   .lbl {
     color: var(--accent);
+    /* Stay on one line. Every label is a fixed phrase that fits the 40ch box, but the box is
+       capped, so a label that outgrows it should lose its tail rather than push the timer
+       onto a line of its own. `min-width: 0` is what lets a flex item shrink below its
+       content at all. */
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Never the item that gives way: the elapsed time is the whole point of the row. */
+  .time {
+    flex: 0 0 auto;
   }
   /* The same rail-and-fill the file browser's size bar uses, so progress looks like the
      one bar this app draws rather than a second idea of one. */
