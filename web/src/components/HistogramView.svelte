@@ -4,7 +4,11 @@
   import { num } from '../lib/format';
   import { cssVar } from '../lib/color';
   import { theme } from '../stores/theme';
-  import Spinner from './Spinner.svelte';
+  import LoadingBar from './LoadingBar.svelte';
+  import { startedNow, type Progress } from '../lib/progress';
+  // The server scans the whole tensor and then answers, so there is no fraction to show —
+  // only how long it has been going.
+  let waitStarted: Progress | null = null;
 
   export let name: string;
   export let dtype: string;
@@ -22,6 +26,7 @@
   $: void load(name, bins);
   async function load(n: string, b: number) {
     loading = true;
+    waitStarted = startedNow();
     err = '';
     try {
       data = await cachedHistogram(n, b);
@@ -91,7 +96,7 @@
     <span class="hover mono">{hover}</span>
   </div>
   {#if loading}
-    <Spinner label="scanning tensor…" />
+    <LoadingBar label="scanning the tensor" progress={waitStarted} />
   {:else if err}
     <p class="err">{err}</p>
   {:else if data}

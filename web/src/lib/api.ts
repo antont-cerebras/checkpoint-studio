@@ -69,6 +69,23 @@ function serverError(body: unknown, status: number): string {
   return typeof detail === 'string' ? detail : `HTTP ${status}`;
 }
 
+/** Told how many bytes have arrived, and the total when the server announced one. */
+export type OnProgress = (received: number, total: number | null) => void;
+
+/**
+ * Fetch JSON, streaming it when the caller wants progress and buffering it otherwise.
+ *
+ * `typeof`, not truthiness: the generic accessor guard in api.test.ts calls every method
+ * with one string, on the premise that a string satisfies any first parameter. A callback
+ * is the one parameter it doesn't, and streaming to a non-function would throw — so a
+ * caller with nothing to report simply gets the plain fetch.
+ */
+function fetchJson<T>(url: string, onProgress?: OnProgress): Promise<T> {
+  return typeof onProgress === 'function'
+    ? getJsonStreamed<T>(url, onProgress)
+    : getJson<T>(url);
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
   // `res.json()` is `any`; keep it `unknown` and narrow, so a malformed error
@@ -104,14 +121,7 @@ function qs(params: Record<string, string | number | undefined>): string {
 export const api = {
   /** The tensor tree — the one response worth a progress bar (tens of MB for a 31k-tensor
    * checkpoint). `onProgress` is optional so every other caller stays a plain fetch. */
-  tree: (onProgress?: (received: number, total: number | null) => void) =>
-    // `typeof`, not truthiness: the generic accessor guard in api.test.ts calls every
-    // method with one string, on the premise that a string satisfies any first parameter.
-    // A callback is the one parameter it doesn't, and streaming to a non-function would
-    // throw — so a caller with nothing to report simply gets the plain fetch.
-    typeof onProgress === 'function'
-      ? getJsonStreamed<TreeResponse>('/api/tree', onProgress)
-      : getJson<TreeResponse>('/api/tree'),
+  tree: (onProgress?: OnProgress) => fetchJson<TreeResponse>('/api/tree', onProgress),
   files: () => getJson<FileNode>('/api/files'),
   filter: (q: string) => getJson<{ active: boolean; names?: string[] }>(`/api/filter?q=${enc(q)}`),
   schema: (q: string) =>
@@ -134,10 +144,16 @@ export const api = {
   health: () => getJson<unknown[]>('/api/health'),
   check: () => getJson<Record<string, unknown> | null>('/api/check'),
   tensor: (name: string) => getJson<TensorInfo>(`/api/tensor?name=${enc(name)}`),
-  layout: (file: string) => getJson<LayoutMap>(`/api/layout?file=${enc(file)}`),
-  file: (path: string) =>
-    getJson<{ path: string; name: string; size: number; truncated: boolean; text: string }>(
+  /** A shard's byte layout. Streamed like the tree when a progress callback is given: a
+   * 12k-tensor shard's segment list is megabytes. */
+  layout: (file: string, onProgress?: OnProgress) =>
+    fetchJson<LayoutMap>(`/api/layout?file=${enc(file)}`, onProgress),
+  /** A sidecar's text, up to `PREVIEW_CAP` (4 MiB) — a real `model.safetensors.index.json`
+   * is 1.7 MB of it, which is worth a bar. */
+  file: (path: string, onProgress?: OnProgress) =>
+    fetchJson<{ path: string; name: string; size: number; truncated: boolean; text: string }>(
       `/api/file?path=${enc(path)}`,
+      onProgress,
     ),
   tensorStats: (name: string, dtype?: string) =>
     getJson<StatsDto>(`/api/tensor/stats?${qs({ name, dtype })}`),

@@ -12,7 +12,10 @@
   import type { DiffResponse, TensorSig } from '../lib/types';
   import { navigate } from '../stores/view';
   import { copyText } from '../lib/clipboard';
-  import Spinner from './Spinner.svelte';
+  import LoadingBar from './LoadingBar.svelte';
+  import { startedNow, type Progress } from '../lib/progress';
+  // The server reads the baseline checkpoint's headers before it can answer.
+  let waitStarted: Progress | null = null;
 
   export let against: string;
 
@@ -32,6 +35,7 @@
     if (!path) return;
     draft = path;
     loading = true;
+    waitStarted = startedNow();
     error = null;
     try {
       result = await api.diff(path);
@@ -93,7 +97,7 @@
   </form>
 
   {#if loading}
-    <p class="dim"><Spinner /> reading {against}…</p>
+    <LoadingBar label="reading {against}" progress={waitStarted} />
   {:else if error}
     <p class="error" role="alert">{error}</p>
   {:else if result && report}

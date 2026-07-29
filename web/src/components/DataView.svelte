@@ -5,7 +5,11 @@
   import type { SampleDto } from '../lib/types';
   import { viridis } from '../lib/color';
   import { num } from '../lib/format';
-  import Spinner from './Spinner.svelte';
+  import LoadingBar from './LoadingBar.svelte';
+  import { startedNow, type Progress } from '../lib/progress';
+  // The server reads tensor bytes and then answers; a multi-GB tensor takes seconds, which
+  // is what the timer is for.
+  let waitStarted: Progress | null = null;
 
   export let tensor: string;
   export let kind: 'heatmap' | 'values';
@@ -92,6 +96,7 @@
   async function load(t: string, p: typeof params) {
     const seq = ++reqSeq;
     loading = true;
+    waitStarted = startedNow();
     try {
       const d = await cachedSample(t, p);
       if (seq !== reqSeq) return; // superseded
@@ -532,10 +537,9 @@
       <button on:click={retry}>Retry</button>
     </div>
   {:else if loading}
-    <Spinner
-      label={kind === 'heatmap'
-        ? 'sampling the tensor… (a multi-GB tensor can take a few seconds)'
-        : 'reading values…'}
+    <LoadingBar
+      label={kind === 'heatmap' ? 'sampling the tensor' : 'reading the values'}
+      progress={waitStarted}
     />
   {:else}
     <div class="failed">

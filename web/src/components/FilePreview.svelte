@@ -3,7 +3,8 @@
   import { humanSize } from '../lib/format';
   import { highlightJson, type Token } from '../lib/jsonhl';
   import { renderMarkdown, highlightMarkdown, isMarkdown, type Rendered } from '../lib/md';
-  import Spinner from './Spinner.svelte';
+  import LoadingBar from './LoadingBar.svelte';
+  import { startedNow, type Progress } from '../lib/progress';
 
   export let path: string;
   export let name: string;
@@ -24,10 +25,16 @@
   $: isMd = data !== null && isMarkdown(name);
   let doc: Promise<Rendered> | null;
   $: doc = isMd && data && mdView === 'rendered' ? renderMarkdown(data.text) : null;
+  // A new wait each time `doc` is rebuilt (a different file, or the toggle). Tied to the
+  // promise's identity rather than created in the markup, where every re-render would
+  // restart the clock and the elapsed time would never move.
+  let renderStarted: Progress | null;
+  $: renderStarted = doc ? startedNow() : null;
   let mdSource: Promise<string> | null;
   $: mdSource = isMd && data && mdView === 'source' ? highlightMarkdown(data.text) : null;
   let err = '';
   let loading = true;
+  let load_: Progress | null = null;
 
   $: void load(path);
   async function load(p: string) {
@@ -35,8 +42,11 @@
     mdView = 'rendered';
     err = '';
     data = null;
+    const startedAt = performance.now();
+    load_ = { received: 0, total: null, startedAt };
     try {
-      data = await api.file(p);
+      // Up to `PREVIEW_CAP` (4 MiB); a real `model.safetensors.index.json` is 1.7 MB of it.
+      data = await api.file(p, (received, total) => (load_ = { received, total, startedAt }));
     } catch (e) {
       err = e instanceof Error ? e.message : String(e);
     } finally {
@@ -64,12 +74,12 @@
     {/if}
   </div>
   {#if loading}
-    <Spinner label="reading file…" />
+    <LoadingBar label="reading file" progress={load_} />
   {:else if err}
     <p class="err">{err}</p>
   {:else if doc}
     {#await doc}
-      <Spinner label="rendering…" />
+      <LoadingBar label="rendering" progress={renderStarted} />
     {:then rendered}
       <div class="md">
         {#if rendered.frontmatter.length > 0}

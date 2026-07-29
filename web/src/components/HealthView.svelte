@@ -2,7 +2,9 @@
   import { onMount } from 'svelte';
   import { api } from '../lib/api';
   import { humanCount } from '../lib/format';
-  import Spinner from './Spinner.svelte';
+  import LoadingBar from './LoadingBar.svelte';
+  import { startedNow, type Progress } from '../lib/progress';
+  let waitStarted: Progress | null = null;
   import Ref from './Ref.svelte';
 
   interface Finding {
@@ -45,6 +47,7 @@
   let loading = true;
 
   onMount(async () => {
+    waitStarted = startedNow();
     try {
       const [c, h] = await Promise.all([api.check(), api.health()]);
       check = c as unknown as CheckReport;
@@ -96,7 +99,7 @@
 <div class="health">
   <div class="inner">
   {#if loading}
-    <Spinner label="running checks…" />
+    <LoadingBar label="running the checks" progress={waitStarted} />
   {:else if err}
     <p class="err">{err}</p>
   {:else if check}
