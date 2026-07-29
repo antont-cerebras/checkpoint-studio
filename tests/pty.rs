@@ -466,3 +466,52 @@ fn the_rename_screen_opens_and_leaves_without_writing() {
     let after = std::fs::metadata(&path).expect("still there");
     assert_eq!(before.len(), after.len(), "opening rename must not write");
 }
+
+#[test]
+fn the_palette_opens_another_checkpoint_in_place() {
+    // The terminal half of switchable checkpoints, driven the way a person drives it: the
+    // command palette, a typed path, Enter. What is proved here is that the *whole* path works
+    // through the real interactive loop — the palette lists the command, the prompt takes a
+    // path, and the tree that comes back is the other checkpoint's.
+    let mut tui = Tui::launch(&[&fixture()]);
+    tui.wait_for("Checkpoint Studio");
+    tui.wait_for("tiny.safetensors");
+
+    // Space opens the palette; the command is palette-only (no hotkey), so this is the only
+    // way in — which makes the palette entry part of what the test covers. Type to narrow
+    // first: Enter takes the highlighted row, which starts on the palette's first entry.
+    tui.send(" ");
+    tui.wait_for("Open another checkpoint");
+    tui.send("open another");
+    tui.send("\r");
+    tui.wait_for("Open checkpoint");
+
+    // A different checkpoint that is checked in, so this needs no fixture generation.
+    tui.send("tests/fixtures/diff_new.safetensors");
+    tui.send("\r");
+
+    // The new checkpoint's own tensors are on screen. `alpha` is in diff_new.safetensors and
+    // not in tiny.safetensors, so seeing it means the switch actually re-read.
+    tui.wait_for("diff_new.safetensors");
+    tui.quit();
+}
+
+#[test]
+fn the_open_prompt_rejects_a_bad_path_and_stays_on_the_checkpoint() {
+    // A typo must be correctable in place, with the checkpoint still loaded behind the prompt.
+    let mut tui = Tui::launch(&[&fixture()]);
+    tui.wait_for("Checkpoint Studio");
+    tui.send(" ");
+    tui.wait_for("Open another checkpoint");
+    tui.send("open another");
+    tui.send("\r");
+    tui.wait_for("Open checkpoint");
+    tui.send("/definitely/not/a/checkpoint");
+    tui.send("\r");
+    // The message names the path that was typed, and the prompt is still up.
+    tui.wait_for("no checkpoint files found");
+    // Esc backs out to the tree we never left.
+    tui.send("\u{1b}");
+    tui.wait_for("tiny.safetensors");
+    tui.quit();
+}

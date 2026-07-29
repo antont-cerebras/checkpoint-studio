@@ -118,6 +118,29 @@ function qs(params: Record<string, string | number | undefined>): string {
     .join('&');
 }
 
+/**
+ * Ask the server to serve a different checkpoint.
+ *
+ * A POST, and the only one: this changes what every other endpoint answers, and a GET that
+ * did that would be a URL a browser could follow on its own (a prefetch, a restored tab) and
+ * swap the checkpoint with nobody having asked. The server replies when the new checkpoint is
+ * *ready*, so there is no state to poll and reconcile — it either resolved or it didn't.
+ */
+async function postJson<T>(url: string): Promise<T> {
+  const res = await fetch(url, { method: 'POST' });
+  const body: unknown = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(serverError(body, res.status));
+  return body as T;
+}
+
+/** What `POST /api/open` answers with. */
+export interface OpenResponse {
+  root: string;
+  tensor_count: number;
+  opened: string;
+  recents: string[];
+}
+
 export const api = {
   /** The tensor tree — the one response worth a progress bar (tens of MB for a 31k-tensor
    * checkpoint). `onProgress` is optional so every other caller stays a plain fetch. */
@@ -140,6 +163,12 @@ export const api = {
   diff: (against: string) => getJson<DiffResponse>(`/api/diff?against=${enc(against)}`),
   /** The compact (family-folded) tree, optionally scoped by the filter query. */
   compact: (q: string) => getJson<CompactTree>(`/api/compact?q=${enc(q)}`),
+  /** Read another checkpoint and serve it instead. Rejects with the server's message for a
+   * path that doesn't resolve, in which case the served checkpoint is unchanged. */
+  open: (spec: string) => postJson<OpenResponse>(`/api/open?path=${enc(spec)}`),
+  /** The checkpoints opened this run, most recent first, and whether this server reads over
+   * an ssh proxy (which decides what kind of path the prompt accepts). */
+  recents: () => getJson<{ recents: string[]; proxied: boolean }>('/api/recents'),
   stats: () => getJson<Record<string, unknown>>('/api/stats'),
   health: () => getJson<unknown[]>('/api/health'),
   check: () => getJson<Record<string, unknown> | null>('/api/check'),

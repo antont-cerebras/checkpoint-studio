@@ -3,7 +3,7 @@
 
 import { derived, writable } from 'svelte/store';
 import { api } from '../lib/api';
-import type { Progress } from '../lib/progress';
+import { startedNow, type Progress } from '../lib/progress';
 import type {
   CompactTree,
   HistogramDto,
@@ -131,6 +131,88 @@ let checkpointStats: Promise<Record<string, unknown>> | null = null;
 export function cachedCheckpointStats(): Promise<Record<string, unknown>> {
   if (!checkpointStats) checkpointStats = api.stats();
   return checkpointStats;
+}
+
+// --- changing which checkpoint is being served ---
+
+/** The checkpoints opened this run, most recent first — the open prompt's list. */
+export const recents = writable<string[]>([]);
+/** Whether the server reads over an ssh proxy, which decides what paths it can open. */
+export const proxied = writable<boolean>(false);
+/** How long the current open has been running; null when none is. Timer only — the server
+ * reads shard headers and *then* answers, so there is no fraction to show (the same rule the
+ * scan and histogram waits follow). */
+export const openProgress = writable<Progress | null>(null);
+
+export async function loadRecents(): Promise<void> {
+  try {
+    const r = await api.recents();
+    recents.set(r.recents);
+    proxied.set(r.proxied);
+  } catch {
+    // A recents list is a convenience; failing to fetch it must not stop the prompt from
+    // accepting a typed path.
+  }
+}
+
+/**
+ * Forget every cached answer about the checkpoint we were on.
+ *
+ * The mirror of the server's swap: over there, every per-checkpoint cache lives inside the
+ * state object, so replacing it discards them. Here they are module-level, so they have to be
+ * cleared by hand — and *all* of them, because tensor names, shard paths and even dtypes can
+ * repeat across two checkpoints. A surviving entry would not look stale; it would look like
+ * an answer.
+ */
+function forgetCheckpoint(): void {
+  treeStarted = false;
+  tree.set(null);
+  treeError.set(null);
+  treeProgress.set(null);
+  compactTree.set(null);
+  compactError.set('');
+  // Supersede any compact fetch still in flight, so its response can't land on the new
+  // checkpoint's screen.
+  compactSeq++;
+  checkpointStats = null;
+  statsCache.clear();
+  sampleCache.clear();
+  histCache.clear();
+}
+
+/**
+ * Ask the server to serve `spec`, and return its new root.
+ *
+ * Throws with the server's own message when the path doesn't resolve — and in that case
+ * nothing here has been discarded, because the server only swaps after a successful read.
+ * A failed open leaves you exactly where you were.
+ *
+ * Deliberately does **not** refetch: the caller has view state to reset first, and the order
+ * matters (see [`reloadCheckpoint`]).
+ */
+export async function openCheckpoint(spec: string): Promise<string> {
+  openProgress.set(startedNow());
+  try {
+    const r = await api.open(spec);
+    recents.set(r.recents);
+    return r.root;
+  } finally {
+    openProgress.set(null);
+  }
+}
+
+/**
+ * Drop every cached answer and fetch the new checkpoint.
+ *
+ * Call this **after** resetting view state, not before. The fold state is seeded by a
+ * subscription that fires when a tree lands, and it only seeds once per checkpoint — so a tree
+ * that arrives before the seed flag is cleared gets no initial expansion, and the new
+ * checkpoint opens fully collapsed while the first one opened expanded. That is the bug this
+ * split exists to prevent.
+ */
+export async function reloadCheckpoint(): Promise<void> {
+  forgetCheckpoint();
+  await ensureTree();
 }
 
 // --- per-tensor data-view memo caches (keyed by request) ---

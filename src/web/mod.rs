@@ -13,8 +13,14 @@
 //! `&mut` (only the on-demand tensor-data scans touch disk, behind a small cache).
 
 mod assets;
+/// The checkpoint currently being served, and how to switch it without a restart.
+pub(crate) mod current;
+#[cfg(test)]
+mod current_tests;
 pub(crate) mod dto;
 pub(crate) mod handlers;
+
+pub(crate) use current::Current;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -318,18 +324,11 @@ pub(crate) fn bind(host: IpAddr, port: u16) -> Result<tiny_http::Server> {
     }
 }
 
-/// Start the server and block until the process is stopped (Ctrl-C). Binds the
-/// port immediately (see [`bind`]); for a remote read, bind first and pass the
-/// server to [`serve_on`] so the port is held while the read runs.
-pub(crate) fn serve(state: Arc<WebState>, host: IpAddr, port: u16) -> Result<()> {
-    serve_on(bind(host, port)?, state, host)
-}
-
 /// Serve on an already-[`bind`]-ed socket and block until stopped. `host` is only
 /// used to render a reachable URL (a wildcard bind isn't clickable).
 pub(crate) fn serve_on(
     server: tiny_http::Server,
-    state: Arc<WebState>,
+    current: Arc<Current>,
     host: IpAddr,
 ) -> Result<()> {
     let bound = server.server_addr().to_ip().map_or(0, |a| a.port());
@@ -352,10 +351,10 @@ pub(crate) fn serve_on(
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
         let server = Arc::clone(&server);
-        let state = Arc::clone(&state);
+        let current = Arc::clone(&current);
         handles.push(std::thread::spawn(move || {
             while let Ok(req) = server.recv() {
-                handle(&state, req);
+                handle(&current, req);
             }
         }));
     }
@@ -450,9 +449,12 @@ struct Prepared {
     identity_len: Option<u64>,
 }
 
-fn handle(state: &WebState, req: tiny_http::Request) {
+fn handle(current: &Current, req: tiny_http::Request) {
     let url = req.url().to_string();
     let gzip = accepts_gzip(&req);
+    // Every endpoint but one is a read, and a read is a GET. `/api/open` changes what the
+    // whole server serves, so it is a POST — see `route_api`.
+    let method = req.method().clone();
     // Contain a panic. The worker pool is small (2-8 threads) and each worker loops on
     // `server.recv()`, so an unwinding handler would kill that worker permanently —
     // after a handful of bad requests the process would still accept connections and
@@ -462,7 +464,7 @@ fn handle(state: &WebState, req: tiny_http::Request) {
     // worker.
     let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let (path, query_str) = url.split_once('?').unwrap_or((url.as_str(), ""));
-        prepare(state, path, query_str, gzip)
+        prepare(current, &method, path, query_str, gzip)
     }))
     .unwrap_or_else(|_| {
         // The default panic hook has already printed the message and location; add the
@@ -495,15 +497,26 @@ fn handle(state: &WebState, req: tiny_http::Request) {
 
 /// Resolve a request to bytes. Pure: touches no socket, so it is safe to run inside the
 /// panic boundary above.
-fn prepare(state: &WebState, path: &str, query_str: &str, gzip: bool) -> Prepared {
+fn prepare(
+    current: &Current,
+    method: &tiny_http::Method,
+    path: &str,
+    query_str: &str,
+    gzip: bool,
+) -> Prepared {
     let Some(api) = path.strip_prefix("/api/") else {
         return prepare_asset(path, gzip);
     };
     let q = parse_query(query_str);
+    // One snapshot for this request, taken before any work: the checkpoint can be swapped
+    // (see `crate::web::current`) while a scan is running, and an answer assembled from two
+    // different checkpoints would be worse than a slightly stale one.
+    let state = current.snapshot();
     // The API reflects one read-once checkpoint; a browser must never reuse a response
-    // from a prior server run (a different checkpoint on the same port) — hence
-    // `no-store` — but we can reuse it SERVER-side: a fixed-content endpoint is encoded
-    // once and then handed out as bytes (see `cached_body`).
+    // from a prior server run — or from before an `/api/open` swapped the checkpoint on
+    // this very port — hence `no-store`. Server-side we still reuse it: a fixed-content
+    // endpoint is encoded once per checkpoint and handed out as bytes (`cached_body`),
+    // and the cache lives inside the state so a swap discards it.
     if q.is_empty()
         && let Some(body) = state.cached_body(api, gzip)
     {
@@ -517,7 +530,7 @@ fn prepare(state: &WebState, path: &str, query_str: &str, gzip: bool) -> Prepare
             identity_len,
         };
     }
-    let (status, data) = route_api(state, api, &q);
+    let (status, data) = route_api(current, &state, method, api, &q);
     let identity_len = data.len() as u64;
     let (body, gzipped) = maybe_gzip(data, gzip);
     Prepared {
@@ -530,8 +543,29 @@ fn prepare(state: &WebState, path: &str, query_str: &str, gzip: bool) -> Prepare
     }
 }
 
-fn route_api(s: &WebState, path: &str, q: &Query) -> Reply {
+fn route_api(
+    current: &Current,
+    s: &WebState,
+    method: &tiny_http::Method,
+    path: &str,
+    q: &Query,
+) -> Reply {
+    // The one endpoint that changes server state gets the one non-GET method. A GET that
+    // swapped the served checkpoint would be a link a browser could follow on its own — a
+    // prefetch, a history restore, a crawler — and the checkpoint would change with nobody
+    // having asked.
+    if path == "open" {
+        return if *method == tiny_http::Method::Post {
+            handlers::open(current, q)
+        } else {
+            handlers::err(
+                405,
+                "opening a checkpoint changes what this server serves — use POST /api/open?path=…",
+            )
+        };
+    }
     match path {
+        "recents" => handlers::recents(current),
         "tree" => handlers::tree(s),
         "files" => handlers::files(s),
         "filter" => handlers::filter(s, q),
@@ -707,25 +741,38 @@ fn fqdn() -> Option<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{WebState, maybe_gzip, parse_query, prepare};
+    use super::{Current, Prepared, maybe_gzip, parse_query, prepare};
 
     /// The request layer: routing, the JSON/asset split, caching, gzip and the panic
     /// boundary. Exercised through `prepare` — the same function `handle` calls — so
     /// these are the real responses a browser gets, minus the socket.
-    fn state() -> WebState {
+    fn serving() -> Current {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.safetensors");
-        let files = vec![fixture];
-        let model = crate::readers::read_local(&files).expect("the fixture reads");
-        WebState::build(model, &files, &[])
+        let opts = crate::opening::Options::default();
+        let opened = crate::opening::Target::from_paths(&[fixture], None, &opts)
+            .expect("the fixture resolves")
+            .read(
+                crate::opening::Want::Model,
+                &crate::hf::ReadProgress::default(),
+            )
+            .expect("the fixture reads");
+        Current::new(opened, None, opts, std::net::IpAddr::from([127, 0, 0, 1]))
+            .expect("the served state builds")
+    }
+
+    /// A GET, which is what every route but `/api/open` takes.
+    fn get(c: &Current, path: &str, query: &str, gzip: bool) -> Prepared {
+        prepare(c, &tiny_http::Method::Get, path, query, gzip)
     }
 
     #[test]
     fn every_api_route_answers_with_json() {
-        let s = state();
-        let name = s.tensors[0].name.clone();
+        let c = serving();
+        let state = c.snapshot();
+        let name = state.tensors[0].name.clone();
         // The layout endpoint takes a shard basename, which is what the tensors carry.
-        let file = s.tensors[0]
+        let file = state.tensors[0]
             .source_path
             .rsplit('/')
             .next()
@@ -744,7 +791,7 @@ mod tests {
             ("/api/schema", "q=*".to_string()),
         ];
         for (path, query) in cases {
-            let out = prepare(&s, path, &query, false);
+            let out = get(&c, path, &query, false);
             assert_eq!(out.status, 200, "{path}?{query} → {}", out.status);
             assert!(
                 serde_json::from_slice::<serde_json::Value>(out.body.as_slice()).is_ok(),
@@ -755,8 +802,8 @@ mod tests {
 
     #[test]
     fn an_unknown_api_route_is_a_404_with_an_error_envelope() {
-        let s = state();
-        let out = prepare(&s, "/api/nope", "", false);
+        let c = serving();
+        let out = get(&c, "/api/nope", "", false);
         assert_eq!(out.status, 404);
         let body: serde_json::Value =
             serde_json::from_slice(out.body.as_slice()).expect("an error envelope is JSON");
@@ -765,8 +812,8 @@ mod tests {
 
     #[test]
     fn a_missing_tensor_is_reported_not_guessed() {
-        let s = state();
-        let out = prepare(&s, "/api/tensor", "name=no.such.tensor", false);
+        let c = serving();
+        let out = get(&c, "/api/tensor", "name=no.such.tensor", false);
         assert!(
             out.status >= 400,
             "expected an error status, got {}",
@@ -781,7 +828,7 @@ mod tests {
         // A client-routed URL (`/#detail?...` arrives as a path on reload) must get
         // index.html, not a 404 — otherwise a deep link breaks on refresh.
         for path in ["/", "/index.html", "/tree", "/some/client/route"] {
-            let out = prepare(&state(), path, "", false);
+            let out = get(&serving(), path, "", false);
             assert_eq!(out.status, 200, "{path} → {}", out.status);
             assert!(
                 out.body.as_slice().starts_with(b"<!") || out.body.as_slice().starts_with(b"<html"),
@@ -792,9 +839,8 @@ mod tests {
 
     #[test]
     fn assets_are_served_with_a_content_type_and_are_cacheable() {
-        let s = state();
-        let index =
-            String::from_utf8_lossy(prepare(&s, "/", "", false).body.as_slice()).to_string();
+        let c = serving();
+        let index = String::from_utf8_lossy(get(&c, "/", "", false).body.as_slice()).to_string();
         // Pull the hashed bundle names out of the shell and fetch them.
         for ext in ["js", "css"] {
             let needle = format!(".{ext}");
@@ -803,21 +849,21 @@ mod tests {
             };
             let start = index[..pos].rfind("/assets/").expect("an asset path");
             let path = &index[start..pos + needle.len()];
-            let out = prepare(&s, path, "", false);
+            let out = get(&c, path, "", false);
             assert_eq!(out.status, 200, "{path} → {}", out.status);
             assert!(!out.body.as_slice().is_empty(), "{path} was empty");
         }
         // A missing asset is a 404, not the SPA shell (which would corrupt a script).
-        let out = prepare(&s, "/assets/nope-12345678.js", "", false);
+        let out = get(&c, "/assets/nope-12345678.js", "", false);
         assert_eq!(out.status, 404);
     }
 
     #[test]
     fn gzip_is_applied_only_when_the_client_asks_and_it_helps() {
-        let s = state();
+        let c = serving();
         // A large JSON body compresses, and the compressed form is what's sent.
-        let plain = prepare(&s, "/api/model", "", false);
-        let zipped = prepare(&s, "/api/model", "", true);
+        let plain = get(&c, "/api/model", "", false);
+        let zipped = get(&c, "/api/model", "", true);
         assert_eq!(plain.status, 200);
         assert!(
             zipped.body.as_slice().len() <= plain.body.as_slice().len(),
@@ -837,23 +883,25 @@ mod tests {
 
     #[test]
     fn the_precomputed_bodies_are_cached_and_shared() {
-        let s = state();
+        let c = serving();
         // The second request for a static endpoint must reuse the first body rather than
         // re-serialising it — an unbounded rebuild per request leaked 2 GB before.
-        let first = prepare(&s, "/api/tree", "", false);
-        let second = prepare(&s, "/api/tree", "", false);
+        let first = get(&c, "/api/tree", "", false);
+        let second = get(&c, "/api/tree", "", false);
         assert_eq!(first.body.as_slice(), second.body.as_slice());
-        // The cache is keyed by endpoint name (see `STATIC_ENDPOINTS`), not by path.
+        // The cache is keyed by endpoint name (see `STATIC_ENDPOINTS`), not by path. It lives
+        // inside the served state, which is what makes a checkpoint switch discard it.
+        let state = c.snapshot();
         assert!(
-            s.cached_body("tree", false).is_some(),
+            state.cached_body("tree", false).is_some(),
             "the body was cached"
         );
         // Gzipped and plain are cached separately, so a mixed client set can't cross.
-        let _ = prepare(&s, "/api/tree", "", true);
-        assert!(s.cached_body("tree", true).is_some());
+        let _ = get(&c, "/api/tree", "", true);
+        assert!(state.cached_body("tree", true).is_some());
         // A parameterised endpoint is not cached under the static key.
         assert!(
-            s.cached_body("tensor", false).is_none(),
+            state.cached_body("tensor", false).is_none(),
             "a parameterised endpoint must not be cached"
         );
     }

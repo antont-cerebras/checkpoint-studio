@@ -194,6 +194,35 @@ export function clearFilter(): void {
   filterQuery.set('');
 }
 
+/**
+ * Forget the view state that belonged to the checkpoint we were on.
+ *
+ * Split by what the state *is*, matching what the terminal's switch drops:
+ *
+ * - **Position in a checkpoint** — selection, expansion, search, filter, sort — is reset. All
+ *   of it names things (tensor ids, a filter that matched) that may not exist in the new
+ *   checkpoint, and a selection index into a tree that has been replaced is the classic
+ *   survives-a-switch-then-misreports bug.
+ * - **Display preference** — compact folding — is kept. It says how you like to read a tree,
+ *   not which tree you were reading. The terminal keeps it across a switch for the same
+ *   reason (`Explorer::switch_to` resets `tree_state`, not `self.compact`).
+ */
+export function resetViewForNewCheckpoint(): void {
+  // Let the incoming tree seed its own initial fold, as the first one did — without this the
+  // new checkpoint arrives fully collapsed while the terminal shows it expanded.
+  seededExpand = false;
+  expanded.set(new Set());
+  selectedId.set(null);
+  searching.set(false);
+  search.set('');
+  filterQuery.set('');
+  filterMatches.set(null);
+  filterError.set(null);
+  filterResolvedFor.set('');
+  sortKey.set('none');
+  sortDir.set('asc');
+}
+
 // Seed the fold state from the tree the server sent, so the first screen matches the
 // terminal UI's (see `expandedIds`). After this the client owns folding.
 let seededExpand = false;

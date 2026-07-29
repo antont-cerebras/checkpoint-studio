@@ -850,7 +850,7 @@ mod tests {
         assert_eq!(truncate_middle("abcdefghij", 1), "…");
         // A long string is elided in the middle: the kept head and tail are a real
         // prefix and suffix of the input, and the result fits the budget.
-        let s = "s3://inference-opensource/minimax-m2.5/4bit/260402";
+        let s = "s3://bucket/example-model/4bit/rev-000001";
         let t = truncate_middle(s, 24);
         assert!(t.chars().count() <= 24 && t.contains('…'), "{t}");
         let (head, tail) = t.split_once('…').unwrap();
@@ -1066,7 +1066,8 @@ mod tests {
         for cols in [20usize, 40, 60, 80, 100, 120, 200] {
             // What `spawn` would hand us: the label is pre-truncated to its budget.
             let budget = cols.saturating_sub(BAR_COLS + 48).max(20);
-            let label = truncate_middle("s3://inference-testing/kimi-k2.6/3bit-22s/260626", budget);
+            let label =
+                truncate_middle("s3://bucket/example-model-name/3bit-variant/rev-01", budget);
             for state in [RUNNING, OK, ERR, ABORTED] {
                 for (done, total, is_bytes) in [
                     (0, 0, false),
