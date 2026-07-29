@@ -15,6 +15,8 @@
   import { humanCount, humanSize } from '../lib/format';
   import { expanded, filterQuery, toggle } from '../stores/view';
   import { compactError, compactTree, loadCompact } from '../stores/server';
+  import LoadingBar from './LoadingBar.svelte';
+  import { startedNow, type Progress } from '../lib/progress';
   import Dtype from './Dtype.svelte';
   import Shape from './Shape.svelte';
 
@@ -22,6 +24,12 @@
   // view's existing controls all work here unchanged: `e` / `c`, the palette's expand /
   // collapse all, and clicking a group. (They used to do nothing in this view, because
   // `setAllExpanded` walked the full tree, whose ids don't occur in the folded one.)
+  // The fold is quick — ~50 ms of server work for a 31k-tensor checkpoint, and the folded
+  // tree it returns is families rather than tensors, so there is little to render. No byte
+  // bar, then: the response is a few kilobytes and a bar would be theatre. What it needs is
+  // the elapsed time, for the case where it *isn't* quick — a slow link, or a checkpoint
+  // with far more families than this one.
+  let waitStarted: Progress | null = null;
   $: data = $compactTree;
   $: err = $compactError;
   $: void refresh($filterQuery);
@@ -30,6 +38,7 @@
    * depth the server sent, the way the tree view does. After that the user owns folding,
    * so this runs once per loaded tree rather than on every store change. */
   async function refresh(q: string) {
+    waitStarted = startedNow();
     const t = await loadCompact(q);
     if (t) expanded.set(expandedIds(t.tree));
   }
@@ -53,7 +62,7 @@
   {#if err}
     <p class="err">{err}</p>
   {:else if !data}
-    <p class="dim">folding…</p>
+    <LoadingBar label="folding the tree" progress={waitStarted} />
   {:else if data}
     <div class="hdr">
       <span
