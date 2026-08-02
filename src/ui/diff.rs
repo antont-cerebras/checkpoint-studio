@@ -202,27 +202,24 @@ impl UI {
 }
 
 /// `1.2 GiB → 1.4 GiB (+195.3 MiB)`, or a note that both sides weigh the same.
+///
+/// The screen's own layout — one line, both totals, no percentages — over the shared arithmetic
+/// (`diff::totals_parts`, which also builds the report's `size:` / `params:` lines and has the
+/// browser's `totalsParts` for a counterpart). This used to compute the delta itself, which is one
+/// more place for two surfaces to disagree about what `→` means.
 fn size_delta(report: &DiffReport) -> String {
-    let bytes = if report.old_bytes == report.new_bytes {
-        format!("{} (unchanged)", format_size(report.new_bytes))
-    } else {
-        let (from, to) = (report.old_bytes, report.new_bytes);
-        let sign = if to > from { '+' } else { '-' };
-        let magnitude = format_size(to.abs_diff(from));
-        format!(
-            "{} → {} ({sign}{magnitude})",
-            format_size(from),
-            format_size(to)
-        )
+    use checkpoint_studio_core::diff::totals_parts;
+    let bytes = totals_parts(report.old_bytes, report.new_bytes, format_size);
+    let bytes = match &bytes.change {
+        None => format!("{} (unchanged)", bytes.new),
+        Some(change) => format!("{} → {} ({})", bytes.old, bytes.new, change.delta),
     };
-    if report.old_params == report.new_params {
-        format!("{bytes} · {} params", format_parameters(report.new_params))
-    } else {
-        format!(
-            "{bytes} · {} → {} params",
-            format_parameters(report.old_params),
-            format_parameters(report.new_params)
-        )
+    // The parameter count keeps its own shape here — a running header has room for one delta, and the
+    // size is the one that answers "did this get smaller". The report's `params:` line has both.
+    let params = totals_parts(report.old_params, report.new_params, format_parameters);
+    match &params.change {
+        None => format!("{bytes} · {} params", params.new),
+        Some(_) => format!("{bytes} · {} → {} params", params.old, params.new),
     }
 }
 

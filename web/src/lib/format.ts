@@ -49,6 +49,84 @@ export function humanCount(n: number): string {
   return i === 0 ? String(n) : `${fixed1(v)}${units[i]}`;
 }
 
+/**
+ * How one overall total changed: `size: 1.9 TiB → 451.8 GiB (-1.5 TiB, -77.0%)`.
+ *
+ * Mirrors Rust `diff::totals_line`, case-by-case in the parity fixture. The report used to print
+ * `451.8 GiB → 32 B` and stop, leaving the reader to work out a difference the terminal states
+ * outright — and the side-by-side showed neither size nor parameter count at all.
+ *
+ * `(unchanged)` when the two agree, and no percentage when the old side is zero: there is no
+ * percentage of nothing. The percentage goes through [[fixed1]] for the same reason every other
+ * one-decimal number here does — an exact tie (`12.25%`) rounds to even in Rust and away from zero
+ * in a bare `toFixed`.
+ */
+export function totalsLine(
+  label: string,
+  oldTotal: number,
+  newTotal: number,
+  fmt: (n: number) => string,
+): string {
+  const p = totalsParts(oldTotal, newTotal, fmt);
+  if (!p.delta) return `${label}: ${p.to} (unchanged)`;
+  return `${label}: ${p.from} → ${p.to} (${p.delta}${p.percent ? `, ${p.percent}` : ''})`;
+}
+
+/** The same change, in pieces — for a layout that is not a line of text. */
+export interface TotalsParts {
+  from: string;
+  to: string;
+  /** `+72 B`, or `''` when the two are equal. */
+  delta: string;
+  /** `+78.3%`, or `''` when there is no baseline to be relative to (or nothing changed). */
+  percent: string;
+  /** Which way it went, for colour: `0` when unchanged. */
+  direction: -1 | 0 | 1;
+}
+
+/**
+ * The parts [[totalsLine]] assembles.
+ *
+ * Split out so a *screen* can lay them out — a label column, the two values, the delta as its own
+ * chip — while the assembled string stays one implementation, pinned against Rust case by case in
+ * `parity.test.ts`. Two functions computing one delta would be the drift that fixture exists to stop.
+ */
+export function totalsParts(
+  oldTotal: number,
+  newTotal: number,
+  fmt: (n: number) => string,
+): TotalsParts {
+  const from = fmt(oldTotal);
+  const to = fmt(newTotal);
+  if (oldTotal === newTotal) return { from, to, delta: '', percent: '', direction: 0 };
+  const diff = newTotal - oldTotal;
+  const sign = diff >= 0 ? '+' : '-';
+  return {
+    from,
+    to,
+    delta: `${sign}${fmt(Math.abs(diff))}`,
+    percent: oldTotal === 0 ? '' : `${sign}${fixed1((Math.abs(diff) / oldTotal) * 100)}%`,
+    direction: diff >= 0 ? 1 : -1,
+  };
+}
+
+/**
+ * What a checkpoint-address box accepts, in one sentence.
+ *
+ * Every such box accepts the same set, because they all resolve through `crate::opening::resolve` —
+ * so saying different things in different boxes is not a difference in the app, only in its labels.
+ * The open prompt used to promise less than the two comparison boxes ("path on the ssh proxy, or an
+ * s3:// prefix"), which reads as "globs and `hf://` are not for this box" when they always were.
+ *
+ * `proxyHost` names the host `:/path` resolves to, which only the server knows (`/api/recents`) —
+ * "the ssh proxy" is only as informative as the reader's memory of their config file.
+ */
+export function specHelp(proxied: boolean, proxyHost = ''): string {
+  return proxied
+    ? `a path, glob, hf:// repo, s3:// URI, host:/path, or :/path on ${proxyHost || 'the ssh proxy'}`
+    : 'a path, glob, hf:// repo, s3:// URI, or [user@]host:/path';
+}
+
 export function shape(dims: number[]): string {
   return dims.length ? dims.join(' × ') : 'scalar';
 }
@@ -86,4 +164,23 @@ export function percent(fraction: number, isZero: boolean): string {
 export function shardNote(shard: ShardTensors): string {
   const unit = shard.tensors === 1 ? 'tensor' : 'tensors';
   return `${shard.tensors} ${unit} · ${percent(shard.params_share, shard.params === 0)} of params`;
+}
+
+/**
+ * Shorten a path by dropping the *middle*, keeping both ends: `/net/…/3bit-22s-kvh5/260724`.
+ *
+ * Checkpoint addresses are long and differ at the tail — `…/3bit-22s/260626` against
+ * `…/3bit-22s-kvh5/260724` — so the CSS default of an ellipsis at the end removes precisely the part
+ * that tells the two apart. At 600px both boxes of a comparison read `/net/antont-vm/srv,` and the
+ * view became two identical labels over two different checkpoints.
+ *
+ * Returns the string unchanged when it already fits, and keeps slightly more of the tail than the
+ * head when the budget is odd: the tail is the distinguishing end.
+ */
+export function middleTruncate(s: string, max: number): string {
+  if (max <= 1) return s.length <= max ? s : '…';
+  if (s.length <= max) return s;
+  const keep = max - 1;
+  const head = Math.floor(keep / 2);
+  return `${s.slice(0, head)}…${s.slice(s.length - (keep - head))}`;
 }

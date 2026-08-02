@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { humanCount, humanSize, num, percent, pyShape, shape } from './format';
+import {
+  humanCount,
+  humanSize,
+  middleTruncate,
+  num,
+  percent,
+  pyShape,
+  shape,
+  specHelp,
+} from './format';
 
 // These formatters exist on BOTH sides of the app: the TUI formats in Rust
 // (`utils::format_size`, `format_parameters`, `format_percent`), the web UI formats
@@ -90,5 +99,54 @@ describe('shape', () => {
     expect(pyShape([768, 2048])).toBe('(768, 2048)');
     expect(pyShape([4])).toBe('(4,)');
     expect(pyShape([])).toBe('()');
+  });
+});
+
+describe('shortening a path for a narrow box', () => {
+  // The tail is what distinguishes two checkpoints, and it is what an end-ellipsis throws away.
+  it('keeps both ends and drops the middle', () => {
+    const p = '/net/data/ws/models/kimi-k2.6/3bit-22s-kvh5/260724';
+    const short = middleTruncate(p, 24);
+    expect(short).toHaveLength(24);
+    expect(short.startsWith('/net/data')).toBe(true);
+    expect(short.endsWith('260724')).toBe(true);
+  });
+
+  it('tells apart two paths that differ only at the end', () => {
+    const a = middleTruncate('/models/kimi/3bit-22s/260626', 20);
+    const b = middleTruncate('/models/kimi/3bit-22s-kvh5/260724', 20);
+    expect(a).not.toEqual(b);
+  });
+
+  it('leaves a string that already fits alone', () => {
+    expect(middleTruncate('/short/path', 40)).toBe('/short/path');
+    expect(middleTruncate('exact', 5)).toBe('exact');
+  });
+
+  it('degrades to an ellipsis rather than producing nonsense', () => {
+    expect(middleTruncate('/a/long/path', 1)).toBe('…');
+    expect(middleTruncate('x', 1)).toBe('x');
+  });
+});
+
+// Every checkpoint-address box shows this one sentence, because they all resolve through the same
+// `crate::opening::resolve` and accept the same set. The open prompt used to promise less than the
+// comparison boxes did, which reads as a narrower feature rather than a shorter label.
+describe('what an address box accepts', () => {
+  it('names the proxy host, since only the server knows which one `:` means', () => {
+    const help = specHelp(true, 'lab@build-host');
+    expect(help).toContain(':/path on lab@build-host');
+    expect(help).toContain('s3:// URI');
+  });
+
+  it('falls back to naming the proxy generically when the host is unknown', () => {
+    expect(specHelp(true)).toContain(':/path on the ssh proxy');
+  });
+
+  it('drops the proxy forms entirely when this server has none', () => {
+    const help = specHelp(false);
+    // The shorthand is what goes away — `[user@]host:/path` carries its own host and stays.
+    expect(help).not.toContain('ssh proxy');
+    expect(help).toContain('[user@]host:/path');
   });
 });

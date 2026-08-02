@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { expandedIds, flatten, nodeId, type Row } from './flatten';
 import { sortRows } from './rows';
-import { humanCount, humanSize, percent, shardNote } from './format';
+import { humanCount, humanSize, percent, shardNote, totalsLine } from './format';
 import { searchTree } from './search';
 import type { TreeNode } from './types';
 
@@ -40,6 +40,7 @@ interface Fixture {
   count: [number, string][];
   percent: [number, number, string][];
   shard: [number, number, number, string][];
+  totals: [string, number, number, string][];
   tree: { nodes: TreeNode[]; rows: RowProjection[] };
   sort: { tensors: SortFixtureTensor[]; orders: SortCase[] };
   search: { names: string[]; matches: [string, string[]][] };
@@ -80,6 +81,16 @@ describe('shard rows read the same as the TUI file browser', () => {
       expect(shardNote({ tensors, params, params_share: paramsShare }), HINT).toBe(expected);
     },
   );
+});
+
+// The diff header's `size:` / `params:` lines, whole — the label, the arrow, the absolute delta and
+// its percentage. Both UIs write this line, and the browser wrote it without the delta.
+describe('overall-total changes read the same as the Rust diff header', () => {
+  it.each(fixture.totals)('%s %i → %i', (label, oldTotal, newTotal, expected) => {
+    // `startsWith`, because a filtered comparison's label carries its scope: `size (filtered subset)`.
+    const fmt = label.startsWith('size') ? humanSize : humanCount;
+    expect(totalsLine(label, oldTotal, newTotal, fmt), HINT).toBe(expected);
+  });
 });
 
 describe('the search matcher matches the same names as the TUI', () => {

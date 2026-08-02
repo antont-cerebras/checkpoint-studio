@@ -26,6 +26,7 @@
 
 use std::path::PathBuf;
 
+use checkpoint_studio_core::diff::totals_line;
 use checkpoint_studio_core::filetree::ShardTensors;
 use checkpoint_studio_core::kernel::{Session, sort_rows};
 use checkpoint_studio_core::tree::{
@@ -113,6 +114,28 @@ const SHARDS: &[(usize, usize, usize)] = &[
     (1, 1_000, 30_000_000_000), // singular, and a share too small for one decimal
     (14, 90_000_000, 30_000_000_000),
     (3, 0, 30_000_000_000), // no parameters at all — an exact "0%"
+];
+
+/// Overall-total changes, as `(label, old, new)`: the diff header's `size:` and `params:` lines.
+///
+/// A re-quantization is the real case — 1966.5 GiB down to 451.8 GiB — and the rest are the branches:
+/// no change at all, growth, a zero baseline (no percentage to give), a drop to almost nothing, and an
+/// exact tie at one decimal, which is where the two languages' rounding rules part company
+/// (12.25% → `12.2` in Rust, `12.3` from a bare `toFixed`).
+const TOTALS: &[(&str, usize, usize)] = &[
+    ("size", 2_111_724_478_464, 485_133_058_048),
+    ("size", 100, 150),
+    ("size", 100, 100),
+    ("size", 0, 100),
+    ("size", 485_133_058_048, 32),
+    ("size", 10_000, 11_225), // +12.25% — an exact tie at one decimal
+    ("params", 1_055_800_000_000, 242_600_000_000),
+    ("params", 56, 40),
+    ("params", 0, 0),
+    // Under a filter the totals cover the matched tensors, and the label says so
+    // (`diff::totals_labels`) — the whole line is contracted, label included.
+    ("size (filtered subset)", 16, 32),
+    ("params (filtered subset)", 4, 8),
 ];
 
 /// A realistic slice of tensor names, plus a couple of shapes that exercise
@@ -303,6 +326,20 @@ fn build() -> Value {
                 let params_share = params as f64 / total as f64;
                 let shard = ShardTensors { tensors, params, params_share };
                 json!([tensors, params, params_share, shard.note()])
+            })
+            .collect::<Vec<_>>(),
+        // The diff header's overall-total lines. Both UIs write them, so the whole line is
+        // contracted — the label, the arrow, the absolute delta and its percentage — not just the
+        // numbers in it. The web report used to show `old → new` and stop there.
+        "totals": TOTALS
+            .iter()
+            .map(|&(label, old, new)| {
+                let fmt: fn(usize) -> String = if label.starts_with("size") {
+                    format_size
+                } else {
+                    format_parameters
+                };
+                json!([label, old, new, totals_line(label, old, new, false, fmt)])
             })
             .collect::<Vec<_>>(),
         // The tree the two UIs flatten into rows. `tree` is the served hierarchy;

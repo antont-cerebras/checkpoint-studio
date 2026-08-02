@@ -232,6 +232,74 @@
       "3 tensors · 0% of params"
     ]
   ],
+  "totals": [
+    [
+      "size",
+      2111724478464,
+      485133058048,
+      "size: 1.9 TiB → 451.8 GiB (-1.5 TiB, -77.0%)"
+    ],
+    [
+      "size",
+      100,
+      150,
+      "size: 100 B → 150 B (+50 B, +50.0%)"
+    ],
+    [
+      "size",
+      100,
+      100,
+      "size: 100 B (unchanged)"
+    ],
+    [
+      "size",
+      0,
+      100,
+      "size: 0 B → 100 B (+100 B)"
+    ],
+    [
+      "size",
+      485133058048,
+      32,
+      "size: 451.8 GiB → 32 B (-451.8 GiB, -100.0%)"
+    ],
+    [
+      "size",
+      10000,
+      11225,
+      "size: 9.8 KiB → 11.0 KiB (+1.2 KiB, +12.2%)"
+    ],
+    [
+      "params",
+      1055800000000,
+      242600000000,
+      "params: 1.1T → 242.6B (-813.2B, -77.0%)"
+    ],
+    [
+      "params",
+      56,
+      40,
+      "params: 56 → 40 (-16, -28.6%)"
+    ],
+    [
+      "params",
+      0,
+      0,
+      "params: 0 (unchanged)"
+    ],
+    [
+      "size (filtered subset)",
+      16,
+      32,
+      "size (filtered subset): 16 B → 32 B (+16 B, +100.0%)"
+    ],
+    [
+      "params (filtered subset)",
+      4,
+      8,
+      "params (filtered subset): 4 → 8 (+4, +100.0%)"
+    ]
+  ],
   "tree": {
     "nodes": [
       {
