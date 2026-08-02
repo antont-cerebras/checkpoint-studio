@@ -203,22 +203,23 @@ describe("urls", () => {
     expect(urls[1]).toBe("/api/compact?q=dtype%3AF32%20*.mlp.*");
   });
 
-  it("encodes a compare path for the diff endpoint", async () => {
+  // The report reads the pair the comparison slot already holds, so it quotes an id rather than a
+  // path — one read for every view of a comparison, and no way for the two views to describe
+  // different pairs.
+  it("names the comparison by id on the report endpoint", async () => {
     const urls = stubFetch({ body: { added: [], removed: [], changed: [] } });
-    await api.diff("/cb/home/u/ws/Qwen3 A3B/");
-    expect(urls[0]).toBe(
-      "/api/diff?against=%2Fcb%2Fhome%2Fu%2Fws%2FQwen3%20A3B%2F",
-    );
+    await api.diff(7);
+    expect(urls[0]).toBe("/api/diff?id=7");
   });
 
-  it("surfaces the server's reason when a compare path is not a checkpoint", async () => {
-    // The 400 path is the one a user actually hits — a typo'd or non-checkpoint path —
-    // and the message has to reach the compare box instead of an empty report.
+  it("surfaces the server's reason when a comparison cannot be answered", async () => {
+    // The 400 path is the one a user actually hits — a typo'd or non-checkpoint path, refused when
+    // the pair is set up — and the message has to reach the compare box instead of an empty report.
     stubFetch({
       status: 400,
       body: { error: "no checkpoint files found at /tmp/x" },
     });
-    await expect(api.diff("/tmp/x")).rejects.toThrow(
+    await expect(api.diff(7)).rejects.toThrow(
       "no checkpoint files found at /tmp/x",
     );
   });
@@ -320,9 +321,9 @@ describe("a scoped diff", () => {
 
   it("sends the selection on the report route", async () => {
     const urls = stubFetch({ body: {} });
-    await api.diff("/base", scope);
+    await api.diff(7, scope);
     const q = new URLSearchParams(urls[0]!.slice(urls[0]!.indexOf("?") + 1));
-    expect(q.get("against")).toBe("/base");
+    expect(q.get("id")).toBe("7");
     expect(q.get("name")).toBe("model.layers.1.*\n!*.bias");
     expect(q.get("dtype_is")).toBe("F*");
     expect(q.get("only_tensors")).toBe("1");
@@ -343,8 +344,8 @@ describe("a scoped diff", () => {
 
   it("adds nothing when there is no scope", async () => {
     let urls = stubFetch({ body: {} });
-    await api.diff("/base");
-    expect(urls[0]).toBe("/api/diff?against=%2Fbase");
+    await api.diff(7);
+    expect(urls[0]).toBe("/api/diff?id=7");
     urls = stubFetch({ body: {} });
     await api.difftree(3);
     expect(urls[0]).toBe("/api/difftree?id=3");

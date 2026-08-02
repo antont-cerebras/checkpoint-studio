@@ -24,10 +24,10 @@
       "stop_other"
     ],
     "diff": [
-      "against",
       "align_fused",
       "dtype_is",
       "full",
+      "id",
       "map",
       "map_json",
       "name",

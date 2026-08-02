@@ -74,7 +74,7 @@ The subcommand this ledger was started for.
 | `--only-tensors` | yes | `only_tensors=1`. Note *any* filter also suppresses the metadata comparison — the CLI's rule (`DiffOpts { metadata: !only_tensors && !filtered }`), pinned by a test |
 | `--map` / `--map-from` | yes | `map=` (newline-separated rules) and `map_json=`, on **both** views. The side-by-side rebuilds the baseline's tree from the renamed names (`difftree::tree_from_tensors`) — rewriting a leaf alone would leave the groups above it named from the name it used to have. Verified against the CLI: `-2 +2` becomes `2 unchanged` on both |
 | `#SUBTREE` suffix | **gap** | accepted by the `diff` subcommand's `OLD`/`NEW`; `opening::resolve` does not take it |
-| `--values` | yes | `POST /api/jobs/values?…&values=1`, polled. Per-tensor findings from `compare::tensor_extras`, shared with the CLI, folded into the report by `diff::compare_with` — so a same-shape tensor whose bytes differ reads as *changed* on both. Numbers cross-checked against the CLI on the fixtures |
+| `--values` | yes | `POST /api/jobs/values?…&values=1`, polled — the **Data** view of a comparison, where the tensor count and the bytes to read are shown before the run starts. The summary used to say the numeric comparison had to be run in a terminal while the other screen was already running it in the browser; the terminal command is offered there as an alternative. Per-tensor findings from `compare::tensor_extras`, shared with the CLI, folded into the report by `diff::compare_with` — so a same-shape tensor whose bytes differ reads as *changed* on both. Numbers cross-checked against the CLI on the fixtures |
 | `--histogram` / `--bins` | yes | `…&histogram=1&bins=N` on the same job |
 | `--dtype` | yes | `…&dtype=V` on the values job, parsed by the same `view_of` every `/api/tensor/*` route uses |
 | `--jobs` | yes | `…&jobs=N`; defaults to logical CPUs, as the CLI does |
@@ -168,8 +168,8 @@ ledger's guard covers every flag clap defines.
 | `--dtype`, `--values`, `--heatmap`, `--histogram`, `--bins`, `--slice`, `--window`, `--edge` | yes | the detail screen's tabs and their hash parameters (`/api/tensor/histogram` takes `bins`) |
 | `--stats`, `--health`, `--files`, `--layout`, `--layout-select`, `--tree`, `--compact`, `--filter`, `--search`, `--sort`, `--overview`, `--abs-max`, `--zebra` | yes | the corresponding screen / hash parameter |
 | `--base`, `--shape`, `--name`, `--rename`, `--rename-rule` | **gap** | `--rename` / `--rename-rule` write; `--base` and `--shape` reinterpret a tensor |
-| `--diff-against` | yes | `#diff?against=…` |
-| `--compare-with`, `--compare-full` | yes | `#compare?against=…[&full=1]`. The side-by-side's own flags, so `y` there reopens *that* screen — it used to copy `--diff-against`, which opens the one-page report of the same pair. `--compare-full` carries the family fold state (`k`), the way `#compare?…&full=1` does |
+| `--diff-against` | yes | `#compare?lhs=…` — the summary view (`lhs`/`rhs` are the pair, in the order `diff OLD NEW` takes them) |
+| `--compare-with`, `--compare-full` | yes | `#compare?lhs=…&rhs=…&view=browse[&full=1]`. **The browser has one comparison screen and three views of it** (`view=summary\|browse\|data`); the terminal keeps two screens, because there the choice is a keypress rather than a fork in the road — `d` opens the report, the palette opens the side-by-side, and neither hides the other. `--compare-full` carries the family fold state (`k`), the way `&full=1` does |
 | `--compute-stats`, `--stats-shards`, `--health-findings`, `--print-arch` | **gap** | one-shot exports with no web equivalent |
 | `--no-preload` | **gap** | the web never preloads, so the *default* differs rather than the flag being absent |
 | `--tree-state`, `--emit-command`, `--print-view` | n/a | the URL hash is the web's state round-trip (`y` in the TUI) |

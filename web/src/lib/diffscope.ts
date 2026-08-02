@@ -159,6 +159,6 @@ export function scopeSummary(s: DiffScopeParams): string {
   if (s.onlyTensors) parts.push('tensors only');
   if (s.alignFused) parts.push('unfused ↔ fused aligned');
   if (s.subtree.trim() !== '') parts.push(`baseline from #${s.subtree.trim()}`);
-  if (s.subtreeNew.trim() !== '') parts.push(`newer side from #${s.subtreeNew.trim()}`);
+  if (s.subtreeNew.trim() !== '') parts.push(`candidate from #${s.subtreeNew.trim()}`);
   return parts.join(' · ');
 }

@@ -9,31 +9,35 @@
   }
 </script>
 
-<div class="status">
-  {#if $screen.kind !== 'tree'}
-    <span class="dim">{$screen.kind}{$screen.kind === 'detail' ? ` · ${$screen.tensor}` : ''}</span>
-  {:else if row && row.node.kind === 'tensor'}
-    <span class="name">{row.node.info.name}</span>
-    <span class="dim">·</span>
-    <span class="mono">{row.node.info.dtype} [{shape(row.node.info.shape)}]</span>
-    <span class="dim">·</span>
-    <span class="mono">{humanSize(row.node.info.size_bytes)}</span>
-    <span class="dim">·</span>
-    <span class="dim">{basename(row.node.info.source_path)}</span>
-  {:else if row && row.node.kind === 'group'}
-    <span class="name">{row.node.name}</span>
-    <span class="dim">·</span>
-    <span class="mono">{humanCount(row.node.tensor_count)} tensors</span>
-    <span class="dim">·</span>
-    <span class="mono">{humanSize(row.node.total_size)}</span>
-  {:else if row && row.node.kind === 'metadata'}
-    <span class="name">{row.node.info.name}</span>
-    <span class="dim">=</span>
-    <span class="mono">{row.node.info.value}</span>
-  {:else}
-    <span class="dim">—</span>
-  {/if}
-</div>
+<!-- The tree's own status line: what the cursor is on.
+     Every other screen used to get the screen's *name* here — a strip across the bottom of the
+     comparison page reading `compare`, under a breadcrumb already saying so. A bar with nothing to
+     say is not drawn at all. -->
+{#if $screen.kind === 'tree'}
+  <div class="status">
+    {#if row && row.node.kind === 'tensor'}
+      <span class="name">{row.node.info.name}</span>
+      <span class="dim">·</span>
+      <span class="mono">{row.node.info.dtype} [{shape(row.node.info.shape)}]</span>
+      <span class="dim">·</span>
+      <span class="mono">{humanSize(row.node.info.size_bytes)}</span>
+      <span class="dim">·</span>
+      <span class="dim">{basename(row.node.info.source_path)}</span>
+    {:else if row && row.node.kind === 'group'}
+      <span class="name">{row.node.name}</span>
+      <span class="dim">·</span>
+      <span class="mono">{humanCount(row.node.tensor_count)} tensors</span>
+      <span class="dim">·</span>
+      <span class="mono">{humanSize(row.node.total_size)}</span>
+    {:else if row && row.node.kind === 'metadata'}
+      <span class="name">{row.node.info.name}</span>
+      <span class="dim">=</span>
+      <span class="mono">{row.node.info.value}</span>
+    {:else}
+      <span class="dim">—</span>
+    {/if}
+  </div>
+{/if}
 
 <style>
   .status {

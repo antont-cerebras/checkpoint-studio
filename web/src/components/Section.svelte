@@ -27,6 +27,9 @@
   /** A one-line note beside the count: what a section says about itself when it is empty *for a
    * reason* (`not compared (filtered subset)`), rather than being empty. */
   export let note = '';
+  /** What the section counts, for a heading whose word is ambiguous on its own — `Metadata` above
+   * all, which a reader may reasonably take to include a tensor's dtype and shape. */
+  export let titleHint = '';
 
   /** Distinct per instance, so `aria-controls` points at this body and no other. */
   const id = `section-${Math.random().toString(36).slice(2, 9)}`;
@@ -36,6 +39,7 @@
   <h3 class={tone}>
     <button
       type="button"
+      title={titleHint}
       aria-expanded={open}
       aria-controls={id}
       on:click={() => onToggle?.(!open)}

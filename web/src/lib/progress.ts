@@ -54,7 +54,9 @@ export function totalBytes(headers: Headers): number | null {
  * make the decoded stream longer than the announced length, and a bar that overshoots reads
  * as a bug in the app rather than in the proxy. */
 export function fraction(p: Progress): number | null {
-  if (p.total === null) return null;
+  // `<= 0` as well as `null`: a zero total is a denominator too, and dividing by it drew
+  // `0 B / 0 B · NaN%`. Both mean the same thing here — there is no fraction to show yet.
+  if (p.total === null || p.total <= 0) return null;
   return Math.min(1, p.received / p.total);
 }
 

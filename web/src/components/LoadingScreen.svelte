@@ -42,7 +42,7 @@
     step.kind === 'comparing'
       ? [
           { label: 'baseline', spec: resolvedSpec(step.spec, $proxyHost) },
-          { label: 'newer side', spec: resolvedSpec(step.right, $proxyHost) },
+          { label: 'candidate', spec: resolvedSpec(step.right, $proxyHost) },
         ]
       : [];
   /**
@@ -71,7 +71,7 @@
     if (i === live) return 'live';
     return i <= high ? 'read' : 'waiting';
   }
-  /** `44 / 66 shards`, or `44 shards` before the reader knows a total. Nothing until it has counted
+  /** `44 / 66 shards`, or `44 shards` before the reader knows a total. Empty until it has counted
    * something: `0` with no unit says less than the timer does. */
   $: counted =
     server && server.done > 0
@@ -80,6 +80,19 @@
         : `${server.done.toLocaleString()} ${server.unit}`.trim()
       : '';
   $: fraction = server && server.total > 0 ? Math.min(1, server.done / server.total) : null;
+  /**
+   * Whether to keep a place for the server's counts — for the whole of a server-side read, not only
+   * while there is something in it.
+   *
+   * **This is what stopped the screen flickering.** A read moves through phases that count different
+   * things (`listing` → `40/40 tensors` → `2/60 S3 objects` → the next checkpoint's `1/30 shards`),
+   * and at every boundary the count is briefly empty and the total briefly unknown. Rendering the bar
+   * and the count only when they had values took them out of the layout and put them back several
+   * times a read, and everything below — the two checkpoint rows, one of which you are reading —
+   * jumped 40 pixels each time. The panel is the same height throughout now, and the count fades in
+   * where it will be.
+   */
+  $: serverStep = step.kind === 'opening' || step.kind === 'comparing';
 </script>
 
 <div class="screen">
@@ -91,21 +104,25 @@
   <!-- What the server has got through, in the units the reader itself counts in. A synchronous open
        tells the browser nothing until it lands, so without this the only honest thing on screen was an
        elapsed timer — for a read that a terminal reports shard by shard. -->
-  {#if counted}
+  {#if serverStep}
     <div class="server">
-      {#if fraction !== null}
-        <div
-          class="bar"
-          role="progressbar"
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={Math.round(fraction * 100)}
-        >
-          <i style="width:{(fraction * 100).toFixed(1)}%"></i>
-        </div>
-      {/if}
+      <!-- The rail is always drawn; the fill appears once there is a denominator. An empty rail is
+           honest — the read has started and nobody has said how much there is yet — and it holds the
+           four pixels so nothing below moves when the answer arrives. -->
+      <div
+        class="bar"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={fraction === null ? undefined : Math.round(fraction * 100)}
+      >
+        {#if fraction !== null}<i style="width:{(fraction * 100).toFixed(1)}%"></i>{/if}
+      </div>
+      <!-- The separator belongs to the pair, not to the stage: before the first count lands there is
+           nothing to separate, and the line read `· loading the checkpoint index`. -->
       <p class="count dim">
-        {counted}{#if server?.stage}<span class="stage"> · {server.stage}</span>{/if}
+        {counted}{#if server?.stage}<span class="stage">{counted ? ' · ' : ''}{server.stage}</span
+          >{/if}
       </p>
     </div>
   {/if}
@@ -118,9 +135,12 @@
         <li class:live={state === 'live'} class:done={state === 'read'}>
           <span class="what">{side.label}</span>
           <span class="spec mono">{shortSpec(side.spec, $proxyHost) || '(the open checkpoint)'}</span>
+          <!-- Where this side is, and nothing else. It used to repeat the count from the line above —
+               the same `2 / 60 S3 objects` twice, in two places that changed width at different
+               moments. The count belongs to the read; the row belongs to the side. -->
           <span class="state dim">
             {#if state === 'live'}
-              {counted || 'reading…'}
+              reading…
             {:else if state === 'read'}
               read
             {:else}
@@ -148,17 +168,21 @@
     margin: 0;
     font-size: 12px;
   }
-  /* The server's own count, under the same 40ch cap the bar above uses — two bars of different
-     widths for one wait would read as two unrelated things. */
+  /* The bar keeps the same 40ch cap as the one above it — two bars of different widths for one wait
+     would read as two unrelated things — while the count beneath may run as long as it needs on its
+     one line. */
   .server {
     display: flex;
     flex-direction: column;
     gap: 5px;
-    width: 40ch;
+    width: fit-content;
+    min-width: 40ch;
     max-width: 100%;
   }
   /* The same rail-and-fill as every other bar here. */
   .bar {
+    width: 40ch;
+    max-width: 100%;
     height: 4px;
     border-radius: 2px;
     background: var(--border);
@@ -170,10 +194,16 @@
     background: var(--accent);
     transition: width 200ms linear;
   }
+  /* One line, always: a count that wrapped onto a second line as the phase changed
+     (`2 / 60 S3 objects · reading S3 storage metadata`) shifted everything under it. */
   .count {
     margin: 0;
+    min-height: 1.2em;
     font-size: 12px;
     font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   /* A row per checkpoint: what it is, which one, and where it has got to. */
   .sides {

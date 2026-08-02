@@ -56,36 +56,19 @@ pub(crate) struct Baseline {
     pub s3: Option<crate::remote::S3Meta>,
 }
 
-/// The baseline of a comparison that will also compare **S3 object metadata**.
-///
-/// [`Want::Model`](crate::opening::Want::Model) rather than [`summarize_spec`]'s `Want::Parts`, which
-/// is the one difference: over the ssh proxy that read also HEADs every object, so an `s3://` baseline
-/// arrives with the per-object metadata this comparison needs. That scan is not free — sixteen seconds
-/// for eleven hundred objects — and it is exactly the scan `checkpoint-studio diff` already pays for
-/// the same pair. The alternative was a browser that could compare two `s3://` checkpoints and never
-/// mention the object-level differences a terminal reports, which is the gap this closes.
-///
-/// For every other source the two `Want`s read identically (see `opening::Target::read`), so nothing
-/// local pays for this.
-pub(crate) fn summarize_baseline(spec: &str, opts: &crate::opening::Options) -> Result<Baseline> {
-    let opened = crate::opening::resolve(spec, opts)
-        .with_context(|| format!("resolving {spec}"))?
-        .read(
-            crate::opening::Want::Model,
-            &crate::hf::ReadProgress::default(),
-        )
-        .with_context(|| format!("reading {spec}"))?;
-    let (tensors, metadata) = (&opened.parts.tensors, &opened.parts.metadata);
-    let summary = CheckpointSummary::from_loaded(tensors, metadata);
-    let s3 = opened.checkpoint.and_then(|cp| cp.s3);
-    Ok(Baseline { summary, s3 })
-}
+// `summarize_baseline` used to live here: the report route's own read of its baseline, with
+// `Want::Model` so an `s3://` side arrived carrying its per-object metadata. Both diff views read the
+// pair from the comparison slot now (`Current::read_side`, which asks for `Want::Model` for the same
+// reason), so a report costs no read at all — and the two views cannot describe different pairs.
 
 /// Compare the two sides' S3 object metadata, attach it to the report, and say what happened.
 ///
-/// Only an s3-vs-s3 pair has it on both sides, so that is the only pair compared; the returned
-/// sentence is the note the CLI prints on stderr and the browser shows above the section. Shared so
-/// neither surface can quietly skip the comparison the other performs.
+/// Only an s3-vs-s3 pair has it on both sides, so that is the only pair compared.
+///
+/// The returned sentence is a note **about the comparison**, not a result of it: it says what was
+/// compared, or why something was not. The CLI prints it on stderr and the browser sets it apart from
+/// the counts (`DiffView`'s `.method`), because among them it read as a finding. Shared so neither
+/// surface can quietly skip the comparison the other performs.
 ///
 /// Timestamp-like deltas are informational and never a difference — see [`crate::diff::compare_s3`].
 pub(crate) fn attach_s3(
@@ -110,9 +93,11 @@ pub(crate) fn attach_s3(
             report.s3 = Some(crate::diff::compare_s3(o, n));
             Some(format!("compared {count} S3 object(s)' metadata"))
         }
-        (Some(_), None) | (None, Some(_)) => {
-            Some("S3 object metadata compared only for s3-vs-s3 (one side isn't s3://)".to_string())
-        }
+        (Some(_), None) | (None, Some(_)) => Some(
+            "S3 object metadata is compared only when both sides are s3:// — one of these is not, \
+             so this comparison is of structure alone."
+                .to_string(),
+        ),
         (None, None) => None,
     }
 }
@@ -192,8 +177,13 @@ pub(crate) fn tensor_filter(text: &ScopeText<'_>) -> Result<crate::diff::TensorF
 
     let mut exact: HashSet<String> = HashSet::new();
     if let Some(list) = text.names_csv {
+        // Commas **or** newlines. `--names` is documented as a comma list and stays one, but the same
+        // field in the browser is a box you paste into, and a pasted column of names is the commonest
+        // thing to put in it. A tensor name contains neither character, so accepting both costs nothing
+        // — unlike `--name`, where the comma belongs to the `{a,b}` alternation and cannot be a
+        // separator (see `NameFilter`).
         exact.extend(
-            list.split(',')
+            list.split([',', '\n'])
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
@@ -386,6 +376,49 @@ pub(crate) fn repack_supported(proxied: bool, s3_pair: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether the two sides' **values** can be compared at all, from their addresses alone.
+///
+/// Asked before either side is read. The job used to read both checkpoints first — minutes over an ssh
+/// proxy — and only then discover that a remote source hands over no tensor data, so the answer arrived
+/// after the wait it should have prevented. Nothing about it depends on the read: a location either
+/// serves bytes or it does not ([`crate::capability::Capabilities::read_bytes`]), and the spec says
+/// which location it is.
+///
+/// The message names the alternative that *does* work for the commonest remote pair, which is why this
+/// is one sentence in one place rather than a guess at each call site.
+pub(crate) fn values_supported(left: &str, right: &str) -> Result<()> {
+    let remote: Vec<&str> = [left, right]
+        .into_iter()
+        .filter(|spec| !crate::capability::Location::of_source_path(spec).is_local())
+        .collect();
+    if remote.is_empty() {
+        return Ok(());
+    }
+    let s3 = |spec: &str| {
+        matches!(
+            crate::capability::Location::of_source_path(spec),
+            crate::capability::Location::S3
+        )
+    };
+    let both_s3 = s3(left) && s3(right);
+    anyhow::bail!(
+        "this build compares values by reading the tensors here, and {} {} read remotely — only the \
+         structure comes from there.{}",
+        remote.join(" and "),
+        if remote.len() == 1 { "is" } else { "are" },
+        if both_s3 {
+            // The terminal *can* do this pair: the comparison runs on the proxy, where the bytes are
+            // (`remote::RemoteRead::value_diff`). The browser has no path to it yet, and saying so is
+            // more use than a refusal that sounds like the app cannot do it at all.
+            " Both sides are s3:// cstorch checkpoints, which the terminal can compare on the proxy — \
+             run the command below (`diff --values`), or verify-repack for a packing check."
+        } else {
+            " Copy a checkpoint down to compare its values here. Two s3:// cstorch checkpoints can be \
+             compared on the proxy from a terminal; a remote safetensors directory cannot yet."
+        }
+    );
+}
+
 /// Plan a repack verification over two **already-scoped** summaries.
 ///
 /// Shared by the `diff` subcommand and the web's job, so the browser verifies exactly the pairs a
@@ -478,19 +511,36 @@ pub(crate) enum Sides {
     OpenFirst,
 }
 
+/// How to name one side of a comparison on a command line.
+///
+/// A local checkpoint is named by the **checkpoint**, not by one of its shards: the resolved file
+/// list of a sharded directory is every shard, and naming the first compares something else
+/// ([`crate::model::checkpoint_path`] answers which single path names them all; `None` when they span
+/// directories, where no one path does). A remote side has no local files at all — an `s3://` prefix,
+/// an `hf://` repo, a path on an ssh proxy — and is named by the address it was opened as, which is
+/// exactly what `diff` accepts. That second case is the one that used to fall through to no command,
+/// which the browser then printed as the word `null`.
+pub(crate) fn side_operand(spec: &str, files: &[PathBuf]) -> Option<String> {
+    if files.is_empty() {
+        let spec = spec.trim();
+        return (!spec.is_empty()).then(|| spec.to_string());
+    }
+    crate::model::checkpoint_path(files).map(|p| p.display().to_string())
+}
+
 /// The `diff OLD NEW` command that reproduces a comparison — the batch equivalent a UI
 /// offers so a finding can be re-run in a terminal (and extended with `--values`).
 ///
-/// `open` is the *resolved* file list, which for a sharded checkpoint is every shard. The
-/// command must name the checkpoint, not one of its shards: naming a shard silently
-/// compares something else. [`crate::model::checkpoint_path`] answers that; `None` means
-/// the files span directories, in which case no single path names them and there is no
-/// honest one-line command to offer.
+/// Both operands come from [`side_operand`], which names a local checkpoint by its path and a remote
+/// one by its address. `diff` accepts either.
+///
 /// `extra` are the scope flags, so a copied command reproduces the comparison *on screen* rather than
 /// an unscoped one over every tensor — which is what it used to hand over.
+///
+/// `None` when a side cannot be named in one word — see [`side_operand`].
 pub(crate) fn cli_diff_command(
-    against: &Path,
-    open: &[PathBuf],
+    baseline: &str,
+    candidate: &str,
     extra: &[String],
     sides: Sides,
     // `#subtree` per side, when a comparison is scoped to one — `(baseline, newer)`. It rides on the
@@ -498,13 +548,14 @@ pub(crate) fn cli_diff_command(
     // the offered command would compare two whole checkpoints.
     subtrees: (Option<&str>, Option<&str>),
 ) -> Option<String> {
-    let open = crate::model::checkpoint_path(open)?;
-    let suffix = |spec: String, sub: Option<&str>| match sub {
-        Some(p) => format!("{spec}#{p}"),
-        None => spec,
+    if baseline.trim().is_empty() || candidate.trim().is_empty() {
+        return None;
+    }
+    let suffix = |spec: &str, sub: Option<&str>| {
+        sub.map_or_else(|| spec.to_string(), |p| format!("{spec}#{p}"))
     };
-    let against = suffix(against.display().to_string(), subtrees.0);
-    let open = suffix(open.display().to_string(), subtrees.1);
+    let against = suffix(baseline, subtrees.0);
+    let open = suffix(candidate, subtrees.1);
     let (old, new) = match sides {
         Sides::BaselineFirst => (&against, &open),
         Sides::OpenFirst => (&open, &against),
@@ -525,7 +576,10 @@ pub(crate) fn cli_diff_command(
 fn shell_quote(s: &str) -> String {
     if !s.is_empty()
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-/=:".contains(&b))
+            // `@` among the safe ones: every scp-style address has one (`lab@host:/opt/…`), and
+            // quoting a whole remote path to protect a character the shell does not treat specially
+            // just made the offered command harder to read.
+            .all(|b| b.is_ascii_alphanumeric() || b"._-/=:@".contains(&b))
     {
         s.to_string()
     } else {
@@ -652,23 +706,17 @@ mod tests {
     fn the_cli_command_puts_the_baseline_first() {
         // `diff OLD NEW`: the baseline is the first argument, the open checkpoint the
         // second — so pasting the command reproduces the screen's own report.
-        let cmd = cli_diff_command(
-            Path::new("/a/old"),
-            &[PathBuf::from("/b/new")],
-            &[],
-            Sides::BaselineFirst,
-            (None, None),
-        )
-        .unwrap();
+        let cmd = cli_diff_command("/a/old", "/b/new", &[], Sides::BaselineFirst, (None, None))
+            .expect("both sides have an address");
         assert_eq!(cmd, "checkpoint-studio diff /a/old /b/new");
         let quoted = cli_diff_command(
-            Path::new("/a/needs quoting"),
-            &[PathBuf::from("/b/new")],
+            "/a/needs quoting",
+            "/b/new",
             &[],
             Sides::BaselineFirst,
             (None, None),
         )
-        .unwrap();
+        .expect("both sides have an address");
         assert!(quoted.contains("'/a/needs quoting'"), "{quoted}");
     }
 
@@ -676,44 +724,78 @@ mod tests {
     /// said `diff OLD NEW` would hand over the opposite of what is on screen.
     #[test]
     fn a_swapped_report_offers_the_swapped_command() {
-        let cmd = cli_diff_command(
-            Path::new("/a/old"),
-            &[PathBuf::from("/b/new")],
-            &[],
-            Sides::OpenFirst,
-            (None, None),
-        )
-        .unwrap();
+        let cmd = cli_diff_command("/a/old", "/b/new", &[], Sides::OpenFirst, (None, None))
+            .expect("both sides have an address");
         assert_eq!(cmd, "checkpoint-studio diff /b/new /a/old");
     }
 
-    /// The regression this function exists for. `open` is the *resolved* file list, so a
-    /// sharded checkpoint arrives here as every shard — and naming the first one produced
-    /// a command that compared a single shard against the baseline instead of the
-    /// checkpoint. Reported from the web compare screen, which offered
-    /// `diff OLD <ckpt>/codebooks.safetensors` for a directory of shards.
+    /// A checkpoint is named by the address it was opened as, whatever it is made of.
+    ///
+    /// The regression behind this: the candidate used to be re-derived from its *resolved file list*,
+    /// so a sharded directory arrived as every shard and naming the first produced
+    /// `diff OLD <ckpt>/codebooks.safetensors` — a command comparing one shard. A spec cannot make
+    /// that mistake, and it also covers the sides that have no local files at all.
     #[test]
-    fn the_cli_command_names_a_sharded_checkpoint_not_one_of_its_shards() {
-        let shards = [
-            PathBuf::from("/ckpt/codebooks.safetensors"),
-            PathBuf::from("/ckpt/model-00001-of-00002.safetensors"),
-            PathBuf::from("/ckpt/model-00002-of-00002.safetensors"),
-        ];
-        let cmd = cli_diff_command(
-            Path::new("/base"),
-            &shards,
+    fn the_cli_command_names_each_side_as_it_was_addressed() {
+        let cmd = cli_diff_command("/base", "/ckpt", &[], Sides::BaselineFirst, (None, None))
+            .expect("both sides have an address");
+        assert_eq!(cmd, "checkpoint-studio diff /base /ckpt");
+
+        // A remote pair: neither side is a path on this machine, and both are still nameable.
+        let remote = cli_diff_command(
+            "s3://bucket/ckpt-2000",
+            "lab@host:/opt/models/ckpt-1000",
             &[],
             Sides::BaselineFirst,
             (None, None),
         )
-        .unwrap();
+        .expect("a remote pair has addresses too");
         assert_eq!(
-            cmd, "checkpoint-studio diff /base /ckpt",
-            "a sharded checkpoint is named by its directory"
+            remote, "checkpoint-studio diff s3://bucket/ckpt-2000 lab@host:/opt/models/ckpt-1000",
+            "the report used to offer no command at all for these, which the browser printed as `null`"
+        );
+    }
+
+    /// Whether a value comparison can happen at all — asked of the two addresses, before any read.
+    ///
+    /// The reported bug: a remote pair was accepted, both checkpoints were read (minutes over an ssh
+    /// proxy), and *then* the job said a remote source serves no tensor data. The question never
+    /// needed the read.
+    #[test]
+    fn comparing_values_needs_both_sides_local_and_says_so_before_reading() {
+        assert!(values_supported("/models/a", "/models/b").is_ok());
+
+        // One remote side: named, so the reader knows which one to copy down.
+        let one = values_supported("/models/a", "lab@host:/opt/models/b")
+            .expect_err("a remote side has no bytes to compare");
+        let msg = format!("{one:#}");
+        assert!(msg.contains("lab@host:/opt/models/b"), "{msg}");
+        assert!(
+            !msg.contains("/models/a"),
+            "the local side is not the problem: {msg}"
+        );
+        assert!(msg.contains("is read remotely"), "{msg}");
+
+        // Two `s3://` sides: the one remote pair that *has* an answer, so the refusal names it.
+        let pair =
+            values_supported("s3://bucket/old", "s3://bucket/new").expect_err("no bytes here");
+        let msg = format!("{pair:#}");
+        assert!(
+            msg.contains("are read remotely"),
+            "both sides, plural: {msg}"
         );
         assert!(
-            !cmd.contains("codebooks"),
-            "naming a shard would compare something else: {cmd}"
+            msg.contains("which the terminal can compare on the proxy"),
+            "the pair the terminal *can* do is worth naming rather than a flat refusal: {msg}"
+        );
+
+        // A mixed remote pair cannot use verify-repack either, and must not be told it can.
+        let mixed = values_supported("lab@host:/opt/a", "s3://bucket/new").expect_err("no bytes");
+        let msg = format!("{mixed:#}");
+        assert!(msg.contains("Copy a checkpoint down"), "{msg}");
+        assert!(
+            msg.contains("a remote safetensors directory cannot yet"),
+            "and says which case is genuinely unsupported anywhere: {msg}"
         );
     }
 
@@ -737,33 +819,36 @@ mod tests {
         );
     }
 
-    /// Files spanning directories have no single name, so there is no honest one-line
-    /// command — better to offer nothing than a command that means something else.
+    /// How each side is named: a local checkpoint by the path that covers its files, a remote one by
+    /// its address. The second case had no answer at all before, and the browser drew the absence.
     #[test]
-    fn there_is_no_command_when_the_files_span_directories() {
+    fn a_side_is_named_by_its_checkpoint_or_by_its_address() {
+        let shards = [
+            PathBuf::from("/ckpt/codebooks.safetensors"),
+            PathBuf::from("/ckpt/model-00001-of-00002.safetensors"),
+        ];
+        assert_eq!(side_operand("/ckpt", &shards).as_deref(), Some("/ckpt"));
+        // No local files: the address is what names it.
+        assert_eq!(
+            side_operand("s3://bucket/ckpt", &[]).as_deref(),
+            Some("s3://bucket/ckpt")
+        );
+        // Files spanning directories have no single name, and neither does nothing at all.
         let scattered = [
             PathBuf::from("/a/one.safetensors"),
             PathBuf::from("/b/two.safetensors"),
         ];
+        assert!(side_operand("/a /b", &scattered).is_none());
+        assert!(side_operand("  ", &[]).is_none());
+    }
+
+    /// A side with no address gets no command — better nothing than `diff /base ''`.
+    #[test]
+    fn there_is_no_command_without_two_addresses() {
+        assert!(cli_diff_command("/base", "", &[], Sides::BaselineFirst, (None, None)).is_none());
+        assert!(cli_diff_command("", "/new", &[], Sides::BaselineFirst, (None, None)).is_none());
         assert!(
-            cli_diff_command(
-                Path::new("/base"),
-                &scattered,
-                &[],
-                Sides::BaselineFirst,
-                (None, None)
-            )
-            .is_none()
-        );
-        assert!(
-            cli_diff_command(
-                Path::new("/base"),
-                &[],
-                &[],
-                Sides::BaselineFirst,
-                (None, None)
-            )
-            .is_none()
+            cli_diff_command("/base", "   ", &[], Sides::BaselineFirst, (None, None)).is_none()
         );
     }
 }

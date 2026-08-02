@@ -23,6 +23,18 @@ import type { LoadStep } from '../lib/loadstep';
 import { initialExpansion, type DiffTreeResponse } from '../lib/difftree';
 import type { DiffScopeParams } from '../lib/diffscope';
 
+/**
+ * The comparison the server has set up: its id and the two specs it resolved.
+ *
+ * **One read, every view.** Establishing the pair (`POST /api/compare`) reads both checkpoints —
+ * seconds each, minutes over an ssh proxy for an `s3://` side. The summary used to resolve and read
+ * its own baseline while the tree read the pair again through this slot, so switching views re-read
+ * both checkpoints and, worse, the summary compared the baseline against whatever the server happened
+ * to have *open* rather than against the candidate: two views of "one comparison" describing two
+ * different pairs. Both views quote this id now.
+ */
+export const comparison = writable<{ id: number; left: string; right: string } | null>(null);
+
 /** The aligned tree, or null when no comparison is set up. */
 export const diffTree = writable<DiffTreeResponse | null>(null);
 export const diffError = writable<string>('');
@@ -66,8 +78,23 @@ let loadedPair: string | null = null;
  * the work away and started it again. Asking twice is now a no-op instead.
  */
 let inFlightPair: string | null = null;
-/** Supersedes an in-flight comparison, exactly as `compactSeq` does for the fold. */
-let compareSeq = 0;
+/** The pair the server has set up, and the one being set up — see [[establishComparison]]. */
+let establishedPair = '';
+let establishing = '';
+/** The set-up in flight, so a second view awaits it rather than starting another. */
+let inFlightSetup: Promise<void> | undefined;
+/**
+ * Two counters, because there are two things to supersede and they have different lifetimes.
+ *
+ * `pairSeq` guards *setting the pair up* (the POST that reads both checkpoints); `treeSeq` guards
+ * *fetching the aligned tree* from a pair already set up. One counter meaning both broke this twice:
+ * a view asking for a tree bumped the counter and thereby told the set-up it was awaiting to discard
+ * its own answer — so the pair never published, the tree never loaded, and the page stayed busy.
+ */
+let pairSeq = 0;
+let treeSeq = 0;
+/** Whether a tree fetch is in progress, so the set-up does not take the progress line down under it. */
+let fetchingTree = false;
 /**
  * Aborts the aligned tree's download when a comparison is cancelled or superseded.
  *
@@ -84,13 +111,18 @@ let inFlight: AbortController | null = null;
  * the same URL denotes a different comparison once the served checkpoint changes, and a key that
  * ignored that kept a comparison against a checkpoint no longer loaded, with no way to refresh it.
  */
+function slotKey(left: string, right: string): string {
+  // The served checkpoint stands in for an empty `right`, because that is what the server does with
+  // it — so the same URL denotes a different comparison once a different checkpoint is open.
+  return `${left}\u0000${right || (get(tree)?.spec ?? '')}`;
+}
+
 function pairKey(c: Comparison): string {
   // The scope is part of the key: two different selections of one pair are two different comparisons,
   // and a key that ignored it would make narrowing a loaded comparison do nothing at all. So is `full`,
   // because the server folds the families — the same pair unfolded is a different tree.
   const sel = c.scope === undefined ? '' : JSON.stringify(c.scope);
-  const right = c.right ?? '';
-  return `${c.left}\u0000${right || (get(tree)?.spec ?? '')}\u0000${sel}\u0000${c.full ?? false ? 'full' : 'folded'}`;
+  return `${slotKey(c.left, c.right ?? '')}\u0000${sel}\u0000${c.full ?? false ? 'full' : 'folded'}`;
 }
 
 /**
@@ -105,7 +137,7 @@ function pairKey(c: Comparison): string {
 export interface Comparison {
   /** The baseline. */
   left: string;
-  /** The newer side; empty (or absent) means the checkpoint the server has open. */
+  /** The candidate; empty (or absent) means the checkpoint the server has open. */
   right?: string;
   /** Re-run even if this exact comparison is already on screen — the Compare button and "try again". */
   force?: boolean;
@@ -126,11 +158,95 @@ export interface Comparison {
 }
 
 /**
- * Set the baseline and load the comparison.
+ * Set the comparison up on the server: read both checkpoints, and remember the pair by id.
+ *
+ * **Once per pair.** Every view of a comparison quotes this id — the summary, the aligned tree, the
+ * data checks — so the two checkpoints are read once however many ways they are then read. They used
+ * to be read per view, which on an ssh proxy is minutes each time the reader changed tab.
+ *
+ * Idempotent, and safe to call from two places at once: a second caller for the same pair waits on
+ * the first rather than starting another.
+ */
+export async function establishComparison(c: Comparison): Promise<void> {
+  await ensurePair(c);
+  // Summary and Data set up only the pair; unlike Browse they have no tree fetch to take the progress
+  // line down afterwards, and leaving it up disabled the Compare button, the checkpoint boxes and
+  // every scope control for good. Not while a tree *is* being fetched: that wait is still running.
+  if (!fetchingTree) diffStep.set(null);
+}
+
+/**
+ * Make sure the server holds this pair, and say whether it does.
+ *
+ * Supersede-safe on its own counter: a set-up that finishes after the reader has asked for a
+ * different pair does not publish. It is deliberately *not* the counter the tree fetch uses — a view
+ * asking for a tree must not tell the set-up it is waiting for to throw its answer away.
+ */
+async function ensurePair(c: Comparison): Promise<boolean> {
+  const left = c.left;
+  const right = c.right ?? '';
+  const force = c.force ?? false;
+  if (!left) return false;
+  const pair = slotKey(left, right);
+  if (!force && establishedPair === pair && get(comparison) !== null) return true;
+  // Being set up by someone else — wait for it rather than reading the same pair twice.
+  if (!force && establishing === pair && inFlightSetup !== undefined) {
+    await inFlightSetup;
+    return get(comparison) !== null;
+  }
+  establishing = pair;
+  const seq = ++pairSeq;
+  diffError.set('');
+  diffBusy.set(null);
+  // Both sides are read one after another, at speeds that can differ by a factor of twenty, and the
+  // screen draws a row for each.
+  diffStep.set({
+    kind: 'comparing',
+    spec: left,
+    right: right || get(tree)?.spec || '',
+    progress: startedNow(),
+  });
+  const run = (async () => {
+    try {
+      // Both sides of a comparison are checkpoints you have now opened, so the server records them.
+      // Take its list back rather than leaving ours stale: without this the paths you just compared
+      // were missing from the pickers until something else happened to refetch them.
+      const set = await api.setComparison(left, right, c.stopOther ?? true);
+      if (seq !== pairSeq) return;
+      recents.set(set.recents);
+      comparison.set({ id: set.id, left: set.left, right: set.right });
+      establishedPair = pair;
+      // A fresh read of the pair invalidates everything derived from the old one. The report is keyed
+      // by the comparison id and so re-fetches by itself; the tree is keyed by the *pair*, which has
+      // not changed — so pressing Compare on an unchanged pair would re-read both checkpoints and go
+      // on showing the tree from before them.
+      loadedPair = null;
+    } catch (e) {
+      if (seq !== pairSeq) return;
+      comparison.set(null);
+      establishedPair = '';
+      // The server reads one checkpoint at a time and said so. Recorded as a fact rather than as
+      // prose, so the view can offer to stop that read instead of telling the reader to wait.
+      if (e instanceof BusyError) {
+        diffBusy.set({ spec: e.busyWith, seconds: e.busyForSeconds });
+      } else {
+        diffError.set(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (seq === pairSeq) establishing = '';
+    }
+  })();
+  inFlightSetup = run;
+  await run;
+  return get(comparison) !== null;
+}
+
+/**
+ * Set the baseline and load the aligned tree.
  *
  * Two requests, because they are two different waits: reading a checkpoint (seconds, on the server)
- * and downloading the aligned tree (the largest body this API serves). Reporting them as one would
- * make a slow disk and a slow link look like the same problem.
+ * and downloading the tree (the largest body this API serves). Reporting them as one would make a
+ * slow disk and a slow link look like the same problem.
  */
 export async function compareAgainst(c: Comparison): Promise<void> {
   const { left, scope } = c;
@@ -153,30 +269,45 @@ export async function compareAgainst(c: Comparison): Promise<void> {
   // button and "try again" are for.
   if (!force && inFlightPair === pair) return;
   inFlightPair = pair;
-  const seq = ++compareSeq;
+  const seq = ++treeSeq;
+  fetchingTree = true;
   // Whatever was still coming is no longer wanted.
   inFlight?.abort();
   const abort = new AbortController();
   inFlight = abort;
   diffError.set('');
   diffBusy.set(null);
-  // Phase one: the server reads both checkpoints. Named after the baseline, which is the side that
-  // is genuinely being fetched from somewhere — the other is usually already open.
-  // Both sides: they are read one after another, at speeds that can differ by a factor of twenty, and
-  // the screen draws a row for each.
-  diffStep.set({
-    kind: 'comparing',
-    spec: left,
-    right: right || get(tree)?.spec || '',
-    progress: startedNow(),
-  });
+  /**
+   * Announce a read only when there is one.
+   *
+   * Switching from the summary to the tree does not re-read anything — the pair is already in the
+   * server's slot — but this set the *reading both checkpoints* step regardless, so Browse opened on
+   * a screen naming two checkpoints as `reading…` and stayed there for as long as the server took to
+   * align them and send the tree. Nothing on it was true. When the pair is already established the
+   * wait starts where it actually is: the comparison coming over the wire.
+   */
+  const reading = force || establishedPair !== slotKey(left, right) || get(comparison) === null;
+  // Phase one, when there is one: the server reads both checkpoints, one after the other, at speeds
+  // that can differ by a factor of twenty — so the screen draws a row for each.
+  diffStep.set(
+    reading
+      ? {
+          kind: 'comparing',
+          spec: left,
+          right: right || get(tree)?.spec || '',
+          progress: startedNow(),
+        }
+      : { kind: 'difftree', progress: startedNow() },
+  );
   try {
-    // Both sides of a comparison are checkpoints you have now opened, so the server records them.
-    // Take its list back rather than leaving ours stale: without this the paths you just compared
-    // were missing from the pickers until something else happened to refetch them.
-    const set = await api.setComparison(left, right, stopOther);
-    if (seq !== compareSeq) return; // superseded while the server was reading
-    recents.set(set.recents);
+    // The pair, set up once and shared with every other view of it (see `establishComparison`).
+    // Reading two checkpoints to draw a second view of the same comparison is the cost this split
+    // exists to avoid.
+    const ready = await ensurePair({ left, right, force, stopOther });
+    if (seq !== treeSeq) return; // superseded while the server was reading
+    // The set-up failed and has already said why; there is no pair to align.
+    const set = get(comparison);
+    if (!ready || set === null) return;
     const startedAt = performance.now();
     const t = await api.difftree(
       // The comparison this client set up, by id. There is one slot on the server, so without this
@@ -198,7 +329,7 @@ export async function compareAgainst(c: Comparison): Promise<void> {
     // Supersede check *before* publishing: a comparison still in flight when you navigate back
     // would otherwise land on top of the newer one and leave the view describing a pair the URL no
     // longer names, with nothing left to re-fire.
-    if (seq !== compareSeq) return;
+    if (seq !== treeSeq) return;
     // And check the server answered about the pair we asked for.
     //
     // Belt and braces over the id: the id makes a swapped comparison a 409 rather than a 200, and this
@@ -220,22 +351,20 @@ export async function compareAgainst(c: Comparison): Promise<void> {
     diffCursor.set(t.differences[0] ?? null);
     loadedPair = pair;
   } catch (e) {
-    if (seq !== compareSeq) return;
+    if (seq !== treeSeq) return;
     diffTree.set(null);
     loadedPair = null;
     // An abort is this app's own doing, not a failure to report: `cancelComparison` bumps the
     // sequence first, so the guard above catches the common case, and this covers a signal that
     // fires without one (a navigation away mid-download).
     if (e instanceof DOMException && e.name === 'AbortError') return;
-    // The server reads one checkpoint at a time and said so. Recorded as a fact rather than as prose,
-    // so the view can offer to stop that read instead of telling the reader to wait for it.
-    if (e instanceof BusyError) {
-      diffBusy.set({ spec: e.busyWith, seconds: e.busyForSeconds });
-      return;
-    }
+    // No `BusyError` arm here: "the server is reading something else" can only come from the POST
+    // that sets the pair up, which `ensurePair` owns — this is the GET that fetches the tree of a
+    // pair the server already holds.
     diffError.set(e instanceof Error ? e.message : String(e));
   } finally {
-    if (seq === compareSeq) {
+    if (seq === treeSeq) {
+      fetchingTree = false;
       diffStep.set(null);
       inFlight = null;
       inFlightPair = null;
@@ -257,7 +386,8 @@ export function cancelComparison(): void {
   inFlightPair = null;
   // Bump first: the abort rejects the fetch, and the guard on `seq` is what stops that rejection
   // from being reported as a failure.
-  compareSeq += 1;
+  pairSeq += 1;
+  treeSeq += 1;
   inFlight?.abort();
   inFlight = null;
   diffStep.set(null);
@@ -283,11 +413,13 @@ export function cancelComparison(): void {
  */
 export async function stopComparing(): Promise<void> {
   // Bump the sequence too: a comparison still loading must not land after a Stop.
-  compareSeq += 1;
+  pairSeq += 1;
+  treeSeq += 1;
   inFlight?.abort();
   inFlight = null;
   diffStep.set(null);
   diffTree.set(null);
+  comparison.set(null);
   loadedPair = null;
   diffError.set('');
   diffExpanded.set(new Set());

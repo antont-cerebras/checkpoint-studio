@@ -178,7 +178,7 @@ describe("the subtree scope", () => {
       "baseline from #language_model",
     );
     expect(scopeSummary({ ...emptyScope(), subtreeNew: " model " })).toBe(
-      "newer side from #model",
+      "candidate from #model",
     );
     expect(
       scopeSummary({
@@ -186,6 +186,6 @@ describe("the subtree scope", () => {
         subtree: "language_model",
         subtreeNew: "model",
       }),
-    ).toBe("baseline from #language_model · newer side from #model");
+    ).toBe("baseline from #language_model · candidate from #model");
   });
 });

@@ -11,9 +11,8 @@
   // screen reads; on any other side a click does nothing rather than show a different checkpoint's
   // numbers under that name, and the cell's tooltip says why (see `clickOutcome`, `cellTitle`).
   import { get } from 'svelte/store';
-  import { onMount, tick } from 'svelte';
+  import { tick } from 'svelte';
   import {
-    cancelComparison,
     compareAgainst,
     diffBusy,
     diffCursor,
@@ -21,10 +20,10 @@
     diffExpanded,
     diffStep,
     diffTree,
-    stopComparing,
   } from '../stores/compare';
-  import { loadRecents, proxied, proxyHost, tree } from '../stores/server';
-  import { navigate, openDetail } from '../stores/view';
+  import { proxyHost } from '../stores/server';
+  import { openDetail } from '../stores/view';
+  import type { CompareScreen } from '../lib/hash';
   import {
     allGroupPaths,
     ancestorsOf,
@@ -50,28 +49,19 @@
   import { sigCells } from '../lib/difflines';
   import { rowGlyph } from '../lib/glyphs';
   import type { TensorSig } from '../lib/types';
-  import {
-    humanCount,
-    humanSize,
-    middleTruncate,
-    specHelp,
-    totalsParts,
-  } from '../lib/format';
+  import { humanCount, humanSize, middleTruncate, totalsParts } from '../lib/format';
   import { isEditable } from '../lib/keys';
   import LoadingScreen from './LoadingScreen.svelte';
-  import ScopeBar from './ScopeBar.svelte';
-  import JobPanel from './JobPanel.svelte';
   import { emptyScope, scopeSummary, type DiffScopeParams } from '../lib/diffscope';
-  import { shortSpec } from '../lib/loadstep';
-  import CheckpointPicker from './CheckpointPicker.svelte';
+  import { shortSpec, stepLabel } from '../lib/loadstep';
   import TextField from './TextField.svelte';
-  import SwapButton from './SwapButton.svelte';
   import FamilyToggle from './FamilyToggle.svelte';
   import DiffChip from './DiffChip.svelte';
+  import { tallyTitle, type TallyKind } from '../lib/tallywords';
 
   /** The comparison's two sides, from the URL — so a comparison is a shareable link. */
-  export let against: string;
-  export let right: string;
+  export let lhs: string;
+  export let rhs: string;
   /** The selection, from the URL — the same parameters the report takes. */
   export let scope: DiffScopeParams | undefined = undefined;
   /**
@@ -86,7 +76,7 @@
   /**
    * Which way round the pair is being read — **a view state, not a different comparison**.
    *
-   * `against` and `right` are the pair the *server* is asked about, always in that order; this says
+   * `lhs` and `rhs` are the pair the *server* is asked about, always in that order; this says
    * which of them is drawn as the baseline. Flipping used to rewrite the two operands instead, which
    * looked right on screen (the loaded rows were transformed in memory) and was wrong in the URL: the
    * scope is directional — `--map` rewrites the baseline's names and cannot be inverted, and a
@@ -96,74 +86,23 @@
    * reproduces exactly what its sender saw. The report screen has always modelled it this way.
    */
   export let swapped = false;
-
-  /** The two boxes, in the order they are *drawn* — which is the pair, flipped when `swapped`. */
-  let draftBase = '';
-  /** The newer side. Prefilled with the open checkpoint, and overridable: naming something else
-   * compares that instead, leaving the open checkpoint loaded and untouched. */
-  let draftRight = '';
-
-  onMount(() => {
-    void loadRecents();
-  });
-
-  // Re-run whenever the URL's baseline changes, including back/forward — the screen is addressable,
-  // so arriving at it twice with different baselines has to show different comparisons.
-  // `scope` is a dependency because it is in the URL: narrowing a loaded comparison must re-align it.
-  // `swapped` is deliberately *not* a dependency: the comparison the server is asked for is the same
-  // one either way round, so flipping costs nothing.
-  $: if (against) void compareAgainst({ left: against, right, scope, full });
-
   /**
-   * Prefill each box when the *URL* changes, and at no other time.
+   * Apply a scope from inside the result — or, with `null`, just open the panel where it is set.
    *
-   * Three attempts here, each wrong in an instructive way:
-   *
-   * 1. `$: draft = prop || draft` reads the variable it assigns, so `bind:value` re-triggered it on
-   *    every keystroke and put the old value straight back — the boxes were uneditable.
-   * 2. A `typed` flag set from `on:input` lost a race with the binding's own handler, so a paste
-   *    reverted too.
-   * 3. Guarding on *emptiness* (`if (!draftBase && against) …`) has no race — and no way to empty a
-   *    box: select-all-and-delete cleared it, the statement saw an empty box, and refilled it. The
-   *    reported bug, and unfixable at that level, because "empty" is both the state to fill and the
-   *    state someone just asked for.
-   *
-   * So the trigger is the prop *changing*, tracked against what was last applied. Emptiness is left
-   * alone: an empty newer side already means "the checkpoint that is open", which the placeholder
-   * says, and an empty baseline is a box waiting for a path.
+   * The tree is where "nothing lines up" becomes visible, and the fix for it lives in a panel above.
+   * Handing the fix to the page rather than describing where to find it is the difference between an
+   * explanation and a way out.
    */
-  //
-  // Fields of an object rather than plain `let`s: what they hold is the value of the *previous* run,
-  // read on the next one — which no static analysis can see (`no-useless-assignment` reports each
-  // assignment as dead), and a suppression would leave the next reader wondering whether it matters.
-  // In *display* order, so the box labelled Baseline always holds the side drawn as the baseline.
-  $: shownBase = swapped ? right : against;
-  $: shownRight = swapped ? against : right;
-  const applied = { base: '', right: '', served: false };
-  $: if (shownBase !== applied.base) {
-    applied.base = shownBase;
-    draftBase = shownBase;
-  }
-  $: if (shownRight !== applied.right) {
-    applied.right = shownRight;
-    draftRight = shownRight;
-  }
-  // Whichever box means "the checkpoint that is open" shows it once the tree lands — before that there
-  // is nothing to show. Cleared deliberately, it stays cleared.
-  $: if (!applied.served && $tree?.spec) {
-    if (!shownBase && !draftBase) {
-      applied.served = true;
-      draftBase = $tree.spec;
-    } else if (!shownRight && !draftRight) {
-      applied.served = true;
-      draftRight = $tree.spec;
-    }
-  }
+  export let onFix: (scope: DiffScopeParams | null) => void = () => {};
+  /**
+   * Change one thing about how this comparison is read.
+   *
+   * Injected by `ComparePage`, like the summary's: a view that navigates on its own has to re-state
+   * the whole comparison, and the one that did dropped the view it was in — so folding the families
+   * from the tree landed back on the summary.
+   */
+  export let onNavigate: (change: Partial<Omit<CompareScreen, 'kind'>>, replace?: boolean) => void;
 
-  /** A comparison is being read. Everything that would start another is inert until it lands: the
-   * server serialises these anyway (and answers 409), so a second submit could only produce an error
-   * message for something the user could not have known was busy. */
-  $: busy = $diffStep !== null;
   // The server's answer is canonical; `swapped` decides which way it is drawn. One transform, applied
   // where the screen reads it, so the rows, the two side descriptions and the counts cannot disagree
   // about the direction — the tally once did.
@@ -179,6 +118,15 @@
   /** An unreadable tally reads as no differences rather than as `NaN` — see `tallyIsReadable`. */
   const EMPTY = { same: 0, changed: 0, only_old: 0, only_new: 0 };
 
+  // Load whenever the URL's pair or scope changes, including back/forward — this view is addressable,
+  // so arriving at it twice with different parameters has to show different comparisons. `swapped` is
+  // deliberately *not* a dependency: the pair the server is asked for is the same either way round,
+  // so flipping costs nothing.
+  //
+  // Lazy, and only here: the aligned tree is the largest body this API serves (91 MB on a real pair),
+  // so the Summary view must not pay for it. That is why the page does not load it centrally.
+  $: if (lhs) void compareAgainst({ left: lhs, right: rhs, scope, full });
+
   /** Show only rows that differ — see [`flattenDiff`]. Off by default: the point of the two panes is
    * that a difference is visible *in context*, and hiding the matches loses the context. */
   let differencesOnly = false;
@@ -186,14 +134,6 @@
    * the scope changes what the server compared. */
   let find = '';
 
-  /**
-   * What an address box accepts, named rather than left to be discovered.
-   *
-   * The `:PATH` shorthand — "this path, on the configured ssh proxy" — was documented nowhere in
-   * either UI, and the server now says which host it resolves to (`/api/recents`), so the hint can
-   * name it instead of saying "the ssh proxy".
-   */
-  $: help = specHelp($proxied, $proxyHost ?? '');
 
   // Virtualized, the same way the tensor tree is (`TreeView.svelte`): two unrelated checkpoints
   // produce a row per tensor on each side — 117k differences were measured — and putting all of them
@@ -240,63 +180,6 @@
   $: differences = data?.differences ?? [];
   $: cursorAt = $diffCursor === null ? -1 : differences.indexOf($diffCursor);
 
-  function submit() {
-    const base = draftBase.trim();
-    if (!base) return;
-    // Both sides live in the URL, so a comparison of any two checkpoints is a shareable link — and
-    // neither has to be the one that is open.
-    const other = draftRight.trim();
-    // Omitted when it is just the open checkpoint, so the common case stays a short URL.
-    const rhs = other === ($tree?.spec ?? '') ? '' : other;
-    // Force only when the URL will not change. Navigating to a *different* pair re-runs the
-    // reactive load below, and forcing as well would read both checkpoints twice; navigating to an
-    // unchanged hash fires nothing at all, which is what left the button dead after Stop and made a
-    // checkpoint rewritten on disk un-recomparable.
-    // The boxes are the pair *as drawn*, so submitting also settles the orientation: what is on
-    // screen becomes what the URL asks for, the right way round.
-    const unchanged = against === base && right === rhs && !swapped;
-    navigate({ kind: 'compare', against: base, right: rhs, scope, full });
-    if (unchanged) {
-      void compareAgainst({ left: base, right: rhs, force: true, scope, full });
-    }
-  }
-
-  /**
-   * Select the box's contents when it is focused *by keyboard* (Tab), so typing replaces the
-   * prefilled path instead of appending to it.
-   *
-   * Keyboard only, honestly: a mouse click fires `focus` before it places the caret, so the click
-   * undoes the selection. Selecting on `click` instead, and deferring by a frame, were both tried
-   * and both still appended. For a mouse, `Ctrl`/`Cmd`-A or a triple-click is the way — which is
-   * what every other path box in this app relies on too.
-   */
-  function selectAll(e: FocusEvent) {
-    (e.currentTarget as HTMLInputElement).select();
-  }
-
-  /**
-   * Swap the two sides — before a comparison has been run, or after.
-   *
-   * It lives between the two boxes rather than in the results header, because that is where it is
-   * needed *first*: with nothing compared yet there was no header, and so no way to say "actually,
-   * the other way round" without retyping both paths.
-   *
-   * With a comparison on screen this is one bit in the URL and nothing else: the pair and its scope
-   * stay as the server was asked for them, and the drawing turns round (see `swapped`). Nothing is
-   * refetched, and the link means what it shows. `replace`, because flipping is not a place to go
-   * Back to.
-   *
-   * With nothing loaded there is no comparison to turn round, so the boxes simply exchange their text
-   * — the same gesture, on the only thing that exists yet.
-   */
-  function swapBoth() {
-    if (!$diffTree) {
-      [draftBase, draftRight] = [draftRight, draftBase];
-      return;
-    }
-    navigate({ kind: 'compare', against, right, scope, full, swapped: !swapped }, true);
-  }
-
   function toggle(path: string) {
     diffExpanded.update((s) => {
       const next = new Set(s);
@@ -336,27 +219,10 @@
     diffExpanded.set(open && data ? allGroupPaths(data.rows) : new Set());
   }
 
-  /**
-   * Discard the comparison *and* the URL that names it.
-   *
-   * Leaving `#compare?against=…&right=…` in the address bar meant the app claimed a comparison that
-   * was no longer on screen, and a reload brought back exactly what had just been cleared. Distinct
-   * from [`cancelComparison`], which stops a read and keeps both paths for a retry.
-   */
-  async function clearComparison() {
-    await stopComparing();
-    navigate({ kind: 'compare', against: '', right: '' }, true);
-  }
-
-  /** Apply a scope by navigating, so the narrowed comparison is a link and the reactive load above
-   * picks it up. */
-  function applyScope(s: DiffScopeParams) {
-    navigate({ kind: 'compare', against, right, scope: s, full, swapped });
-  }
-
-  /** Fold or unfold the families — through the URL, like every other view control here. */
+  /** Fold or unfold the families — through the page, which holds the rest of what makes this *this*
+   * comparison. Navigating from here dropped `view`, so folding sent the reader back to the summary. */
   function setFull(everything: boolean) {
-    navigate({ kind: 'compare', against, right, scope, full: everything, swapped });
+    onNavigate({ full: everything });
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -364,15 +230,9 @@
     // The shared rule (`lib/keys`), not a hand-written tag list: this one checked `INPUT` and `SELECT`
     // and not `TEXTAREA`, so `s` typed into a scope box swapped the two checkpoints.
     if (isEditable(e.target)) return;
-    if (e.key === 's') {
-      // The terminal's key for the same thing, so the two surfaces are one habit.
-      e.preventDefault();
-      swapBoth();
-    } else if (e.key === 'k') {
-      // The terminal's key for the same control, and the tree screen's key for the same idea.
-      e.preventDefault();
-      setFull(!full);
-    } else if (e.key === 'n') {
+    // No `k` here: the page handles it, for every view of the comparison. Handled in both, the two
+    // listeners fired on one keypress and the fold toggled twice — back to where it started.
+    if (e.key === 'n') {
       e.preventDefault();
       void step(1);
     } else if (e.key === 'N') {
@@ -423,13 +283,18 @@
     return `${total.toLocaleString()} difference${plural}${at} · `;
   })();
 
-  /** The counts worth a chip, in report order — the empty ones say nothing worth the space. */
-  function countChips(t: DiffTally): { tone: 'added' | 'removed' | 'changed' | 'meta'; count: number; label: string }[] {
+  /** The counts worth a chip, in report order — the empty ones say nothing worth the space.
+   *
+   * `label` doubles as the kind whose meaning the tooltip states (`lib/tallywords`), so this strip and
+   * the summary's answer "what counts as metadata" with one sentence rather than two. */
+  function countChips(
+    t: DiffTally,
+  ): { tone: 'added' | 'removed' | 'changed' | 'meta'; count: number; label: TallyKind }[] {
     return [
-      { tone: 'added' as const, count: t.tensors.only_new, label: 'added' },
-      { tone: 'removed' as const, count: t.tensors.only_old, label: 'removed' },
-      { tone: 'changed' as const, count: t.tensors.changed, label: 'changed' },
-      { tone: 'meta' as const, count: differing(t.metadata), label: 'metadata' },
+      { tone: 'added' as const, count: t.tensors.only_new, label: 'added' as const },
+      { tone: 'removed' as const, count: t.tensors.only_old, label: 'removed' as const },
+      { tone: 'changed' as const, count: t.tensors.changed, label: 'changed' as const },
+      { tone: 'meta' as const, count: differing(t.metadata), label: 'metadata' as const },
     ].filter((c) => c.count > 0);
   }
 
@@ -487,58 +352,15 @@
 <svelte:window on:keydown={onKeydown} />
 
 <div class="compare">
-  <form class="pick" on:submit|preventDefault={submit}>
-    <label for="cmp-base">Baseline</label>
-    <!-- The one checkpoint box (`CheckpointPicker`): the same field, the same recents dropdown, and
-         the same ability to forget a stale entry as the header's. These used a native `datalist`, which
-         offers no per-entry action — a path picked here could only be deleted somewhere else. -->
-    <CheckpointPicker
-      id="cmp-base"
-      bind:value={draftBase}
-      on:focus={selectAll}
-      {busy}
-      ariaLabel="baseline"
-      placeholder="baseline — {help}"
-      title={help}
-      onEnter={() => submit()}
-    />
-    <SwapButton onSwap={swapBoth} disabled={busy} title="Swap the two sides (s)" />
-    <!-- A real `<label>`, like `#cmp-base` has. "against" was a bare `<span>`, so the newer side's
-         box had no accessible name at all — the one of the two you are more likely to be changing. -->
-    <label class="dim" for="cmp-right">vs newer</label>
-    <CheckpointPicker
-      id="cmp-right"
-      bind:value={draftRight}
-      on:focus={selectAll}
-      {busy}
-      ariaLabel="the newer side"
-      placeholder={$tree?.spec ?? 'the open checkpoint'}
-      title={help}
-      onEnter={() => submit()}
-    />
-    <button type="submit" disabled={!draftBase.trim() || busy}>Compare</button>
-    <!-- Two buttons, because they are two different actions on two different states. One "Stop"
-         used to mean "discard the result" and was rendered only *after* the read finished — so the
-         phase you would actually want to stop was the one with no button at all. -->
-    {#if busy}
-      <button type="button" class="quiet" on:click={cancelComparison}>Cancel</button>
-    {:else if data}
-      <button type="button" class="quiet" on:click={() => void clearComparison()}>Clear</button>
-    {/if}
-  </form>
-
-  {#if against}
-    <ScopeBar
-      scope={scope ?? emptyScope()}
-      onApply={applyScope}
-      matched={data?.matched ?? null}
-      {busy}
-    />
-    <!-- Next to the scope, because these read *what the scope selected*. -->
-    <JobPanel left={against} right={right || $tree?.spec || ''} {scope} />
-  {/if}
-
-  {#if $diffStep}
+  <!-- No pair boxes, no scope bar, no data panel: those belong to the *comparison*, and
+       `ComparePage` owns them. This is one reading of it — the aligned tree. -->
+  <!-- The tree stays while a *fold* is re-aligned.
+       Pressing `k` asks the server to redraw the same comparison with families collapsed — nothing is
+       re-read, and both checkpoints are already in its slot — but the whole tree used to vanish behind
+       the loading screen while the new one came over, which reads exactly like starting again. A first
+       tree has nothing to keep and gets the screen; one already on display stays, dimmed, with a line
+       saying what is coming. -->
+  {#if $diffStep && !data}
     <LoadingScreen step={$diffStep} />
   {:else if $diffBusy}
     <!-- Only reachable when the takeover itself failed: asking for a comparison already asks the server
@@ -556,7 +378,7 @@
         <button
           type="button"
           on:click={() =>
-            void compareAgainst({ left: against, right, force: true, scope, full })}
+            void compareAgainst({ left: lhs, right: rhs, force: true, scope, full })}
         >
           Try again
         </button>
@@ -570,7 +392,7 @@
       <button
         type="button"
         class="quiet"
-        on:click={() => void compareAgainst({ left: against, right, force: true, scope, full })}
+        on:click={() => void compareAgainst({ left: lhs, right: rhs, force: true, scope, full })}
       >
         Try again
       </button>
@@ -592,7 +414,12 @@
       <button type="button" on:click={() => location.reload()}>Reload</button>
     </div>
   {:else if data && tally}
-    <div class="head">
+    <div class="head" class:updating={$diffStep !== null}>
+      {#if $diffStep}
+        <!-- What is coming, over the tree that is still readable. `stepLabel` rather than a second
+             wording: it is the same wait, drawn smaller. -->
+        <p class="updating-note dim" role="status">{stepLabel($diffStep)}…</p>
+      {/if}
       <!-- In full. A fixed 64-character cut threw away the end of the path — `…/Kimi-K2.6-3bit` — which
            is the part that says *which* checkpoint this column is, and there is room for it: each
            column is half a window wide. Wraps rather than truncating when there genuinely is not. -->
@@ -611,9 +438,19 @@
           <!-- The same chips the report's strip is made of, in the same colours — they were two sets
                with two greens. Plain here: these describe the tree already on screen, so there is
                nowhere for a click to go. -->
-          <DiffChip tone="same" count={tally.tensors.same.toLocaleString()} label="unchanged" />
+          <DiffChip
+            tone="same"
+            count={tally.tensors.same.toLocaleString()}
+            label="unchanged"
+            title={tallyTitle('unchanged', tally.tensors.same)}
+          />
           {#each countChips(tally) as chip (chip.label)}
-            <DiffChip tone={chip.tone} count={chip.count.toLocaleString()} label={chip.label} />
+            <DiffChip
+              tone={chip.tone}
+              count={chip.count.toLocaleString()}
+              label={chip.label}
+              title={tallyTitle(chip.label, chip.count)}
+            />
           {/each}
           {#if differences.length}
             <span class="nav dim">
@@ -671,14 +508,25 @@
         </div>
       {/if}
       {#if isDisjoint(tally)}
-        <!-- The one sentence that explains the whole comparison, when it applies. Two checkpoints
-             with unrelated naming schemes align nothing, so every tensor of both is one-sided and
-             the difference count is just their sum — a number that describes nothing. -->
-        <p class="verdict" role="status">
-          These two checkpoints share no tensor names — different naming schemes, so nothing lines
-          up. {tally.tensors.only_old.toLocaleString()} only in the baseline,
-          {tally.tensors.only_new.toLocaleString()} only in the newer side.
-        </p>
+        <!-- The one sentence that explains the whole comparison, when it applies — with the things
+             that fix it. Two checkpoints with unrelated naming schemes align nothing, so every tensor
+             of both is one-sided and the difference count is just their sum: a number that describes
+             nothing. Naming the cause and leaving the reader to find `--align-fused` in a panel of
+             nine inputs is a diagnosis without a treatment. -->
+        <div class="disjoint" role="status">
+          <p>
+            These two checkpoints share no tensor names — different naming schemes, so nothing lines
+            up. {tally.tensors.only_old.toLocaleString()} only in the baseline,
+            {tally.tensors.only_new.toLocaleString()} only in the candidate.
+          </p>
+          <div class="fixes">
+            <button type="button" on:click={() => onFix({ ...(scope ?? emptyScope()), alignFused: true })}>
+              Try fused ↔ unfused alignment
+            </button>
+            <button type="button" on:click={() => onFix(null)}>Choose matching subtrees…</button>
+            <span class="dim">or add a custom rule under <em>Match different names</em>.</span>
+          </div>
+        </div>
       {/if}
     </div>
 
@@ -854,6 +702,15 @@
     white-space: pre-wrap;
   }
   /* The two column headers sit over the columns they name. */
+  /* A tree being replaced stays readable — it is the same comparison, folded the other way. */
+  .head.updating {
+    opacity: 0.7;
+  }
+  .updating-note {
+    grid-column: 1 / -1;
+    margin: 0 0 4px;
+    font-size: 11px;
+  }
   .head {
     flex: 0 0 auto;
     display: grid;
@@ -893,6 +750,39 @@
   }
   .nav {
     font-size: 12px;
+  }
+  /* The "nothing lines up" banner: the sentence, then the two things that fix it. Background fill,
+     no border — the treatment every other panel here uses. */
+  .disjoint {
+    margin: 6px 0 2px;
+    padding: 7px 10px;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--warn) 12%, var(--bg-panel));
+  }
+  .disjoint p {
+    margin: 0 0 6px;
+    font-weight: 600;
+  }
+  .fixes {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+    font-size: 12px;
+  }
+  .fixes button {
+    font: inherit;
+    font-size: 12px;
+    color: var(--fg);
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 9px;
+    cursor: pointer;
+  }
+  .fixes button:hover {
+    border-color: var(--accent);
+    color: var(--accent);
   }
   /* Two stats, aligned: label, the two values, and the change as its own piece. */
   .stats {

@@ -55,6 +55,12 @@ describe('the fraction', () => {
     expect(fraction(at(100, 100))).toBe(1);
   });
 
+  // A zero denominator is not a fraction either: dividing by it wrote `0 B / 0 B · NaN%` across the
+  // wait for a comparison whose size the server had not yet announced.
+  it('is null for a zero total, not NaN', () => {
+    expect(fraction(at(0, 0))).toBeNull();
+  });
+
   it('clamps rather than overshooting', () => {
     // A proxy that re-encodes can make the decoded stream longer than what was announced.
     // A bar past 100% reads as a bug in the app rather than in the proxy.

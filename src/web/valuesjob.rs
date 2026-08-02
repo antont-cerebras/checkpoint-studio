@@ -74,6 +74,10 @@ pub(crate) fn run(
     what: &What,
 ) -> Result<()> {
     let opts = current.read_options();
+    // Before either read: a remote side serves no tensor data, and finding that out after two
+    // multi-minute reads is the failure this check exists to prevent. The start handler asks the same
+    // question, so this is the second line of defence rather than the only one.
+    crate::compare::values_supported(left, right)?;
     job.progress_to(0, left);
     let old = read_side(left, opts, job)?;
     if job.cancelled() {
@@ -84,10 +88,16 @@ pub(crate) fn run(
     if job.cancelled() {
         return Ok(());
     }
+    // The specs said both sides are local (`values_supported`, above); this catches a resolution that
+    // disagreed — a glob that reached a remote path, say — before the comparison reads a byte.
     if !old.local || !new.local {
         anyhow::bail!(
-            "comparing values needs both checkpoints' tensor data, which a remote source does not \
-             provide — for two s3:// checkpoints use verify-repack, which decodes on the proxy"
+            crate::compare::values_supported(left, right)
+                .err()
+                .map_or_else(
+                    || "one side turned out not to be local".to_string(),
+                    |e| format!("{e:#}")
+                )
         );
     }
 

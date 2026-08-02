@@ -246,9 +246,17 @@ export const api = {
    * `scope` is the CLI's selection flags — see `lib/diffscope`. Omitted means the whole comparison. */
   /** `swapped` turns the comparison round — the open checkpoint as the baseline. `full` says the reader
    * expanded the families, which the offered command has to carry. */
-  diff: (against: string, scope?: DiffScopeParams, swapped = false, full = false) =>
+  /**
+   * The one-page report for a comparison the server has set up.
+   *
+   * By `id`, like [[difftree]]: both views read the pair the comparison slot already holds, so
+   * neither re-reads a checkpoint, and the two cannot end up describing different pairs — which is
+   * what happened when this resolved its own baseline and compared it against whatever the server
+   * had *open* rather than against the candidate the reader named.
+   */
+  diff: (id: number, scope?: DiffScopeParams, swapped = false, full = false) =>
     getJson<DiffResponse>(
-      `/api/diff?against=${enc(against)}${swapped ? '&swap=1' : ''}${full ? '&full=1' : ''}${scopeTail(scope)}`,
+      `/api/diff?id=${id}${swapped ? '&swap=1' : ''}${full ? '&full=1' : ''}${scopeTail(scope)}`,
     ),
   /** The compact (family-folded) tree, optionally scoped by the filter query. */
   compact: (q: string) => getJson<CompactTree>(`/api/compact?q=${enc(q)}`),

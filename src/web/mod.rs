@@ -416,7 +416,7 @@ fn print_serve_banner(url: &str, host: IpAddr) {
     );
     // The server has no authentication of any kind. On a wildcard or specific
     // non-loopback bind that means anyone who can reach the port gets everything this
-    // UI can show — including `/api/diff?against=PATH`, which will read any checkpoint
+    // UI can show — including `POST /api/compare?left=PATH`, which will read any checkpoint
     // path the serving user can read. Light red: worth reading, not a failure.
     if exposed {
         println!("  {WARN}{}{RESET}\n", access_warning(host));
@@ -435,7 +435,7 @@ fn access_warning(host: IpAddr) -> String {
     };
     format!(
         "⚠ No access control: bound to {where_}, so anyone who can reach this port can \
-         read this checkpoint — and any checkpoint path this user can read (see /api/diff). \
+         read this checkpoint — and any checkpoint path this user can read (see /api/compare). \
          Use --host 127.0.0.1 to restrict it to this machine."
     )
 }
@@ -609,9 +609,10 @@ fn accepted_params(path: &str) -> Option<(&'static [&'static str], Scoped)> {
         "compare" => (&["left", "right", "stop_other"], Scoped::No),
         // `full` says the reader turned family folding off — every layer as its own row.
         "difftree" => (&["id", "full"], Scoped::Yes),
-        // `swap` reads the pair the other way round; `full` says the reader expanded the families, which
-        // the offered command has to carry.
-        "diff" => (&["against", "swap", "full"], Scoped::Yes),
+        // Both diff views work from the comparison slot, so both take its id: `swap` reads the pair
+        // the other way round, and `full` says the reader expanded the families, which the offered
+        // command has to carry.
+        "diff" => (&["id", "swap", "full"], Scoped::Yes),
         "jobs/verify-repack" => (&["left", "right", "repack_bits"], Scoped::Yes),
         "jobs/values" => (
             &[
@@ -782,7 +783,7 @@ fn route_api(
         "tensor" => handlers::tensor(s, q),
         "layout" => handlers::layout(s, q),
         "file" => handlers::file(s, q),
-        "diff" => handlers::diff(s, q, current.read_options()),
+        "diff" => handlers::diff(current, q),
         "tensor/stats" => handlers::tensor_stats(s, q),
         "tensor/sample" => handlers::tensor_sample(s, q),
         "tensor/histogram" => handlers::tensor_histogram(s, q),
@@ -1073,14 +1074,10 @@ mod tests {
             ),
             // A switch that is neither on nor off.
             ("/api/difftree", "id=1&full=yes".to_string(), "not a switch"),
+            ("/api/diff", "id=1&swap=maybe".to_string(), "not a switch"),
             (
                 "/api/diff",
-                "against=x&swap=maybe".to_string(),
-                "not a switch",
-            ),
-            (
-                "/api/diff",
-                "against=x&only_tensors=please".to_string(),
+                "id=1&only_tensors=please".to_string(),
                 "not a switch",
             ),
         ] {
@@ -1144,7 +1141,7 @@ mod tests {
         }
         // A near-miss of a real parameter, which is the case that matters: silently dropping this one
         // returns every tensor under a heading that says the filter was applied.
-        let out = get(&c, "/api/diff", "against=/tmp/x&nmae=layers.1", false);
+        let out = get(&c, "/api/diff", "id=1&nmae=layers.1", false);
         assert_eq!(out.status, 400);
         let body: serde_json::Value = serde_json::from_slice(out.body.as_slice()).expect("JSON");
         let msg = body["error"].as_str().unwrap_or_default();

@@ -40,26 +40,29 @@ const SCREENS: Screen[] = [
   },
   { kind: "detail", tensor: "lm_head.weight", tab: "heatmap" },
   { kind: "preview", path: "/ckpt/config.json", name: "config.json" },
-  { kind: "diff", against: "/models/checkpoint_1000" },
+  { kind: "compare", lhs: "/models/checkpoint_1000", rhs: "", view: "data" },
   { kind: "open" },
-  { kind: "compare", against: "/models/checkpoint_1000", right: "" },
-  { kind: "compare", against: "/models/base", right: "/models/other" },
+  { kind: "compare", lhs: "/models/checkpoint_1000", rhs: "" },
+  { kind: "compare", lhs: "/models/base", rhs: "/models/other" },
   // A path with characters that must survive percent-encoding in the hash.
-  { kind: "diff", against: "/models/a b/model-00001-of-00002.safetensors" },
+  { kind: "compare", lhs: "/models/a b/model-00001-of-00002.safetensors", rhs: "" },
   // Turned round: the open checkpoint as the baseline. It changes what the report *says* — added and
   // removed trade places — so it has to be in the link, like every other piece of view state.
-  { kind: "diff", against: "/models/checkpoint_1000", swapped: true },
+  { kind: "compare", lhs: "/models/checkpoint_1000", rhs: "", swapped: true },
   // Every tensor rather than collapsed families, and the sections folded away: both are what the
   // reader set deliberately, so a reload — and a link — has to land on them.
-  { kind: "diff", against: "/models/base", full: true },
+  { kind: "compare", lhs: "/models/base", rhs: "", full: true },
   {
-    kind: "diff",
-    against: "/models/base",
+    kind: "compare",
+    lhs: "/models/base",
+    rhs: "",
     closed: ["tensors_added", "metadata"],
   },
   {
-    kind: "diff",
-    against: "/models/base",
+    kind: "compare",
+    lhs: "/models/base",
+    rhs: "",
+    view: "browse",
     swapped: true,
     full: true,
     closed: ["tensors_changed"],
@@ -67,8 +70,9 @@ const SCREENS: Screen[] = [
   // A *scoped* comparison is a link you send someone, so the selection round-trips like every other
   // piece of view state. Both screens carry it.
   {
-    kind: "diff",
-    against: "/models/base",
+    kind: "compare",
+    lhs: "/models/base",
+    rhs: "",
     scope: {
       name: "model.layers.1.*\n!*.bias",
       names: "",
@@ -83,8 +87,8 @@ const SCREENS: Screen[] = [
   },
   {
     kind: "compare",
-    against: "/models/base",
-    right: "/models/other",
+    lhs: "/models/base",
+    rhs: "/models/other",
     scope: {
       name: "",
       names: "lm_head.weight",
@@ -250,7 +254,47 @@ describe("hashFor", () => {
   });
 
   it("joins it with ? when the screen has none", () => {
-    expect(hashFor({ kind: "stats" }, g)).toBe("stats?filter=w&compact=1");
+    expect(hashFor({ kind: "stats" }, { ...DEFAULTS, ckpt: "/m" })).toBe("stats?ckpt=%2Fm");
+  });
+
+  // The list state describes the *tensor list*. Carried everywhere, a shared comparison link read
+  // `#compare?lhs=…&ckpt=…&compact=1` — a parameter that changes nothing on the screen it is on.
+  it("carries the list state only on the screens that show the list", () => {
+    for (const kind of ["tree", "detail"] as const) {
+      const s: Screen = kind === "tree" ? { kind } : { kind, tensor: "w", tab: "info" };
+      expect(hashFor(s, g)).toContain("compact=1");
+      expect(hashFor(s, g)).toContain("filter=w");
+    }
+    for (const s of [
+      { kind: "stats" } as const,
+      { kind: "files" } as const,
+      { kind: "compare", lhs: "/a", rhs: "" } as const,
+    ]) {
+      expect(hashFor(s, g)).not.toContain("compact");
+      expect(hashFor(s, g)).not.toContain("filter");
+    }
+  });
+
+  // Which checkpoint is being looked at is true of every *other* screen, and of a comparison whose
+  // candidate is the open one.
+  it("keeps the checkpoint on every screen that depends on it", () => {
+    const withCkpt = { ...g, ckpt: "/models/ckpt" };
+    expect(hashFor({ kind: "stats" }, withCkpt)).toContain("ckpt=%2Fmodels");
+    // An empty candidate *means* "the checkpoint that is open", so the link has to say which.
+    expect(hashFor({ kind: "compare", lhs: "/a", rhs: "" }, withCkpt)).toContain("ckpt=%2Fmodels");
+    // A blank comparison screen is still a view of the served checkpoint.
+    expect(hashFor({ kind: "compare", lhs: "", rhs: "" }, withCkpt)).toContain("ckpt=%2Fmodels");
+  });
+
+  // The report this closes: a comparison of two named checkpoints carried a *third* address — whatever
+  // the sender's server happened to be serving — and opening the link would switch the recipient's
+  // server to it.
+  it("drops the checkpoint from a comparison that names both of its own", () => {
+    const withCkpt = { ...g, ckpt: "/tmp/mapfix/new.safetensors" };
+    const hash = hashFor({ kind: "compare", lhs: "lab@host:/opt/boxes", rhs: "s3://b/ckpt" }, withCkpt);
+    expect(hash).not.toContain("ckpt=");
+    expect(hash).toContain("lhs=lab%40host%3A%2Fopt%2Fboxes");
+    expect(hash).toContain("rhs=s3%3A%2F%2Fb%2Fckpt");
   });
 
   it("produces a hash both halves can be read back out of", () => {
@@ -299,12 +343,12 @@ describe("the comparison screen", () => {
   // the `ckpt` global. So a link reproduces the whole comparison, not half of it.
   it("carries its baseline, and survives an awkward one", () => {
     expect(
-      screenToHash({ kind: "compare", against: "/models/a b/ckpt", right: "" }),
-    ).toBe("compare?against=%2Fmodels%2Fa%20b%2Fckpt");
-    expect(parseScreen("#compare?against=%2Fmodels%2Fa%20b%2Fckpt")).toEqual({
+      screenToHash({ kind: "compare", lhs: "/models/a b/ckpt", rhs: "" }),
+    ).toBe("compare?lhs=%2Fmodels%2Fa%20b%2Fckpt");
+    expect(parseScreen("#compare?lhs=%2Fmodels%2Fa%20b%2Fckpt")).toEqual({
       kind: "compare",
-      against: "/models/a b/ckpt",
-      right: "",
+      lhs: "/models/a b/ckpt",
+      rhs: "",
     });
   });
 
@@ -313,19 +357,19 @@ describe("the comparison screen", () => {
   it("carries an overridden newer side too", () => {
     const s: Screen = {
       kind: "compare",
-      against: "/models/base",
-      right: "/models/other",
+      lhs: "/models/base",
+      rhs: "/models/other",
     };
     expect(screenToHash(s)).toBe(
-      "compare?against=%2Fmodels%2Fbase&right=%2Fmodels%2Fother",
+      "compare?lhs=%2Fmodels%2Fbase&rhs=%2Fmodels%2Fother",
     );
     expect(parseScreen(`#${screenToHash(s)}`)).toEqual(s);
   });
 
   // Omitted when it is just the open checkpoint, so the common case stays a short URL.
   it("omits the newer side when it is the open checkpoint", () => {
-    expect(screenToHash({ kind: "compare", against: "/a", right: "" })).toBe(
-      "compare?against=%2Fa",
+    expect(screenToHash({ kind: "compare", lhs: "/a", rhs: "" })).toBe(
+      "compare?lhs=%2Fa",
     );
   });
 
@@ -334,8 +378,8 @@ describe("the comparison screen", () => {
   it("opens empty when the link names no baseline", () => {
     expect(parseScreen("#compare")).toEqual({
       kind: "compare",
-      against: "",
-      right: "",
+      lhs: "",
+      rhs: "",
     });
   });
 });
@@ -355,50 +399,71 @@ describe("the open screen", () => {
   });
 });
 
-describe("the diff report screen", () => {
+describe("the comparison screen", () => {
   // It navigates with no baseline from the palette, so falling through to the tree made the entry do
   // nothing — you asked for a screen and stayed on the one you were already on. It carries its own
-  // path box, so an empty baseline is a usable state.
+  // path boxes, so an empty baseline is a usable state.
   it("opens with an empty baseline", () => {
-    expect(parseScreen("#diff")).toEqual({ kind: "diff", against: "" });
-    expect(parseScreen("#diff?against=")).toEqual({
-      kind: "diff",
-      against: "",
+    expect(parseScreen("#compare")).toEqual({ kind: "compare", lhs: "", rhs: "" });
+    expect(parseScreen("#compare?lhs=")).toEqual({
+      kind: "compare",
+      lhs: "",
+      rhs: "",
     });
   });
 
   it("percent-encodes the path so a space or hash cannot break the URL", () => {
-    const h = screenToHash({ kind: "diff", against: "/a b/c#d" });
+    const h = screenToHash({ kind: "compare", lhs: "/a b/c#d", rhs: "" });
     expect(h).not.toContain(" ");
-    expect(h.slice("diff?against=".length)).not.toContain("#");
-    expect(parseScreen(`#${h}`)).toEqual({ kind: "diff", against: "/a b/c#d" });
+    expect(h.slice("compare?lhs=".length)).not.toContain("#");
+    expect(parseScreen(`#${h}`)).toEqual({
+      kind: "compare",
+      lhs: "/a b/c#d",
+      rhs: "",
+    });
+  });
+
+  it("keeps the view in the URL, and says nothing when it is the default", () => {
+    expect(screenToHash({ kind: "compare", lhs: "/a", rhs: "" })).not.toContain("view=");
+    expect(screenToHash({ kind: "compare", lhs: "/a", rhs: "", view: "summary" })).not.toContain(
+      "view=",
+    );
+    expect(screenToHash({ kind: "compare", lhs: "/a", rhs: "", view: "data" })).toContain(
+      "view=data",
+    );
+    // A view nobody has heard of is not a view: fall back rather than render nothing.
+    expect(parseScreen("#compare?lhs=%2Fa&view=sideways")).toEqual({
+      kind: "compare",
+      lhs: "/a",
+      rhs: "",
+    });
   });
 });
 
 describe("the side-by-side comparison in a URL", () => {
   it("carries the family fold state, and only when it is off", () => {
-    expect(screenToHash({ kind: "compare", against: "/a", right: "" })).toBe(
-      "compare?against=%2Fa",
+    expect(screenToHash({ kind: "compare", lhs: "/a", rhs: "" })).toBe(
+      "compare?lhs=%2Fa",
     );
     expect(
-      screenToHash({ kind: "compare", against: "/a", right: "", full: true }),
-    ).toBe("compare?against=%2Fa&full=1");
+      screenToHash({ kind: "compare", lhs: "/a", rhs: "", full: true }),
+    ).toBe("compare?lhs=%2Fa&full=1");
     expect(
-      screenToHash({ kind: "compare", against: "/a", right: "/b", full: true }),
-    ).toBe("compare?against=%2Fa&right=%2Fb&full=1");
+      screenToHash({ kind: "compare", lhs: "/a", rhs: "/b", full: true }),
+    ).toBe("compare?lhs=%2Fa&rhs=%2Fb&full=1");
   });
 
   it("reads it back — folded is the default, so nothing in the URL means folded", () => {
-    expect(parseScreen("compare?against=%2Fa&full=1")).toEqual({
+    expect(parseScreen("compare?lhs=%2Fa&full=1")).toEqual({
       kind: "compare",
-      against: "/a",
-      right: "",
+      lhs: "/a",
+      rhs: "",
       full: true,
     });
-    expect(parseScreen("compare?against=%2Fa")).toEqual({
+    expect(parseScreen("compare?lhs=%2Fa")).toEqual({
       kind: "compare",
-      against: "/a",
-      right: "",
+      lhs: "/a",
+      rhs: "",
     });
   });
 });
@@ -416,15 +481,15 @@ describe("the orientation of a comparison", () => {
     };
     const shown = {
       kind: "compare" as const,
-      against: "/hf",
-      right: "/converted",
+      lhs: "/hf",
+      rhs: "/converted",
       scope,
       swapped: true,
     };
     const hash = screenToHash(shown);
     // The operands are in the order the server is asked about them, whichever way it is drawn.
-    expect(hash).toContain("against=%2Fhf");
-    expect(hash).toContain("right=%2Fconverted");
+    expect(hash).toContain("lhs=%2Fhf");
+    expect(hash).toContain("rhs=%2Fconverted");
     expect(hash).toContain("swap=1");
     expect(hash).toContain("subtree=language_model");
 
@@ -441,12 +506,12 @@ describe("the orientation of a comparison", () => {
 
   it("says nothing about direction when the pair is read the way it was asked for", () => {
     expect(
-      screenToHash({ kind: "compare", against: "/a", right: "" }),
+      screenToHash({ kind: "compare", lhs: "/a", rhs: "" }),
     ).not.toContain("swap");
-    expect(parseScreen("compare?against=%2Fa")).toEqual({
+    expect(parseScreen("compare?lhs=%2Fa")).toEqual({
       kind: "compare",
-      against: "/a",
-      right: "",
+      lhs: "/a",
+      rhs: "",
     });
   });
 });

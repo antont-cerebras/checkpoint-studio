@@ -425,8 +425,10 @@ describe("orientation", () => {
     );
   });
 
-  // The fold state is part of the key: the same pair unfolded is a different tree from the server.
-  it("reads again when the family fold changes", async () => {
+  // The fold state is part of the tree's key but not the pair's: folding the families re-aligns what
+  // the server already holds. Re-reading two checkpoints — seconds each, minutes over an ssh proxy —
+  // to draw the same pair a second way is the cost the comparison slot exists to avoid.
+  it("re-aligns when the family fold changes, without re-reading the pair", async () => {
     const calls = stubFetch((u) =>
       u.includes("difftree") ? tree("/a", "/b") : comparisonSet(u),
     );
@@ -434,7 +436,115 @@ describe("orientation", () => {
     await c.compareAgainst({ left: "/a", right: "/b" });
     await c.compareAgainst({ left: "/a", right: "/b", full: true });
     expect(calls.filter((u) => u.includes("/api/compare?left="))).toHaveLength(
+      1,
+    );
+    expect(calls.filter((u) => u.includes("/api/difftree"))).toHaveLength(2);
+  });
+
+  // Switching to the aligned tree reads nothing: the pair is in the server's slot, and what is being
+  // waited for is the comparison coming over the wire. It used to raise the *reading both checkpoints*
+  // step regardless — so Browse opened naming two checkpoints as `reading…`, for as long as the server
+  // took to align and send them, with nothing on screen that was true.
+  it("announces a read only when there is one to announce", async () => {
+    const calls = stubFetch(
+      (u) => (u.includes("difftree") ? tree("/a", "/b") : comparisonSet(u)),
+      20,
+    );
+    const { c } = await load();
+    const steps: (string | null)[] = [];
+    const stop = c.diffStep.subscribe((s) => steps.push(s?.kind ?? null));
+    await c.compareAgainst({ left: "/a", right: "/b" });
+    expect(steps).toContain("comparing");
+    steps.length = 0;
+    // The same pair again, from another view of it.
+    await c.compareAgainst({ left: "/a", right: "/b", full: true });
+    expect(steps).not.toContain("comparing");
+    expect(steps).toContain("difftree");
+    stop();
+    expect(calls.filter((u) => u.includes("/api/compare?left="))).toHaveLength(1);
+  });
+
+  // `force` is how the Compare button re-runs a pair that is already set up — the only way to pick up
+  // a checkpoint rewritten on disk.
+  it("re-reads the pair when forced", async () => {
+    const calls = stubFetch((u) =>
+      u.includes("difftree") ? tree("/a", "/b") : comparisonSet(u),
+    );
+    const { c } = await load();
+    await c.establishComparison({ left: "/a", right: "/b" });
+    expect(get(c.diffStep)).toBeNull();
+    await c.establishComparison({ left: "/a", right: "/b", force: true });
+    expect(calls.filter((u) => u.includes("/api/compare?left="))).toHaveLength(
       2,
+    );
+  });
+
+  // An empty baseline is not a comparison: nothing to set up, nothing to ask the server.
+  it("asks nothing for an empty baseline", async () => {
+    const calls = stubFetch((u) =>
+      u.includes("difftree") ? tree("/a", "/b") : comparisonSet(u),
+    );
+    const { c } = await load();
+    await c.establishComparison({ left: "", right: "/b" });
+    expect(calls).toHaveLength(0);
+    expect(get(c.comparison)).toBeNull();
+  });
+
+  // Two views mounting at once must not each read the pair — the second waits for the first.
+  it("does not set the same pair up twice at once", async () => {
+    const calls = stubFetch(
+      (u) => (u.includes("difftree") ? tree("/a", "/b") : comparisonSet(u)),
+      5,
+    );
+    const { c } = await load();
+    const both = [
+      c.establishComparison({ left: "/a", right: "/b" }),
+      c.establishComparison({ left: "/a", right: "/b" }),
+    ];
+    await Promise.all(both);
+    expect(get(c.comparison)).not.toBeNull();
+    expect(get(c.diffStep)).toBeNull();
+    expect(calls.filter((u) => u.includes("/api/compare?left="))).toHaveLength(
+      1,
+    );
+  });
+
+  // A pair that cannot be set up leaves nothing claiming to be one: the views read `comparison`, and
+  // a stale id there would have them asking the server about a comparison it does not have.
+  it("holds no comparison when the pair cannot be read", async () => {
+    stubFailure(400, "no checkpoint files found at /nope");
+    const { c } = await load();
+    await c.establishComparison({ left: "/nope", right: "/b" });
+    expect(get(c.comparison)).toBeNull();
+    expect(get(c.diffError)).toContain("no checkpoint files found");
+  });
+
+  // The server reads one checkpoint at a time and says so; that is an offer to stop the other read,
+  // not an error to print.
+  it("reports a busy server as something to act on", async () => {
+    stubFailure(409, "the server is reading /other", {
+      can_stop_other: true,
+      busy_with: "/other",
+      busy_for_seconds: 3,
+    });
+    const { c } = await load();
+    await c.establishComparison({ left: "/a", right: "/b" });
+    expect(get(c.diffBusy)).toEqual({ spec: "/other", seconds: 3 });
+    expect(get(c.comparison)).toBeNull();
+  });
+
+  // The same for a view that needs no tree at all: establishing the pair is what costs, and it
+  // happens once however many views read it.
+  it("sets the pair up once, however many views read it", async () => {
+    const calls = stubFetch((u) =>
+      u.includes("difftree") ? tree("/a", "/b") : comparisonSet(u),
+    );
+    const { c } = await load();
+    await c.establishComparison({ left: "/a", right: "/b" });
+    await c.compareAgainst({ left: "/a", right: "/b" });
+    await c.establishComparison({ left: "/a", right: "/b" });
+    expect(calls.filter((u) => u.includes("/api/compare?left="))).toHaveLength(
+      1,
     );
   });
 });

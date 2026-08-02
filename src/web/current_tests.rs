@@ -218,14 +218,18 @@ fn swapping_the_report_mirrors_it() {
     let current = serving("tiny.safetensors");
     let against = baseline.to_string_lossy().into_owned();
 
+    // One read of the pair, both orientations over it — which is the point of the report working from
+    // the comparison slot rather than resolving its own baseline.
+    let set = current
+        .set_comparison(&against, "", WhenBusy::StopTheOther)
+        .expect("the pair sets up");
     let report = |swap: bool| -> serde_json::Value {
         let mut q: crate::web::handlers::Query =
-            std::iter::once(("against".to_string(), against.clone())).collect();
+            std::iter::once(("id".to_string(), set.id.to_string())).collect();
         if swap {
             q.insert("swap".to_string(), "1".to_string());
         }
-        let (status, body) =
-            crate::web::handlers::diff(&current.snapshot(), &q, current.read_options());
+        let (status, body) = crate::web::handlers::diff(&current, &q);
         assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
         serde_json::from_slice(&body).expect("JSON")
     };
@@ -277,22 +281,20 @@ fn both_diff_views_report_the_same_totals() {
     let baseline = write_checkpoint(&dir.join("old"), "kept.weight");
     let current = serving("tiny.safetensors");
 
+    // One pair, read once; both views work from it.
+    let set = current
+        .set_comparison(&baseline.to_string_lossy(), "", WhenBusy::Refuse)
+        .expect("the pair sets up");
+
     // The report: the baseline is the OLD side, the served checkpoint the NEW one.
-    let q: crate::web::handlers::Query = std::iter::once((
-        "against".to_string(),
-        baseline.to_string_lossy().into_owned(),
-    ))
-    .collect();
-    let (status, body) =
-        crate::web::handlers::diff(&current.snapshot(), &q, current.read_options());
+    let q: crate::web::handlers::Query =
+        std::iter::once(("id".to_string(), set.id.to_string())).collect();
+    let (status, body) = crate::web::handlers::diff(&current, &q);
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let report: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
     let report = &report["report"];
 
-    // The side-by-side, over the same pair: `right` empty means the served checkpoint.
-    let set = current
-        .set_comparison(&baseline.to_string_lossy(), "", WhenBusy::Refuse)
-        .expect("the pair sets up");
+    // The side-by-side, over that same pair.
     let q: crate::web::handlers::Query =
         std::iter::once(("id".to_string(), set.id.to_string())).collect();
     let (status, body) = crate::web::handlers::difftree(&current, &current.snapshot(), &q);
@@ -335,11 +337,13 @@ fn a_scoped_comparison_narrows_the_totals_on_both_views() {
     // than fall back to the whole checkpoints.
     let scope = [("name".to_string(), "no.such.tensor".to_string())];
 
+    let set = current
+        .set_comparison(&against, "", WhenBusy::StopTheOther)
+        .expect("the pair sets up");
     let mut q: crate::web::handlers::Query =
-        std::iter::once(("against".to_string(), against.clone())).collect();
+        std::iter::once(("id".to_string(), set.id.to_string())).collect();
     q.extend(scope.iter().cloned());
-    let (status, body) =
-        crate::web::handlers::diff(&current.snapshot(), &q, current.read_options());
+    let (status, body) = crate::web::handlers::diff(&current, &q);
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let report: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
 
@@ -370,8 +374,8 @@ fn a_scoped_comparison_narrows_the_totals_on_both_views() {
     // Without the scope the same pair totals more than nothing — so the zeros above are the scope's
     // doing rather than a fixture with no bytes in it.
     let q: crate::web::handlers::Query =
-        std::iter::once(("against".to_string(), against)).collect();
-    let (_, body) = crate::web::handlers::diff(&current.snapshot(), &q, current.read_options());
+        std::iter::once(("id".to_string(), set.id.to_string())).collect();
+    let (_, body) = crate::web::handlers::diff(&current, &q);
     let whole: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
     assert!(
         whole["report"]["new_bytes"].as_u64().unwrap_or_default() > 0,
@@ -592,4 +596,200 @@ fn a_job_can_be_started_polled_and_stopped() {
     // An id nobody was given is a 404.
     assert_eq!(crate::web::handlers::job_status(&current, 99_999).0, 404);
     assert_eq!(crate::web::handlers::cancel_job(&current, 99_999).0, 404);
+}
+
+/// A comparison announces the checkpoint it is reading *now*, not the one it started with.
+///
+/// The pair takes the read slot once — one cancel handle, one elapsed clock — and both sides are read
+/// under it. The announcement used to be written when the slot was taken and never again, so the
+/// browser's second progress row, the one for the candidate, never lit up: while an `s3://` prefix
+/// took twenty seconds, the screen said it was still reading the local baseline it had finished with.
+#[test]
+fn the_announcement_follows_the_side_being_read() {
+    let current = serving("tiny.safetensors");
+    let held = current
+        .take_slot("the-baseline", WhenBusy::Refuse)
+        .expect("nothing else is reading");
+    assert_eq!(
+        current.busy_with().expect("a read is in flight").0,
+        "the-baseline"
+    );
+
+    current.now_reading("the-candidate");
+    assert_eq!(
+        current.busy_with().expect("still the same read").0,
+        "the-candidate",
+        "the second side of a pair is what the progress line names once it starts"
+    );
+
+    drop(held);
+    assert!(
+        current.busy_with().is_none(),
+        "and the slot still frees on drop"
+    );
+}
+
+/// Stopping a read stops **every** checkpoint it covers.
+///
+/// A comparison holds the slot with two reads under it, running at once. "Stop it and read this
+/// instead" used to cancel the one handle the slot carried; with two, cancelling either alone leaves
+/// the other running — and the taker then waits out its twenty-second deadline for a slot the
+/// survivor is still holding.
+#[test]
+fn stopping_a_comparison_stops_both_of_its_reads() {
+    let current = std::sync::Arc::new(serving("tiny.safetensors"));
+    let pair = ["side-one".to_string(), "side-two".to_string()];
+    let held = current
+        .take_slot(&pair, WhenBusy::Refuse)
+        .expect("nothing else is reading");
+    assert!(
+        current.reading().is_some_and(|r| r.sides.len() == 2),
+        "the slot covers both sides"
+    );
+
+    // Another request asks for the slot, which cancels whatever holds it before waiting.
+    let taker = {
+        let current = std::sync::Arc::clone(&current);
+        std::thread::spawn(move || {
+            let taken = current.take_slot(
+                std::slice::from_ref(&"the-newcomer".to_string()),
+                WhenBusy::StopTheOther,
+            );
+            taken.map(drop).is_ok()
+        })
+    };
+    // Both handles see the stop — the point of the test. Polled rather than assumed: the taker runs
+    // on its own thread and the cancel lands a moment after it starts.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && !held.every_side_cancelled() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        held.every_side_cancelled(),
+        "a stop has to reach both reads, not just the first"
+    );
+    // A cooperative cancel only asks; the reads here are notional, so let go on their behalf.
+    drop(held);
+    assert!(taker.join().expect("the taker thread finished"));
+}
+
+/// **A value comparison a remote pair cannot do is refused before it reads anything.**
+///
+/// The reported failure: the job accepted an `s3://` pair, read both checkpoints — minutes over an ssh
+/// proxy — and then said a remote source serves no tensor data. The addresses alone answer that, so the
+/// refusal belongs at the door.
+#[test]
+fn a_remote_pair_is_refused_a_value_comparison_at_the_door() {
+    let current = std::sync::Arc::new(serving("tiny.safetensors"));
+    let ask = |left: &str, right: &str| -> (u16, String) {
+        let q: crate::web::handlers::Query = [("left", left), ("right", right), ("values", "1")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let (status, body) = crate::web::handlers::start_values(&current, &q);
+        let json: serde_json::Value = serde_json::from_slice(body.as_slice()).expect("JSON");
+        (
+            status,
+            json["error"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+
+    let (status, msg) = ask("s3://bucket/old", "s3://bucket/new");
+    assert_eq!(status, 400, "refused, and immediately: {msg}");
+    assert!(
+        msg.contains("which the terminal can compare on the proxy"),
+        "and pointed at what does work for this pair: {msg}"
+    );
+
+    let (status, msg) = ask("lab@host:/opt/models/a", "/tmp/local");
+    assert_eq!(status, 400);
+    assert!(
+        msg.contains("lab@host:/opt/models/a") && !msg.contains("/tmp/local"),
+        "the refusal names the side without bytes, not the one with them: {msg}"
+    );
+
+    // Two local paths are accepted here — they do not resolve, so the *job* fails, which is the
+    // difference this test is about: a refusal is instant, a failure is a job's own business.
+    assert_eq!(ask("/nope/a", "/nope/b").0, 200);
+}
+
+/// **Every scope control reaches the offered command.**
+///
+/// The report hands over a `diff` invocation "for the same comparison", so a selection the browser
+/// applied and the command omitted would be a handover that answers a different question — and the one
+/// reported: an exact name picked in the panel had to appear in the command. Walked control by control
+/// rather than spot-checked, because the failure mode is one forgotten `if let` in `cli_args`.
+#[test]
+fn every_scope_control_reaches_the_offered_command() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let old = dir.join("diff_old.safetensors");
+    let new = dir.join("diff_new.safetensors");
+    let current = {
+        let opened =
+            opening::Target::from_paths(std::slice::from_ref(&new), None, &Options::default())
+                .expect("the fixture resolves")
+                .read(Want::Model, &crate::hf::ReadProgress::default())
+                .expect("the fixture reads");
+        Current::new(
+            opened,
+            None,
+            Options::default(),
+            LOOPBACK,
+            Recents::default(),
+        )
+        .expect("the served state builds")
+    };
+    let set = current
+        .set_comparison(&old.to_string_lossy(), "", WhenBusy::Refuse)
+        .expect("the pair reads");
+
+    // Every control the panel has, and what it must put on the command line.
+    let controls: &[(&str, &str, &str)] = &[
+        ("name", "model.layers.1.*", "--name model.layers.1.*"),
+        ("names", "model.norm.weight", "--names model.norm.weight"),
+        ("dtype_is", "BF16", "--dtype-is BF16"),
+        ("shape_is", "768,**", "--shape-is 768,**"),
+        ("map", "^a=>b", "--map ^a=>b"),
+        ("only_tensors", "1", "--only-tensors"),
+        ("align_fused", "1", "--align-fused"),
+        // The subtrees ride on the operands, which is how `diff` spells them.
+        ("subtree", "model", "#model"),
+    ];
+    for (key, value, expected) in controls {
+        let q: crate::web::handlers::Query = [
+            ("id".to_string(), set.id.to_string()),
+            ((*key).to_string(), (*value).to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let (status, body) = crate::web::handlers::diff(&current, &q);
+        assert_eq!(status, 200, "{key} is a valid scope");
+        let json: serde_json::Value = serde_json::from_slice(body.as_slice()).expect("JSON");
+        let command = json["command"].as_str().unwrap_or_default().to_string();
+        // Quoting is the shell's business, so compare on the unquoted text.
+        let flat = command.replace('\'', "");
+        assert!(
+            flat.contains(expected),
+            "{key}={value} must reach the offered command as `{expected}`: {command}"
+        );
+    }
+
+    // And the family fold, which is a view control rather than a selection but changes what the command
+    // would print.
+    let q: crate::web::handlers::Query = [
+        ("id".to_string(), set.id.to_string()),
+        ("full".to_string(), "1".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let json: serde_json::Value =
+        serde_json::from_slice(crate::web::handlers::diff(&current, &q).1.as_slice())
+            .expect("JSON");
+    assert!(
+        json["command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--full"),
+        "the fold state belongs in the command too: {json}"
+    );
 }

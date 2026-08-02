@@ -251,7 +251,9 @@ impl Current {
     }
 
     /// Take the read slot the way `busy` asks for.
-    fn take_slot(&self, spec: &str, busy: WhenBusy) -> Result<Reading<'_>> {
+    // `pub(super)` — with `Reading` — only so `current_tests`, a sibling module rather than a child,
+    // can hold the slot and watch what gets announced under it. Nothing outside `web` can reach either.
+    pub(super) fn take_slot(&self, spec: &str, busy: WhenBusy) -> Result<Reading<'_>> {
         match busy {
             WhenBusy::StopTheOther => self.begin_read_taking_over(spec),
             WhenBusy::Refuse => self.begin_read(spec).ok_or_else(|| {
@@ -275,6 +277,21 @@ impl Current {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|f| (f.spec.clone(), f.since.elapsed().as_secs_f64()))
+    }
+
+    /// Move the in-flight record onto the next checkpoint of a comparison.
+    ///
+    /// The slot is taken once for the pair — one cancel handle, one elapsed clock — but *what is being
+    /// read* changes halfway through, and that is the part a progress line has to be honest about.
+    pub(super) fn now_reading(&self, spec: &str) {
+        if let Some(f) = self
+            .in_flight
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            f.spec = spec.to_string();
+        }
     }
 
     /// The read in flight, in as much detail as it reports: what it is reading, for how long, how far
@@ -380,11 +397,8 @@ impl Current {
     /// Shares the open lock with [`Self::open`]: these are multi-second reads that install a
     /// checkpoint, and letting them run at once would have reads competing for the same disk while
     /// the caller cannot tell which one it is waiting for.
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "the read slot is held for the whole read on purpose — that is what serialises reads; \
-                  releasing it as soon as `progress` has been taken would let a second read start"
-    )]
+    // The read slot below is held for the whole read on purpose — that is what serialises them.
+    // Releasing it as soon as `progress` has been taken would let a second read start.
     pub(crate) fn set_comparison(
         &self,
         left: &str,
@@ -405,7 +419,16 @@ impl Current {
         let right_read = match right.trim() {
             "" => None,
             r if r == served_spec => None,
-            r => Some(self.read_side(r, &reading.progress)?),
+            r => {
+                // Say which checkpoint is being read *now*. A comparison reads two, one after the
+                // other, at speeds that can differ by a factor of twenty — a local directory in a
+                // second, an `s3://` prefix in twenty — and the screen draws a row for each. The
+                // in-flight record kept naming the *first* one throughout, so the second row never
+                // lit up: both bars belonged to the baseline and the candidate looked like it was
+                // never read at all.
+                self.now_reading(r);
+                Some(self.read_side(r, &reading.progress)?)
+            }
         };
         let (right_state, right_spec) = match right_read {
             Some((state, spec)) => (Some(state), spec),
@@ -549,7 +572,7 @@ struct InFlight {
 /// written when this is created and cleared when it drops, including on the `?` of a failed read. Two
 /// bare fields updated by hand would have had a path — an early return — that left the server claiming
 /// to be busy with a read that had already failed.
-struct Reading<'a> {
+pub(super) struct Reading<'a> {
     current: &'a Current,
     /// This read's progress-and-control handle, shared with `in_flight` so a later request can cancel
     /// it. The read itself is handed this, not a throwaway.

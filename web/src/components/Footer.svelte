@@ -11,6 +11,7 @@
     compact,
     type Screen,
   } from '../stores/view';
+  import type { CompareView } from '../lib/hash';
 
   interface Hint {
     keys: string;
@@ -50,19 +51,26 @@
   //
   // The acts are no-ops because the handlers belong to the view that owns the state; same as `↑↓` in
   // the tree footer, which is a legend entry rather than a button.
-  const compareHints: Hint[] = [
-    { keys: 'n/N', label: 'next/prev difference', act: () => {} },
-    { keys: 's', label: 'swap sides', act: () => {} },
-    { keys: 'k', label: 'families', act: () => {} },
-    { keys: 'Esc/⌫', label: 'back', act: back },
-  ];
+  // `n`/`N` step between rows, so they are promised only where there are rows: the summary's list and
+  // the aligned tree, not the data checks. Advertising a key that does nothing on the tab you are
+  // looking at is how `k` came to be reported as broken.
+  function compareHints(view: CompareView): Hint[] {
+    return [
+      ...(view === 'data'
+        ? []
+        : [{ keys: 'n/N', label: 'next/prev difference', act: () => {} }]),
+      { keys: 's', label: 'swap sides', act: () => {} },
+      { keys: 'k', label: 'families', act: () => {} },
+      { keys: 'Esc/⌫', label: 'back', act: back },
+    ];
+  }
 
   const otherHints: Hint[] = [{ keys: 'Esc/⌫', label: 'back', act: back }];
 
   function hintsFor(s: Screen): Hint[] {
     if (s.kind === 'tree') return treeHints;
     if (s.kind === 'detail') return detailHints;
-    if (s.kind === 'compare') return compareHints;
+    if (s.kind === 'compare') return compareHints(s.view ?? 'summary');
     return otherHints;
   }
 

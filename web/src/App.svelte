@@ -57,14 +57,13 @@
   import LayoutView from './components/LayoutView.svelte';
   import StatsView from './components/StatsView.svelte';
   import HealthView from './components/HealthView.svelte';
-  import DiffView from './components/DiffView.svelte';
   import FilePreview from './components/FilePreview.svelte';
   import StatusBar from './components/StatusBar.svelte';
   import Footer from './components/Footer.svelte';
   import LoadingScreen from './components/LoadingScreen.svelte';
   import CheckpointBar from './components/CheckpointBar.svelte';
   import OpenView from './components/OpenView.svelte';
-  import CompareView from './components/CompareView.svelte';
+  import ComparePage from './components/ComparePage.svelte';
   import Palette from './components/Palette.svelte';
   import FilterBuilder from './components/FilterBuilder.svelte';
   import CompactView from './components/CompactView.svelte';
@@ -140,18 +139,15 @@
         return '› Stats';
       case 'health':
         return '› Health';
-      case 'diff':
-        return s.against ? `› Diff report: ${s.against}` : '› Diff report';
       case 'preview':
         return `› ${s.name}`;
       case 'open':
         return '› Open';
       case 'compare':
-        // Both sides, because a swap exchanges them: naming only the baseline meant the crumb still
-        // read as the pre-swap orientation after `s` had reversed the panes.
-        return s.against
-          ? `› Compare: ${s.against} ↔ ${s.right || 'the open checkpoint'}`
-          : '› Compare';
+        // Just the word. The two addresses are in the two boxes directly below, where they can be
+        // read *and* edited; spelling them out here as well made a header three lines deep on the
+        // remote pairs this screen exists for.
+        return '› Compare';
     }
   }
 
@@ -440,22 +436,26 @@
       <span class="crumb dim" title={crumb($screen)}>{crumb($screen)}</span>
     {/if}
     <!-- The checkpoint address: a real input, so copy/paste/select work, with the recents
-         list on `↓`. Editing it opens another checkpoint (see CheckpointBar). -->
-    <CheckpointBar />
+         list on `↓`. Editing it opens another checkpoint (see CheckpointBar).
+         Not on the comparison screen, which is *about* two addresses and carries a box for each: a
+         third box up here named one of them again, could only hold one of the two, and changed
+         which checkpoint the server serves rather than which one is being compared. Three controls
+         for two operands. -->
+    {#if $screen.kind !== 'compare'}
+      <CheckpointBar />
+    {/if}
     <!-- Compare: the one action that needs a *second* checkpoint, so it sits beside the address
-         bar rather than being buried in the palette. -->
-    <button
-      class="cmp"
-      type="button"
-      title="Compare with another checkpoint, side by side"
-      on:click={() =>
-        navigate({
-          kind: 'compare',
-          against: $screen.kind === 'compare' ? $screen.against : '',
-          right: $screen.kind === 'compare' ? $screen.right : '',
-        })}
-      >Compare</button
-    >
+         bar rather than being buried in the palette.
+         Not on the comparison screen itself, which has its own Compare button over its own two
+         boxes: two buttons of the same name, one of which only re-opens the screen you are on. -->
+    {#if $screen.kind !== 'compare'}
+      <button
+        class="cmp"
+        type="button"
+        title="Compare with another checkpoint, side by side"
+        on:click={() => navigate({ kind: 'compare', lhs: '', rhs: '' })}>Compare</button
+      >
+    {/if}
     {#if $searching && $screen.kind === 'tree'}
       <span class="search">
         /
@@ -581,24 +581,17 @@
       <StatsView />
     {:else if $screen.kind === 'health'}
       <HealthView />
-    {:else if $screen.kind === 'diff'}
-      <DiffView
-        against={$screen.against}
-        scope={$screen.scope}
-        swapped={$screen.swapped ?? false}
-        full={$screen.full ?? false}
-        closed={$screen.closed ?? []}
-        root={$tree.root}
-      />
     {:else if $screen.kind === 'preview'}
       <FilePreview path={$screen.path} name={$screen.name} />
     {:else if $screen.kind === 'compare'}
-      <CompareView
-        against={$screen.against}
-        right={$screen.right}
+      <ComparePage
+        lhs={$screen.lhs}
+        rhs={$screen.rhs}
+        view={$screen.view ?? 'summary'}
         scope={$screen.scope}
         full={$screen.full ?? false}
         swapped={$screen.swapped ?? false}
+        closed={$screen.closed ?? []}
       />
     {/if}
   </main>

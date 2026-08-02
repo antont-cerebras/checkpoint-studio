@@ -70,6 +70,34 @@ fn query(key: &str, value: &str) -> handlers::Query {
     std::iter::once((key.to_string(), value.to_string())).collect()
 }
 
+/// A server with `files` open, and a comparison against `against` already set up.
+///
+/// The report reads the pair from the comparison slot rather than resolving its own baseline — one
+/// read for every view of a comparison — so asking it anything means establishing the pair first,
+/// exactly as the browser does (`POST /api/compare`, then `GET /api/diff?id=N`).
+fn comparing(files: &[PathBuf], against: &str) -> (crate::web::Current, u64) {
+    let opts = crate::opening::Options::default();
+    let opened = crate::opening::Target::from_paths(files, None, &opts)
+        .expect("the fixture resolves")
+        .read(
+            crate::opening::Want::Model,
+            &crate::hf::ReadProgress::default(),
+        )
+        .expect("the fixture reads");
+    let current = crate::web::Current::new(
+        opened,
+        None,
+        opts,
+        std::net::IpAddr::from([127, 0, 0, 1]),
+        crate::opening::Recents::default(),
+    )
+    .expect("the served state builds");
+    let set = current
+        .set_comparison(against, "", crate::web::current::WhenBusy::StopTheOther)
+        .expect("the baseline reads");
+    (current, set.id)
+}
+
 /// A handler's body as JSON, asserting it answered 200 — the shape a browser gets.
 fn body(reply: handlers::Reply) -> Value {
     let (status, bytes) = reply;
@@ -486,15 +514,11 @@ fn the_structural_diff_agrees_between_the_cli_and_the_web() {
 
     // The web: serve `diff_new`, ask it to compare against `diff_old`.
     let files = vec![new];
-    let model = crate::readers::read_local(&files).expect("the fixture reads");
-    let state = WebState::build(model, &files, &[]);
-    let served = body(handlers::diff(
-        &state,
-        &query("against", &old.display().to_string()),
-        &crate::opening::Options::default(),
-    ));
+    let (current, id) = comparing(&files, &old.display().to_string());
+    let served = body(handlers::diff(&current, &query("id", &id.to_string())));
 
     // The CLI: the same pair through the shared comparison the `diff` subcommand uses.
+    let state = current.snapshot();
     let expected = crate::compare::structural_diff(
         &state.tensors,
         &state.checkpoint.metadata_vec(),
@@ -539,12 +563,8 @@ fn the_structural_diff_agrees_between_the_cli_and_the_web() {
 /// not merely through the core — the projection could drop a section and look clean.
 #[test]
 fn the_web_reports_no_differences_against_itself() {
-    let s = web();
-    let served = body(handlers::diff(
-        &s,
-        &query("against", &fixture().display().to_string()),
-        &crate::opening::Options::default(),
-    ));
+    let (current, id) = comparing(&[fixture()], &fixture().display().to_string());
+    let served = body(handlers::diff(&current, &query("id", &id.to_string())));
     assert_eq!(served["verdict"], "structurally identical");
     for section in [
         "tensors_added",
@@ -564,16 +584,41 @@ fn the_web_reports_no_differences_against_itself() {
 
 /// A bad `?against=` is a 400 whose message the UI shows — not a 500, and not a silent
 /// empty report that would read as "no differences".
+///
+/// The refusal moved with the read: the report works from the comparison slot now, so a path that is
+/// not a checkpoint is refused by `POST /api/compare` — before any view of it exists — and asking for
+/// a comparison that was never set up is its own refusal.
 #[test]
 fn the_diff_endpoint_rejects_a_path_that_is_not_a_checkpoint() {
-    let s = web();
+    let opts = crate::opening::Options::default();
+    let opened = crate::opening::Target::from_paths(&[fixture()], None, &opts)
+        .expect("the fixture resolves")
+        .read(
+            crate::opening::Want::Model,
+            &crate::hf::ReadProgress::default(),
+        )
+        .expect("the fixture reads");
+    let current = crate::web::Current::new(
+        opened,
+        None,
+        opts,
+        std::net::IpAddr::from([127, 0, 0, 1]),
+        crate::opening::Recents::default(),
+    )
+    .expect("the served state builds");
     for bad in ["", "/nonexistent/checkpoint"] {
-        let (status, bytes) = handlers::diff(
-            &s,
-            &query("against", bad),
-            &crate::opening::Options::default(),
+        let refused = current
+            .set_comparison(bad, "", crate::web::current::WhenBusy::StopTheOther)
+            .is_err();
+        assert!(refused, "'{bad}' should be refused rather than compared");
+    }
+    // And a request naming no comparison at all is a client error, not an empty report.
+    for missing in ["", "404"] {
+        let (status, bytes) = handlers::diff(&current, &query("id", missing));
+        assert!(
+            status == 400 || status == 409,
+            "an unknown comparison should be refused, got {status}"
         );
-        assert_eq!(status, 400, "'{bad}' should be a client error");
         let msg: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(
             msg["error"].as_str().is_some_and(|e| !e.is_empty()),
@@ -672,13 +717,8 @@ fn the_served_diff_command_names_the_checkpoint_not_a_shard() {
     files.sort();
     assert!(files.len() > 1, "this case needs several shards");
 
-    let model = crate::readers::read_local(&files).expect("the fixtures read");
-    let state = WebState::build(model, &files, &[]);
-    let served = body(handlers::diff(
-        &state,
-        &query("against", &fixture().display().to_string()),
-        &crate::opening::Options::default(),
-    ));
+    let (current, id) = comparing(&files, &fixture().display().to_string());
+    let served = body(handlers::diff(&current, &query("id", &id.to_string())));
     let command = served["command"]
         .as_str()
         .expect("a multi-shard checkpoint in one directory has a one-line command");
@@ -1098,9 +1138,8 @@ fn counts_agree_for(old_name: &str, new_name: &str) {
 fn a_scoped_diff_agrees_between_the_cli_and_the_web() {
     let old = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_old.safetensors");
     let new = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_new.safetensors");
-    let model = crate::readers::read_local(std::slice::from_ref(&new)).expect("the fixture reads");
-    let state = WebState::build(model, std::slice::from_ref(&new), &[]);
-    let opts = crate::opening::Options::default();
+    let (current, id) = comparing(std::slice::from_ref(&new), &old.display().to_string());
+    let state = current.snapshot();
 
     // Every scope the web accepts, exercised against the flags that mean the same thing.
     for (query, name, names, dtype_is, shape_is, only_tensors) in [
@@ -1146,13 +1185,13 @@ fn a_scoped_diff_agrees_between_the_cli_and_the_web() {
         ),
         (vec![("only_tensors", "1")], vec![], None, None, None, true),
     ] {
-        // The web: the scope as query parameters.
+        // The web: the scope as query parameters, over the comparison already set up.
         let mut q = handlers::Query::new();
-        q.insert("against".to_string(), old.display().to_string());
+        q.insert("id".to_string(), id.to_string());
         for (k, v) in &query {
             q.insert((*k).to_string(), (*v).to_string());
         }
-        let served = body(handlers::diff(&state, &q, &opts));
+        let served = body(handlers::diff(&current, &q));
 
         // The CLI: the same selection through its own builders, then the shared apply order.
         let filter = crate::compare::tensor_filter(&crate::compare::ScopeText {
@@ -1201,18 +1240,12 @@ fn a_scoped_diff_agrees_between_the_cli_and_the_web() {
 fn the_offered_command_carries_the_scope() {
     let old = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_old.safetensors");
     let new = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_new.safetensors");
-    let model = crate::readers::read_local(std::slice::from_ref(&new)).expect("the fixture reads");
-    let state = WebState::build(model, std::slice::from_ref(&new), &[]);
-
+    let (current, id) = comparing(std::slice::from_ref(&new), &old.display().to_string());
     let mut q = std::collections::HashMap::new();
-    q.insert("against".to_string(), old.display().to_string());
+    q.insert("id".to_string(), id.to_string());
     q.insert("name".to_string(), "model.layers.*\n!*.bias".to_string());
     q.insert("only_tensors".to_string(), "1".to_string());
-    let served = body(handlers::diff(
-        &state,
-        &q,
-        &crate::opening::Options::default(),
-    ));
+    let served = body(handlers::diff(&current, &q));
     let cmd = served["command"].as_str().expect("a one-line command");
     assert!(cmd.contains("--name 'model.layers.*'"), "{cmd}");
     assert!(cmd.contains("--name '!*.bias'"), "{cmd}");

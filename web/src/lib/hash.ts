@@ -76,32 +76,28 @@ export type Screen =
   // would put `scope: emptyScope()` at a dozen call sites that have nothing to do with scoping.
   // `swapped` turns the report round: the open checkpoint becomes the baseline. In the URL because it
   // changes what the report *says* — added and removed trade places — so a link has to carry it.
-  | {
-      kind: 'diff';
-      against: string;
-      scope?: DiffScopeParams | undefined;
-      swapped?: boolean | undefined;
-      /** `--full`: show every tensor rather than collapsing index-templated families onto one row.
-       * In the URL because it changes what the report *shows*, and because the copyable command has to
-       * carry it. */
-      full?: boolean | undefined;
-      /** Sections the reader has folded away, by key. In the URL so a reload — or a link — lands on the
-       * report as it was being read, which is the whole point of folding a 31,247-row section away. */
-      closed?: string[] | undefined;
-    }
-  // Side-by-side comparison. `against` is the baseline; the other side is whatever the server
-  // serves, which the `ckpt` global already names — so the pair is fully in the URL.
+  // **One comparison, three ways of reading it.** There were two screens — a report and an aligned
+  // tree — reached from two places, so the reader chose a representation before seeing the result and
+  // switching meant starting again. The pair, the direction and the scope are the comparison; the
+  // view is how it is being read, and it lives here with the rest of the view state.
   | {
       kind: 'compare';
-      against: string;
-      right: string;
+      /** The baseline — the left-hand side of `diff OLD NEW`. */
+      lhs: string;
+      /** The candidate; empty means the checkpoint the server has open. */
+      rhs: string;
+      /** Which of the three views is showing; `summary` by default. */
+      view?: CompareView | undefined;
       scope?: DiffScopeParams | undefined;
       /** `--full`: every layer as its own row, rather than uniform families folded onto one each.
        * In the URL for the reason every view control is: a link shows what the sender was reading. */
-      full?: boolean;
+      full?: boolean | undefined;
       /** Which way round the pair is read. The *operands* stay canonical — the scope is directional,
        * so swapping them would describe a comparison the server would answer differently. */
-      swapped?: boolean;
+      swapped?: boolean | undefined;
+      /** Summary sections the reader has folded away, by key. In the URL so a reload — or a link —
+       * lands on the report as it was being read, which is the point of folding away 31,247 rows. */
+      closed?: string[] | undefined;
     }
   | { kind: 'preview'; path: string; name: string }
   // The open prompt carries no state of its own: what it does is change the *server*, and a
@@ -113,6 +109,13 @@ export type Screen =
 /** Sorting for the flat (filter / search) tensor list. `none` keeps the natural
  * order (fuzzy-score for search, tree order for a filter); the tree view is never
  * reordered. */
+/** The comparison screen's state, for the code that changes one thing about it. */
+export type CompareScreen = Extract<Screen, { kind: 'compare' }>;
+
+/** How a comparison is being read: the categorised summary, the aligned tree, or the data checks. */
+export type CompareView = 'summary' | 'browse' | 'data';
+const COMPARE_VIEWS: readonly string[] = ['summary', 'browse', 'data'];
+
 export type SortKey = 'none' | 'name' | 'size' | 'params' | 'dtype' | 'rank';
 const SORT_KEYS: readonly string[] = ['name', 'size', 'params', 'dtype', 'rank'];
 
@@ -170,16 +173,14 @@ export function screenToHash(s: Screen): string {
       return 'stats';
     case 'health':
       return 'health';
-    case 'diff': {
-      const closed = s.closed?.length ? `&closed=${s.closed.map(enc).join(',')}` : '';
-      return `diff?against=${enc(s.against)}${s.swapped ? '&swap=1' : ''}${s.full ? '&full=1' : ''}${closed}${scopeQuery(s.scope)}`;
-    }
     case 'compare': {
-      const right = s.right ? `&right=${enc(s.right)}` : '';
-      const full = s.full ? '&full=1' : '';
-      // `swap`, the same spelling the report uses for the same idea.
+      const rhs = s.rhs ? `&rhs=${enc(s.rhs)}` : '';
+      // `summary` is the default, so an ordinary comparison keeps a short URL.
+      const view = s.view && s.view !== 'summary' ? `&view=${s.view}` : '';
       const swap = s.swapped ? '&swap=1' : '';
-      return `compare?against=${enc(s.against)}${right}${swap}${full}${scopeQuery(s.scope)}`;
+      const full = s.full ? '&full=1' : '';
+      const closed = s.closed?.length ? `&closed=${s.closed.map(enc).join(',')}` : '';
+      return `compare?lhs=${enc(s.lhs)}${rhs}${view}${swap}${full}${closed}${scopeQuery(s.scope)}`;
     }
     case 'preview':
       return `preview?path=${enc(s.path)}&name=${enc(s.name)}`;
@@ -216,31 +217,21 @@ export function parseScreen(hash: string): Screen {
       return { kind: 'stats' };
     case 'health':
       return { kind: 'health' };
-    case 'diff':
-      // Opens with an empty baseline, because the screen carries its own path box — the same reason
-      // the side-by-side does. Falling through to the tree instead made the palette's "Diff report"
-      // entry do nothing at all: it navigates with no baseline, so the screen it asked for was
-      // silently replaced by the one you were already on.
+    case 'compare': {
+      const view = q.get('view') ?? '';
+      // No baseline means no comparison to draw, but the screen is still where you pick one — so it
+      // opens empty rather than falling through to the tree, which is what made the palette's entry
+      // appear to do nothing at all.
       return {
-        kind: 'diff',
-        against: q.get('against') ?? '',
+        kind: 'compare',
+        lhs: q.get('lhs') ?? '',
+        rhs: q.get('rhs') ?? '',
+        ...(COMPARE_VIEWS.includes(view) ? { view: view as CompareView } : {}),
         ...(q.get('swap') === '1' ? { swapped: true } : {}),
         ...(q.get('full') === '1' ? { full: true } : {}),
         ...(q.get('closed')
           ? { closed: (q.get('closed') ?? '').split(',').filter((k) => k !== '') }
           : {}),
-        ...scopeIfAny(q),
-      };
-    case 'compare': {
-      // No baseline means no comparison to draw, but the screen is still where you pick one — so
-      // it opens empty rather than falling through to the tree.
-      // `right` absent means "the checkpoint that is open" — the common case, and a short URL.
-      return {
-        kind: 'compare',
-        against: q.get('against') ?? '',
-        right: q.get('right') ?? '',
-        ...(q.get('swap') === '1' ? { swapped: true } : {}),
-        ...(q.get('full') === '1' ? { full: true } : {}),
         ...scopeIfAny(q),
       };
     }
@@ -287,10 +278,46 @@ export function parseGlobals(hash: string): Globals {
   };
 }
 
+/**
+ * Which screens the *list* state (filter, sort, family fold, search) belongs to.
+ *
+ * It describes the tensor list, so it is noise anywhere else: a comparison link carried `compact=1`
+ * and a `filter=` that changed nothing on screen, in a URL people paste to each other. The detail
+ * view keeps it because it is a view *of a row in that list* — Back returns to the list, and to the
+ * list as it was.
+ */
+const LIST_SCREENS: readonly Screen['kind'][] = ['tree', 'detail'];
+
+/** The globals a screen can actually use — the rest would describe a screen you are not on. */
+function forScreen(g: Globals, s: Screen): Globals {
+  const kept = LIST_SCREENS.includes(s.kind)
+    ? g
+    : {
+        ...g,
+        filter: '',
+        sortKey: 'none' as const,
+        compact: false,
+        searching: false,
+        search: '',
+      };
+  // **A comparison that names both of its checkpoints does not need to name a third.**
+  //
+  // `ckpt` says which checkpoint a view is *of*, and opening a link that names one the server is not
+  // serving switches to it (`App`'s startup). On a comparison of two named checkpoints that is neither
+  // true nor harmless: the parameter carried whatever the sender's server happened to hold —
+  // `#compare?lhs=…12-boxes&rhs=s3://…&ckpt=/tmp/mapfix/new.safetensors`, a third checkpoint with no
+  // part in the comparison, which the recipient's server would then be told to open.
+  //
+  // It stays when the candidate is *implicit*: an empty `rhs` means "the checkpoint that is open", so
+  // then the link genuinely does depend on which one that is.
+  const namesBoth = s.kind === 'compare' && s.lhs !== '' && s.rhs !== '';
+  return namesBoth ? { ...kept, ckpt: '' } : kept;
+}
+
 /** A screen's hash plus the global state — the complete, shareable view. */
 export function hashFor(s: Screen, g: Globals): string {
   const base = screenToHash(s);
-  const q = globalQuery(g);
+  const q = globalQuery(forScreen(g, s));
   if (!q) return base;
   return base.includes('?') ? `${base}&${q}` : `${base}?${q}`;
 }

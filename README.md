@@ -189,7 +189,7 @@ The UI is a Svelte single-page app **embedded in the binary**, so a released
 > [!WARNING]
 > **There is no access control.** The server has no authentication of any kind, and it
 > binds `0.0.0.0` by default so it is reachable at your machine's hostname. Anyone who can
-> reach the port can read the served checkpoint — and, through `/api/diff?against=PATH`,
+> reach the port can read the served checkpoint — and, through `POST /api/compare?left=PATH`,
 > the structure of **any checkpoint path the serving user can read**. Pass
 > `--host 127.0.0.1` to restrict it to your own machine. When the bind is not loopback,
 > the startup banner says so in the terminal and the page carries a strip saying the same.

@@ -26,6 +26,12 @@
   export let onOpen: ((name: string) => void) | null = null;
   /** Why it is not clickable, when it is not — a removed tensor exists only in the baseline. */
   export let why = '';
+  /** Identifies this row for `n`/`N`, which scroll it into view by this attribute. Unique across the
+   * report: a name can appear in two sections (removed here, added there, under a rename). */
+  export let rowId = '';
+  /** The row `n`/`N` have stepped to. Marked, not focused: focus would scroll on its own terms and
+   * steal the caret from the *Find in results* box. */
+  export let cursor = false;
 
   $: parts = splitName(name);
   $: dims = old && neu ? shapeDiff(old.shape, neu.shape) : null;
@@ -34,7 +40,11 @@
   $: shapeChanged = !!old && !!neu && old.shape.join() !== neu.shape.join();
 </script>
 
-<div class="row {mark === '+' ? 'added' : mark === '-' ? 'removed' : 'changed'}">
+<div
+  class="row {mark === '+' ? 'added' : mark === '-' ? 'removed' : 'changed'}"
+  class:cursor
+  data-row={rowId || null}
+>
   <span class="mark" aria-hidden="true">{mark}</span>
   {#if onOpen}
     <button type="button" class="name" title="Open {name}" on:click={() => onOpen?.(name)}>
@@ -110,6 +120,12 @@
 </div>
 
 <style>
+  /* Where `n`/`N` have got to. A background rather than an outline, the treatment the tree's cursor
+     and the palette's selection use, so "the row I am on" looks the same everywhere. */
+  .row.cursor {
+    background: var(--bg-hover);
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
   .row {
     display: flex;
     align-items: baseline;

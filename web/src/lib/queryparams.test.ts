@@ -88,7 +88,7 @@ describe('every parameter the browser sends', () => {
     await api.forgetRecent('/ckpt');
     await api.setComparison('/a', '/b', true);
     await api.difftree(1, FULL_SCOPE, undefined, undefined, undefined, true);
-    await api.diff('/a', FULL_SCOPE, true, true);
+    await api.diff(1, FULL_SCOPE, true, true);
     await api.tensor('model.w');
     await api.layout('shard.safetensors');
     await api.file('config.json');

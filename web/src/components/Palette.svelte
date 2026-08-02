@@ -28,28 +28,21 @@
     { group: 'Go', label: 'Health check', run: () => navigate({ kind: 'health' }) },
     {
       group: 'Go',
-      // "diff" in the label on purpose: it is what this is called everywhere else — the
-      // subcommand, the report's own headings — so it is what someone searches the palette for.
-      label: 'Diff report: a one-page summary against another checkpoint…',
+      // One entry, because there is one comparison. There were two — *Diff report* and *Compare side
+      // by side* — which made the reader choose a representation before seeing the result; the
+      // summary, the tree and the data checks are views on the page now. "diff" stays in the label
+      // because that is what this is called everywhere else (the subcommand, the report's headings),
+      // and so it is what someone searches the palette for.
+      label: 'Compare (diff) with another checkpoint…',
       run: () => {
-        // The screen carries its own path input, so open it with whatever was compared
-        // last (or empty) and let the user type there — one place to enter a path rather
-        // than a prompt here and an input there.
-        const s = get(screen);
-        navigate({ kind: 'diff', against: s.kind === 'diff' ? s.against : '' });
-      },
-    },
-    {
-      group: 'Go',
-      // The side-by-side. Reachable from the header button too, but a feature that exists only as
-      // a button is a feature you cannot find by searching for what it does.
-      label: 'Compare side by side: browse two checkpoints in lockstep…',
-      run: () => {
+        // The page carries its own path boxes, so open it with whatever was compared last (or empty)
+        // and let the reader type there — one place to enter a path rather than a prompt here and an
+        // input there.
         const s = get(screen);
         navigate({
           kind: 'compare',
-          against: s.kind === 'compare' ? s.against : '',
-          right: s.kind === 'compare' ? s.right : '',
+          lhs: s.kind === 'compare' ? s.lhs : '',
+          rhs: s.kind === 'compare' ? s.rhs : '',
         });
       },
     },

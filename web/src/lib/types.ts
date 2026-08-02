@@ -234,7 +234,11 @@ export interface DiffReport {
 /** `/api/diff`'s envelope: the baseline it compared against, the shared one-line
  * verdict, the equivalent CLI command, and the report. */
 export interface DiffResponse {
+  /** The baseline, as the server resolved it. */
   against: string;
+  /** The other side, as the server resolved it — the checkpoint the reader named as the candidate,
+   * which is not necessarily the one this server has open. */
+  candidate: string;
   /** Which way round the report reads: `true` means the open checkpoint is the baseline (`?swap=1`).
    * Answered by the server so the view labels the report it actually got, not the one it asked for. */
   swapped: boolean;
@@ -253,6 +257,13 @@ export interface DiffResponse {
    * of what happened.
    */
   metadata_note: string | null;
+  /**
+   * Why the tensor *values* cannot be compared for this pair, or `null` when they can.
+   *
+   * From the two addresses alone (`compare::values_supported`), so the Data view can say it instead of
+   * offering a run that reads both checkpoints — minutes, over an ssh proxy — and then refuses.
+   */
+  values_note: string | null;
   /** What the S3 object comparison did, or why it did not happen. `null` for a non-`s3://` pair. */
   s3_note: string | null;
   /** The S3 object section as the terminal prints it. `null` unless both sides are `s3://`. */

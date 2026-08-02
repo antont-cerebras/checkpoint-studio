@@ -7,29 +7,25 @@
   // Structure only: names, dtypes and shapes. The value comparison reads every byte of
   // both checkpoints, so it stays on the CLI where it has a progress bar — the footer
   // hands over the exact command, extended with --values.
-  import { api } from '../lib/api';
-  import { humanCount, humanSize, specHelp, totalsLine } from '../lib/format';
-  import type { DiffResponse } from '../lib/types';
-  import { navigate, openDetail } from '../stores/view';
+  import { diffReport, loadReport, reportError, reportWait } from '../stores/report';
+  import { comparison } from '../stores/compare';
+  import { humanCount, humanSize, totalsLine } from '../lib/format';
+  import { openDetail } from '../stores/view';
+  import type { CompareScreen } from '../lib/hash';
   import { copyText } from '../lib/clipboard';
   import { identicalNote } from '../lib/difftree';
-  import ScopeBar from './ScopeBar.svelte';
   import Section from './Section.svelte';
   import DiffRow from './DiffRow.svelte';
   import { byChangeKind, changeKindLabel } from '../lib/difflines';
-  import { emptyScope, type DiffScopeParams } from '../lib/diffscope';
+  import type { DiffScopeParams } from '../lib/diffscope';
   import LoadingBar from './LoadingBar.svelte';
-  import { startedNow, type Progress } from '../lib/progress';
-  import { proxied, proxyHost, tree } from '../stores/server';
-  import { shortSpec } from '../lib/loadstep';
   import TextField from './TextField.svelte';
-  import SwapButton from './SwapButton.svelte';
   import FamilyToggle from './FamilyToggle.svelte';
+  import MoreRows from './MoreRows.svelte';
+  import { TALLY_MEANS, tallyTitle } from '../lib/tallywords';
+  import { isEditable } from '../lib/keys';
   import DiffChip from './DiffChip.svelte';
-  // The server reads the baseline checkpoint's headers before it can answer.
-  let waitStarted: Progress | null = null;
 
-  export let against: string;
   /** The selection, from the URL — so a scoped report is a link you can send. */
   export let scope: DiffScopeParams | undefined = undefined;
   /**
@@ -51,6 +47,14 @@
   export let full = false;
   /** Sections folded away, by key — from the URL, so a reload lands on the report as it was read. */
   export let closed: string[] = [];
+  /**
+   * Change one thing about how this comparison is read.
+   *
+   * Injected by `ComparePage`, which holds the pair, the direction and the scope: a view that
+   * navigated on its own would have to re-state all of them, and the one that did dropped three —
+   * so *Browse these two side by side* arrived at a different comparison than the one being read.
+   */
+  export let onNavigate: (change: Partial<Omit<CompareScreen, 'kind'>>, replace?: boolean) => void;
 
   /**
    * How many rows of a section to draw before offering the rest on request.
@@ -62,6 +66,8 @@
    * header links to it.
    */
   const SECTION_CAP = 200;
+  /** Past this many withheld rows, offer the tree instead of a longer flat list. */
+  const BROWSE_AT = 2000;
   /** Which sections the reader has asked to see in full, by heading. */
   let showAll: Record<string, boolean> = {};
 
@@ -89,15 +95,15 @@
   /** Fold or unfold a section, through the URL — which is what makes it survive a reload. */
   function setOpen(key: SectionKey, open: boolean) {
     const next = open ? closed.filter((k) => k !== key) : [...closed.filter((k) => k !== key), key];
-    navigate({ kind: 'diff', against, scope, swapped, full, closed: next });
+    onNavigate({ closed: next });
   }
 
   /** The count strip's entries, in report order. */
   const SECTIONS = [
-    { key: 'tensors_added', title: 'Added', tone: 'added' },
-    { key: 'tensors_removed', title: 'Removed', tone: 'removed' },
-    { key: 'tensors_changed', title: 'Changed', tone: 'changed' },
-    { key: 'metadata', title: 'Metadata', tone: 'meta' },
+    { key: 'tensors_added', title: 'Added', tone: 'added', means: 'added' },
+    { key: 'tensors_removed', title: 'Removed', tone: 'removed', means: 'removed' },
+    { key: 'tensors_changed', title: 'Changed', tone: 'changed', means: 'changed' },
+    { key: 'metadata', title: 'Metadata', tone: 'meta', means: 'metadata' },
   ] as const;
 
   /** How many rows a chip is standing for — the *shown* count, so it agrees with the heading it
@@ -204,69 +210,25 @@
   $: metaChanged = keep(report?.meta_changed ?? [], (c) => c.name, match);
   $: metaShown = metaAdded.length + metaRemoved.length + metaChanged.length;
 
-  let result: DiffResponse | null = null;
-  let error: string | null = null;
-  let loading = false;
-  /** The path in the input, which may differ from the one being shown. */
-  let draft = against;
   let copied = false;
 
   // Re-run whenever the URL's baseline, scope *or direction* changes (including back/forward), not
   // just on mount — the screen is addressable, so arriving at it twice with different parameters has
   // to show different reports. Each of the three is in the dependency list because each is in the URL.
-  // `full` is a dependency because the *command* the server offers depends on it; `closed` is not, since
-  // folding is a display choice this component makes on data it already has.
-  $: void load(against, scope, swapped, full);
-
-  async function load(
-    path: string,
-    sel: DiffScopeParams | undefined,
-    flip: boolean,
-    everything: boolean,
-  ) {
-    if (!path) return;
-    draft = path;
-    loading = true;
-    waitStarted = startedNow();
-    error = null;
-    try {
-      result = await api.diff(path, sel, flip, everything);
-    } catch (e) {
-      result = null;
-      error = e instanceof Error ? e.message : String(e);
-    } finally {
-      loading = false;
-    }
-  }
-
-  function submit() {
-    const p = draft.trim();
-    // Navigating rather than loading directly keeps the URL the source of truth, so the
-    // comparison is shareable and survives a reload.
-    if (p) navigate({ kind: 'diff', against: p, scope, swapped, full, closed });
-  }
-
-  /** Apply a scope by navigating: the URL is the source of truth, so the reactive load above picks it
-   * up and the narrowed report is a link. */
-  function applyScope(s: DiffScopeParams) {
-    navigate({ kind: 'diff', against, scope: s, swapped, full, closed });
-  }
-
-  /** Read the same pair the other way round. Through the URL, so it lands in the history and a
-   * swapped report can be sent to someone. */
-  function swap() {
-    navigate({ kind: 'diff', against, scope, swapped: !swapped, full, closed });
-  }
-
-  /** The same comparison, in the view that can be navigated — with everything that makes it *this*
-   * comparison: both sides, the direction, the scope and the family fold. */
-  function browse() {
-    navigate({ kind: 'compare', against, right: '', scope, full, swapped });
-  }
+  // `full` is a dependency because the *command* the server offers depends on it; `closed` is not,
+  // since folding is a display choice this component makes on data it already has.
+  //
+  // The result lives in a store (`stores/report`) rather than here: it is one of three readings of a
+  // comparison now, and the Data view sizes its run from the totals this response carries.
+  $: void loadReport($comparison?.id ?? null, scope, swapped, full);
+  $: result = $diffReport;
+  $: error = $reportError;
+  $: waitStarted = $reportWait;
+  $: loading = $reportWait !== null;
 
   /** Collapse families, or show every tensor. Through the URL, like the fold state. */
   function setFull(everything: boolean) {
-    navigate({ kind: 'diff', against, scope, swapped, full: everything, closed });
+    onNavigate({ full: everything });
   }
 
   /**
@@ -290,20 +252,6 @@
   }
 
   $: report = result?.report ?? null;
-  /**
-   * The name of this checkpoint, for the side that is not the baseline.
-   *
-   * The *spec* — what was opened — not `root`, which for a single-file checkpoint is the directory
-   * holding it: the header read `new  tests/fixtures` against `old  tests/fixtures/diff_new.safetensors`,
-   * naming a directory as one side of a comparison of two files. The server's own answer, so the two
-   * lines are the two things being compared.
-   */
-  $: thisOne = $tree?.spec ?? ($$props.root as string | undefined) ?? 'this checkpoint';
-  // Which spec sits on which side, from the *server's* answer rather than from the prop: while a
-  // swapped report is loading, the old one is still on screen, and labels that flipped early would
-  // caption it wrongly.
-  $: oldSide = result?.swapped ? thisOne : (result?.against ?? '');
-  $: newSide = result?.swapped ? (result?.against ?? '') : thisOne;
   /**
    * The matching-checkpoints banner, from the same function the side-by-side view uses.
    *
@@ -334,20 +282,114 @@
    * The first `SECTION_CAP` rows of a section, unless the reader asked for all of them.
    *
    * `all` is passed in for the same reason `keep` takes its needle: a template expression is re-run when
-   * an identifier *in it* changes, and `showAll` read from inside the body was not one — so clicking
-   * "show the remaining" updated the state and redrew nothing.
+   * an identifier *in it* changes, and `showAll` read from inside the body was not one — so pressing
+   * the tail's button updated the state and redrew nothing.
    *
-   * `items` is the already-filtered list, so both the cap and the withheld count are relative to what
-   * the filter matched rather than to the whole section.
+   * `items` is the already-filtered list, so both the cap and the count below are relative to what the
+   * filter matched rather than to the whole section.
    */
   function capped<T>(items: T[], key: string, all: Record<string, boolean>): T[] {
     return all[key] ? items : items.slice(0, SECTION_CAP);
   }
 
-  /** How many rows this section is holding back, out of those the filter matched. */
-  function withheld(items: unknown[], key: string, all: Record<string, boolean>): number {
-    return all[key] ? 0 : Math.max(0, items.length - SECTION_CAP);
+  /**
+   * How many **rows** a section is holding back.
+   *
+   * A count of rows, not of tensors. Folded, a section draws one row per family and this counted the
+   * tensors behind them — five rows on screen under "show the remaining 79,532", and pressing it added
+   * nothing, because there were no more rows to add. What is offered has to be what arrives.
+   */
+  function withheldRows(rows: number, key: string, all: Record<string, boolean>): number {
+    return all[key] ? 0 : Math.max(0, rows - SECTION_CAP);
   }
+  /** Per section, of the list it actually draws: families when folded, tensors under `--full`. */
+  $: moreAdded = withheldRows(full ? added.length : groupedAdded.length, 'tensors_added', showAll);
+  $: moreRemoved = withheldRows(
+    full ? removed.length : groupedRemoved.length,
+    'tensors_removed',
+    showAll,
+  );
+  $: moreChangedFolded = withheldRows(groupedChanged.length, 'tensors_changed', showAll);
+  $: moreChangedFull = withheldRows(changed.length, 'tensors_changed', showAll);
+  /** Show every row of a section — the tail's own button. */
+  function revealAll(key: SectionKey) {
+    showAll = { ...showAll, [key]: true };
+  }
+
+  /**
+   * The rows `n`/`N` step through: every difference **drawn**, in the order it is drawn.
+   *
+   * Drawn, not merely present: a folded section shows one row per family and a closed one shows none,
+   * and a cursor that moved to a row nobody can see would scroll the page to nothing. So the list
+   * follows the screen — the fold, the filter, the cap and the folds of the sections themselves.
+   *
+   * The footer has advertised `n/N next/prev difference` on this screen from the start and only the
+   * aligned tree obeyed it, which is the report this closes: on the summary the keys did nothing.
+   */
+  // A flat row is identified by its tensor name (unique in a checkpoint); a *grouped* row by its
+  // position, because two of them can share a display name — see the each-block below.
+  $: cursorRows = [
+    ...(openSections.tensors_added
+      ? full
+        ? capped(added, 'tensors_added', showAll).map(([n]) => `tensors_added:${n}`)
+        : capped(groupedAdded, 'tensors_added', showAll).map((_, i) => `tensors_added:${i}`)
+      : []),
+    ...(openSections.tensors_removed
+      ? full
+        ? capped(removed, 'tensors_removed', showAll).map(([n]) => `tensors_removed:${n}`)
+        : capped(groupedRemoved, 'tensors_removed', showAll).map((_, i) => `tensors_removed:${i}`)
+      : []),
+    ...(openSections.tensors_changed
+      ? full
+        ? byChangeKind(changed)
+            .flatMap((g) => shownByKind.get(g.kind) ?? [])
+            .map((c) => `tensors_changed:${c.name}`)
+        : capped(groupedChanged, 'tensors_changed', showAll).map((_, i) => `tensors_changed:${i}`)
+      : []),
+  ];
+  /** Which of them the cursor is on; `''` for none yet. Kept as the row's own id rather than an index,
+   * so folding a section or narrowing the filter moves the cursor with the row instead of onto a
+   * different one. */
+  let cursorRow = '';
+  /** Step to the next difference (`+1`) or the previous one (`-1`), wrapping at the ends. */
+  function step(delta: 1 | -1) {
+    if (cursorRows.length === 0) return;
+    const at = cursorRows.indexOf(cursorRow);
+    // From nowhere, `n` starts at the first row and `N` at the last — what the terminal does.
+    const next =
+      at < 0
+        ? delta === 1
+          ? 0
+          : cursorRows.length - 1
+        : (at + delta + cursorRows.length) % cursorRows.length;
+    cursorRow = cursorRows[next] ?? '';
+    // Centred rather than merely "into view": a row that lands under the sticky controls is a row you
+    // have to scroll to anyway.
+    document
+      .querySelector(`[data-row="${CSS.escape(cursorRow)}"]`)
+      ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
+  /**
+   * `n`/`N` step between differences, and `k` folds the families.
+   *
+   * On this view as well as on the aligned tree, because both are readings of one comparison and the
+   * footer promises the keys for the screen rather than for one of its tabs. `s` (swap) belongs to the
+   * page, which owns the pair; `k` is *also* the page's state, but it is handled here and there for the
+   * same reason `n`/`N` are — the view that has rows is the one that knows what the keys mean.
+   */
+  function onKeydown(e: KeyboardEvent) {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (isEditable(e.target)) return;
+    if (e.key === 'n') {
+      e.preventDefault();
+      step(1);
+    } else if (e.key === 'N') {
+      e.preventDefault();
+      step(-1);
+    }
+  }
+
 
   /**
    * Open a tensor's detail view from a report row.
@@ -361,36 +403,13 @@
     openDetail(name);
   }
 
-  /** What this box accepts — the same sentence the side-by-side view shows, including the `:PATH`
-   * shorthand and which host it resolves to. */
-  $: help = specHelp($proxied, $proxyHost ?? '');
 </script>
 
+<svelte:window on:keydown={onKeydown} />
+
 <div class="diff">
-  <form
-    class="pick"
-    on:submit|preventDefault={submit}
-  >
-    <label for="diff-against">Compare against</label>
-    <TextField
-      id="diff-against"
-      bind:value={draft}
-      placeholder="baseline — {help}"
-      title={help}
-      spellcheck="false"
-    />
-    <button type="submit" disabled={!draft.trim() || draft.trim() === against}>Compare</button>
-  </form>
-
-  {#if against}
-    <ScopeBar
-      scope={scope ?? emptyScope()}
-      onApply={applyScope}
-      matched={result?.matched ?? null}
-      busy={loading}
-    />
-  {/if}
-
+  <!-- No pair box and no scope bar here: they belong to the *comparison*, and `ComparePage` owns
+       them. This is one reading of it — the categorised summary. -->
   {#if result && report}
     <div class="controls">
       <!-- *Find in results*, not "filter": the scope bar above decides what the server compared, and
@@ -414,62 +433,46 @@
            and it is in the URL, so a link shows what the sender was looking at. -->
       <FamilyToggle {full} onChange={setFull} />
       <span class="dim rowcount">
-        {full ? 'every tensor' : `${familyRows.toLocaleString()} rows for ${flatRows.toLocaleString()} tensors`}
+        · {full ? 'every tensor' : `${familyRows.toLocaleString()} rows for ${flatRows.toLocaleString()} tensors`}
       </span>
     </div>
   {/if}
 
-  {#if loading}
-    <!-- Not `reading {against}`: that puts an unbounded filesystem path into a label sized
-         for a phrase, so a 48-char path wrapped to three lines and stranded the timer alone
-         on the first. Nothing is lost — the path is on screen twice already, in the
-         breadcrumb and the box directly above — and "baseline" is what the TUI's legend
-         calls this side of a diff. -->
-    <LoadingBar label="reading the baseline" progress={waitStarted} />
+  <!-- **Nothing is read here.** Both checkpoints are already in the comparison the server holds; this
+       is the server re-deriving the report from them, which is milliseconds. It used to say "reading
+       the baseline" and replace the whole report with a progress bar — so turning the pair round, or
+       narrowing it, looked like starting over on something that had just been read.
+       A first report has nothing to show yet and gets the bar; a report already on screen stays, with
+       a word to say a newer one is coming. -->
+  {#if loading && !result}
+    <LoadingBar label="building the report" progress={waitStarted} />
   {:else if error}
     <p class="error" role="alert">{error}</p>
   {:else if result && report}
-    <header>
-      <!-- Which checkpoint is on which side comes from the server's `swapped`, not from this
-           component's copy of the parameter: the report below was built one way round, and the labels
-           have to name that one. -->
-      <!-- The addresses in full: they run the width of the pane, and what a cut removes is the end —
-           `…/Kimi-K2.6-3bit` — which is the part that says which checkpoint it is. `.path` wraps. -->
-      <!-- `:/path` rather than `host:/path` when the host is this server's own proxy — the same fifty
-           characters on every line otherwise. The full form is the tooltip. -->
-      <!-- The pair as one block, with the control in a column of its own.
-           The button used to sit *after* the newer side's path, inside a `word-break: break-all` span —
-           so where it landed depended on how long that path was. With a remote address it ended up
-           mid-line in the middle of a wall of monospace, and was reported as missing. A grid column
-           puts it in the same place every time, whatever the two addresses are. -->
-      <div class="pair">
-        <span class="side old">old</span><span class="path" title={oldSide}
-          >{shortSpec(oldSide, $proxyHost ?? '')}</span>
-        <span class="side new">new</span><span class="path" title={newSide}
-          >{shortSpec(newSide, $proxyHost ?? '')}</span>
-        <span class="swapslot">
-          <SwapButton
-            onSwap={swap}
-            title="Swap the two sides — the same pair, compared the other way (the terminal's `s`)"
-          />
-        </span>
-      </div>
+    <header class:updating={loading}>
+      {#if loading}
+        <p class="updating-note dim" role="status">updating…</p>
+      {/if}
+      <!-- No `old …` / `new …` block and no swap button here.
+           Both were a second copy of what the page already shows: the two address boxes are the pair,
+           in the order it is being read, with the one swap control between them. Repeating the
+           addresses under them cost four lines of the report to say what was two inches above it, and
+           the second swap button meant two ways to flip one thing. What is *not* duplicated — which
+           side the server actually read as old — is still enforced here: the labels come from the
+           server's `swapped`, and the boxes above are drawn from the same bit. -->
       {#if identical}
         <div class="identical" role="status">
           <strong>{identical.headline}</strong>
           <span class="what">{identical.detail}</span>
         </div>
-      {:else}
-        <p class="verdict">{result.verdict}</p>
       {/if}
-      <!-- This page is a summary; the side-by-side view is where a comparison is navigable — folding,
-           lockstep, `n`/`N` stepping. Linking to it beats reproducing all of that here.
-           **Carrying the whole comparison**, not just the baseline: the scope, the direction and the
-           family fold are what make this *these two*, and arriving at the other view with a different
-           selection reads as the link having changed the comparison. -->
-      <p class="alt">
-        <button type="button" class="link" on:click={browse}>
-          Browse these two side by side →
+      <!-- What this report is, before its numbers: names, dtypes and shapes — not values. It used to
+           be the first line of the footer, below every section, which is the one place a reader who
+           has taken the counts at face value will never look. -->
+      <p class="scope-note">
+        Structure only — names, dtypes and shapes.
+        <button type="button" class="link" on:click={() => onNavigate({ view: 'data' })}>
+          Compare the numbers →
         </button>
       </p>
       <!-- The two overall totals, worded as the terminal words them — including the delta and its
@@ -486,13 +489,27 @@
       <!-- When each side has one (an s3-vs-s3 pair), which is newer. The server's line, humanised
            by the rule the terminal uses rather than by a second one here. -->
       {#if result.modified_line}<p class="delta dim mono">{result.modified_line}</p>{/if}
-      {#if result.s3_note}<p class="delta dim">{result.s3_note}</p>{/if}
     </header>
 
     <!-- A strip of counts, each a link to its section: the shape of the comparison in one line, and a
          way into the part you care about. On a 31,247-row report the alternative is scrolling to find
          out whether anything was removed. -->
-    <nav class="tally" aria-label="Sections">
+    <!-- The verdict used to be a line of prose above this: `0 unchanged; 79,732 added, 558 removed,
+         375 changed`, immediately followed by chips saying the same four numbers. The strip is the
+         better of the two — each count is a way *into* its section — so it carries `unchanged` too
+         now, and the terminal's sentence stays as the strip's tooltip. -->
+    <nav class="tally" aria-label="Sections" title={result.verdict}>
+      <!-- Not a button: there is no "unchanged" section to go to. It is here because a comparison
+           with 79,732 changes and 0 unchanged tensors is a different thing from one with 80,000
+           unchanged, and the chips are where that is read. -->
+      <DiffChip
+        tone="same"
+        label="Unchanged"
+        order="label-first"
+        count={report.tensors_unchanged.toLocaleString()}
+        empty={report.tensors_unchanged === 0}
+        title={tallyTitle('unchanged', report.tensors_unchanged)}
+      />
       {#each SECTIONS as sec (sec.key)}
         {@const n = sectionCount(sec.key, report, { added, removed, changed, metaShown })}
         <DiffChip
@@ -501,7 +518,7 @@
           order="label-first"
           count={n.toLocaleString()}
           empty={n === 0}
-          title={n === 0 ? `${sec.title}: none` : `Show ${sec.title.toLowerCase()}`}
+          title={tallyTitle(sec.means, n, true)}
           onPick={() => reveal(sec.key)}
         />
       {/each}
@@ -509,6 +526,7 @@
 
     <Section
       title="Tensors added"
+      titleHint={TALLY_MEANS.added}
       count={countLabel(added.length, report.tensors_added.length)}
       tone="added"
       open={openSections.tensors_added}
@@ -517,24 +535,39 @@
       {#if !added.length}<p class="none dim">none</p>{/if}
       {#if full}
         {#each capped(added, 'tensors_added', showAll) as [name, s] (name)}
-          <DiffRow mark="+" {name} neu={s} onOpen={open} />
+          <DiffRow
+            mark="+"
+            {name}
+            neu={s}
+            onOpen={open}
+            rowId="tensors_added:{name}"
+            cursor={cursorRow === `tensors_added:${name}`}
+          />
         {/each}
       {:else}
         <!-- A family row stands for many tensors, so it opens none of them: `Collapse families` off is
              the way to a single tensor's detail. -->
-        {#each capped(groupedAdded, 'tensors_added', showAll) as g (g.name)}
-          <DiffRow mark="+" name={g.name} neu={g.sig} count={g.count} />
+        {#each capped(groupedAdded, 'tensors_added', showAll) as g, i (i)}
+          <DiffRow
+            mark="+"
+            name={g.name}
+            neu={g.sig}
+            count={g.count}
+            rowId="tensors_added:{i}"
+            cursor={cursorRow === `tensors_added:${i}`}
+          />
         {/each}
       {/if}
-      {#if withheld(added, 'tensors_added', showAll)}
-        <button type="button" class="more" on:click={() => (showAll = { ...showAll, tensors_added: true })}>
-          show the remaining {withheld(added, 'tensors_added', showAll).toLocaleString()}
-        </button>
-      {/if}
+      <MoreRows
+        n={moreAdded}
+        onShowAll={() => revealAll('tensors_added')}
+        onBrowse={moreAdded > BROWSE_AT ? () => onNavigate({ view: 'browse' }) : null}
+      />
     </Section>
 
     <Section
       title="Tensors removed"
+      titleHint={TALLY_MEANS.removed}
       count={countLabel(removed.length, report.tensors_removed.length)}
       tone="removed"
       open={openSections.tensors_removed}
@@ -548,28 +581,33 @@
             {name}
             old={s}
             why="only in the baseline, so there is nothing here to open"
+            rowId="tensors_removed:{name}"
+            cursor={cursorRow === `tensors_removed:${name}`}
           />
         {/each}
       {:else}
-        {#each capped(groupedRemoved, 'tensors_removed', showAll) as g (g.name)}
+        {#each capped(groupedRemoved, 'tensors_removed', showAll) as g, i (i)}
           <DiffRow
             mark="-"
             name={g.name}
             old={g.sig}
             count={g.count}
             why="only in the baseline, so there is nothing here to open"
+            rowId="tensors_removed:{i}"
+            cursor={cursorRow === `tensors_removed:${i}`}
           />
         {/each}
       {/if}
-      {#if withheld(removed, 'tensors_removed', showAll)}
-        <button type="button" class="more" on:click={() => (showAll = { ...showAll, tensors_removed: true })}>
-          show the remaining {withheld(removed, 'tensors_removed', showAll).toLocaleString()}
-        </button>
-      {/if}
+      <MoreRows
+        n={moreRemoved}
+        onShowAll={() => revealAll('tensors_removed')}
+        onBrowse={moreRemoved > BROWSE_AT ? () => onNavigate({ view: 'browse' }) : null}
+      />
     </Section>
 
     <Section
       title="Tensors changed"
+      titleHint={TALLY_MEANS.changed}
       count={countLabel(changed.length, report.tensors_changed.length)}
       tone="changed"
       open={openSections.tensors_changed}
@@ -582,7 +620,12 @@
       {#if !full}
         <!-- Grouped: one row per family, already sorted by the server. Kinds are not sub-headed here —
              a family row *is* the summary, and 18 of them need no further grouping. -->
-        {#each capped(groupedChanged, 'tensors_changed', showAll) as g (g.name)}
+        <!-- Keyed by position, not by name: two grouped rows can carry the *same* display name when one
+             name template holds two signatures — `model.layers.{0-1}.experts.{0-1}.w  F32 → F16` beside
+             `… F32 → BF16`, which is what a re-quantization that split a family looks like. A keyed
+             `{#each}` on a value the server does not promise to be unique is a broken update waiting
+             to happen. -->
+        {#each capped(groupedChanged, 'tensors_changed', showAll) as g, i (i)}
           <DiffRow
             mark="~"
             name={g.name}
@@ -590,13 +633,15 @@
             neu={g.new}
             count={g.count}
             fold={g.fold ? `×${g.fold[0].toLocaleString()} → ×${g.fold[1].toLocaleString()}` : ''}
+            rowId="tensors_changed:{i}"
+            cursor={cursorRow === `tensors_changed:${i}`}
           />
         {/each}
-        {#if withheld(groupedChanged, 'tensors_changed', showAll)}
-          <button type="button" class="more" on:click={() => (showAll = { ...showAll, tensors_changed: true })}>
-            show the remaining {withheld(groupedChanged, 'tensors_changed', showAll).toLocaleString()}
-          </button>
-        {/if}
+        <MoreRows
+          n={moreChangedFolded}
+          onShowAll={() => revealAll('tensors_changed')}
+          onBrowse={moreChangedFolded > BROWSE_AT ? () => onNavigate({ view: 'browse' }) : null}
+        />
       {/if}
       {#each full ? byChangeKind(changed) : [] as group (group.kind)}
         {@const rows = shownByKind.get(group.kind) ?? []}
@@ -617,25 +662,28 @@
               neu={c.new}
               fold={foldNote(c.name, result.folded)}
               onOpen={open}
+              rowId="tensors_changed:{c.name}"
+              cursor={cursorRow === `tensors_changed:${c.name}`}
             />
           {/each}
         {/if}
       {/each}
-      {#if withheld(changed, 'tensors_changed', showAll)}
-        <button type="button" class="more" on:click={() => (showAll = { ...showAll, tensors_changed: true })}>
-          show the remaining {withheld(changed, 'tensors_changed', showAll).toLocaleString()}
-        </button>
+      <!-- Inside `{#if full}`, like the rows it belongs to. Rendered unconditionally, a *folded* section
+           drew this one as well as its own — two buttons, the second counting the 1,000 tensors behind
+           the 500 rows on screen. Clicking it revealed nothing (the rows it was counting are not the
+           rows being drawn) and the button vanished, which is how it was reported. -->
+      {#if full}
+        <MoreRows
+          n={moreChangedFull}
+          onShowAll={() => revealAll('tensors_changed')}
+          onBrowse={moreChangedFull > BROWSE_AT ? () => onNavigate({ view: 'browse' }) : null}
+        />
       {/if}
     </Section>
 
-    <!-- Its own heading rather than loose beneath the changed list, where it read as a stray footnote to
-         that section instead of a count of its own. Nothing to fold: the count *is* the section. -->
-    <p class="unchanged dim">
-      Tensors unchanged <b>{report.tensors_unchanged.toLocaleString()}</b>
-    </p>
-
     <Section
       title="Metadata"
+      titleHint={TALLY_MEANS.metadata}
       count={result.metadata_note ? '' : countLabel(metaShown, metaTotal)}
       note={result.metadata_note ? `not compared (${result.metadata_note})` : ''}
       tone="meta"
@@ -683,18 +731,24 @@
         {/if}
       </Section>
     {:else if result.s3_note}
-      <p class="none dim">{result.s3_note}</p>
+      <!-- A note about *how the comparison was made*, not a result of it. Among the counts it read as
+           a finding — and it was there twice, once here and once above the totals. -->
+      <p class="method">{result.s3_note}</p>
     {/if}
 
     <footer>
-      <p class="dim">
-        Structure only. To compare the numbers, run this in a terminal with
-        <code>--values</code>:
-      </p>
-      <div class="cmd">
-        <code>{result.command}</code>
-        <button on:click={copyCommand}>{copied ? '✓ copied' : 'copy'}</button>
-      </div>
+      <!-- This is structure: names, dtypes and shapes. Comparing the *numbers* is the Data view —
+           which used to say "run this in a terminal", while the other screen ran it in the browser.
+           Both sentences were about the same pair and one of them was false. -->
+      <!-- Only the command is left down here. What this report *is* — a structural comparison, with
+           the numbers a tab away — belongs above the numbers it qualifies, not under 31,247 rows. -->
+      {#if result.command}
+        <p class="dim">The same comparison in a terminal:</p>
+        <div class="cmd">
+          <code>{result.command}</code>
+          <button on:click={copyCommand}>{copied ? '✓ copied' : 'copy'}</button>
+        </div>
+      {/if}
     </footer>
   {/if}
 </div>
@@ -703,17 +757,6 @@
   .diff {
     padding: 10px 14px;
     overflow: auto;
-  }
-  /* The boxes are `TextField`, which owns their look — see that component. */
-  .pick {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 12px;
-  }
-  .pick label {
-    font-size: 12px;
-    color: var(--fg-dim);
   }
   .controls {
     display: flex;
@@ -735,35 +778,32 @@
   header {
     margin-bottom: 14px;
   }
-  /* Label, address, control — three columns, so the button's place does not depend on the length of a
-     path. The addresses still wrap (`.path`), and the button stays beside them either way. */
-  /* The control's place in the header grid; what it *is* lives in `SwapButton`. */
-  .swapslot {
-    grid-column: 3;
-    grid-row: 1 / span 2;
-    align-self: center;
-    justify-self: start;
-    margin-left: 12px;
+  /* A report being replaced stays readable — it is the same comparison, one turn behind. */
+  header.updating {
+    opacity: 0.7;
   }
-  .pair {
-    display: grid;
-    /* The address column takes what it needs and no more (`max-content`, capped by the room there is),
-       so the control sits beside the pair rather than out at the window's edge. */
-    grid-template-columns: 2.2em minmax(0, max-content) auto;
-    align-items: baseline;
-    column-gap: 8px;
-    row-gap: 2px;
-    font-size: 12.5px;
+  .updating-note {
+    margin: 0 0 4px;
+    font-size: 11px;
   }
-  .side {
-    font-weight: 600;
+  /* What the report covers, stated before its numbers. Quiet, but not dim-to-invisible: it is the
+     difference between "these two are the same" and "the same in every way this looked at". */
+  .scope-note {
+    margin: 0 0 8px;
+    padding: 5px 9px;
+    border-radius: 4px;
+    background: var(--bg-elev);
+    color: var(--fg-dim);
+    font-size: 12px;
   }
-  .path {
-    word-break: break-all;
-  }
-  .verdict {
-    margin: 6px 0 0;
-    font-weight: 600;
+  /* A note about method, set apart from the findings by having a shape of its own. */
+  .method {
+    margin: 8px 0 0;
+    padding: 5px 9px;
+    border-radius: 4px;
+    background: var(--bg-elev);
+    color: var(--fg-dim);
+    font-size: 12px;
   }
   /* Background fill, no border — matching the side-by-side view's banner and the command palette. */
   .identical {
@@ -813,12 +853,6 @@
     text-decoration: underline;
     cursor: pointer;
   }
-  .alt {
-    margin: 4px 0 0;
-  }
-  .alt .link {
-    padding-left: 0;
-  }
   .none {
     margin: 2px 0 2px 8px;
     font-size: 12px;
@@ -859,15 +893,6 @@
     font-variant-numeric: tabular-nums;
     text-transform: none;
     letter-spacing: 0;
-  }
-  /* The unchanged count is a fact, not a section: no caret, nothing to open. */
-  .unchanged {
-    margin: 0 0 12px;
-    font-size: 12.5px;
-  }
-  .unchanged b {
-    color: var(--fg);
-    font-variant-numeric: tabular-nums;
   }
   .row {
     display: flex;

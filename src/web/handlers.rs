@@ -763,52 +763,78 @@ pub(crate) fn check(s: &WebState) -> Reply {
         .map_or_else(|| ok(Value::Null), |report| ok(report.to_json(false)))
 }
 
-/// Structural diff against another checkpoint: `?against=PATH`, where PATH is a file,
-/// directory of shards, or glob on the server's filesystem. The checkpoint being served
-/// is the **new** side and `against` the baseline — see [`crate::compare`].
+/// The structural report for a comparison the server holds: `?id=N`, from `POST /api/compare`.
 ///
-/// Reads shard headers only, so this is fast even for multi-GB checkpoints. Value
-/// comparison (`diff --values`) is deliberately not here: a scan that takes minutes needs
-/// progress and cancellation, which is the CLI's job.
+/// Both checkpoints were read when the pair was set up, so this route reads nothing — it categorises
+/// what is already in the slot, under whatever selection the query carries. Value comparison
+/// (`diff --values`) is deliberately not here: a scan that takes minutes needs progress and
+/// cancellation, which the jobs API and the CLI provide.
 ///
-/// The result is **not** cached. Every other cacheable endpoint is keyed by something
-/// fixed at startup; this one is keyed by a path from the request, so a cache would grow
-/// without bound under a client that asks about many paths. Re-reading headers is cheap.
-pub(crate) fn diff(s: &WebState, q: &Query, opts: &crate::opening::Options) -> Reply {
-    let Some(against) = q
-        .get("against")
-        .map(String::as_str)
-        .filter(|p| !p.is_empty())
-    else {
-        return err(
-            400,
-            "diff needs ?against=SPEC (a checkpoint to compare with)",
-        );
-    };
-    // Resolved through `opening`, so this route accepts exactly what `/api/compare` accepts. It used
-    // to take a bare filesystem path, which made the two diff features disagree about what a
-    // checkpoint address even is.
+/// The result is **not** cached: it is keyed by the scope, the direction and the fold, which come
+/// from the request, so a cache would grow without bound under a client that varies them. Deriving
+/// it from two checkpoints already in memory is cheap.
+pub(crate) fn diff(current: &super::Current, q: &Query) -> Reply {
+    // **The same pair the other views read.**
+    //
+    // This used to resolve and read its own baseline (`?against=SPEC`) and compare it against
+    // whatever checkpoint the server had open. Two things were wrong with that once the report became
+    // one view of a comparison rather than a screen of its own: naming a candidate that is not the
+    // open checkpoint gave a report about a *different pair* than the tree beside it, and switching
+    // between the two views re-read both checkpoints — seconds each, over an ssh proxy.
+    //
+    // The comparison slot already holds both sides, read once. Everything below works from it, and
+    // this route reads nothing.
     let scope = match super::diffscope::DiffScope::from_query(q) {
         Ok(scope) => scope,
         // A bad glob or rename rule is a client mistake worth naming: the alternative is an empty diff
         // that looks like "nothing matched".
         Err(e) => return err(400, format!("{e:#}")),
     };
-    // Read before the baseline is: a mistyped switch is answered in milliseconds, rather than after a
-    // checkpoint has been fetched over an ssh proxy only to be described the wrong way round.
     let swapped = match switch(q, "swap") {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let baseline = match crate::compare::summarize_baseline(against, opts) {
-        Ok(sum) => sum,
-        // A spec that doesn't resolve to a checkpoint is a client mistake, not a server fault: the
-        // message is what the UI shows next to the input.
-        Err(e) => return err(400, format!("{e:#}")),
+    let Some(id) = q.get("id").and_then(|v| v.parse::<u64>().ok()) else {
+        return err(
+            400,
+            "diff needs ?id=N, the id returned by POST /api/compare —              without it this could answer about a comparison you did not ask for",
+        );
     };
-    let metadata = s.checkpoint.metadata_vec();
-    let mut served = crate::diff::CheckpointSummary::from_loaded(&s.tensors, &metadata);
-    let mut baseline = baseline;
+    let (base, candidate) = match current.comparison_for(id) {
+        ComparisonLookup::None => {
+            return err(
+                409,
+                "no comparison set up — POST /api/compare?left=SPEC first",
+            );
+        }
+        ComparisonLookup::Replaced { current: now } => {
+            return err(
+                409,
+                format!(
+                    "comparison {id} was replaced by another request (now {now}) —                      POST /api/compare again to set up yours"
+                ),
+            );
+        }
+        ComparisonLookup::Found { base, right } => (base, right),
+    };
+    let against = base.spec.as_str();
+    // What each side is called on a command line, for the invocation offered at the bottom of the
+    // report. Empty when a side cannot be named in one word, which `cli_diff_command` turns into no
+    // command rather than a wrong one.
+    let baseline_operand = crate::compare::side_operand(against, &base.files).unwrap_or_default();
+    let candidate_operand =
+        crate::compare::side_operand(&candidate.spec, &candidate.files).unwrap_or_default();
+    let mut baseline = crate::compare::Baseline {
+        summary: crate::diff::CheckpointSummary::from_loaded(
+            &base.tensors,
+            &base.checkpoint.metadata_vec(),
+        ),
+        s3: base.checkpoint.s3.clone(),
+    };
+    let mut served = crate::diff::CheckpointSummary::from_loaded(
+        &candidate.tensors,
+        &candidate.checkpoint.metadata_vec(),
+    );
     // `#subtree`, per side and before anything else: it re-keys a side's tensors to their sub-path, so
     // two checkpoints under different namespaces line up. A prefix that selects nothing is a typo, and
     // the message says which side it was on rather than showing an empty report.
@@ -832,12 +858,12 @@ pub(crate) fn diff(s: &WebState, q: &Query, opts: &crate::opening::Options) -> R
             baseline.summary,
             served,
             baseline.s3.as_ref(),
-            s.checkpoint.s3.as_ref(),
+            candidate.checkpoint.s3.as_ref(),
         ),
         crate::compare::Sides::OpenFirst => (
             served,
             baseline.summary,
-            s.checkpoint.s3.as_ref(),
+            candidate.checkpoint.s3.as_ref(),
             baseline.s3.as_ref(),
         ),
     };
@@ -860,6 +886,11 @@ pub(crate) fn diff(s: &WebState, q: &Query, opts: &crate::opening::Options) -> R
         .map(|s3| s3.summary_lines(true, scope.is_filtered()));
     ok(json!({
         "against": against,
+        // The other side, as the server resolved it — *not* whatever this server has open. Naming the
+        // served checkpoint there was how a report of `hf ↔ candidate` came to head itself
+        // `new /tmp/mapfix/new.safetensors`: the label was reading a different variable than the
+        // comparison was.
+        "candidate": candidate.spec,
         // Which way round this report reads, so the view labels its two sides from the server's answer
         // rather than from its own copy of the parameter.
         "swapped": sides == crate::compare::Sides::OpenFirst,
@@ -896,9 +927,10 @@ pub(crate) fn diff(s: &WebState, q: &Query, opts: &crate::opening::Options) -> R
         // extended with --values) in a terminal. `null` when the served files span
         // directories, since then no single path names this side of the comparison.
         // Carries the scope, so the command compares what is on screen rather than everything.
+        // Each side named the way a command line can name it — see `compare::side_operand`.
         "command": crate::compare::cli_diff_command(
-            std::path::Path::new(against),
-            &s.files,
+            &baseline_operand,
+            &candidate_operand,
             // `--full` when the reader has expanded the families, so the command reproduces the screen
             // rather than the default the screen is not showing.
             &{
