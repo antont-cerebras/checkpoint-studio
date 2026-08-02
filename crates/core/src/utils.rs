@@ -323,3 +323,58 @@ mod tests {
         }
     }
 }
+
+/// A count with thousands separators: `31247` → `31,247`.
+///
+/// Distinct from [`format_parameters`], which *abbreviates* (`31.2K`) because a parameter count is a
+/// magnitude. A count of tensors is an exact quantity that gets compared against a list you can
+/// scroll, so it is shown in full — and shown the same way everywhere, which is the point: one view
+/// printed `31,247 added` while the verdict line above it read `31247 added`, in the same screen.
+/// Truncate `s` to at most `width` characters, keeping the **end** — the informative half of a path
+/// or a tensor name — and prefixing `…` when anything was dropped.
+///
+/// The result never exceeds `width`, including the ellipsis: at `width == 1` that leaves room for the
+/// `…` and nothing else, and at `0` for nothing at all. There were two copies of this, one of which
+/// answered `…` for a width of zero — a character in a column that does not exist, which in a
+/// terminal is a wrapped line rather than a truncated one.
+#[must_use]
+pub fn truncate_keep_end(s: &str, width: usize) -> String {
+    let count = s.chars().count();
+    if count <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let tail: String = s.chars().skip(count - (width - 1)).collect();
+    format!("…{tail}")
+}
+
+#[must_use]
+pub fn format_count(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod count_tests {
+    use super::format_count;
+
+    #[test]
+    fn groups_digits_in_threes_from_the_right() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(7), "7");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1,000");
+        assert_eq!(format_count(31_247), "31,247");
+        assert_eq!(format_count(116_510), "116,510");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+    }
+}

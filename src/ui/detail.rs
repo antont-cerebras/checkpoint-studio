@@ -18,7 +18,7 @@ use super::data::render_histogram;
 use super::hints::{ChipHit, Seg, chip_regions, close_button, hint_key, wrap_hint_items};
 use super::json::highlight_json_lines;
 use super::palette;
-use super::text::{fmt_duration, fmt_value, view_dtype_spans, view_shape_spans, with_thousands};
+use super::text::{fmt_duration, fmt_value, format_count, view_dtype_spans, view_shape_spans};
 use super::theme::{COMPRESSED_MARK, UNCOMPRESSED_TAG, UNINDEXED_MARK, dim_span, key_span};
 use super::{ChipRegions, Link, LinkRegions, Overlay, ScanProgress, StatsView, UI};
 
@@ -389,7 +389,7 @@ fn detail_field_lines(
     lines.push(Line::from(vec![
         dim_span("Parameters: "),
         Span::raw(format!("{} ", format_parameters(num_elements))),
-        dim_span(format!("({})", with_thousands(num_elements))),
+        dim_span(format!("({})", format_count(num_elements))),
     ]));
 
     // Codebook packing schema disclosure (only for tensors that carry one).
@@ -455,8 +455,8 @@ fn detail_field_lines(
                 dim_span("Data offsets: "),
                 Span::raw(format!(
                     "{} – {}  (within file data)",
-                    with_thousands(*start as usize),
-                    with_thousands(*end as usize)
+                    format_count(*start as usize),
+                    format_count(*end as usize)
                 )),
             ]));
         }
@@ -465,7 +465,7 @@ fn detail_field_lines(
                 dim_span("Data offset: "),
                 Span::raw(format!(
                     "{}  (within tensor data)",
-                    with_thousands(*offset as usize)
+                    format_count(*offset as usize)
                 )),
             ]));
         }
@@ -475,7 +475,7 @@ fn detail_field_lines(
                 Span::raw(format!(
                     "{} × {}",
                     format_shape(chunk),
-                    with_thousands(*num_chunks)
+                    format_count(*num_chunks)
                 )),
             ]));
         }

@@ -18,8 +18,8 @@ use super::detail::{
 use super::hints::{ChipHit, data_view_footer_wrapped_lines, data_view_regions, hint_spans};
 use super::palette;
 use super::text::{
-    bar, fmt_duration, fmt_hist_edge, fmt_value, truncate_keep_end, view_dtype_spans,
-    view_shape_spans, with_thousands,
+    bar, fmt_duration, fmt_hist_edge, fmt_value, format_count, truncate_keep_end, view_dtype_spans,
+    view_shape_spans,
 };
 use super::theme::{dim_span, heat_color};
 use super::{ScanProgress, StatsView, UI};
@@ -596,12 +596,12 @@ pub(super) fn render_histogram(
     // Heading.
     let mut head = vec![
         dim_span("Histogram: "),
-        Span::raw(format!("{} values", with_thousands(hist.total as usize))),
+        Span::raw(format!("{} values", format_count(hist.total as usize))),
     ];
     if hist.nonfinite > 0 {
         head.push(dim_span(format!(
             "  ·  {} non-finite",
-            with_thousands(hist.nonfinite as usize)
+            format_count(hist.nonfinite as usize)
         )));
     }
     if let Some((spinner, elapsed, progress)) = scanning {
@@ -628,7 +628,7 @@ pub(super) fn render_histogram(
     let counts: Vec<String> = hist
         .counts
         .iter()
-        .map(|c| with_thousands(*c as usize))
+        .map(|c| format_count(*c as usize))
         .collect();
     let count_w = counts.iter().map(|s| s.chars().count()).max().unwrap_or(1);
     let max_count = hist.counts.iter().copied().max().unwrap_or(0).max(1);

@@ -99,33 +99,16 @@ pub(super) fn line_to_text(line: &Line<'static>) -> String {
         .collect()
 }
 
-/// Truncate `s` to at most `width` characters, keeping the END (so a path's
-/// file name stays visible) and prefixing `…` when truncated.
-pub(super) fn truncate_keep_end(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count <= width {
-        return s.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let tail: String = s.chars().skip(count - (width - 1)).collect();
-    format!("…{tail}")
-}
+// Keeping the end of an over-long string is `crate::utils::truncate_keep_end`, re-exported here with
+// the rest of the screens' formatting. `main.rs` had a second copy (`truncate_tail`) that differed
+// only in answering `…` for a width of zero.
+pub(super) use crate::utils::truncate_keep_end;
 
-/// Format an integer with thousands separators (e.g. 579133440 -> "579,133,440").
-pub(super) fn with_thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let len = digits.len();
-    let mut out = String::with_capacity(len + len / 3);
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
-}
+// `format_count` (thousands separators) is `crate::utils::format_count`, re-exported here so the
+// screens keep importing their formatting from one place. It used to be a second copy under a
+// different name (`with_thousands`), character for character the same, which is how one screen came
+// to print `31,247 added` above a verdict reading `31247 added`.
+pub(super) use crate::utils::format_count;
 
 /// A horizontal bar `width` cells wide filled to `frac` of `[0, 1]`. Uses the
 /// lower three-quarters block `▆` (rather than a full `█`) so its top sits below

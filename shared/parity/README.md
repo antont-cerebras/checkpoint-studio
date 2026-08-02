@@ -83,3 +83,21 @@ revisit — but each has a reason.
   few milliseconds per keystroke over 116k names. Only the order differs.
 - **Histogram bin percentages.** A TUI-only readout; the web's histogram draws bars
   without per-bin percentages.
+
+## `queryparams.json` — what the API accepts
+
+Generated from the server's own allowlist (`src/web/mod.rs::accepted_params`, the table
+`unknown_params` refuses against) and checked by `web/src/lib/queryparams.test.ts`, which drives the
+real `api.*` calls through a stubbed `fetch` and asserts every key they put on a URL is in it.
+
+    UPDATE_PARITY=1 cargo test the_accepted_parameters
+
+This replaced a hand-copied list of the client's keys held in Rust. It was missing six parameters —
+`align_fused`, `subtree`, `subtree_new`, `full`, `names_list`, `map_json` — and passed anyway, because
+a stale copy of the client agrees with itself. A client parameter the server does not accept is a
+`400` on a screen that used to work, so the check has to compare against what the client sends.
+
+The scope half is checked in both directions: a parameter the server takes and no control produces is
+called out too, unless it is on the test's short `deliberatelyUnsent` list (`names_list`, `map_json` —
+accepted for a script to post, with no UI control today). That direction is how a server-only feature
+gets noticed before it ships without a way to use it.

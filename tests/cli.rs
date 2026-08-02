@@ -1225,6 +1225,37 @@ fn diff_parallel_matches_sequential_and_reports_time() {
     );
 }
 
+/// **A filtered diff's `size:` / `params:` cover the tensors it compared.**
+///
+/// They used to be the whole checkpoints': the summary summed its sizes once at load, and a filter
+/// dropped only the signatures — so a report about two of six tensors was headed by the sizes of both
+/// files. Nothing marked them as such, so they simply read as the subset's while being something else.
+/// Now they *are* the subset's, and the label says so.
+#[test]
+fn diff_filtered_totals_cover_the_matched_subset() {
+    ensure_diff_fixtures();
+    let (whole, _) = run_diff(&[DIFF_OLD, DIFF_NEW]);
+    let (scoped, _) = run_diff(&[DIFF_OLD, DIFF_NEW, "--name", "model.norm.weight"]);
+
+    // Unfiltered: the bare label, and the checkpoints' own totals.
+    assert!(whole.contains("\nsize: 92 B → 164 B"), "{whole}");
+    assert!(whole.contains("\nparams: 40 → 56"), "{whole}");
+
+    // Filtered to one tensor — F32 [4] → F32 [8], so 16 B → 32 B and 4 → 8 params.
+    assert!(
+        scoped.contains("size (filtered subset): 16 B → 32 B (+16 B, +100.0%)"),
+        "{scoped}"
+    );
+    assert!(
+        scoped.contains("params (filtered subset): 4 → 8 (+4, +100.0%)"),
+        "{scoped}"
+    );
+    assert!(
+        !scoped.contains("92 B"),
+        "a scoped report must not carry the whole checkpoint's size:\n{scoped}"
+    );
+}
+
 #[test]
 fn diff_filter_reports_matched_schema_on_stderr() {
     ensure_group_fixtures();
@@ -1331,6 +1362,154 @@ fn diff_map_bad_regex_exits_2() {
     ensure_map_fixtures();
     let (_out, code) = run_diff(&[MAP_OLD, MAP_NEW, "--map", "([unclosed=>x"]);
     assert_eq!(code, 2, "an invalid --map regex should exit 2");
+}
+
+/// **`--align-fused` lines an unfused checkpoint up with its fused counterpart.**
+///
+/// The reported case, in miniature: two layouts of one model share no tensor name, so a plain diff
+/// reports every tensor of both sides as one-sided — 80,107 against 933 for the real pair — which is
+/// true and answers nothing. Aligned, the per-expert tensors fold onto the fused tensor that holds them
+/// and the row says how many did.
+#[test]
+fn diff_align_fused_folds_the_experts_onto_the_fused_tensor() {
+    let dir = std::env::temp_dir().join(format!("cs_fused_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let unfused = dir.join("unfused.safetensors");
+    let fused = dir.join("fused.safetensors");
+    // Two experts, Mixtral naming; and the one fused tensor with the expert dimension in front.
+    write_st(
+        unfused.to_str().unwrap(),
+        &[
+            (
+                "model.layers.0.block_sparse_moe.experts.0.w2.weight",
+                Dtype::U8,
+                vec![4, 2],
+                0,
+            ),
+            (
+                "model.layers.0.block_sparse_moe.experts.1.w2.weight",
+                Dtype::U8,
+                vec![4, 2],
+                0,
+            ),
+        ],
+        &[],
+    );
+    write_st(
+        fused.to_str().unwrap(),
+        &[(
+            "model.layers.0.block_sparse_moe.experts.down_proj.weight",
+            Dtype::U8,
+            vec![2, 4, 2],
+            0,
+        )],
+        &[],
+    );
+
+    // Unaligned: nothing lines up — one added, two removed.
+    let (plain, _) = run_diff(&[unfused.to_str().unwrap(), fused.to_str().unwrap()]);
+    assert!(plain.contains("tensors: -2 +1 ~0"), "{plain}");
+
+    // Aligned: one row, and it says two tensors fold onto one.
+    let (aligned, _) = run_diff(&[
+        unfused.to_str().unwrap(),
+        fused.to_str().unwrap(),
+        "--align-fused",
+    ]);
+    assert!(aligned.contains("tensors: -0 +0 ~1"), "{aligned}");
+    assert!(
+        aligned.contains("~ model.layers.0.block_sparse_moe.experts.down_proj.weight"),
+        "{aligned}"
+    );
+    assert!(
+        aligned.contains("(×2 → ×1)"),
+        "the row should say what folded:\n{aligned}"
+    );
+}
+
+/// **A path that carries its own host is not given a second one.**
+///
+/// `--ssh-proxy H` plus `H:/path` used to keep the host on the path and prefix `H:` again, so the read
+/// looked for `H:H:/path` — "no safetensors files found" — and that spelling was written to the recents
+/// list, where it sat as a row that could never be opened. Nothing here connects: the failure is a
+/// resolution failure, and the message names the path it tried.
+#[test]
+fn diff_accepts_a_scp_path_together_with_the_matching_proxy_flag() {
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+        .env("XDG_CONFIG_HOME", scratch_config())
+        .args([
+            "diff",
+            "--ssh-proxy",
+            "user@example.invalid",
+            "user@example.invalid:/opt/a",
+            "user@example.invalid:/opt/b",
+        ])
+        .output()
+        .expect("run diff");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("example.invalid:user@example.invalid")
+            && !err.contains("invalid:user@example"),
+        "the host was prefixed twice; stderr:\n{err}"
+    );
+
+    // And two hosts that disagree is a named conflict, not a guess.
+    let clash = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+        .env("XDG_CONFIG_HOME", scratch_config())
+        .args([
+            "diff",
+            "--ssh-proxy",
+            "user@one.invalid",
+            "user@two.invalid:/opt/a",
+            "user@two.invalid:/opt/b",
+        ])
+        .output()
+        .expect("run diff");
+    let err = String::from_utf8_lossy(&clash.stderr);
+    assert!(
+        err.contains("one checkpoint has one host"),
+        "expected the two hosts to be named; stderr:\n{err}"
+    );
+}
+
+/// `--verify-repack` decodes packed indices where the data is: on the ssh proxy, which addresses each
+/// side by its `s3://` URI. A remote *safetensors directory* has no URI to load, so the pair is
+/// refused — and refused **before** either side is read.
+///
+/// That ordering is the bug this test pins. The check used to live after two (slow, network) structure
+/// reads and after a printed structural diff, so a mixed `:/path` + `s3://` pair looked accepted and
+/// simply had no repack section — indistinguishable from a run that found no fold-pairs. Nothing here
+/// can connect (`example.invalid` does not resolve), so a run that reached the reads would fail with a
+/// connection error rather than this refusal.
+#[test]
+fn diff_verify_repack_refuses_a_mixed_remote_pair_before_reading_anything() {
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
+        .env("XDG_CONFIG_HOME", scratch_config())
+        .args([
+            "diff",
+            "--ssh-proxy",
+            "user@example.invalid",
+            "/tmp/no-such-checkpoint",
+            "s3://bucket/key",
+            "--verify-repack",
+        ])
+        .output()
+        .expect("run diff --verify-repack");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unsupported pair exits 2; {err}"
+    );
+    assert!(
+        err.contains("both sides to be s3:// cstorch checkpoints"),
+        "the refusal should name what is needed; stderr:\n{err}"
+    );
+    assert!(
+        !err.contains("connecting to") && !err.contains("reading each checkpoint"),
+        "the refusal must come before the reads; stderr:\n{err}"
+    );
 }
 
 #[test]

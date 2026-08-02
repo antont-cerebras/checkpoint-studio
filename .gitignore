@@ -29,3 +29,10 @@
 # Python bytecode from the compileall syntax gate
 __pycache__/
 *.pyc
+# Review notes dropped in the tree while working — like TODO.md, they are not the deliverable.
+/CODE_REVIEW.md
+/ARCHITECTURE_REVIEW.md
+/WEB_DIFF_UX_REVIEW.md
+
+# Throwaway Playwright checks written while verifying a change in a real browser.
+web/qa-*.mjs

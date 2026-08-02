@@ -528,3 +528,56 @@ fn the_open_prompt_rejects_a_bad_path_and_stays_on_the_checkpoint() {
     tui.wait_for("tiny.safetensors");
     tui.quit();
 }
+
+#[test]
+fn the_palette_opens_a_side_by_side_comparison_and_steps_through_it() {
+    // The terminal's two-pane compare screen, driven the way a person drives it: palette, a typed
+    // baseline, then `n` to walk the differences. What is proved is the whole path through the real
+    // interactive loop — the palette entry, the prompt, the read of a second checkpoint, and the
+    // aligned panes it produces.
+    let mut tui = Tui::launch(&[&fixture()]);
+    tui.wait_for("Checkpoint Studio");
+
+    tui.send(" ");
+    tui.wait_for("Compare side by side");
+    tui.send("side by side");
+    tui.send("\r");
+    tui.wait_for("Compare side by side with");
+
+    // A checked-in checkpoint that differs from the fixture, so there is something to align.
+    tui.send("tests/fixtures/diff_new.safetensors");
+    tui.send("\r");
+
+    // Both panes are labelled, and the screen says how much differs.
+    tui.wait_for("diff_new.safetensors");
+    tui.wait_for("difference");
+
+    // The cursor opens on the first difference. Stepping itself is asserted where it can be
+    // asserted precisely — `compare_mode_tests::stepping_moves_the_cursor_between_differences`
+    // drives the same handler and reads the cursor, rather than pattern-matching a redrawn screen.
+    tui.wait_for("1of");
+    tui.send("n");
+    tui.pump();
+    // Esc returns to the checkpoint we never left.
+    tui.send("\u{1b}");
+    tui.wait_for("tiny.safetensors");
+    tui.quit();
+}
+
+#[test]
+fn the_side_by_side_reports_a_baseline_it_cannot_read() {
+    // The path came from something typed, so a bad one explains itself instead of being fatal.
+    let mut tui = Tui::launch(&[&fixture()]);
+    tui.wait_for("Checkpoint Studio");
+    tui.send(" ");
+    tui.wait_for("Compare side by side");
+    tui.send("side by side");
+    tui.send("\r");
+    tui.wait_for("Compare side by side with");
+    tui.send("/definitely/not/a/checkpoint");
+    tui.send("\r");
+    tui.wait_for("Cannot compare");
+    tui.send("\u{1b}");
+    tui.wait_for("tiny.safetensors");
+    tui.quit();
+}
