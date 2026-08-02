@@ -1,6 +1,7 @@
 // Typed fetch wrappers over the Rust `--web` JSON API. The server owns the data;
 // these just fetch it. Errors surface the server's `{error}` envelope.
 
+import { noteServedBuild } from './build';
 import { totalBytes } from './progress';
 import { scopeToQuery, type DiffScopeParams } from './diffscope';
 import type { JobStatus } from '../stores/jobs';
@@ -32,6 +33,7 @@ async function getJsonStreamed<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   const res = await fetch(url, signal ? { signal } : {});
+  noteServedBuild(res.headers.get(BUILD_HEADER));
   const total = totalBytes(res.headers);
   const reader = res.ok ? (res.body?.getReader() ?? null) : null;
   let text: string;
@@ -136,12 +138,22 @@ function fetchJson<T>(
 
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
+  noteServedBuild(res.headers.get(BUILD_HEADER));
   // `res.json()` is `any`; keep it `unknown` and narrow, so a malformed error
   // envelope can't smuggle an untyped value into the app.
   const body: unknown = await res.json().catch(() => null);
   if (!res.ok) throw new Error(serverError(body, res.status));
   return body as T;
 }
+
+/**
+ * Which build of the UI the server serves, sent on every response.
+ *
+ * Read here rather than by asking, because this is the layer that already talks to the server: the
+ * first request a tab makes after the server is reinstalled under it is the one that finds out
+ * (`stores/version` explains the other two chances).
+ */
+const BUILD_HEADER = 'X-App-Build';
 
 const enc = encodeURIComponent;
 
@@ -185,6 +197,7 @@ function qs(params: Record<string, string | number | undefined>): string {
  */
 async function postJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { method: 'POST' });
+  noteServedBuild(res.headers.get(BUILD_HEADER));
   const body: unknown = await res.json().catch(() => null);
   if (!res.ok) {
     const message = serverError(body, res.status);
@@ -196,6 +209,7 @@ async function postJson<T>(url: string): Promise<T> {
 /** Drop one entry from the recents list. `DELETE`, because it removes one identified thing. */
 async function deleteJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { method: 'DELETE' });
+  noteServedBuild(res.headers.get(BUILD_HEADER));
   const body: unknown = await res.json().catch(() => null);
   if (!res.ok) throw new Error(serverError(body, res.status));
   return body as T;

@@ -13,11 +13,15 @@
     loadRecents,
     openCheckpoint,
     proxied,
+    proxyHost,
     recents,
     reloadCheckpoint,
     tree,
   } from '../stores/server';
+  import { specHelp } from '../lib/format';
   import { navigate, resetViewForNewCheckpoint } from '../stores/view';
+  import RecentRow from './RecentRow.svelte';
+  import CheckpointPicker from './CheckpointPicker.svelte';
 
   let draft = '';
   let error: string | null = null;
@@ -27,6 +31,16 @@
   // (`#open`, or the recovery button on a failed load), and then nothing has fetched it yet.
   onMount(loadRecents);
 
+  /**
+   * What this box accepts — the same sentence the two comparison boxes show.
+   *
+   * It used to promise less than they do ("path on the ssh proxy, or an s3:// prefix"), which reads as
+   * though a glob or an `hf://` repo were not for this box. All three resolve through
+   * `crate::opening::resolve` and accept exactly the same set, so a narrower hint was a narrower
+   * *label*, not a narrower feature.
+   */
+  $: help = specHelp($proxied, $proxyHost ?? '');
+
   // Trailing slashes stripped on both sides: a recents entry is the spec as typed
   // (`…/Qwen3-Coder-30B-A3B-lut-3bit/`) while the root is the resolved directory (no slash),
   // so comparing them raw never matched and the badge never appeared.
@@ -34,6 +48,12 @@
   // its directory, which no recents entry equals.
   $: current = trim($tree?.spec ?? $tree?.root ?? '');
   const trim = (s: string) => s.replace(/\/+$/, '');
+
+  /** Enter in the box: open what it names. Named and typed rather than inline, because a callback
+   * prop's parameter has no type inside the template. */
+  function openSpec(spec: string) {
+    void open(spec);
+  }
 
   async function open(spec: string) {
     const path = spec.trim();
@@ -61,23 +81,23 @@
     }
   }
 
-  /** The last path component, for a readable recents row; the full path is the title. */
-  function short(spec: string): string {
-    return trim(spec).split('/').pop() || spec;
-  }
 </script>
 
 <div class="open">
   <form class="pick" on:submit|preventDefault={() => open(draft)}>
     <label for="open-path">Open checkpoint</label>
-    <input
+    <!-- The same box as the header's and the comparison screen's (`CheckpointPicker`), with its
+         dropdown off: every recent is listed underneath already, and the same entries in a popup over a
+         list of them is one list too many. -->
+    <CheckpointPicker
       id="open-path"
       bind:value={draft}
-      placeholder={$proxied
-        ? 'path on the ssh proxy, or an s3:// prefix'
-        : 'file, directory, glob, or hf://owner/repo'}
-      spellcheck="false"
-      autocomplete="off"
+      {busy}
+      menu={false}
+      ariaLabel="Checkpoint to open"
+      placeholder={help}
+      title={help}
+      onEnter={openSpec}
     />
     <button type="submit" disabled={!draft.trim() || busy}>Open</button>
   </form>
@@ -93,17 +113,8 @@
     <ul class="recents">
       {#each $recents as spec (spec)}
         <li>
-          <button
-            type="button"
-            class="recent"
-            title={spec}
-            disabled={busy}
-            on:click={() => open(spec)}
-          >
-            <span class="name">{short(spec)}</span>
-            <span class="path dim">{spec}</span>
-            {#if trim(spec) === current}<span class="badge">open</span>{/if}
-          </button>
+          <!-- The same row the address bar's dropdown uses, so both lists pick and forget alike. -->
+          <RecentRow {spec} current={trim(spec) === current} busy={busy} onPick={open} />
         </li>
       {/each}
     </ul>
@@ -120,15 +131,19 @@
 </div>
 
 <style>
+  /* No cap on the screen itself. Measured at 668px, against 1572px for the *same* address box on the
+     two comparison screens — so arriving here narrowed the app and leaving it widened it again, for a
+     box holding the same kind of value: a checkpoint address, which is long, with a hint naming six
+     accepted forms, which does not fit in 480px.
+     What is capped instead is the prose and the list, which is what the old cap was really for — a
+     line of text 1500px wide is a line you lose your place in. */
   .open {
     padding: 14px 18px;
     display: flex;
     flex-direction: column;
     gap: 14px;
-    /* The content is a path box and a short list; letting it run the full width of a wide
-       window would leave the eye travelling for no reason. */
-    max-width: 90ch;
   }
+  /* The boxes are `TextField`, which owns their look — see that component. */
   .pick {
     display: flex;
     align-items: center;
@@ -137,16 +152,6 @@
   .pick label {
     color: var(--fg-dim);
     flex: 0 0 auto;
-  }
-  .pick input {
-    flex: 1 1 auto;
-    min-width: 0;
-    font: inherit;
-    padding: 5px 8px;
-    color: var(--fg);
-    background: var(--bg-elev);
-    border: 1px solid var(--border);
-    border-radius: 4px;
   }
   h3 {
     margin: 0;
@@ -163,48 +168,9 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-  }
-  /* Background fill rather than a box border, like the other lists in this UI. */
-  .recent {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-    width: 100%;
-    text-align: left;
-    font: inherit;
-    color: var(--fg);
-    background: none;
-    border: none;
-    border-radius: 4px;
-    padding: 4px 8px;
-    cursor: pointer;
-  }
-  .recent:hover:not(:disabled) {
-    background: var(--bg-hover);
-  }
-  .recent:disabled {
-    cursor: default;
-    opacity: 0.6;
-  }
-  .recent .name {
-    color: var(--accent);
-    flex: 0 0 auto;
-  }
-  .recent .path {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 12px;
-  }
-  .badge {
-    flex: 0 0 auto;
-    font-size: 11px;
-    color: var(--bg);
-    background: var(--accent);
-    border-radius: 3px;
-    padding: 0 5px;
+    /* A row is a path plus two small controls; stretching it across a 1600px window would put the
+       controls a screen away from the name they act on. */
+    max-width: 120ch;
   }
   .err {
     color: var(--danger);

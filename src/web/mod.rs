@@ -891,6 +891,16 @@ fn send_encoded(
     if let Some(cc) = cache_control {
         headers.push(header("Cache-Control", cc));
     }
+    // Which build of the UI this binary serves, on **every** response.
+    //
+    // The tab already asks `/api/version` when it starts and whenever it is brought back to the front,
+    // and that missed the case this project produces constantly: the tab is open and *watched* while
+    // the server is reinstalled under it. Nothing brought it to the front, so nothing re-asked, and the
+    // page went on running an older interface with no sign of it. A header costs no request — the first
+    // thing the tab asks the new server for tells it.
+    if let Some(id) = assets::build_id() {
+        headers.push(header("X-App-Build", &id));
+    }
     if gzipped {
         headers.push(header("Content-Encoding", "gzip"));
     }

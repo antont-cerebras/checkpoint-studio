@@ -34,6 +34,9 @@ describe('the read-progress poll', () => {
       calls += 1;
       return Promise.resolve({
         ok: true,
+        // A `Response` has headers, and the API layer reads one off every reply (the build the
+        // server serves) — a stub without them is not a reply this app can be handed.
+        headers: new Headers(),
         json: () => Promise.resolve(body),
       } as unknown as Response);
     });

@@ -14,54 +14,77 @@
   // which is what the terminal offers. An always-live editable address bar is a browser idiom
   // (it *is* the URL bar's affordance); the terminal's equivalent is its prompt with `↑` history.
   import { onMount } from 'svelte';
-  import { forgetRecent, loadRecents, proxied, recents, tree } from '../stores/server';
+  import { loadRecents, proxied, proxyHost, tree } from '../stores/server';
+  import { specHelp } from '../lib/format';
   import { switchCheckpoint } from '../stores/open';
+  import CheckpointPicker from './CheckpointPicker.svelte';
   import Spinner from './Spinner.svelte';
 
-  let box: HTMLElement;
-  let input: HTMLInputElement;
+  /**
+   * The picker, as *what this bar asks of it*.
+   *
+   * A structural type rather than the component class: a `.svelte` import carries no type outside
+   * svelte-check, so `picker.blur()` would be a call on `any` — and an `any` here is how
+   * `picker?.blur?.()` came to call a method that did not exist at all.
+   */
+  let picker: { blur: () => void } | undefined;
   let draft = '';
-  /** True once the text diverges from the served root, so a switch elsewhere can't overwrite
-   * what is being typed. */
-  let dirty = false;
-  let listOpen = false;
-  /** Which recent the keyboard is on; -1 = none, so Enter opens what is typed. */
-  let cursor = -1;
   let busy = false;
   let error = '';
-  /** Which entry is asking "forget this?"; one at a time, so the answer is never ambiguous. */
-  let confirming: string | null = null;
 
   onMount(loadRecents);
+
+  /** Escape with the menu closed: put back what is being served, and stop editing. The header should
+   * never be left showing a path that is not the checkpoint behind it. */
+  function revert() {
+    draft = root;
+    error = '';
+  }
 
   // The *address*, not the display root: for a single-file checkpoint the root is its containing
   // directory, and opening that would read a different checkpoint (a directory of three HDF5
   // files has one root and three addresses).
   $: root = $tree?.spec ?? $tree?.root ?? '';
-  // Follow the served checkpoint unless the box is being edited — otherwise a switch made
-  // somewhere else (the open screen, another tab's doing) would leave the header lying.
-  $: if (!dirty && !busy) draft = root;
-  $: options = $recents.filter((s) => s !== draft);
+  // Follow the served checkpoint, unless the box has been edited — otherwise a switch made somewhere
+  // else (the open screen, another tab's doing) would leave the header lying.
+  //
+  // Tracked against what was last *shown* rather than derived from `draft !== root`: the derived form
+  // is a cycle (`draft → dirty → draft`), and it is the same mistake the comparison boxes made — a
+  // statement that both reads and writes the value it is about.
+  //
+  // A field of an object rather than a plain `let`: what is stored is the value of the *previous* run,
+  // which no static analysis can see being read (`no-useless-assignment` says so), and a bare
+  // suppression would leave the next reader wondering whether the assignment matters.
+  const applied = { root: '' };
+  $: if (root !== applied.root && !busy) {
+    applied.root = root;
+    draft = root;
+  }
+  /** Edited away from what is served — which is when the Open button appears. Declared by the reactive
+   * statement, since any initial value here would be overwritten before it could be read. */
+  $: dirty = draft.trim() !== '' && draft.trim() !== root;
 
+
+  /** Enter, or a recent chosen from the dropdown: both mean "open this". Named and typed rather than
+   * inline, because a callback prop's parameter has no type inside the template. */
+  function openSpec(spec: string) {
+    void submit(spec);
+  }
 
   async function submit(spec: string) {
     const path = spec.trim();
     if (!path || busy) return;
-    listOpen = false;
-    cursor = -1;
     // Re-opening what is already served would re-read a 31k-tensor checkpoint to arrive back
     // where we started; treat it as "done" instead.
     if (path === root) {
-      dirty = false;
-      input?.blur();
+      picker?.blur();
       return;
     }
     busy = true;
     error = '';
     try {
       await switchCheckpoint(path);
-      dirty = false;
-      input?.blur();
+      draft = path;
     } catch (e) {
       // Leave the text as typed, with the caret still in it: the point of an editable bar is
       // that a wrong path is corrected where it was entered. `readonly` rather than `disabled`
@@ -73,116 +96,31 @@
     }
   }
 
-  function onKeydown(e: KeyboardEvent) {
-    // The header sits inside the app's global key handling; every key typed here is for the
-    // box, so none of them reach the tree.
-    e.stopPropagation();
-    switch (e.key) {
-      case 'Enter':
-        e.preventDefault();
-        void submit(cursor >= 0 ? (options[cursor] ?? draft) : draft);
-        return;
-      case 'Escape':
-        e.preventDefault();
-        // Innermost state first: a pending "forget this?" is what Escape should answer, before it
-        // starts closing the list or discarding what was typed.
-        if (confirming !== null) {
-          confirming = null;
-        } else if (listOpen) {
-          listOpen = false;
-          cursor = -1;
-        } else {
-          draft = root;
-          dirty = false;
-          error = '';
-          input.blur();
-        }
-        return;
-      case 'ArrowDown':
-        e.preventDefault();
-        if (!listOpen) {
-          listOpen = true;
-          cursor = -1;
-        } else if (options.length) {
-          cursor = Math.min(cursor + 1, options.length - 1);
-        }
-        return;
-      case 'ArrowUp':
-        e.preventDefault();
-        // Up from the first entry returns to what was typed, rather than wrapping to the end.
-        if (listOpen) cursor = Math.max(cursor - 1, -1);
-        return;
-      default:
-        // Any edit invalidates a highlighted recent and the stale error.
-        cursor = -1;
-        error = '';
-    }
-  }
 
-  /** Remove one entry from the list. The checkpoint itself, and the one being served, are
-   * untouched — forgetting the open one is allowed and leaves you looking at it. */
-  async function forget(spec: string) {
-    confirming = null;
-    try {
-      await forgetRecent(spec);
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-    }
-  }
 
-  function onInput() {
-    dirty = draft !== root;
-  }
 
-  /**
-   * Escape while the menu is open, wherever focus is.
-   *
-   * The input's own handler only fires when the caret is in it — and after clicking a cross, focus
-   * is on that button, so a pending "forget this?" could not be dismissed with the keyboard. The
-   * input stops propagation, so this never double-handles.
-   */
-  function onWindowKeydown(e: KeyboardEvent) {
-    if (e.key !== 'Escape') return;
-    if (confirming !== null) {
-      e.preventDefault();
-      e.stopPropagation();
-      confirming = null;
-    } else if (listOpen) {
-      e.preventDefault();
-      e.stopPropagation();
-      listOpen = false;
-      cursor = -1;
-    }
-  }
 
-  /** Click anywhere else closes the dropdown — the same dismiss rule the palette follows. */
-  function onWindowPointerDown(e: Event) {
-    if (listOpen && box && !box.contains(e.target as Node)) {
-      listOpen = false;
-      cursor = -1;
-      // An unanswered question does not survive the menu it was asked in.
-      confirming = null;
-    }
-  }
 
-  const short = (s: string) => s.replace(/\/+$/, '').split('/').pop() || s;
 </script>
 
-<svelte:window on:pointerdown={onWindowPointerDown} on:keydown|capture={onWindowKeydown} />
-
-<div class="bar" bind:this={box}>
-  <input
-    bind:this={input}
+<div class="bar">
+  <!-- The one checkpoint box (`CheckpointPicker`): the same field, dropdown, keys and forget flow as
+       the two on the comparison screen. `bare` because here the box *is* the header rather than a
+       control sitting on it. Choosing a recent here means "open it", which is what `onPickRecent` says;
+       elsewhere it fills the box. -->
+  <CheckpointPicker
+    id="ckpt-path"
+    variant="bare"
+    bind:this={picker}
     bind:value={draft}
-    on:input={onInput}
-    on:keydown={onKeydown}
     on:focus={() => (error = '')}
-    readonly={busy}
-    spellcheck="false"
-    autocomplete="off"
-    aria-label="Checkpoint path — edit to open another"
-    title={busy ? 'opening…' : (draft || 'no checkpoint')}
-    placeholder={$proxied ? 'path on the ssh proxy' : 'path, glob, or hf://owner/repo'}
+    {busy}
+    ariaLabel="Checkpoint path — edit to open another"
+    title={busy ? 'opening…' : draft || 'no checkpoint'}
+    placeholder={specHelp($proxied, $proxyHost ?? '')}
+    onEnter={openSpec}
+    onPickRecent={openSpec}
+    onEscape={revert}
   />
 
   {#if busy}
@@ -196,61 +134,6 @@
     <button class="go" type="button" title="Open this checkpoint (Enter)" on:click={() => void submit(draft)}
       >Open</button
     >
-  {/if}
-
-  {#if $recents.length > 1 || (options.length && !dirty)}
-    <button
-      class="caret"
-      type="button"
-      aria-expanded={listOpen}
-      aria-label="Recently opened checkpoints"
-      title="Recently opened (↓)"
-      on:click={() => {
-        listOpen = !listOpen;
-        cursor = -1;
-        confirming = null;
-      }}>▾</button
-    >
-  {/if}
-
-  {#if listOpen && options.length}
-    <!-- Background fill, no border: the same treatment as the command palette and the filter
-         builder, rather than a second idea of what a popup looks like. -->
-    <ul class="menu" role="listbox" aria-label="Recently opened checkpoints">
-      {#each options as spec, i (spec)}
-        <li class="row" class:on={i === cursor}>
-          {#if confirming === spec}
-            <!-- Confirmation in the row itself, not a browser dialog: it keeps the path you are
-                 about to forget in front of you, and the dropdown open behind it. -->
-            <span class="ask">Forget <b>{short(spec)}</b>?</span>
-            <button class="danger" type="button" on:click={() => void forget(spec)}>Forget</button>
-            <button class="quiet" type="button" on:click={() => (confirming = null)}>Cancel</button>
-          {:else}
-            <button
-              class="pick"
-              type="button"
-              role="option"
-              aria-selected={i === cursor}
-              title={spec}
-              on:click={() => void submit(spec)}
-              on:mouseenter={() => (cursor = i)}
-            >
-              <span class="name">{short(spec)}</span>
-              <span class="path dim">{spec}</span>
-            </button>
-            <!-- A sibling button, not nested in the row's: nested buttons are invalid, and a click
-                 on the cross must not also open the checkpoint. -->
-            <button
-              class="drop"
-              type="button"
-              title="Forget this checkpoint (removes it from the list only)"
-              aria-label="Forget {short(spec)}"
-              on:click={() => (confirming = spec)}>×</button
-            >
-          {/if}
-        </li>
-      {/each}
-    </ul>
   {/if}
 
   {#if error}
@@ -267,33 +150,9 @@
     align-items: center;
     gap: 4px;
   }
-  /* Reads as the dim path text it replaced until touched. */
-  input {
-    flex: 1 1 auto;
-    min-width: 0;
-    font: inherit;
-    font-size: 12px;
-    color: var(--fg-dim);
-    background: none;
-    border: none;
-    border-radius: 4px;
-    padding: 3px 6px;
-    text-overflow: ellipsis;
-  }
-  input:hover:not(:read-only) {
-    background: var(--bg-hover);
-  }
-  input:focus {
-    outline: none;
-    color: var(--fg);
-    background: var(--bg-elev);
-    text-overflow: clip;
-  }
-  /* Still selectable and copyable while a checkpoint loads; just not editable. */
-  input:read-only {
-    color: var(--fg-dim);
-    cursor: default;
-  }
+  /* The field's own look lives in `TextField` (variant `bare`, which reads as the dim path text it
+     replaced until touched) — it was eight declarations repeated in six components, drifting by a
+     pixel of padding and a shade of background. */
   .working {
     flex: 0 0 auto;
     display: flex;
@@ -311,115 +170,6 @@
     border-radius: 4px;
     padding: 2px 8px;
     cursor: pointer;
-  }
-  .caret {
-    flex: 0 0 auto;
-    font: inherit;
-    font-size: 11px;
-    line-height: 1;
-    color: var(--fg-dim);
-    background: none;
-    border: none;
-    border-radius: 4px;
-    padding: 3px 5px;
-    cursor: pointer;
-  }
-  .caret:hover {
-    background: var(--bg-hover);
-    color: var(--fg);
-  }
-  .menu {
-    position: absolute;
-    top: calc(100% + 4px);
-    left: 0;
-    z-index: 50;
-    margin: 0;
-    padding: 4px;
-    list-style: none;
-    min-width: 100%;
-    max-width: 90vw;
-    max-height: 50vh;
-    overflow: auto;
-    background: var(--bg-elev);
-    border-radius: 6px;
-    box-shadow: 0 6px 20px rgb(0 0 0 / 35%);
-  }
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    border-radius: 4px;
-  }
-  .row.on,
-  .row:hover {
-    background: var(--bg-hover);
-  }
-  .menu button {
-    font: inherit;
-    font-size: 12px;
-    color: var(--fg);
-    background: none;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .menu .pick {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-    flex: 1 1 auto;
-    min-width: 0;
-    text-align: left;
-    padding: 4px 8px;
-  }
-  /* Dim until the row is under the cursor: a row of crosses reads as a list of delete buttons
-     rather than a list of checkpoints. */
-  .menu .drop {
-    flex: 0 0 auto;
-    padding: 2px 7px;
-    color: transparent;
-  }
-  .row:hover .drop,
-  .row.on .drop {
-    color: var(--fg-dim);
-  }
-  .menu .drop:hover {
-    color: var(--danger);
-    background: var(--bg-elev);
-  }
-  .ask {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    padding: 4px 8px;
-    font-size: 12px;
-  }
-  .menu .danger {
-    flex: 0 0 auto;
-    color: var(--bg);
-    background: var(--danger);
-    padding: 2px 8px;
-  }
-  .menu .quiet {
-    flex: 0 0 auto;
-    color: var(--fg-dim);
-    padding: 2px 8px;
-  }
-  .menu .quiet:hover {
-    color: var(--fg);
-    background: var(--bg-elev);
-  }
-  .menu .name {
-    color: var(--accent);
-    flex: 0 0 auto;
-  }
-  .menu .path {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
   /* Under the box, like the dropdown — the header stays one row whatever goes wrong. */
   .err {
