@@ -377,9 +377,16 @@ impl Explorer {
             }
             frame += 1;
         }
-        let ((tensors, metadata, config, disk, health), checkpoint) = handle
+        let (parts, checkpoint) = handle
             .join()
             .map_err(|_| anyhow::anyhow!("checkpoint loader thread panicked"))??;
+        let crate::opening::CheckpointParts {
+            tensors,
+            metadata,
+            config,
+            disk_usage: disk,
+            health,
+        } = parts;
         if let Some(rc) = self.remote.as_mut() {
             rc.disk = disk;
         }
@@ -397,12 +404,18 @@ impl Explorer {
         // A remote read opens one SSH session and keeps it alive on `self`, so the
         // file browser (and remote layout / sidecar reads) reuse it without a
         // second auth prompt. A local read uses the plain static gatherer.
-        let ((tensors, metadata, config, disk, health), checkpoint) =
-            if self.remote_read().is_some() {
-                self.gather_remote_keeping_session()?
-            } else {
-                Self::gather_checkpoint(&self.files, None)?
-            };
+        let (parts, checkpoint) = if self.remote_read().is_some() {
+            self.gather_remote_keeping_session()?
+        } else {
+            Self::gather_checkpoint(&self.files, None)?
+        };
+        let crate::opening::CheckpointParts {
+            tensors,
+            metadata,
+            config,
+            disk_usage: disk,
+            health,
+        } = parts;
         if let Some(rc) = self.remote.as_mut() {
             rc.disk = disk;
         }
@@ -418,7 +431,10 @@ impl Explorer {
     /// [`crate::remote::RemoteRead::fetch_with_config`] but over one owned session.
     pub(super) fn gather_remote_keeping_session(
         &mut self,
-    ) -> Result<(CheckpointParts, Option<crate::model::Checkpoint>)> {
+    ) -> Result<(
+        crate::opening::CheckpointParts,
+        Option<crate::model::Checkpoint>,
+    )> {
         // Bind the remote context once. Re-reading `self.remote` at each use meant three
         // separate assertions that it is `Some` in a function whose whole purpose is the
         // remote read; the caller's contract is now stated once, as an error.
@@ -568,13 +584,13 @@ impl Explorer {
         if let Some(rc) = self.remote.as_mut() {
             rc.s3_meta = s3_meta;
         }
-        let parts = (
+        let parts = crate::opening::CheckpointParts {
             tensors,
             metadata,
             config,
-            crate::stats::DiskUsage::from_shards(disk_shards),
+            disk_usage: crate::stats::DiskUsage::from_shards(disk_shards),
             health,
-        );
+        };
         Ok((parts, Some(cp)))
     }
 
@@ -751,7 +767,10 @@ impl Explorer {
     pub(crate) fn gather_checkpoint(
         files: &[PathBuf],
         remote: Option<&crate::remote::RemoteRead>,
-    ) -> Result<(CheckpointParts, Option<crate::model::Checkpoint>)> {
+    ) -> Result<(
+        crate::opening::CheckpointParts,
+        Option<crate::model::Checkpoint>,
+    )> {
         Self::gather_checkpoint_with(files, remote, &crate::hf::ReadProgress::default())
     }
 
@@ -761,7 +780,10 @@ impl Explorer {
         files: &[PathBuf],
         remote: Option<&crate::remote::RemoteRead>,
         progress: &crate::hf::ReadProgress,
-    ) -> Result<(CheckpointParts, Option<crate::model::Checkpoint>)> {
+    ) -> Result<(
+        crate::opening::CheckpointParts,
+        Option<crate::model::Checkpoint>,
+    )> {
         // Through `crate::opening`, which is the one place either frontend reads a
         // checkpoint — so the terminal and the web server cannot drift on what a given spec
         // means. `Want::Parts` is the terminal's half: the flat parts, with the remote reader

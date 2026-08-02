@@ -27,7 +27,6 @@
     // (5 sites reading `.ByteRange` / `.j` off index-signature types — mechanical bracket
     // access) and `noUncheckedSideEffectImports` (needs a declaration for `import
     // './app.css'`). Both are small, deliberate follow-ups rather than silent omissions.
-    "noFallthroughCasesInSwitch": true,
     "allowUnreachableCode": false,
     "allowUnusedLabels": false,
     "verbatimModuleSyntax": true,

@@ -12,6 +12,7 @@
   // The folding is `crate::compact::compact_tree`, which is `diff`'s own family
   // collapsing — so a "family" means the same thing here and in a diff.
   import { flatten, type Row } from '../lib/flatten';
+  import { GLYPH, rowGlyph } from '../lib/glyphs';
   import { humanCount, humanSize } from '../lib/format';
   import { expanded, toggle } from '../stores/view';
   import { compactError, compactTree } from '../stores/server';
@@ -67,13 +68,15 @@
         <div class="row" style="padding-left:{row.depth * 14 + 4}px">
           {#if n.kind === 'group'}
             <button class="grp" on:click={() => toggle(row.id)}>
-              <span class="arrow">{$expanded.has(row.id) ? '▾' : '▸'}</span>
+              <span class="arrow"
+                >{rowGlyph({ kind: 'group', fold: $expanded.has(row.id) ? 'open' : 'closed' })}</span
+              >
               <span class="gname">{n.name}</span>
-              <span class="dim">▦ {n.tensor_count} · {humanSize(n.total_size)}</span>
+              <span class="dim">{GLYPH.tensorCount} {n.tensor_count} · {humanSize(n.total_size)}</span>
             </button>
           {:else if n.kind === 'tensor'}
             {@const v = varies(row)}
-            <span class="mark dim">·</span>
+            <span class="mark dim">{rowGlyph({ kind: 'tensor', listing: 'listed' })}</span>
             <span class="name">{n.label ?? n.info.name}</span>
             <span class="times" title="how many real tensors this family stands for"
               >×{count(row)}</span

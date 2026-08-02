@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 /// that starts at 0 and is set once known (e.g. after a remote directory is
 /// listed). The loading screen polls [`LoadProgress::snapshot`] to draw a bar
 /// instead of a bare spinner, so a slow SSH read visibly makes progress.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct LoadProgress {
     done: AtomicUsize,
     total: AtomicUsize,
@@ -92,6 +92,15 @@ impl Stage {
             Self::Tensors => "reading tensor metadata",
             Self::S3Objects => "reading S3 storage metadata",
         }
+    }
+
+    /// The step said in words, for a caller drawing this somewhere other than a terminal.
+    ///
+    /// The same phrase the bar shows dimmed after its timer, so a browser watching a read says exactly
+    /// what a terminal watching it would.
+    #[must_use]
+    pub const fn note(self) -> &'static str {
+        self.label()
     }
 
     /// A terse form for a narrow terminal, where the full phrase wouldn't fit.
@@ -303,6 +312,13 @@ impl Bars {
     #[must_use]
     pub fn progress(&self, i: usize) -> Option<Arc<LoadProgress>> {
         self.progress.get(i).cloned()
+    }
+
+    /// Bar `i`'s counter by reference — for a caller choosing at runtime between drawing a bar and
+    /// filling a counter someone else owns, where both arms have to hand back the same borrowed type.
+    #[must_use]
+    pub fn progress_ref(&self, i: usize) -> Option<&LoadProgress> {
+        self.progress.get(i).map(AsRef::as_ref)
     }
 
     /// Mark read `i` finished — freezing its timer and showing `✓` (ok) or `✗`.

@@ -491,12 +491,17 @@ fn the_structural_diff_agrees_between_the_cli_and_the_web() {
     let served = body(handlers::diff(
         &state,
         &query("against", &old.display().to_string()),
+        &crate::opening::Options::default(),
     ));
 
     // The CLI: the same pair through the shared comparison the `diff` subcommand uses.
-    let expected =
-        crate::compare::structural_diff(&state.tensors, &state.checkpoint.metadata_vec(), &old)
-            .expect("the pair compares");
+    let expected = crate::compare::structural_diff(
+        &state.tensors,
+        &state.checkpoint.metadata_vec(),
+        &old.display().to_string(),
+        &crate::opening::Options::default(),
+    )
+    .expect("the pair compares");
 
     assert_eq!(
         served["report"],
@@ -538,6 +543,7 @@ fn the_web_reports_no_differences_against_itself() {
     let served = body(handlers::diff(
         &s,
         &query("against", &fixture().display().to_string()),
+        &crate::opening::Options::default(),
     ));
     assert_eq!(served["verdict"], "structurally identical");
     for section in [
@@ -562,7 +568,11 @@ fn the_web_reports_no_differences_against_itself() {
 fn the_diff_endpoint_rejects_a_path_that_is_not_a_checkpoint() {
     let s = web();
     for bad in ["", "/nonexistent/checkpoint"] {
-        let (status, bytes) = handlers::diff(&s, &query("against", bad));
+        let (status, bytes) = handlers::diff(
+            &s,
+            &query("against", bad),
+            &crate::opening::Options::default(),
+        );
         assert_eq!(status, 400, "'{bad}' should be a client error");
         let msg: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(
@@ -667,6 +677,7 @@ fn the_served_diff_command_names_the_checkpoint_not_a_shard() {
     let served = body(handlers::diff(
         &state,
         &query("against", &fixture().display().to_string()),
+        &crate::opening::Options::default(),
     ));
     let command = served["command"]
         .as_str()
@@ -973,5 +984,297 @@ fn the_inferred_architecture_agrees_across_the_surfaces() {
     assert!(
         rendered.contains("not in the tensors"),
         "the config-only rows should be admitted on screen:\n{rendered}"
+    );
+}
+
+/// **One count, two views.** The one-page diff report and the side-by-side comparison describe the
+/// same pair, and used to print different totals for it. The aligned tree's tally is now the single
+/// counter; this pins it to the report's own sections, so the day one of them changes definition the
+/// other is not left quietly disagreeing.
+#[test]
+fn the_two_diff_views_count_the_same_differences() {
+    // Every pair of diff fixtures, not one: the disagreement was reported on a 116k-tensor pair, and
+    // a single small fixture is exactly the case both counters happen to get right.
+    for (o, n) in [
+        ("diff_old.safetensors", "diff_new.safetensors"),
+        ("diff_group_old.safetensors", "diff_group_new.safetensors"),
+        ("diff_map_old.safetensors", "diff_map_new.safetensors"),
+        // A checkpoint against itself: every leaf must land in `same`, and nothing in `differing`.
+        ("diff_old.safetensors", "diff_old.safetensors"),
+        // Metadata on one side only — the group node that was suspected of being miscounted.
+        ("diff_meta.safetensors", "diff_new.safetensors"),
+    ] {
+        counts_agree_for(o, n);
+    }
+}
+
+#[allow(clippy::similar_names)]
+fn counts_agree_for(old_name: &str, new_name: &str) {
+    let old = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(old_name);
+    let new = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(new_name);
+
+    let old_state = {
+        let m = crate::readers::read_local(std::slice::from_ref(&old)).expect("the baseline reads");
+        WebState::build(m, std::slice::from_ref(&old), &[])
+    };
+    let new_state = {
+        let m =
+            crate::readers::read_local(std::slice::from_ref(&new)).expect("the newer side reads");
+        WebState::build(m, std::slice::from_ref(&new), &[])
+    };
+
+    // The side-by-side: align the two trees and tally the leaves.
+    let rows = crate::difftree::align_rooted(&old_state.tree, &new_state.tree);
+    let tally = crate::difftree::tally(&rows);
+
+    // The one-page report: the same pair through the shared structural comparison.
+    let report = crate::compare::structural_diff(
+        &new_state.tensors,
+        &new_state.checkpoint.metadata_vec(),
+        &old.display().to_string(),
+        &crate::opening::Options::default(),
+    )
+    .expect("the pair compares");
+
+    // Section by section, not summed. The tally counts tensors and metadata apart precisely so the two
+    // views can use the same words — `1 removed, 2 metadata changes` rather than `3 removed` — so this
+    // asserts the finer correspondence rather than only that the totals happen to match.
+    assert_eq!(
+        (
+            tally.tensors.only_new,
+            tally.tensors.only_old,
+            tally.tensors.changed,
+            tally.tensors.same,
+        ),
+        (
+            report.tensors_added.len(),
+            report.tensors_removed.len(),
+            report.tensors_changed.len(),
+            report.tensors_unchanged,
+        ),
+        "{old_name} vs {new_name}: the aligned tree and the report disagree about tensors: \
+         tree={:?} report=(added {}, removed {}, changed {}, unchanged {})",
+        tally.tensors,
+        report.tensors_added.len(),
+        report.tensors_removed.len(),
+        report.tensors_changed.len(),
+        report.tensors_unchanged,
+    );
+    assert_eq!(
+        (
+            tally.metadata.only_new,
+            tally.metadata.only_old,
+            tally.metadata.changed,
+            tally.metadata.same,
+        ),
+        (
+            report.meta_added.len(),
+            report.meta_removed.len(),
+            report.meta_changed.len(),
+            report.meta_unchanged,
+        ),
+        "{old_name} vs {new_name}: the aligned tree and the report disagree about metadata: {:?}",
+        tally.metadata,
+    );
+    // And the headline total is still the size of the steppable list.
+    assert_eq!(
+        tally.differing(),
+        crate::difftree::differences(&rows).len(),
+        "{old_name} vs {new_name}: the count and the steppable list must describe the same rows"
+    );
+}
+
+/// **A scoped comparison is the same comparison on both surfaces.**
+///
+/// `diff --name 'model.layers.1.*'` and `/api/diff?…&name=model.layers.1.*` must produce the same
+/// report, including the `matched M of N` context. The two now share their scope builders
+/// (`crate::compare::tensor_filter` / `name_map`) and their apply order — this is what stops that from
+/// being a claim in a comment.
+#[test]
+fn a_scoped_diff_agrees_between_the_cli_and_the_web() {
+    let old = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_old.safetensors");
+    let new = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_new.safetensors");
+    let model = crate::readers::read_local(std::slice::from_ref(&new)).expect("the fixture reads");
+    let state = WebState::build(model, std::slice::from_ref(&new), &[]);
+    let opts = crate::opening::Options::default();
+
+    // Every scope the web accepts, exercised against the flags that mean the same thing.
+    for (query, name, names, dtype_is, shape_is, only_tensors) in [
+        (
+            vec![("name", "model.layers.*")],
+            vec!["model.layers.*".to_string()],
+            None,
+            None,
+            None,
+            false,
+        ),
+        (
+            vec![("name", "*\n!*.mlp.weight")],
+            vec!["*".to_string(), "!*.mlp.weight".to_string()],
+            None,
+            None,
+            None,
+            false,
+        ),
+        (
+            vec![("names", "model.norm.weight,lm_head.weight")],
+            vec![],
+            Some("model.norm.weight,lm_head.weight"),
+            None,
+            None,
+            false,
+        ),
+        (
+            vec![("dtype_is", "F*")],
+            vec![],
+            None,
+            Some("F*"),
+            None,
+            false,
+        ),
+        (
+            vec![("shape_is", "4")],
+            vec![],
+            None,
+            None,
+            Some("4"),
+            false,
+        ),
+        (vec![("only_tensors", "1")], vec![], None, None, None, true),
+    ] {
+        // The web: the scope as query parameters.
+        let mut q = handlers::Query::new();
+        q.insert("against".to_string(), old.display().to_string());
+        for (k, v) in &query {
+            q.insert((*k).to_string(), (*v).to_string());
+        }
+        let served = body(handlers::diff(&state, &q, &opts));
+
+        // The CLI: the same selection through its own builders, then the shared apply order.
+        let filter = crate::compare::tensor_filter(&crate::compare::ScopeText {
+            name: &name,
+            names_csv: names,
+            names_lines: None,
+            dtype_is,
+            shape_is,
+        })
+        .expect("the flags compile");
+        let mut old_sum = crate::compare::summarize(&old).expect("the baseline summarizes");
+        let mut new_sum = crate::diff::CheckpointSummary::from_loaded(
+            &state.tensors,
+            &state.checkpoint.metadata_vec(),
+        );
+        filter.apply(&mut old_sum, &mut new_sum);
+        // The CLI's rule: `DiffOpts { metadata: !only_tensors && !filtered }` — a scoped diff does not
+        // compare metadata, which is also what `--name`'s help promises.
+        if only_tensors || filter.is_active() {
+            old_sum.metadata.clear();
+            new_sum.metadata.clear();
+        }
+        let expected = crate::diff::compare(&old_sum, &new_sum);
+
+        assert_eq!(
+            served["report"],
+            serde_json::to_value(&expected).unwrap(),
+            "scope {query:?}: the served report is not the one the shared comparison produces"
+        );
+        // And the scope is *reported*, so a reader can tell the diff was narrowed.
+        if !query.iter().any(|(k, _)| *k == "only_tensors") {
+            let matched = &served["matched"];
+            assert!(
+                matched.is_object(),
+                "scope {query:?}: a narrowed comparison should say what it matched, got {matched}"
+            );
+        }
+    }
+}
+
+/// The copyable command reproduces the comparison **on screen**, scope included.
+///
+/// It used to hand over an unscoped `diff OLD NEW` while the page showed nineteen tensors of 117,664 —
+/// a command that answers a different question than the one you were looking at.
+#[test]
+fn the_offered_command_carries_the_scope() {
+    let old = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_old.safetensors");
+    let new = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_new.safetensors");
+    let model = crate::readers::read_local(std::slice::from_ref(&new)).expect("the fixture reads");
+    let state = WebState::build(model, std::slice::from_ref(&new), &[]);
+
+    let mut q = std::collections::HashMap::new();
+    q.insert("against".to_string(), old.display().to_string());
+    q.insert("name".to_string(), "model.layers.*\n!*.bias".to_string());
+    q.insert("only_tensors".to_string(), "1".to_string());
+    let served = body(handlers::diff(
+        &state,
+        &q,
+        &crate::opening::Options::default(),
+    ));
+    let cmd = served["command"].as_str().expect("a one-line command");
+    assert!(cmd.contains("--name 'model.layers.*'"), "{cmd}");
+    assert!(cmd.contains("--name '!*.bias'"), "{cmd}");
+    assert!(cmd.contains("--only-tensors"), "{cmd}");
+}
+
+/// **`--values` means the same thing on both surfaces.**
+///
+/// The value comparison itself is `compare::tensor_extras`, shared with the `diff` subcommand, and both
+/// feed it into `diff::compare_with`. This asserts the result: a tensor whose dtype and shape match but
+/// whose bytes differ reads as *changed* on both, and identically.
+#[test]
+fn a_value_comparison_agrees_between_the_cli_and_the_web() {
+    let old = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_old.safetensors");
+    let new = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff_new.safetensors");
+    let read = |p: &PathBuf| {
+        crate::readers::read_local(std::slice::from_ref(p)).expect("the fixture reads")
+    };
+    let (om, nm) = (read(&old), read(&new));
+    let (ot, nt) = (om.tensors_vec(), nm.tensors_vec());
+    let (omd, nmd) = (om.metadata_vec(), nm.metadata_vec());
+
+    // The fixtures share `model.layers.0.mlp.weight` with the same dtype and shape but different bytes
+    // (seed 0 vs 7) — a values-only change, which is the case `--values` exists for.
+    let opts = crate::compare::ValueOpts {
+        view: crate::sample::ViewDtype::Stored,
+        bins: None,
+        values: true,
+        histogram: false,
+        old_schemas: &crate::sample::parse_packing_schemas(&ot, &omd),
+        new_schemas: &crate::sample::parse_packing_schemas(&nt, &nmd),
+    };
+    let find = |ts: &[crate::tree::TensorInfo], n: &str| {
+        ts.iter().find(|t| t.name == n).cloned().expect("present")
+    };
+    let name = "model.layers.0.mlp.weight";
+    let extras = crate::compare::tensor_extras(&find(&ot, name), &find(&nt, name), &opts);
+    let v = extras
+        .values
+        .expect("a same-shape pair has a value comparison");
+    assert!(
+        v.differing > 0,
+        "the fixtures differ in bytes for {name}: {v:?}"
+    );
+
+    // Folded into the report, that tensor is *changed* — where a structural diff called it unchanged.
+    let old_sum = crate::compare::summarize(&old).expect("baseline summarizes");
+    let new_sum = crate::diff::CheckpointSummary::from_loaded(&nt, &nmd);
+    let structural = crate::diff::compare(&old_sum, &new_sum);
+    assert!(
+        !structural.tensors_changed.iter().any(|c| c.name == name),
+        "structurally this tensor matches, which is why --values exists"
+    );
+    let mut one: std::collections::HashMap<String, crate::diff::TensorExtras> =
+        std::collections::HashMap::new();
+    one.insert(name.to_string(), extras);
+    let cell = std::cell::RefCell::new(one);
+    let with_values = crate::diff::compare_with(&old_sum, &new_sum, |n| {
+        cell.borrow_mut().remove(n).unwrap_or_default()
+    });
+    assert!(
+        with_values.tensors_changed.iter().any(|c| c.name == name),
+        "with values compared it must read as changed"
     );
 }

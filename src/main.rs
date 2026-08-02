@@ -20,9 +20,9 @@ const _: () = assert!(
 // them at the crate root so the (still bin-side) `explorer`/`ui` keep resolving
 // their `crate::tree::…` / `crate::stats::…` paths unchanged during the refactor.
 pub use checkpoint_studio_core::{
-    arch, capability, check, codec, compact, config, diff, filetree, filter, gguf, health, hf,
-    kernel, model, npy, progress, readers, remote, rename, repack, s3, safelayout, sample, sftp,
-    stats, stheader, tensorfilter, tree, utils, viewstate,
+    arch, capability, check, codec, compact, config, diff, difftree, filetree, filter, gguf,
+    health, hf, kernel, model, npy, progress, readers, remote, rename, repack, s3, safelayout,
+    sample, sftp, stats, stheader, tensorfilter, tree, utils, viewstate,
 };
 #[cfg(feature = "hdf5")]
 pub use checkpoint_studio_core::{convert, hdf5, hdf5_lz4, hdf5_zstd};
@@ -35,6 +35,9 @@ mod explorer;
 /// The one path from a typed spec to a read checkpoint, shared by the terminal and the
 /// web server so both accept the same spellings when changing checkpoint at runtime.
 mod opening;
+/// The CLI↔web parity ledger's guard (tests only) — see `docs/cli-web-parity.md`.
+#[cfg(test)]
+mod parity_audit;
 /// Data sources behind one trait — a new kind is an impl plus an arm in
 /// [`source::resolve`], not another branch in the loader.
 mod source;
@@ -394,6 +397,20 @@ struct ExploreArgs {
     diff_against: Option<String>,
 
     #[arg(
+        long = "compare-with",
+        value_name = "PATH",
+        help = "Open straight into the side-by-side compare screen: this checkpoint and PATH as one aligned tree, browsed in lockstep (the palette's *Compare side by side*). `--diff-against` opens the one-page report of the same pair instead"
+    )]
+    compare_with: Option<String>,
+
+    #[arg(
+        long = "compare-full",
+        requires = "compare_with",
+        help = "With --compare-with: show every layer as its own row. By default the compare screen folds uniform index families onto one row each (`{0-61}` ×62, the `k` key), so the layer that is *not* like its neighbours stands out"
+    )]
+    compare_full: bool,
+
+    #[arg(
         long,
         help = "Open straight into the file browser — the checkpoint's directory tree (the `Tab` toggle)"
     )]
@@ -710,6 +727,20 @@ enum Command {
         /// override for a non-max-density packing.
         #[arg(long = "repack-bits", value_name = "N")]
         repack_bits: Option<usize>,
+        /// Line an UNFUSED checkpoint up with its FUSED counterpart before comparing.
+        ///
+        /// Two layouts of one model share no tensor name, so a plain diff reports every
+        /// tensor of both sides as one-sided — 80,107 against 933, "nothing lines up",
+        /// which answers nothing. This drops the per-expert index (so the 256 tensors of
+        /// `…experts.37.w2.weight` fold onto the one fused `…experts.down_proj.weight`
+        /// that holds them, reported as `×256 → ×1`) and applies the standard layout
+        /// synonyms — `w1`/`w3` ↔ `gate_up_proj`, `w2` ↔ `down_proj`, q/k/v ↔ `qkv_proj`,
+        /// `.weight.qscale` ↔ `.qscale`, `e_score_correction_bias` ↔ `gate.bias`,
+        /// a `language_model.` prefix or none. The rules are printed, and are exactly
+        /// what --map takes, so a checkpoint they mis-align can be aligned by hand.
+        /// Applied to both sides: each rule is a no-op on a checkpoint already fused.
+        #[arg(long = "align-fused")]
+        align_fused: bool,
     },
 
     /// Run health checks on a checkpoint and report any problems.
@@ -876,6 +907,7 @@ fn main() -> Result<()> {
             map_from,
             verify_repack,
             repack_bits,
+            align_fused,
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
             // the `Result` convention `main` uses elsewhere, so exit explicitly.
@@ -913,12 +945,35 @@ fn main() -> Result<()> {
                 }
             };
             let filtered = filter.is_active();
+            // `--align-fused` is a rename map with a name: the canonical unfused→fused rules, applied
+            // to *both* sides and folding many names onto one (`diff::fused_layout_rules`). Printed, so
+            // the transformation is checkable and adaptable — the pairs are what `--map` takes.
             let name_map = match build_name_map(&map, map_from.as_deref()) {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("checkpoint-studio diff: {e:#}");
                     std::process::exit(2);
                 }
+            };
+            let align = if align_fused {
+                let rules = diff::fused_layout_rules();
+                utils::eprint_note(
+                    "checkpoint-studio diff: ",
+                    "aligning the unfused layout onto the fused one — dropping the expert index and \
+                     applying the standard synonyms. Each rule is `--map PATTERN=>REPLACEMENT`:",
+                );
+                for (pat, rep) in &rules {
+                    eprintln!("    {pat}=>{rep}");
+                }
+                match diff::NameMap::from_pairs(rules) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        eprintln!("checkpoint-studio diff: --align-fused: {e:#}");
+                        std::process::exit(2);
+                    }
+                }
+            } else {
+                None
             };
             let opts = diff::DiffOpts {
                 color: color_enabled(no_color),
@@ -952,6 +1007,7 @@ fn main() -> Result<()> {
                 repack_bits,
                 old_root.as_deref(),
                 new_root.as_deref(),
+                align.as_ref(),
             );
             // Report how long it took, by default (on stderr, so a piped diff on
             // stdout stays clean). Skip on trouble (exit 2) — the error already said.
@@ -1132,8 +1188,13 @@ fn run_check(
             if files.is_empty() {
                 anyhow::bail!("no checkpoint files found");
             }
-            let ((tensors, metadata, config, _disk, _health), cp) =
-                Explorer::gather_checkpoint(&files, None)?;
+            let (parts, cp) = Explorer::gather_checkpoint(&files, None)?;
+            let opening::CheckpointParts {
+                tensors,
+                metadata,
+                config,
+                ..
+            } = parts;
             // Index-vs-disk health from the tensors just loaded (no extra header
             // reads); folded into the file check below.
             let health: Vec<health::HealthReport> = index_specs
@@ -1205,11 +1266,11 @@ struct ValueCtx<'a> {
     new_schemas: &'a HashMap<String, sample::PackingSchema>,
 }
 
-/// Build a [`diff::TensorFilter`] from the `diff` selection flags: compile each
-/// `--name`/`--dtype-is`/`--shape-is` glob and merge `--names` + `--names-from`
-/// into the exact-name set. `--shape-is` dims are comma/`x`-separated and joined
-/// with `/` so the shape glob's `*`/`**` act per-dimension. Errors (bad glob or
-/// unreadable names file) bubble up to a `2` exit.
+/// Build a [`diff::TensorFilter`] from the `diff` selection flags.
+///
+/// Reads `--names-from` and hands the *content* to [`crate::compare::tensor_filter`], which the web's
+/// diff routes also call — so both surfaces scope a comparison by one implementation rather than two
+/// that agree until one of them is edited.
 fn build_tensor_filter(
     name: &[String],
     names: Option<&str>,
@@ -1217,54 +1278,21 @@ fn build_tensor_filter(
     dtype_is: Option<&str>,
     shape_is: Option<&str>,
 ) -> Result<diff::TensorFilter> {
-    use glob::Pattern;
-
-    let name_filter = filter::NameFilter::parse(name)?;
-
-    let mut exact: HashSet<String> = HashSet::new();
-    if let Some(list) = names {
-        exact.extend(
-            list.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-        );
-    }
-    if let Some(path) = names_from {
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("reading --names-from {}", path.display()))?;
-        exact.extend(
-            text.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(str::to_string),
-        );
-    }
-    let names_exact = (names.is_some() || names_from.is_some()).then_some(exact);
-
-    let dtype = dtype_is
-        .map(|d| {
-            Pattern::new(&d.to_uppercase())
-                .with_context(|| format!("invalid --dtype-is glob {d:?}"))
+    let lines = names_from
+        .map(|path| {
+            fs::read_to_string(path)
+                .with_context(|| format!("reading --names-from {}", path.display()))
         })
         .transpose()?;
-
-    let shape = shape_is
-        .map(|s| {
-            let path: String = s
-                .chars()
-                .map(|c| if matches!(c, ',' | 'x' | 'X') { '/' } else { c })
-                .collect();
-            Pattern::new(&path).with_context(|| format!("invalid --shape-is pattern {s:?}"))
-        })
-        .transpose()?;
-
-    Ok(diff::TensorFilter {
-        names: name_filter,
-        names_exact,
-        dtype,
-        shape,
+    compare::tensor_filter(&compare::ScopeText {
+        name,
+        names_csv: names,
+        names_lines: lines.as_deref(),
+        dtype_is,
+        shape_is,
     })
+    // Name the flag the glob came from; the shared builder cannot know which one it was.
+    .map_err(|e| e.context("in a --name / --dtype-is / --shape-is pattern"))
 }
 
 /// Build a [`diff::NameMap`] from the `diff` rename flags: the `--map` rules first
@@ -1274,26 +1302,28 @@ fn build_tensor_filter(
 /// `--map` (and as `--names-from`). Errors (bad rule, unreadable/invalid file, bad
 /// regex) bubble up to a `2` exit.
 fn build_name_map(map: &[String], map_from: Option<&Path>) -> Result<diff::NameMap> {
-    let mut pairs = diff::NameMap::parse_rules(map.iter().map(String::as_str))?;
-    if let Some(path) = map_from {
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("reading --map-from {}", path.display()))?;
-        if path
-            .extension()
+    let text = map_from
+        .map(|path| {
+            fs::read_to_string(path)
+                .with_context(|| format!("reading --map-from {}", path.display()))
+        })
+        .transpose()?;
+    let json = map_from.is_some_and(|p| {
+        p.extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("json"))
-        {
-            let json: Vec<(String, String)> = serde_json::from_str(&text).with_context(|| {
-                format!(
-                    "parsing --map-from {} as JSON [[pattern, replacement], …]",
-                    path.display()
-                )
-            })?;
-            pairs.extend(json);
-        } else {
-            pairs.extend(diff::NameMap::parse_rules(text.lines())?);
-        }
-    }
-    diff::NameMap::from_pairs(pairs)
+    });
+    // `--map-from`'s extension picks the format; the web picks by which box was filled.
+    let (lines, as_json) = if json {
+        (None, text.as_deref())
+    } else {
+        (text.as_deref(), None)
+    };
+    compare::name_map(map, lines, as_json).with_context(|| {
+        map_from.map_or_else(
+            || "in a --map rule".to_string(),
+            |p| format!("in --map-from {}", p.display()),
+        )
+    })
 }
 
 /// Shared state between the value-comparison workers and the spinner thread.
@@ -1579,19 +1609,10 @@ fn format_elapsed(d: std::time::Duration) -> String {
     }
 }
 
-/// Keep the tail of `s` (a tensor name's informative end) within `max` columns,
-/// prefixing `…` when truncated.
-fn truncate_tail(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        return s.to_string();
-    }
-    if max <= 1 {
-        return "…".to_string();
-    }
-    let tail: String = s.chars().skip(n - (max - 1)).collect();
-    format!("…{tail}")
-}
+// Keeping a tensor name's informative end within a budget is `utils::truncate_keep_end`, which the
+// TUI's screens already used. This was a second copy that answered `…` for a budget of zero — a
+// character in a column that does not exist.
+use crate::utils::truncate_keep_end as truncate_tail;
 
 /// The tensors + metadata read from one checkpoint (local or remote).
 type Loaded = (Vec<TensorInfo>, Vec<MetadataInfo>);
@@ -1667,7 +1688,12 @@ fn resolve_remote_sources(
     let prefixed = paths.iter().any(|p| config_proxy_prefixed(p));
     let needs_proxy = prefixed || paths.iter().any(|p| is_s3_source(p));
     let stripped: Vec<PathBuf> = paths.iter().map(|p| strip_config_proxy_prefix(p)).collect();
-    let remote = resolve_ssh_proxy(proxy, venv, cfg, needs_proxy);
+    // A path in scp form carries its own host: take it off, and let it stand in for `--ssh-proxy`.
+    // Without this, `diff --ssh-proxy H H:/path` kept the host on the path and had it prefixed again.
+    let (stripped, own_host) = split_off_scp_host(&stripped, proxy.as_deref())?;
+    // A host on the path is as explicit as the flag, so it also decides that the read is remote.
+    let has_own_host = own_host.is_some();
+    let remote = resolve_ssh_proxy(proxy.or(own_host), venv, cfg, needs_proxy || has_own_host);
     if prefixed && remote.is_none() {
         let where_ = cli_config::CliConfig::path().map_or_else(
             || "the config file".to_string(),
@@ -1709,7 +1735,7 @@ fn scope_key(name: &str, root: Option<&str>) -> Option<String> {
 /// A scoped copy of a tensor list for the structural summary: keep only the tensors
 /// inside `prefix` and re-key them to their sub-path, so the summary's names and
 /// totals describe the subtree. The originals are untouched (kept for value I/O).
-fn scope_tensors(tensors: &[TensorInfo], prefix: &str) -> Vec<TensorInfo> {
+pub(crate) fn scope_tensors(tensors: &[TensorInfo], prefix: &str) -> Vec<TensorInfo> {
     tensors
         .iter()
         .filter_map(|t| {
@@ -1735,6 +1761,8 @@ fn run_diff(
     repack_bits: Option<usize>,
     old_root: Option<&str>,
     new_root: Option<&str>,
+    // `--align-fused`: the canonical unfused→fused rules, applied to **both** sides with folding.
+    align: Option<&diff::NameMap>,
 ) -> i32 {
     const MAX_SCHEMA_LINES: usize = 40;
     let load_local = |path: &Path| -> Result<SideLoad> {
@@ -1744,12 +1772,25 @@ fn run_diff(
             anyhow::bail!("no checkpoint files found at {}", path.display());
         }
         // `diff` compares structure only — the config sidecar isn't needed here.
-        let ((tensors, metadata, _config, _disk, _health), _cp) =
-            Explorer::gather_checkpoint(&files, None)?;
+        let (parts, _cp) = Explorer::gather_checkpoint(&files, None)?;
+        let opening::CheckpointParts {
+            tensors, metadata, ..
+        } = parts;
         Ok(((tensors, metadata), None)) // local sources have no S3 object metadata
     };
 
     let (old_str, new_str) = (old.to_string_lossy(), new.to_string_lossy());
+    // Both sides `s3://`: the pair the proxy can decode, and the pair whose S3 object
+    // metadata is worth comparing.
+    let s3_pair = old_str.starts_with("s3://") && new_str.starts_with("s3://");
+    // Whether `--verify-repack` can run at all — asked **before** either side is read.
+    // It depends on the two specs and the proxy, nothing else, and refusing after two
+    // slow structure reads and a printed diff looked like a run that simply found
+    // nothing to verify. Shared with the web's job, so both refuse in the same words.
+    if verify_repack && let Err(e) = compare::repack_supported(remote.is_some(), s3_pair) {
+        eprintln!("checkpoint-studio diff: {e:#}");
+        return 2;
+    }
     // Remote: read both checkpoints in parallel, one over each of two SSH sessions
     // (ssh2 sessions aren't Sync, so a session per thread). The password is entered
     // once and reused for the second session, so it's still one prompt; agent/key
@@ -1919,7 +1960,6 @@ fn run_diff(
     }
     let compares_data = compares_data && !compares_data_unavailable;
 
-    let s3_pair = old_str.starts_with("s3://") && new_str.starts_with("s3://");
     let remote_values = match remote {
         Some(_) if compares_data && !s3_pair => {
             eprintln!(
@@ -2078,6 +2118,22 @@ fn run_diff(
     }
     let mut old_sum = diff::CheckpointSummary::from_loaded(old_sum_src, old_meta);
     let mut new_sum = diff::CheckpointSummary::from_loaded(new_sum_src, new_meta);
+    // `--align-fused` first, and on **both** sides: it is a statement about layout, not about which
+    // checkpoint is which, and every rule is a no-op on a side already fused. Folding, because the
+    // whole point is that 256 per-expert tensors *are* the one fused tensor holding them.
+    if let Some(align) = align {
+        for sum in [&mut old_sum, &mut new_sum] {
+            align.remap_summary_with(sum, diff::OnCollision::Fold);
+        }
+        let folds = old_sum.folds().len() + new_sum.folds().len();
+        utils::eprint_note(
+            "checkpoint-studio diff: ",
+            &format!(
+                "aligned: {folds} name(s) stand for several tensors after folding (shown as ×N on \
+                 their row)"
+            ),
+        );
+    }
     // Rename rules (`--map` / `--map-from`) rewrite the OLD side's tensor names
     // into the NEW side's naming scheme, so corresponding tensors line up in the
     // comparison below instead of showing as a removed/added pair. Applied before
@@ -2221,16 +2277,19 @@ fn run_diff(
                 let (Some(a), Some(b)) = (old_map.get(name), new_map.get(name)) else {
                     return diff::TensorExtras::default();
                 };
-                if a.shape != b.shape {
-                    return diff::TensorExtras::default(); // needs matching shapes
-                }
-                diff::TensorExtras {
-                    values: opts.values.then(|| tensor_values(a, b, &ctx)).flatten(),
-                    histogram: opts
-                        .histogram
-                        .then(|| tensor_histogram(a, b, &ctx))
-                        .flatten(),
-                }
+                // Shared with the web's values job, so `--values` means the same thing in both.
+                compare::tensor_extras(
+                    a,
+                    b,
+                    &compare::ValueOpts {
+                        view: ctx.view,
+                        bins: ctx.bins,
+                        values: opts.values,
+                        histogram: opts.histogram,
+                        old_schemas: ctx.old_schemas,
+                        new_schemas: ctx.new_schemas,
+                    },
+                )
             };
             // Reading tensor data is I/O-bound, so compare up to `jobs` tensors at
             // once (the results are order-independent). `jobs == 1` stays sequential.
@@ -2331,28 +2390,10 @@ fn run_diff(
     }
     // S3 object metadata is compared only when BOTH sides are `s3://` (only then do
     // both carry it). last-modified / timestamp-like deltas are informational and
-    // never affect the exit code (see `diff::compare_s3`).
-    match (&old_s3, &new_s3) {
-        (Some(o), Some(n)) => {
-            let count = o.objects.len().max(n.objects.len());
-            eprintln!("checkpoint-studio diff: compared {count} S3 object(s)' metadata");
-            // Each checkpoint's last-modified = the newest object under its prefix
-            // (ISO-8601 UTC strings sort chronologically), shown in the summary.
-            let latest = |m: &remote::S3Meta| {
-                m.objects
-                    .iter()
-                    .map(|x| x.last_modified.clone())
-                    .filter(|s| !s.is_empty())
-                    .max()
-            };
-            report.old_modified = latest(o);
-            report.new_modified = latest(n);
-            report.s3 = Some(diff::compare_s3(o, n));
-        }
-        (Some(_), None) | (None, Some(_)) => eprintln!(
-            "checkpoint-studio diff: S3 object metadata compared only for s3-vs-s3 (one side isn't s3://)"
-        ),
-        (None, None) => {}
+    // never affect the exit code (see `diff::compare_s3`). Shared with the web's
+    // report, which showed no S3 section at all until it called this.
+    if let Some(note) = compare::attach_s3(&mut report, old_s3.as_ref(), new_s3.as_ref()) {
+        eprintln!("checkpoint-studio diff: {note}");
     }
     print!("{}", report.render(&old_label, &new_label, opts));
 
@@ -2384,7 +2425,6 @@ fn run_diff(
             &mut password,
             &old_str,
             &new_str,
-            s3_pair,
             &old_t,
             &new_t,
             &old_sum,
@@ -2410,71 +2450,33 @@ fn run_diff(
 /// their packed indices match — on the ssh proxy for `s3://` sources, or locally for
 /// local checkpoint files — and print a verdict. Returns the exit code: 0 = every
 /// matched tensor is equivalent (and nothing else differs), 1 otherwise, 2 on trouble.
+///
+/// Where the data has to be reachable from was settled before the reads
+/// ([`compare::repack_supported`]), so a remote here is an s3-vs-s3 pair the proxy can decode.
 #[allow(clippy::too_many_arguments)]
 fn run_repack_verify(
     remote: Option<&remote::RemoteRead>,
     password: &mut Option<String>,
     old_uri: &str,
     new_uri: &str,
-    s3_pair: bool,
     old_t: &[TensorInfo],
     new_t: &[TensorInfo],
     old_sum: &diff::CheckpointSummary,
     new_sum: &diff::CheckpointSummary,
     repack_bits: Option<usize>,
 ) -> i32 {
-    // A non-s3 remote (safetensors dir over SFTP) can't do this — the data isn't
-    // reachable. Local files and s3-vs-s3 both can.
-    if remote.is_some() && !s3_pair {
-        eprintln!(
-            "checkpoint-studio diff: --verify-repack over --ssh-proxy needs both sides to be \
-             s3:// cstorch checkpoints (a remote safetensors dir isn't supported)"
-        );
-        return 2;
-    }
-    // Candidate pairs: same name on both sides, shape folds along dim 0. Scoped by
-    // `--name` already (old_sum/new_sum are the filtered summaries). Track the fold
-    // so the bit-width can be auto-derived.
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    let mut fold0 = None;
-    for (name, osig) in &old_sum.tensors {
-        if let Some(nsig) = new_sum.tensors.get(name)
-            && let Some(fold) = detect_fold(&osig.shape, &nsig.shape)
-        {
-            fold0.get_or_insert(fold);
-            pairs.push((name.clone(), name.clone()));
+    // Candidate pairs, bit width and "does anything else differ" — shared with the web's job, so the
+    // browser verifies exactly the pairs a terminal would (`compare::plan_repack`).
+    let plan = match compare::plan_repack(old_sum, new_sum, repack_bits) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("checkpoint-studio diff: --verify-repack: {e:#}");
+            return 2;
         }
-    }
-    if pairs.is_empty() {
-        eprintln!(
-            "checkpoint-studio diff: --verify-repack: no fold-pair tensors matched — check \
-             --name and that the shapes fold along dim 0 (old E, new ceil(E/fold))"
-        );
-        return 2;
-    }
-    // Index bit-width: as given, else the max-density packing for the detected fold
-    // (`16 / fold` — fold 5 ⇒ 3-bit, fold 4 ⇒ 4-bit).
-    let bits = repack_bits.unwrap_or_else(|| (16 / fold0.unwrap_or(1)).max(1));
-    // Whether anything OTHER than the verified fold-pairs differs structurally — an
-    // add/remove, a non-fold-pair sig change, or a metadata change. The fold-pairs
-    // themselves always show as "changed" (shape/dtype), so they're excluded: if
-    // they verify equivalent and nothing else differs, the checkpoints are the same
-    // modulo packing (exit 0).
-    let verified: HashSet<&String> = pairs.iter().map(|(_, n)| n).collect();
-    let added = new_sum
-        .tensors
-        .keys()
-        .any(|k| !old_sum.tensors.contains_key(k));
-    let removed = old_sum
-        .tensors
-        .keys()
-        .any(|k| !new_sum.tensors.contains_key(k));
-    let other_changed = old_sum.tensors.iter().any(|(k, osig)| {
-        new_sum.tensors.get(k).is_some_and(|nsig| nsig != osig) && !verified.contains(k)
-    });
-    let other_differs = added || removed || other_changed || old_sum.metadata != new_sum.metadata;
+    };
+    let (pairs, bits, other_differs) = (plan.pairs, plan.bits, plan.other_differs);
 
-    let results = if let Some(r) = remote.filter(|_| s3_pair) {
+    let results = if let Some(r) = remote {
         let labels = repack_bar_labels(&pairs, old_t, new_t);
         match fetch_remote_repack(r, password, old_uri, new_uri, &pairs, &labels, bits, false) {
             Ok(m) => m,
@@ -3061,51 +3063,8 @@ fn print_repack_aux(
 /// dims equal and `2 ≤ fold ≤ 16` (so `bits = 16/fold ≥ 1`). Returns the fold, or
 /// `None` if the shapes aren't a fold pair. The bit-width is derived separately.
 fn detect_fold(old: &[usize], new: &[usize]) -> Option<usize> {
-    // A fold pair is `(E, inner…)` ↔ `(ceil(E/fold), inner…)`: same rank, same inner dims.
-    let (Some((&e, old_inner)), Some((&w, new_inner))) = (old.split_first(), new.split_first())
-    else {
-        return None;
-    };
-    if old_inner != new_inner {
-        return None;
-    }
-    if w == 0 || e <= w {
-        return None;
-    }
-    let fold = e.div_ceil(w);
-    if !(2..=16).contains(&fold) || w != e.div_ceil(fold) {
-        return None;
-    }
-    Some(fold)
-}
-
-/// `compare_values` for two same-shape tensors under `ctx`, as an `Option`.
-fn tensor_values(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> Option<sample::ValueDiff> {
-    sample::compare_values(
-        a,
-        ctx.old_schemas.get(&a.name),
-        b,
-        ctx.new_schemas.get(&b.name),
-        ctx.view,
-    )
-    .ok()
-}
-
-/// `histogram_diff` for two same-shape tensors under `ctx`, summarized to a shift.
-fn tensor_histogram(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> Option<diff::HistShift> {
-    let hd = sample::histogram_diff(
-        a,
-        ctx.old_schemas.get(&a.name),
-        b,
-        ctx.new_schemas.get(&b.name),
-        ctx.view,
-        ctx.bins,
-    )
-    .ok()?;
-    Some(diff::HistShift {
-        tvd: hd.tvd(),
-        bins: hd.n,
-    })
+    // One implementation, shared with the web's repack job — see `compare::detect_fold`.
+    compare::detect_fold(old, new)
 }
 
 /// Open a session (reusing the already-entered `password`, so no second prompt) and
@@ -3410,6 +3369,46 @@ fn split_scp(s: &str) -> Option<(String, String)> {
     Some((s[..colon].to_string(), s[colon + 1..].to_string()))
 }
 
+/// Split an `[user@]host:` prefix off every path, when they carry one.
+///
+/// `Ok(None)` when none does — every path is local, or a URI, or the `:PATH` shorthand (whose colon
+/// is at index 0, so [`split_scp`] declines it).
+///
+/// **Applied whether or not `--ssh-proxy` was also given**, which is the bug this exists for. It used
+/// to run only when the flag was absent, so `--ssh-proxy H host:/path` kept the host on the path *and*
+/// had the proxy host prefixed onto it again — producing `H:H:/path`, which reads as nothing ("no
+/// safetensors files found at H:H:/path") and, worse, was written to the recents list, where it sat as
+/// an entry that could never be opened.
+///
+/// Two hosts that disagree is a conflict worth naming rather than resolving by guess.
+fn split_off_scp_host(
+    paths: &[PathBuf],
+    proxy: Option<&str>,
+) -> Result<(Vec<PathBuf>, Option<String>)> {
+    let Some((host, _)) = paths.iter().find_map(|p| split_scp(&p.to_string_lossy())) else {
+        return Ok((paths.to_vec(), None));
+    };
+    if let Some(flag) = proxy
+        && flag != host
+    {
+        anyhow::bail!(
+            "the path names host `{host}` and --ssh-proxy names `{flag}` — one checkpoint has one \
+             host; drop the host from the path, or drop the flag"
+        );
+    }
+    let mut stripped = Vec::with_capacity(paths.len());
+    for p in paths {
+        match split_scp(&p.to_string_lossy()) {
+            Some((h, path)) if h == host => stripped.push(PathBuf::from(path)),
+            _ => anyhow::bail!(
+                "can't mix local and scp-style ({host}:…) paths (or different hosts); \
+                 list paths from one host, or use --ssh-proxy"
+            ),
+        }
+    }
+    Ok((stripped, Some(host)))
+}
+
 /// `web` subcommand: read a local checkpoint once and serve the web UI + JSON API,
 /// blocking until Ctrl-C. The server supplies the data; the browser owns the view
 /// state (see `crate::web`).
@@ -3464,27 +3463,13 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         std::process::exit(1);
     }
 
-    // Support scp-style positional paths (`[user@]host:/path`) without an explicit
-    // --ssh-proxy: derive the host and read the path part remotely, so
-    // `checkpoint-studio host:/opt/model` just works.
-    if args.ssh_proxy.is_none()
-        && let Some((host, _)) = args
-            .paths
-            .iter()
-            .find_map(|p| split_scp(&p.to_string_lossy()))
+    // scp-style positional paths (`[user@]host:/path`) carry their own host: read the path part
+    // remotely, so `checkpoint-studio host:/opt/model` just works — with or without an explicit
+    // `--ssh-proxy` naming the same host (see `split_off_scp_host`).
     {
-        let mut remote_paths = Vec::with_capacity(args.paths.len());
-        for p in &args.paths {
-            match split_scp(&p.to_string_lossy()) {
-                Some((h, path)) if h == host => remote_paths.push(PathBuf::from(path)),
-                _ => anyhow::bail!(
-                    "can't mix local and scp-style ({host}:…) paths (or different hosts); \
-                     list paths from one host, or use --ssh-proxy"
-                ),
-            }
-        }
-        args.paths = remote_paths;
-        args.ssh_proxy = Some(host);
+        let (paths, host) = split_off_scp_host(&args.paths, args.ssh_proxy.as_deref())?;
+        args.paths = paths;
+        args.ssh_proxy = args.ssh_proxy.or(host);
     }
 
     // `--ssh-proxy` delegates the read to cstorch on a remote host, so the s3://
@@ -3539,6 +3524,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.layout.is_some()
         || args.rename
         || args.diff_against.is_some()
+        || args.compare_with.is_some()
         || args.sort.is_some()
         || args.compact;
     let view = if args.values {
@@ -3594,6 +3580,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.layout.is_some()
         || args.rename
         || args.diff_against.is_some()
+        || args.compare_with.is_some()
         || args.sort.is_some()
         || args.compact
         || args.exit;
@@ -3649,6 +3636,8 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         layout_select: args.layout_select,
         rename: args.rename,
         diff_against: args.diff_against.clone(),
+        compare_with: args.compare_with.clone(),
+        compare_full: args.compare_full,
         sort: args.sort,
         compact: args.compact,
         rename_rules: args.rename_rule,
@@ -3661,7 +3650,8 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
     // works for a Hugging Face repo as readily as a local checkpoint.
     if args.print_arch {
         let source = source::resolve(&args.paths, None)?;
-        let ((tensors, _, _, _, _), _) = source.read(&hf::ReadProgress::default())?;
+        let (parts, _) = source.read(&hf::ReadProgress::default())?;
+        let tensors = parts.tensors;
         let inferred = arch::infer(&tensors, None);
         match args.format {
             explorer::TreeFormat::Json => {
@@ -3703,6 +3693,10 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
                     .map(|f| f.to_string_lossy().to_string())
                     .unwrap_or_default(),
                 remote::ObjectMeta::Skip,
+                // A one-shot dump: there is no second request that could ask it to stop.
+                None,
+                // On a terminal, so it draws its own bar.
+                None,
             )?
         } else {
             readers::read_local(&files)?

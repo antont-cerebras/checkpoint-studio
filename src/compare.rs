@@ -20,10 +20,105 @@ use anyhow::{Context, Result};
 
 use crate::diff::{CheckpointSummary, DiffReport};
 
-/// Reduce the checkpoint at `path` to its comparable structure — the baseline side of a
-/// diff. `path` is a file, a directory of shards, or a glob, resolved exactly the way
-/// the CLI resolves its own arguments (so `diff` and the interactive screens accept the
-/// same spellings).
+/// Reduce the checkpoint named by `spec` to its comparable structure — the baseline side of a diff.
+///
+/// **One resolver, deliberately.** `spec` goes through [`crate::opening::resolve`], which is the same
+/// path `/api/open` and `/api/compare` take, so every surface that compares two checkpoints accepts
+/// the same addresses: a file, a directory of shards, a glob, `hf://`, `s3://`, `[user@]host:/path`
+/// and the `:PATH` proxy shorthand. The diff report used to resolve its own side with
+/// [`crate::collect_safetensors_files`] over a bare `Path`, which meant it rejected — as *"no
+/// checkpoint files found"* — every remote address the comparison beside it resolved happily.
+///
+/// [`Want::Parts`](crate::opening::Want::Parts): a structural summary needs names, dtypes, shapes and
+/// metadata, not an assembled model or per-object sizes, and skipping those is what keeps comparing
+/// two multi-GB checkpoints as fast as opening one.
+pub(crate) fn summarize_spec(
+    spec: &str,
+    opts: &crate::opening::Options,
+) -> Result<CheckpointSummary> {
+    let opened = crate::opening::resolve(spec, opts)
+        .with_context(|| format!("resolving {spec}"))?
+        .read(
+            crate::opening::Want::Parts,
+            &crate::hf::ReadProgress::default(),
+        )
+        .with_context(|| format!("reading {spec}"))?;
+    let (tensors, metadata) = (&opened.parts.tensors, &opened.parts.metadata);
+    Ok(CheckpointSummary::from_loaded(tensors, metadata))
+}
+
+/// A comparison's baseline: its comparable structure, plus the S3 object metadata when the source
+/// carries any.
+pub(crate) struct Baseline {
+    pub summary: CheckpointSummary,
+    /// Per-object `ETag` / size / checksums / tags, for an `s3://` baseline — the input to
+    /// [`crate::diff::compare_s3`]. `None` for every other source, which has no such thing.
+    pub s3: Option<crate::remote::S3Meta>,
+}
+
+/// The baseline of a comparison that will also compare **S3 object metadata**.
+///
+/// [`Want::Model`](crate::opening::Want::Model) rather than [`summarize_spec`]'s `Want::Parts`, which
+/// is the one difference: over the ssh proxy that read also HEADs every object, so an `s3://` baseline
+/// arrives with the per-object metadata this comparison needs. That scan is not free — sixteen seconds
+/// for eleven hundred objects — and it is exactly the scan `checkpoint-studio diff` already pays for
+/// the same pair. The alternative was a browser that could compare two `s3://` checkpoints and never
+/// mention the object-level differences a terminal reports, which is the gap this closes.
+///
+/// For every other source the two `Want`s read identically (see `opening::Target::read`), so nothing
+/// local pays for this.
+pub(crate) fn summarize_baseline(spec: &str, opts: &crate::opening::Options) -> Result<Baseline> {
+    let opened = crate::opening::resolve(spec, opts)
+        .with_context(|| format!("resolving {spec}"))?
+        .read(
+            crate::opening::Want::Model,
+            &crate::hf::ReadProgress::default(),
+        )
+        .with_context(|| format!("reading {spec}"))?;
+    let (tensors, metadata) = (&opened.parts.tensors, &opened.parts.metadata);
+    let summary = CheckpointSummary::from_loaded(tensors, metadata);
+    let s3 = opened.checkpoint.and_then(|cp| cp.s3);
+    Ok(Baseline { summary, s3 })
+}
+
+/// Compare the two sides' S3 object metadata, attach it to the report, and say what happened.
+///
+/// Only an s3-vs-s3 pair has it on both sides, so that is the only pair compared; the returned
+/// sentence is the note the CLI prints on stderr and the browser shows above the section. Shared so
+/// neither surface can quietly skip the comparison the other performs.
+///
+/// Timestamp-like deltas are informational and never a difference — see [`crate::diff::compare_s3`].
+pub(crate) fn attach_s3(
+    report: &mut DiffReport,
+    old: Option<&crate::remote::S3Meta>,
+    new: Option<&crate::remote::S3Meta>,
+) -> Option<String> {
+    match (old, new) {
+        (Some(o), Some(n)) => {
+            let count = o.objects.len().max(n.objects.len());
+            // Each checkpoint's last-modified = the newest object under its prefix
+            // (ISO-8601 UTC strings sort chronologically), shown in the summary.
+            let latest = |m: &crate::remote::S3Meta| {
+                m.objects
+                    .iter()
+                    .map(|x| x.last_modified.clone())
+                    .filter(|s| !s.is_empty())
+                    .max()
+            };
+            report.old_modified = latest(o);
+            report.new_modified = latest(n);
+            report.s3 = Some(crate::diff::compare_s3(o, n));
+            Some(format!("compared {count} S3 object(s)' metadata"))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            Some("S3 object metadata compared only for s3-vs-s3 (one side isn't s3://)".to_string())
+        }
+        (None, None) => None,
+    }
+}
+
+/// Reduce the checkpoint at `path` to its comparable structure — the local-path entry point, kept
+/// for the `diff` subcommand, which resolves its own arguments before it gets here.
 pub(crate) fn summarize(path: &Path) -> Result<CheckpointSummary> {
     // A leading `~` is expanded by `collect_safetensors_files` (one rule for every path
     // the program is handed); resolve it here too so an error can name both spellings.
@@ -52,15 +147,284 @@ pub(crate) fn summarize(path: &Path) -> Result<CheckpointSummary> {
 }
 
 /// The structural diff of the open checkpoint (`tensors` / `metadata`, the **new** side)
-/// against the checkpoint at `against` (the **old** side).
+/// against the checkpoint named by `against` (the **old** side).
+///
+/// Takes a spec rather than a path — see [`summarize_spec`] for why that matters.
 pub(crate) fn structural_diff(
     tensors: &[crate::tree::TensorInfo],
     metadata: &[crate::tree::MetadataInfo],
-    against: &Path,
+    against: &str,
+    opts: &crate::opening::Options,
 ) -> Result<DiffReport> {
-    let old = summarize(against)?;
+    let old = summarize_spec(against, opts)?;
     let new = CheckpointSummary::from_loaded(tensors, metadata);
     Ok(crate::diff::compare(&old, &new))
+}
+
+/// Everything a `diff` can be scoped by, built from **text** rather than from files.
+///
+/// The CLI reads `--names-from` and `--map-from` off disk; the browser posts the same content pasted
+/// into a box. Both then call the functions below, so "which tensors does this comparison cover" has
+/// one implementation — the point of the exercise. Two surfaces each parsing globs their own way is
+/// how they end up scoping differently and reporting different diffs of the same pair.
+pub(crate) struct ScopeText<'a> {
+    /// `--name`: globs, `!`-prefixed to exclude, a tensor passing if it matches ANY.
+    pub name: &'a [String],
+    /// `--names`: exact names, comma-separated.
+    pub names_csv: Option<&'a str>,
+    /// The *content* of `--names-from`: one exact name per line; blank lines and `#` comments ignored.
+    pub names_lines: Option<&'a str>,
+    /// `--dtype-is`: a glob against the uppercased dtype.
+    pub dtype_is: Option<&'a str>,
+    /// `--shape-is`: a glob over comma/`x`-separated dims.
+    pub shape_is: Option<&'a str>,
+}
+
+/// Compile a [`crate::diff::TensorFilter`] from those inputs.
+///
+/// `--shape-is` dims are joined with `/` so the glob's `*`/`**` act per dimension. A bad glob is an
+/// error rather than a filter that silently matches nothing.
+pub(crate) fn tensor_filter(text: &ScopeText<'_>) -> Result<crate::diff::TensorFilter> {
+    use glob::Pattern;
+    use std::collections::HashSet;
+
+    let names = crate::filter::NameFilter::parse(text.name)?;
+
+    let mut exact: HashSet<String> = HashSet::new();
+    if let Some(list) = text.names_csv {
+        exact.extend(
+            list.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if let Some(lines) = text.names_lines {
+        exact.extend(
+            lines
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string),
+        );
+    }
+    // `Some(empty)` and `None` are different: an exact list that matched nothing scopes the diff to
+    // nothing, where no list at all leaves it unconstrained.
+    let names_exact = (text.names_csv.is_some() || text.names_lines.is_some()).then_some(exact);
+
+    let dtype = text
+        .dtype_is
+        .map(|d| {
+            Pattern::new(&d.to_uppercase()).with_context(|| format!("invalid dtype glob {d:?}"))
+        })
+        .transpose()?;
+
+    let shape = text
+        .shape_is
+        .map(|s| {
+            let path: String = s
+                .chars()
+                .map(|c| if matches!(c, ',' | 'x' | 'X') { '/' } else { c })
+                .collect();
+            Pattern::new(&path).with_context(|| format!("invalid shape pattern {s:?}"))
+        })
+        .transpose()?;
+
+    Ok(crate::diff::TensorFilter {
+        names,
+        names_exact,
+        dtype,
+        shape,
+    })
+}
+
+/// Compile a [`crate::diff::NameMap`] from `--map` rules plus the content of `--map-from`.
+///
+/// `lines` is the plain form (`PATTERN=>REPLACEMENT` per line); `json` is a `[[pattern, replacement]]`
+/// array. The CLI picks between them by file extension and the web by which box was filled; either way
+/// the rules land in order — `--map` first, then the file — because later rules apply to the result of
+/// earlier ones.
+pub(crate) fn name_map(
+    rules: &[String],
+    lines: Option<&str>,
+    json: Option<&str>,
+) -> Result<crate::diff::NameMap> {
+    let mut pairs = crate::diff::NameMap::parse_rules(rules.iter().map(String::as_str))?;
+    if let Some(text) = json {
+        let parsed: Vec<(String, String)> = serde_json::from_str(text)
+            .context("parsing rename rules as JSON [[pattern, replacement], …]")?;
+        pairs.extend(parsed);
+    }
+    if let Some(text) = lines {
+        pairs.extend(crate::diff::NameMap::parse_rules(text.lines())?);
+    }
+    crate::diff::NameMap::from_pairs(pairs)
+}
+
+/// What a value comparison needs beyond the two tensors: how to decode them, and what to compute.
+///
+/// Shared by the `diff` subcommand and the web's job, so `--values` means the same thing in a terminal
+/// and in a browser — down to the decode view and the bin count.
+pub(crate) struct ValueOpts<'a> {
+    /// `--dtype`: decode both sides under this view before comparing.
+    pub view: crate::sample::ViewDtype,
+    /// `--bins`: histogram bucket count; `None` picks a sensible count per dtype.
+    pub bins: Option<usize>,
+    /// `--values`: compare element values.
+    pub values: bool,
+    /// `--histogram`: compare value distributions.
+    pub histogram: bool,
+    /// Packing schemas per side, for decoding fused-codebook weights.
+    pub old_schemas: &'a std::collections::HashMap<String, crate::sample::PackingSchema>,
+    pub new_schemas: &'a std::collections::HashMap<String, crate::sample::PackingSchema>,
+}
+
+/// The value/distribution findings for one tensor present on both sides.
+///
+/// Empty when the shapes differ: comparing element values across a reshape has no meaning, and the
+/// structural diff already reports the shape change.
+pub(crate) fn tensor_extras(
+    a: &crate::tree::TensorInfo,
+    b: &crate::tree::TensorInfo,
+    opts: &ValueOpts<'_>,
+) -> crate::diff::TensorExtras {
+    if a.shape != b.shape {
+        return crate::diff::TensorExtras::default();
+    }
+    let values = opts.values.then(|| {
+        crate::sample::compare_values(
+            a,
+            opts.old_schemas.get(&a.name),
+            b,
+            opts.new_schemas.get(&b.name),
+            opts.view,
+        )
+        .ok()
+    });
+    let histogram = opts.histogram.then(|| {
+        let hd = crate::sample::histogram_diff(
+            a,
+            opts.old_schemas.get(&a.name),
+            b,
+            opts.new_schemas.get(&b.name),
+            opts.view,
+            opts.bins,
+        )
+        .ok()?;
+        Some(crate::diff::HistShift {
+            tvd: hd.tvd(),
+            bins: hd.n,
+        })
+    });
+    crate::diff::TensorExtras {
+        values: values.flatten(),
+        histogram: histogram.flatten(),
+    }
+}
+
+/// Whether two shapes are a repack **fold pair**: `(E, inner…)` against `(ceil(E/fold), inner…)`.
+///
+/// The sparse side stores one index per 16-bit word; the dense side folds `fold` experts along dim 0
+/// into one word. So a candidate pair has the same rank and the same inner dims, with dim 0 divided.
+pub(crate) fn detect_fold(old: &[usize], new: &[usize]) -> Option<usize> {
+    let (Some((&e, old_inner)), Some((&w, new_inner))) = (old.split_first(), new.split_first())
+    else {
+        return None;
+    };
+    if old_inner != new_inner {
+        return None;
+    }
+    if w == 0 || e <= w {
+        return None;
+    }
+    let fold = e.div_ceil(w);
+    if !(2..=16).contains(&fold) || w != e.div_ceil(fold) {
+        return None;
+    }
+    Some(fold)
+}
+
+/// What a `--verify-repack` run will do: which tensors to verify, at what bit width, and whether
+/// anything *else* differs.
+pub(crate) struct RepackPlan {
+    /// `(old name, new name)` per candidate — the same name on both sides today, but kept as a pair
+    /// because a rename map could make them differ.
+    pub pairs: Vec<(String, String)>,
+    /// Index bit width: as asked, else the max-density packing for the detected fold (`16 / fold`, so
+    /// fold 5 ⇒ 3-bit, fold 4 ⇒ 4-bit).
+    pub bits: usize,
+    /// Whether anything other than the verified fold-pairs differs — an add, a removal, a non-fold
+    /// signature change, or a metadata change.
+    ///
+    /// The fold-pairs themselves always read as "changed" (their shapes differ by construction), so
+    /// they are excluded: if they verify equivalent and nothing else differs, the two checkpoints are
+    /// the same weights in different packings.
+    pub other_differs: bool,
+}
+
+/// Can a `--verify-repack` run happen at all, given where the two checkpoints live?
+///
+/// The verification decodes packed indices **where the data is**: on the ssh proxy, which addresses
+/// each side by its `s3://` URI, or here for two local files. A remote *safetensors directory* has no
+/// URI the proxy can load, so there is nothing to decode and the answer is a refusal.
+///
+/// Two properties this signature exists to hold:
+///
+/// * **One wording.** The web's job and the `diff` subcommand call this, so they cannot refuse the same
+///   pair in different words — or, worse, one refuse and the other accept.
+/// * **Before the reads.** It depends on the two *specs* and the proxy alone, never on their contents,
+///   so it is answerable before a byte is read. The CLI used to check it after two structure reads and
+///   a printed diff, which read as "accepted, nothing to verify" — indistinguishable from a run that
+///   found no fold-pairs.
+pub(crate) fn repack_supported(proxied: bool, s3_pair: bool) -> Result<()> {
+    if proxied && !s3_pair {
+        anyhow::bail!(
+            "--verify-repack over an ssh proxy needs both sides to be s3:// cstorch checkpoints \
+             (a remote safetensors dir isn't supported)"
+        );
+    }
+    Ok(())
+}
+
+/// Plan a repack verification over two **already-scoped** summaries.
+///
+/// Shared by the `diff` subcommand and the web's job, so the browser verifies exactly the pairs a
+/// terminal would. `Err` when nothing folds — which is a user-facing message, not a bug: it usually
+/// means the `--name` scope selected the wrong tensors.
+pub(crate) fn plan_repack(
+    old: &CheckpointSummary,
+    new: &CheckpointSummary,
+    repack_bits: Option<usize>,
+) -> Result<RepackPlan> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut fold0 = None;
+    for (name, osig) in &old.tensors {
+        if let Some(nsig) = new.tensors.get(name)
+            && let Some(fold) = detect_fold(&osig.shape, &nsig.shape)
+        {
+            fold0.get_or_insert(fold);
+            pairs.push((name.clone(), name.clone()));
+        }
+    }
+    if pairs.is_empty() {
+        anyhow::bail!(
+            "no fold-pair tensors matched — check the name scope, and that the shapes fold along \
+             dim 0 (old E, new ceil(E/fold))"
+        );
+    }
+    let bits = repack_bits.unwrap_or_else(|| (16 / fold0.unwrap_or(1)).max(1));
+
+    let verified: std::collections::HashSet<&String> = pairs.iter().map(|(_, n)| n).collect();
+    let added = new.tensors.keys().any(|k| !old.tensors.contains_key(k));
+    let removed = old.tensors.keys().any(|k| !new.tensors.contains_key(k));
+    let other_changed = old.tensors.iter().any(|(k, osig)| {
+        new.tensors.get(k).is_some_and(|nsig| nsig != osig) && !verified.contains(k)
+    });
+    Ok(RepackPlan {
+        pairs,
+        bits,
+        other_differs: added || removed || other_changed || old.metadata != new.metadata,
+    })
 }
 
 /// A one-line verdict for a screen's header: what the report found, or that the two are
@@ -76,13 +440,14 @@ pub(crate) fn verdict(report: &DiffReport) -> String {
         (report.tensors_changed.len(), "changed"),
     ] {
         if n > 0 {
-            parts.push(format!("{n} {what}"));
+            parts.push(format!("{} {what}", crate::utils::format_count(n)));
         }
     }
     let meta = report.meta_added.len() + report.meta_removed.len() + report.meta_changed.len();
     if meta > 0 {
         parts.push(format!(
-            "{meta} metadata {}",
+            "{} metadata {}",
+            crate::utils::format_count(meta),
             if meta == 1 { "change" } else { "changes" }
         ));
     }
@@ -91,8 +456,26 @@ pub(crate) fn verdict(report: &DiffReport) -> String {
         // (currently only the S3 object metadata of an s3-vs-s3 diff).
         return "differs".to_string();
     }
-    format!("{} tensors: {}", report.tensors_unchanged, parts.join(", "))
-        .replace("tensors: ", "unchanged; ")
+    format!(
+        "{} tensors: {}",
+        crate::utils::format_count(report.tensors_unchanged),
+        parts.join(", ")
+    )
+    .replace("tensors: ", "unchanged; ")
+}
+
+/// Which of a comparison's two checkpoints is the **old** side.
+///
+/// A diff is directional — added and removed swap over when you turn it round — and the side-by-side
+/// view has always been able to turn it round. The report could not, so seeing the same pair the other
+/// way meant editing the URL. Naming the two arrangements keeps "which way round is this" a stated
+/// fact rather than an argument order to get right at three call sites.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sides {
+    /// The baseline is old, the open checkpoint new — how a report reads by default.
+    BaselineFirst,
+    /// Swapped: the open checkpoint is the baseline. The same pair, the other direction.
+    OpenFirst,
 }
 
 /// The `diff OLD NEW` command that reproduces a comparison — the batch equivalent a UI
@@ -103,13 +486,39 @@ pub(crate) fn verdict(report: &DiffReport) -> String {
 /// compares something else. [`crate::model::checkpoint_path`] answers that; `None` means
 /// the files span directories, in which case no single path names them and there is no
 /// honest one-line command to offer.
-pub(crate) fn cli_diff_command(against: &Path, open: &[PathBuf]) -> Option<String> {
-    let new = crate::model::checkpoint_path(open)?;
-    Some(format!(
+/// `extra` are the scope flags, so a copied command reproduces the comparison *on screen* rather than
+/// an unscoped one over every tensor — which is what it used to hand over.
+pub(crate) fn cli_diff_command(
+    against: &Path,
+    open: &[PathBuf],
+    extra: &[String],
+    sides: Sides,
+    // `#subtree` per side, when a comparison is scoped to one — `(baseline, newer)`. It rides on the
+    // operand rather than on a flag, which is how `diff` spells it, so it has to be appended here or
+    // the offered command would compare two whole checkpoints.
+    subtrees: (Option<&str>, Option<&str>),
+) -> Option<String> {
+    let open = crate::model::checkpoint_path(open)?;
+    let suffix = |spec: String, sub: Option<&str>| match sub {
+        Some(p) => format!("{spec}#{p}"),
+        None => spec,
+    };
+    let against = suffix(against.display().to_string(), subtrees.0);
+    let open = suffix(open.display().to_string(), subtrees.1);
+    let (old, new) = match sides {
+        Sides::BaselineFirst => (&against, &open),
+        Sides::OpenFirst => (&open, &against),
+    };
+    let mut cmd = format!(
         "checkpoint-studio diff {} {}",
-        shell_quote(&against.display().to_string()),
-        shell_quote(&new.display().to_string())
-    ))
+        shell_quote(old),
+        shell_quote(new)
+    );
+    for arg in extra {
+        cmd.push(' ');
+        cmd.push_str(&shell_quote(arg));
+    }
+    Some(cmd)
 }
 
 /// Single-quote a path for a copyable shell command when it needs it.
@@ -132,6 +541,71 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(name)
+    }
+
+    /// The baseline of a diff resolves through `opening`, so it takes every address the rest of the
+    /// app takes.
+    ///
+    /// This is the fix for two diff features that disagreed about what a checkpoint address is: the
+    /// report handed its `?against=` to `Path::new` and looked for files, so `s3://…`, `hf://…`,
+    /// `[user@]host:/path` and the `:PATH` shorthand all came back as *"no checkpoint files found"*
+    /// from the same server whose side-by-side comparison resolved them without complaint.
+    ///
+    /// Classification only — no read, so no network. That is the part that was wrong; whether a
+    /// remote host answers is not this test's business.
+    #[test]
+    fn a_diff_baseline_accepts_the_addresses_the_rest_of_the_app_accepts() {
+        let opts = crate::opening::Options::default();
+        // scp-style carries its own host, so it needs no configured proxy and cannot depend on
+        // whose machine the suite runs on.
+        let target = crate::opening::resolve("host.invalid:/models/ckpt", &opts)
+            .expect("an scp-style spec resolves");
+        assert!(
+            target.remote.is_some(),
+            "a diff baseline spelled `host:/path` should resolve to a remote read, \
+             not be looked for on this disk"
+        );
+        assert!(
+            target.resolved.is_empty(),
+            "a remote target has no local shard files"
+        );
+    }
+
+    /// A local spec that names nothing still fails the way it always did, with the typed spelling in
+    /// the message — going through `opening` must not cost the error its usefulness.
+    #[test]
+    fn a_diff_baseline_that_names_nothing_says_so() {
+        let Err(e) = summarize_spec(
+            "/nope/not/a/checkpoint",
+            &crate::opening::Options::default(),
+        ) else {
+            panic!("a missing path should not summarize");
+        };
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("/nope/not/a/checkpoint"),
+            "the rejection should name what was typed: {msg}"
+        );
+    }
+
+    /// The spec-based entry point and the path-based one agree on a local checkpoint — so routing
+    /// `/api/diff` through `opening` changed which addresses are accepted and nothing else.
+    #[test]
+    fn resolving_a_local_baseline_by_spec_matches_resolving_it_by_path() {
+        let path = fixture("diff_old.safetensors");
+        let by_path = summarize(&path).expect("the fixture summarizes");
+        let by_spec = summarize_spec(
+            &path.display().to_string(),
+            &crate::opening::Options::default(),
+        )
+        .expect("the same fixture summarizes as a spec");
+        // Through serde, which these types derive: it gives a readable diff on failure without
+        // asking the comparable-structure types to carry a `Debug` they have no other use for.
+        assert_eq!(
+            serde_json::to_value(&by_path).unwrap(),
+            serde_json::to_value(&by_spec).unwrap(),
+            "the same local checkpoint should summarize identically by path and by spec"
+        );
     }
 
     #[test]
@@ -178,11 +652,39 @@ mod tests {
     fn the_cli_command_puts_the_baseline_first() {
         // `diff OLD NEW`: the baseline is the first argument, the open checkpoint the
         // second — so pasting the command reproduces the screen's own report.
-        let cmd = cli_diff_command(Path::new("/a/old"), &[PathBuf::from("/b/new")]).unwrap();
+        let cmd = cli_diff_command(
+            Path::new("/a/old"),
+            &[PathBuf::from("/b/new")],
+            &[],
+            Sides::BaselineFirst,
+            (None, None),
+        )
+        .unwrap();
         assert_eq!(cmd, "checkpoint-studio diff /a/old /b/new");
-        let quoted =
-            cli_diff_command(Path::new("/a/needs quoting"), &[PathBuf::from("/b/new")]).unwrap();
+        let quoted = cli_diff_command(
+            Path::new("/a/needs quoting"),
+            &[PathBuf::from("/b/new")],
+            &[],
+            Sides::BaselineFirst,
+            (None, None),
+        )
+        .unwrap();
         assert!(quoted.contains("'/a/needs quoting'"), "{quoted}");
+    }
+
+    /// Turned round, the command has to turn round with it: a swapped report whose command still
+    /// said `diff OLD NEW` would hand over the opposite of what is on screen.
+    #[test]
+    fn a_swapped_report_offers_the_swapped_command() {
+        let cmd = cli_diff_command(
+            Path::new("/a/old"),
+            &[PathBuf::from("/b/new")],
+            &[],
+            Sides::OpenFirst,
+            (None, None),
+        )
+        .unwrap();
+        assert_eq!(cmd, "checkpoint-studio diff /b/new /a/old");
     }
 
     /// The regression this function exists for. `open` is the *resolved* file list, so a
@@ -197,7 +699,14 @@ mod tests {
             PathBuf::from("/ckpt/model-00001-of-00002.safetensors"),
             PathBuf::from("/ckpt/model-00002-of-00002.safetensors"),
         ];
-        let cmd = cli_diff_command(Path::new("/base"), &shards).unwrap();
+        let cmd = cli_diff_command(
+            Path::new("/base"),
+            &shards,
+            &[],
+            Sides::BaselineFirst,
+            (None, None),
+        )
+        .unwrap();
         assert_eq!(
             cmd, "checkpoint-studio diff /base /ckpt",
             "a sharded checkpoint is named by its directory"
@@ -205,6 +714,26 @@ mod tests {
         assert!(
             !cmd.contains("codebooks"),
             "naming a shard would compare something else: {cmd}"
+        );
+    }
+
+    /// Which pairs `--verify-repack` can run over, in the one place both surfaces ask.
+    ///
+    /// The middle case is the reported bug: a `:PATH` (remote safetensors directory) against an
+    /// `s3://` checkpoint. The web refused it; the CLI checked the same condition only after two
+    /// structure reads and a printed diff, so it looked accepted. Both now call this, before reading.
+    #[test]
+    fn a_repack_needs_either_two_local_files_or_two_s3_uris() {
+        // Two local checkpoints: decoded here, no proxy involved.
+        assert!(repack_supported(false, false).is_ok());
+        // Two s3:// checkpoints over the proxy: what the mode exists for.
+        assert!(repack_supported(true, true).is_ok());
+        // Mixed: the proxy addresses each side by URI, so there is nothing to decode.
+        let refused = repack_supported(true, false).expect_err("a mixed remote pair is refused");
+        let msg = format!("{refused:#}");
+        assert!(
+            msg.contains("both sides to be s3:// cstorch checkpoints"),
+            "the refusal should say what is needed: {msg}"
         );
     }
 
@@ -216,7 +745,25 @@ mod tests {
             PathBuf::from("/a/one.safetensors"),
             PathBuf::from("/b/two.safetensors"),
         ];
-        assert!(cli_diff_command(Path::new("/base"), &scattered).is_none());
-        assert!(cli_diff_command(Path::new("/base"), &[]).is_none());
+        assert!(
+            cli_diff_command(
+                Path::new("/base"),
+                &scattered,
+                &[],
+                Sides::BaselineFirst,
+                (None, None)
+            )
+            .is_none()
+        );
+        assert!(
+            cli_diff_command(
+                Path::new("/base"),
+                &[],
+                &[],
+                Sides::BaselineFirst,
+                (None, None)
+            )
+            .is_none()
+        );
     }
 }

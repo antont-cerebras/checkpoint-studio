@@ -217,7 +217,12 @@ impl RemoteSession {
     /// Marker in the error returned when a read is cut short via the `abort` flag —
     /// so a caller running two reads in parallel can prefer the *real* failure over
     /// this consequential one when reporting.
-    pub const ABORTED: &'static str = "read aborted (the other side failed first)";
+    ///
+    /// Deliberately says nothing about *why*. It used to read "the other side failed first", which was
+    /// true of its only caller at the time; the flag now also carries a person asking the server to
+    /// stop a read so another can start, and a message that names the wrong cause is worse than one
+    /// that names none.
+    pub const ABORTED: &'static str = "read stopped before it finished";
 
     /// [`Self::exec_capture`], but cut short if `abort` is set (checked between
     /// reads — so it takes effect within one streamed chunk of a script that emits

@@ -43,11 +43,26 @@
     { keys: 'Esc/⌫', label: 'back', act: back },
   ];
 
+  // Mirrors the TUI's `hints::compare_hint_lines`, so the same screen advertises the same keys in
+  // both surfaces. The footer used to fall through to a bare "back" here, which meant `n`/`N` and `s`
+  // were mentioned only in one dim line inside the view — and `s` means *stats* on every other
+  // screen, so a collision that is documented nowhere global is a collision nobody expects.
+  //
+  // The acts are no-ops because the handlers belong to the view that owns the state; same as `↑↓` in
+  // the tree footer, which is a legend entry rather than a button.
+  const compareHints: Hint[] = [
+    { keys: 'n/N', label: 'next/prev difference', act: () => {} },
+    { keys: 's', label: 'swap sides', act: () => {} },
+    { keys: 'k', label: 'families', act: () => {} },
+    { keys: 'Esc/⌫', label: 'back', act: back },
+  ];
+
   const otherHints: Hint[] = [{ keys: 'Esc/⌫', label: 'back', act: back }];
 
   function hintsFor(s: Screen): Hint[] {
     if (s.kind === 'tree') return treeHints;
     if (s.kind === 'detail') return detailHints;
+    if (s.kind === 'compare') return compareHints;
     return otherHints;
   }
 

@@ -2,6 +2,10 @@
 // these just fetch it. Errors surface the server's `{error}` envelope.
 
 import { totalBytes } from './progress';
+import { scopeToQuery, type DiffScopeParams } from './diffscope';
+import type { JobStatus } from '../stores/jobs';
+import type { ReadingProgress } from '../stores/reading';
+import type { ComparisonSet, DiffTreeResponse } from './difftree';
 import type {
   FileNode,
   HistogramDto,
@@ -24,8 +28,10 @@ import type {
 async function getJsonStreamed<T>(
   url: string,
   onProgress: (received: number, total: number | null) => void,
+  onDecoding?: () => void,
+  signal?: AbortSignal,
 ): Promise<T> {
-  const res = await fetch(url);
+  const res = await fetch(url, signal ? { signal } : {});
   const total = totalBytes(res.headers);
   const reader = res.ok ? (res.body?.getReader() ?? null) : null;
   let text: string;
@@ -41,6 +47,14 @@ async function getJsonStreamed<T>(
       chunks.push(value);
       received += value.length;
       onProgress(received, total);
+    }
+    // The last byte has arrived, and the slow part is about to start: decoding and parsing 91 MB
+    // blocks the main thread for tens of seconds, with the bar stuck at 100% and its timer frozen
+    // because nothing can re-render. Announcing the change of phase *and yielding a task* is what
+    // lets the new label paint before the thread is taken.
+    if (onDecoding) {
+      onDecoding();
+      await new Promise((resume) => setTimeout(resume, 0));
     }
     text = new TextDecoder().decode(concat(chunks, received));
   }
@@ -58,6 +72,35 @@ function concat(chunks: Uint8Array[], total: number): Uint8Array {
     at += c.length;
   }
   return out;
+}
+
+/**
+ * The server is mid-read and refused this one, naming what it is busy with.
+ *
+ * A distinct error type, not a string to match on: the reply carries the running spec and how long it
+ * has been going so a caller can *offer to stop it*, and prose is the wrong place to keep facts a
+ * button needs. `postJson` raises this whenever the server says stopping is available.
+ */
+export class BusyError extends Error {
+  readonly busyWith: string;
+  readonly busyForSeconds: number;
+  constructor(message: string, busyWith: string, busyForSeconds: number) {
+    super(message);
+    this.name = 'BusyError';
+    this.busyWith = busyWith;
+    this.busyForSeconds = busyForSeconds;
+  }
+}
+
+/** Whether a refusal body is the server saying "something else is reading; you may stop it". */
+function busyFrom(body: unknown, message: string): BusyError | null {
+  if (typeof body !== 'object' || body === null || !('can_stop_other' in body)) return null;
+  const b = body as { busy_with?: unknown; busy_for_seconds?: unknown };
+  return new BusyError(
+    message,
+    typeof b.busy_with === 'string' ? b.busy_with : '',
+    typeof b.busy_for_seconds === 'number' ? b.busy_for_seconds : 0,
+  );
 }
 
 /** The server's `{error}` envelope, or a bare status when it didn't send one. */
@@ -80,9 +123,14 @@ export type OnProgress = (received: number, total: number | null) => void;
  * is the one parameter it doesn't, and streaming to a non-function would throw — so a
  * caller with nothing to report simply gets the plain fetch.
  */
-function fetchJson<T>(url: string, onProgress?: OnProgress): Promise<T> {
+function fetchJson<T>(
+  url: string,
+  onProgress?: OnProgress,
+  onDecoding?: () => void,
+  signal?: AbortSignal,
+): Promise<T> {
   return typeof onProgress === 'function'
-    ? getJsonStreamed<T>(url, onProgress)
+    ? getJsonStreamed<T>(url, onProgress, onDecoding, signal)
     : getJson<T>(url);
 }
 
@@ -96,6 +144,15 @@ async function getJson<T>(url: string): Promise<T> {
 }
 
 const enc = encodeURIComponent;
+
+/** A scope as a query tail, or nothing. One place, so the two diff routes cannot encode it differently. */
+function scopeTail(scope: DiffScopeParams | undefined): string {
+  return scope === undefined
+    ? ''
+    : scopeToQuery(scope)
+        .map(([k, v]) => `&${k}=${enc(v)}`)
+        .join('');
+}
 
 // `?: T | undefined` throughout: callers build this object with every key present and
 // leave the inapplicable ones `undefined` (`qs` drops those), which
@@ -129,7 +186,10 @@ function qs(params: Record<string, string | number | undefined>): string {
 async function postJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { method: 'POST' });
   const body: unknown = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(serverError(body, res.status));
+  if (!res.ok) {
+    const message = serverError(body, res.status);
+    throw busyFrom(body, message) ?? new Error(message);
+  }
   return body as T;
 }
 
@@ -166,18 +226,93 @@ export const api = {
         size_bytes: number;
       }[];
     }>(`/api/schema?q=${enc(q)}`),
-  /** Structural diff against another checkpoint on the server's filesystem. Rejects
-   * with the server's message (a 400) when the path is not a readable checkpoint. */
-  diff: (against: string) => getJson<DiffResponse>(`/api/diff?against=${enc(against)}`),
+  /** Structural diff against another checkpoint. Rejects with the server's message (a 400) when the
+   * spec is not a readable checkpoint, or when a scope's glob does not compile.
+   *
+   * `scope` is the CLI's selection flags — see `lib/diffscope`. Omitted means the whole comparison. */
+  /** `swapped` turns the comparison round — the open checkpoint as the baseline. `full` says the reader
+   * expanded the families, which the offered command has to carry. */
+  diff: (against: string, scope?: DiffScopeParams, swapped = false, full = false) =>
+    getJson<DiffResponse>(
+      `/api/diff?against=${enc(against)}${swapped ? '&swap=1' : ''}${full ? '&full=1' : ''}${scopeTail(scope)}`,
+    ),
   /** The compact (family-folded) tree, optionally scoped by the filter query. */
   compact: (q: string) => getJson<CompactTree>(`/api/compact?q=${enc(q)}`),
   /** Read another checkpoint and serve it instead. Rejects with the server's message for a
    * path that doesn't resolve, in which case the served checkpoint is unchanged. */
-  open: (spec: string) => postJson<OpenResponse>(`/api/open?path=${enc(spec)}`),
+  /** `stopOther` asks the server to cancel a read already in progress and take its place — what the
+   * "Stop it" offer on a [[BusyError]] does. */
+  open: (spec: string, stopOther = false) =>
+    postJson<OpenResponse>(`/api/open?path=${enc(spec)}${stopOther ? '&stop_other=1' : ''}`),
+  /** Which build the server serves, so a tab can tell it has gone stale (see `lib/build`). */
+  version: () =>
+    getJson<{ app: string; assets: string | null; spec: string }>('/api/version'),
+  /** How far the read in flight has got — the only view into a synchronous open (see
+   * `stores/reading`). `{reading: null}` when the server is idle. */
+  reading: () => getJson<{ reading: ReadingProgress | null }>('/api/reading'),
   /** The checkpoints opened this run, most recent first, and whether this server reads over
    * an ssh proxy (which decides what kind of path the prompt accepts). */
   recents: () =>
     getJson<{ recents: string[]; proxied: boolean; proxy_host: string | null }>('/api/recents'),
+  /**
+   * Set up a comparison. `right` empty means "the checkpoint that is open" — the common case, which
+   * costs no second read. A read either way, so it can take seconds.
+   *
+   * Answers with the comparison's `id`, which [[difftree]] must quote, and the two specs as the
+   * server *resolved* them — which is what the caller checks the returned tree against.
+   */
+  setComparison: (left: string, right: string, stopOther = false) =>
+    postJson<ComparisonSet>(
+      `/api/compare?left=${enc(left)}&right=${enc(right)}${stopOther ? '&stop_other=1' : ''}`,
+    ),
+  /**
+   * Start a long-running comparison. Answers with the id to poll — see `stores/jobs`.
+   *
+   * `params` is built by the caller because the value modes take a dozen between them; encoding them
+   * here would mean a second place that knows the flag names.
+   */
+  // `params = []` for the generic accessor guard in api.test.ts, which calls every method with a single
+  // string on the premise that one argument satisfies any first parameter — same reason `fetchJson`
+  // tests `typeof onProgress`.
+  startJob: (kind: 'values' | 'verify-repack', params: [string, string][] = []) =>
+    postJson<{ id: number }>(
+      `/api/jobs/${kind}?${params.map(([k, v]) => `${k}=${enc(v)}`).join('&')}`,
+    ),
+  /** Where a job has got to, and what it has found so far. */
+  jobStatus: (id: number) => getJson<JobStatus>(`/api/jobs/${id}`),
+  /** Ask a job to stop. Cooperative: the state becomes `cancelled` once the work notices. */
+  cancelJob: (id: number) => deleteJson<JobStatus>(`/api/jobs/${id}`),
+  /** Drop the comparison, freeing whatever it held. */
+  clearComparison: () => deleteJson<{ comparison: null }>('/api/compare'),
+  /**
+   * The two checkpoints aligned into one tree, for the comparison with this `id`.
+   *
+   * Streamed: a 31k-tensor comparison carries both sides, so it is the largest body this API serves.
+   * `onDecoding` fires when the last byte has arrived and the parse is about to block the thread — the
+   * phase that used to look like a hang (see `LoadStep`'s `building`).
+   *
+   * `id` is required by the server. There is one comparison slot per server, and this route used to
+   * answer from whatever was in it — so two overlapping clients received each other's results with a
+   * `200`. Quoting the id makes a lost race a `409` rather than a confident wrong answer.
+   */
+  difftree: (
+    id: number,
+    scope?: DiffScopeParams,
+    onProgress?: OnProgress,
+    onDecoding?: () => void,
+    signal?: AbortSignal,
+    /** `full`: every layer as its own row. Off means uniform families arrive folded, which is what
+     * makes a 117,000-row comparison readable — the server does the folding. */
+    full = false,
+  ) =>
+    fetchJson<DiffTreeResponse>(
+      // The scope is applied at *align* time, so changing it re-aligns without re-reading either
+      // checkpoint — the comparison id still identifies the pair.
+      `/api/difftree?id=${id}${full ? '&full=1' : ''}${scopeTail(scope)}`,
+      onProgress,
+      onDecoding,
+      signal,
+    ),
   /** Forget one checkpoint. Returns the list without it; rejects with a 404 if it wasn't there. */
   forgetRecent: (spec: string) =>
     deleteJson<{ forgot: string; recents: string[] }>(`/api/recents?path=${enc(spec)}`),

@@ -23,9 +23,9 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 use crate::capability::Location;
-use crate::explorer::CheckpointParts;
 use crate::hf::ReadProgress;
 use crate::model::Checkpoint;
+use crate::opening::CheckpointParts;
 
 /// What a read produced: the flat parts every screen needs, and the central serializable
 /// model when the source can build one.
@@ -33,6 +33,10 @@ use crate::model::Checkpoint;
 /// The remote (ssh-proxy) reader fills the model in a later step, so it returns `None`
 /// here — which is why this is a pair rather than just a [`Checkpoint`]. Modelling that
 /// honestly beat pretending every source can produce a model up front.
+///
+/// A pair and not a struct: two elements whose types could not be confused for each other, read at
+/// every call site as "the parts, and the model if there is one". The *parts* were a five-element
+/// tuple and are [`CheckpointParts`] now, which is where the positional risk actually was.
 pub(crate) type Read = (CheckpointParts, Option<Checkpoint>);
 
 /// One kind of checkpoint source: what it can do, and how to read it.
@@ -129,14 +133,18 @@ impl Source for ProxiedSource {
         }
     }
 
-    fn read(&self, _progress: &ReadProgress) -> Result<Read> {
+    fn read(&self, progress: &ReadProgress) -> Result<Read> {
         let mut tensors = Vec::new();
         let mut metadata = Vec::new();
         let mut config = None;
         let mut disk_shards = Vec::new();
         let mut health = Vec::new();
         for path in &self.paths {
-            let (t, m, cfg, disk, h) = self.remote.fetch_with_config(&path.to_string_lossy())?;
+            let (t, m, cfg, disk, h) = self.remote.fetch_with_config(
+                &path.to_string_lossy(),
+                Some(progress.abort_flag()),
+                Some(progress.load()),
+            )?;
             tensors.extend(t);
             metadata.extend(m);
             config = config.or(cfg);
@@ -146,13 +154,13 @@ impl Source for ProxiedSource {
             health.extend(h);
         }
         // The central model is assembled by the remote reader in a later step.
-        let parts = (
+        let parts = CheckpointParts {
             tensors,
             metadata,
             config,
-            crate::stats::DiskUsage::from_shards(disk_shards),
+            disk_usage: crate::stats::DiskUsage::from_shards(disk_shards),
             health,
-        );
+        };
         Ok((parts, None))
     }
 }
@@ -160,13 +168,13 @@ impl Source for ProxiedSource {
 /// The flat parts derived from a model — the same projection for every source that can
 /// build one, which the Hub and local branches used to each spell out.
 fn parts_of(cp: &Checkpoint) -> CheckpointParts {
-    (
-        cp.tensors_vec(),
-        cp.metadata_vec(),
-        cp.config.clone(),
-        None,
-        Vec::new(),
-    )
+    CheckpointParts {
+        tensors: cp.tensors_vec(),
+        metadata: cp.metadata_vec(),
+        config: cp.config.clone(),
+        disk_usage: None,
+        health: Vec::new(),
+    }
 }
 
 /// Pick the source for what the user asked for.

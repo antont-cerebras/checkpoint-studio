@@ -300,6 +300,13 @@ pub(crate) struct OpenRequest {
     /// Open the compare screen against this checkpoint (`--diff-against PATH`, the
     /// tree's `d` command). Round-trips through `y`.
     pub diff_against: Option<String>,
+    /// Open the **side-by-side** compare screen against this checkpoint (`--compare-with PATH`, the
+    /// palette's *Compare side by side*) — the aligned two-column tree, as against `diff_against`'s one-page report.
+    /// Round-trips through `y`.
+    pub compare_with: Option<String>,
+    /// Show every layer there rather than folding uniform index families onto one row each
+    /// (`--compare-full`, the `k` key). Round-trips through `y`.
+    pub compare_full: bool,
     /// Order the flat search / filter list (`--sort KEY[.DIR]`, the `o` / `O` keys).
     /// Round-trips through `y`.
     pub sort: Option<(crate::viewstate::SortKey, crate::viewstate::SortDir)>,

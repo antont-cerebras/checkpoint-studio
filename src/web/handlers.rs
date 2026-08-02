@@ -4,12 +4,14 @@
 //! data routes read tensor bytes on demand (local-only) via `crate::sample`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::WebState;
+use super::current::{ComparisonLookup, WhenBusy};
 use crate::sample::{self, SampleMode, ViewDtype};
 use crate::tree::TensorInfo;
 use crate::web::dto::{self, HistogramDto, SampleDto, StatsDto};
@@ -34,6 +36,37 @@ pub(crate) fn err(status: u16, msg: impl Into<String>) -> Reply {
     let body = json!({ "error": msg.into() });
     (
         status,
+        serde_json::to_vec(&body)
+            .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec()),
+    )
+}
+
+/// How to treat a read that is already running, from `?stop_other=1`.
+///
+/// Opt-in per request rather than a server setting: stopping someone else's read is a decision the
+/// person making it should have taken, and the refusal that precedes it names what would be stopped.
+fn when_busy(q: &Query) -> Result<WhenBusy, Reply> {
+    Ok(if switch(q, "stop_other")? {
+        WhenBusy::StopTheOther
+    } else {
+        WhenBusy::Refuse
+    })
+}
+
+/// A refusal that offers the way out, as the `{error}` envelope plus the fields a UI needs to render a
+/// button rather than a sentence telling the reader to wait.
+fn busy_reply(current: &super::Current, e: &anyhow::Error) -> Reply {
+    let (spec, secs) = current.busy_with().unwrap_or_else(|| (String::new(), 0.0));
+    let body = json!({
+        "error": format!("{e:#}"),
+        // What is running, so the offer can name it, and a flag so the client does not have to
+        // pattern-match on prose to know a retry-with-takeover is available.
+        "busy_with": spec,
+        "busy_for_seconds": secs,
+        "can_stop_other": true,
+    });
+    (
+        409,
         serde_json::to_vec(&body)
             .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec()),
     )
@@ -79,7 +112,11 @@ pub(crate) fn open(current: &super::Current, q: &Query) -> Reply {
              path on the ssh proxy)",
         );
     };
-    match current.open(spec) {
+    let busy = match when_busy(q) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match current.open(spec, busy) {
         Ok(state) => ok(json!({
             "root": state.root,
             "tensor_count": state.tensors.len(),
@@ -88,6 +125,9 @@ pub(crate) fn open(current: &super::Current, q: &Query) -> Reply {
             "opened": spec,
             "recents": current.recents(),
         })),
+        // Something else is mid-read: a 409 with the offer to stop it, not a 400 — the request was
+        // fine, the server was busy.
+        Err(e) if current.busy_with().is_some() => busy_reply(current, &e),
         // A spec that doesn't resolve is a client mistake, not a server fault: this message
         // is what the open prompt shows inline, so it carries the whole `anyhow` chain
         // (`opening /nope: no checkpoint files found at …`).
@@ -114,6 +154,40 @@ pub(crate) fn forget_recent(current: &super::Current, q: &Query) -> Reply {
     }
 }
 
+/// `GET /api/version` — which build of the app this is, so a browser tab can tell it has gone stale.
+///
+/// A tab outlives the server it was loaded from. This project restarts the server under open tabs as a
+/// matter of routine, and the failure that produces is silent and unbounded: an old client reading a
+/// newer response shape declared two checkpoints that share no tensor name "structurally identical",
+/// because every counter it looked for was missing and `NaN > 0` is false. One defensive check fixed
+/// that symptom; this answers the question behind it.
+///
+/// `assets` is the entry script's hashed name — the identity of the UI being served, which the tab
+/// compares against the script it is running (`web/src/lib/build.ts`). `app` is the binary's version,
+/// for a human reading the reply.
+pub(crate) fn version(s: &WebState) -> Reply {
+    ok(json!({
+        "app": env!("CARGO_PKG_VERSION"),
+        "assets": super::assets::build_id(),
+        // Which checkpoint this server holds, so the one cheap poll answers "is anything about this
+        // server different from when I loaded" rather than only "is the UI different".
+        "spec": if s.spec.is_empty() { &s.root } else { &s.spec },
+    }))
+}
+
+/// `GET /api/reading` — how far the read in flight has got, or `{"reading":null}`.
+///
+/// Polled while a wait is on screen. `/api/open` and `/api/compare` are synchronous — the answer means
+/// *ready*, which is what spares the client a state machine — so this is the only way the browser can
+/// see inside a read it is waiting on. Without it the wait had an elapsed timer and no numbers, while a
+/// terminal reading the same checkpoint counted `1155/1155 S3 objects`.
+///
+/// Deliberately not part of the busy refusal: that says what is *blocking you*, this says how the thing
+/// you asked for is going, and they are different questions asked by different code.
+pub(crate) fn reading(current: &super::Current) -> Reply {
+    ok(json!({ "reading": current.reading() }))
+}
+
 /// `GET /api/recents` — the checkpoints opened this run, most recent first.
 ///
 /// Not folded into `/api/tree`: that body is encoded once per checkpoint and cached, so a
@@ -127,6 +201,433 @@ pub(crate) fn recents(current: &super::Current) -> Reply {
         // And *which* host, so the client can show `:/path` as the address it resolves to.
         "proxy_host": current.proxy_host(),
     }))
+}
+
+// ---- comparing two checkpoints ----
+
+/// A checkpoint named for a client: what to address it by, what to label it, and whether it is the
+/// one being *served*.
+///
+/// `served` is stated rather than left to be derived. The client used to decide it by string-comparing
+/// this `spec` against `/api/tree`'s, which only worked because both are built by the same expression
+/// — and which produced a false "not loaded" for any two spellings that resolve to the same
+/// checkpoint (a glob versus the directory it expands to, `:path` versus `host:/path`). The server
+/// holds the fact outright, so it says it. Same rule as `crate::capability`: record it at the source,
+/// never re-derive it from a path's shape.
+fn side_json(s: &WebState, served: bool, totals: crate::diff::Footprint) -> Value {
+    json!({
+        "spec": if s.spec.is_empty() { &s.root } else { &s.spec },
+        "root": s.root,
+        "tensor_count": s.tensors.len(),
+        "served": served,
+        // The two overall totals, so the side-by-side can head itself with the same `size:` and
+        // `params:` lines the report and the terminal show. It had neither, which made it the one
+        // view of a re-quantization that never said the checkpoint got four times smaller.
+        //
+        // Passed in rather than read off `s`, because under a scope they cover the *selected* tensors:
+        // the rows on this screen are the selection, and totals describing the whole checkpoints would
+        // be a true statement about something the reader is not looking at (see `totals_of`).
+        "params": totals.params,
+        "bytes": totals.bytes,
+    })
+}
+
+/// The summed footprint of `tensors`, or of the subset `keep` names.
+///
+/// Over the **deduped** canonical list, like `diff::CheckpointSummary::from_loaded`: a sharded
+/// checkpoint lists a shared name once per shard, and counting it per shard would put a different total
+/// on the side-by-side than on the report — which a test pins together.
+fn totals_of(
+    tensors: &[TensorInfo],
+    keep: Option<&std::collections::HashSet<String>>,
+) -> crate::diff::Footprint {
+    tensors
+        .iter()
+        .filter(|t| keep.is_none_or(|k| k.contains(&t.name)))
+        .fold(crate::diff::Footprint::default(), |acc, t| {
+            crate::diff::Footprint {
+                bytes: acc.bytes + t.size_bytes,
+                params: acc.params + t.num_elements,
+                // A total, not a fold: `parts` counts tensors behind *one name*, and this is a sum
+                // over many names.
+                parts: 1,
+            }
+        })
+}
+
+/// `POST /api/compare?left=SPEC&right=SPEC` — set up a comparison between two checkpoints.
+///
+/// `right` may be omitted to mean "the checkpoint that is open", which is the common case and costs
+/// no second read. Naming a different one compares two checkpoints that are both other than the
+/// served one — either way the served checkpoint stays loaded and untouched, which is what makes the
+/// right-hand box overridable rather than decorative.
+///
+/// Synchronous like `/api/open`, and for the same reason: the answer means "ready", so the client has
+/// no state to poll and reconcile.
+pub(crate) fn set_comparison(current: &super::Current, q: &Query) -> Reply {
+    let Some(left) = q.get("left").map(String::as_str).filter(|p| !p.is_empty()) else {
+        return err(
+            400,
+            "a comparison needs ?left=SPEC (the baseline), and optionally &right=SPEC",
+        );
+    };
+    let right = q.get("right").map_or("", String::as_str);
+    let busy = match when_busy(q) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match current.set_comparison(left, right, busy) {
+        // The id is what the follow-up `/api/difftree` must quote, and the two specs are what they
+        // *resolved* to — so the client can check that the comparison it gets back is the one it asked
+        // for, without re-deriving a resolution only this side performed.
+        Ok(set) => ok(json!({
+            "id": set.id,
+            "left": set.left_spec,
+            "right": set.right_spec,
+            "recents": current.recents(),
+        })),
+        Err(e) if current.busy_with().is_some() => busy_reply(current, &e),
+        Err(e) => err(400, format!("{e:#}")),
+    }
+}
+
+/// `DELETE /api/compare` — drop the comparison, freeing whatever it held.
+pub(crate) fn clear_comparison(current: &super::Current) -> Reply {
+    current.clear_comparison();
+    ok(json!({ "comparison": Value::Null }))
+}
+
+/// `GET /api/difftree?id=N` — the two checkpoints aligned into one tree.
+///
+/// The whole side-by-side comes from this one response: one row per name, each side's content on its
+/// own side, a per-row status, per-group differing counts, and the ordered list of differences that
+/// `n`/`N` step through. Aligning here rather than in each frontend is what stops the terminal and
+/// the browser from drawing different comparisons of the same two checkpoints
+/// (see `checkpoint_studio_core::difftree`).
+///
+/// **`id` is required.** There is one comparison slot per server, and this route used to answer from
+/// whatever was in it. Two overlapping clients therefore swapped results — A set up its pair, B
+/// replaced it, and A's request returned B's comparison with a `200`. Quoting the id from
+/// `POST /api/compare` makes that a `409` instead of a wrong answer.
+pub(crate) fn difftree(current: &super::Current, _s: &WebState, q: &Query) -> Reply {
+    // The request's own parameters first: a typo is a typo whether or not the comparison it names
+    // still exists, and reporting the id problem for a malformed switch sends the reader looking in
+    // the wrong place.
+    let full = match switch(q, "full") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let Some(id) = q.get("id").and_then(|v| v.parse::<u64>().ok()) else {
+        return err(
+            400,
+            "difftree needs ?id=N, the id returned by POST /api/compare — \
+             without it this could answer about a comparison you did not ask for",
+        );
+    };
+    let (base, right) = match current.comparison_for(id) {
+        // 409, not 404: the endpoint exists and the request is well-formed — there is simply no
+        // comparison set up yet, which the client fixes by POSTing a baseline.
+        ComparisonLookup::None => {
+            return err(
+                409,
+                "no comparison set up — POST /api/compare?left=SPEC first",
+            );
+        }
+        ComparisonLookup::Replaced { current: now } => {
+            return err(
+                409,
+                format!(
+                    "comparison {id} was replaced by another request (now {now}) — \
+                     POST /api/compare again to set up yours"
+                ),
+            );
+        }
+        ComparisonLookup::Found { base, right } => (base, right),
+    };
+    let served = current.snapshot();
+    // Identity, not string equality: whether a side *is* the served state is a fact about the
+    // pointers, and no spelling of a path can make it wrong.
+    let base_served = Arc::ptr_eq(&base, &served);
+    let right_served = Arc::ptr_eq(&right, &served);
+    let s = right.as_ref();
+
+    let scope = match super::diffscope::DiffScope::from_query(q) {
+        Ok(scope) => scope,
+        Err(e) => return err(400, format!("{e:#}")),
+    };
+    // Rename rules first, then scoping — the CLI's order, and the reason both are here rather than only
+    // on the report: a side-by-side that ignored `--map` would compare two schemes that were meant to be
+    // lined up, and read as every tensor added and removed.
+    //
+    // The baseline's tree is *rebuilt* from the renamed names, because groups are named from name
+    // segments and rewriting a leaf alone leaves the path above it describing the old name.
+    let base_meta = base.checkpoint.metadata_vec();
+    let right_meta = s.checkpoint.metadata_vec();
+    // A `#subtree` on either side first: it re-keys that side's tensors to their sub-path, so the two
+    // checkpoints line up under different namespaces (`hf#language_model` against a converted
+    // `model.…`), and everything below — renames, filters, totals — is written against those names.
+    // Rebuilt trees, because a group is named from name segments.
+    let base_sub = scope.reroot_tensors(super::diffscope::Sub::Baseline, &base.tensors);
+    let right_sub = scope.reroot_tensors(super::diffscope::Sub::Newer, &s.tensors);
+    let renamed = scope.rename_tensors(&base_sub);
+    let (base_tensors, rename_collisions) = (renamed.tensors, renamed.collisions);
+    let renamed_tree = (scope.has_rename_rules() || scope.reroots())
+        .then(|| crate::difftree::tree_from_tensors(&base.root, &base_tensors, &base_meta));
+    // The newer side is rebuilt only when *it* is re-rooted: no rename rule touches it.
+    let right_tree = scope
+        .subtrees()
+        .1
+        .map(|_| crate::difftree::tree_from_tensors(&s.root, &right_sub, &right_meta));
+
+    // Scope the trees, if a *filter* narrows them.
+    //
+    // `scope.compare` is given the **original** names and renames them itself — passing the renamed ones
+    // would apply the rules twice, which is a no-op for most rules and silently wrong for any that match
+    // their own output. Its `matched` names are therefore post-rename, which is what the rebuilt tree's
+    // leaves are called.
+    //
+    // Keyed on `matched`, not on `is_active()`: a scope can be active because of a rename rule alone, and
+    // an empty keep-set then pruned *every* row — a comparison of two lined-up checkpoints came back
+    // completely empty rather than as two unchanged tensors.
+    // The summaries are built from the **re-rooted** names, and `scope.compare` re-roots nothing it has
+    // already been given — it renames and filters from here.
+    let scoped = scope.is_active().then(|| {
+        scope.compare(
+            crate::diff::CheckpointSummary::from_loaded(&base_sub, &base_meta),
+            crate::diff::CheckpointSummary::from_loaded(&right_sub, &right_meta),
+        )
+    });
+    let matched = scoped.and_then(|out| out.matched);
+    // The selected names, once — the pruning below and the totals both work from it.
+    let keep: Option<std::collections::HashSet<String>> =
+        matched.as_ref().map(|m| m.names.iter().cloned().collect());
+    // Which tree each side starts from: the rebuilt one when a rename rule or a `#subtree` changed the
+    // names, else the one the read already built.
+    let base_full = renamed_tree.as_deref().unwrap_or(&base.tree);
+    let right_full = right_tree.as_deref().unwrap_or(&s.tree);
+    let pruned = keep.as_ref().map(|keep| {
+        (
+            scope.prune_tree(base_full, keep),
+            scope.prune_tree(right_full, keep),
+        )
+    });
+    let base_rows = pruned.as_ref().map_or(base_full, |(b, _)| b.as_slice());
+    let right_rows = pruned.as_ref().map_or(right_full, |(_, r)| r.as_slice());
+
+    // `align_rooted`: each tree hangs under a root named after its own checkpoint, and those
+    // names never match across two files — aligning the roots would pair nothing.
+    let mut rows = crate::difftree::align_rooted(base_rows, right_rows);
+    // A folded baseline leaf says how many tensors it stands for (`×256`), because the fused side has
+    // one of them and the question is whether the conversion kept them all. On the aligned rows, so the
+    // note sits on the side it describes.
+    crate::difftree::note_folds(&mut rows, &renamed.folds);
+    // The headline is counted over **every** row, before families are folded: turning a view control on
+    // must not change what the comparison says. (`tally` below reads `rows`, which is why this is taken
+    // here and the folded tree is a separate value.)
+    let tally = crate::difftree::tally(&rows);
+    // Uniform layers fold into one row unless the reader asked for all of them (`full`, read at the
+    // top) — the report's default, and the terminal's, for the same reason: 62 rows differing only by
+    // a layer number say less than one row that says so.
+    let rows = if full {
+        rows
+    } else {
+        crate::difftree::fold_families(&rows)
+    };
+    // What `n`/`N` walk — over the rows actually returned, so a jump lands on a row that is on screen.
+    let differences = crate::difftree::differences(&rows);
+    // The totals follow the scope: over the selected tensors when there is a selection, over the
+    // checkpoint when there is not. The baseline's are summed from its **renamed** tensors, since that
+    // is what the selection names.
+    let base_totals = totals_of(&base_tensors, keep.as_ref());
+    let right_totals = totals_of(&right_sub, keep.as_ref());
+    let (size_label, params_label) = crate::diff::totals_labels(scope.is_filtered());
+    ok(json!({
+        "base": side_json(&base, base_served, base_totals),
+        "current": side_json(s, right_served, right_totals),
+        // What to call those totals — `size (filtered subset)` under a filter, since then they describe
+        // the rows on screen rather than the checkpoints. The server words it, so the two views and the
+        // terminal cannot label the same numbers differently.
+        "totals_labels": { "size": size_label, "params": params_label },
+        // The headline, counted here so the side-by-side and the one-page report cannot print
+        // different totals for the same pair — which they did.
+        "tally": tally,
+        // Whether the rows below are every layer or families folded onto one row each. The server says
+        // so, because the client's checkbox and the tree it is looking at can be one request apart.
+        "full": full,
+        // What the scope selected, in the report's own words. `null` when nothing narrowed it.
+        "matched": matched.as_ref().map(|m| json!({
+            "selected": m.selected,
+            "total": m.total,
+        })),
+        // Two old names that map onto one lose a tensor from the comparison; the report says so too.
+        "rename_collisions": rename_collisions,
+        // What `n`/`N` walk, in draw order. Precomputed server-side because the walk is over the
+        // whole tree and the client would otherwise redo it on every keypress.
+        "differences": differences,
+        "rows": rows,
+    }))
+}
+
+// ---- long-running work ----
+
+/// `POST /api/jobs/verify-repack?left=SPEC&right=SPEC&<scope>[&repack_bits=N]`
+///
+/// The browser's `diff --verify-repack`: do two checkpoints hold the **same weights in different
+/// packings**? Reads both tensors of every candidate pair, so it takes minutes and reports per-tensor
+/// findings as they land — hence a job rather than a response (see [`super::jobs`]).
+///
+/// Answers immediately with the id to poll. The work runs on its own thread, so the request does not
+/// hold a `tiny_http` worker for the run.
+pub(crate) fn start_verify_repack(current: &Arc<super::Current>, q: &Query) -> Reply {
+    let Some(left) = q.get("left").map(String::as_str).filter(|s| !s.is_empty()) else {
+        return err(
+            400,
+            "verify-repack needs ?left=SPEC&right=SPEC (the two checkpoints to compare)",
+        );
+    };
+    let right = q.get("right").map_or("", String::as_str);
+    if right.is_empty() {
+        return err(400, "verify-repack needs ?right=SPEC as well as ?left=SPEC");
+    }
+    let scope = match super::diffscope::DiffScope::from_query(q) {
+        Ok(scope) => scope,
+        Err(e) => return err(400, format!("{e:#}")),
+    };
+    if scope.reroots() {
+        return err(
+            400,
+            "a #subtree comparison is structure-only here — clear the subtree fields to verify a repack",
+        );
+    }
+    // Parsed here so a bad value is a 400 rather than a job that fails a minute later.
+    let bits = match q.get("repack_bits").map(|v| v.parse::<usize>()) {
+        None => None,
+        Some(Ok(n)) if (1..=16).contains(&n) => Some(n),
+        Some(_) => return err(400, "repack_bits must be a whole number from 1 to 16"),
+    };
+
+    let job = current.jobs().start("verify-repack");
+    let id = job.id;
+    let (owner, left, right) = (Arc::clone(current), left.to_string(), right.to_string());
+    // A named thread, so a stuck run is identifiable in a debugger or a `ps` listing.
+    let spawned = std::thread::Builder::new()
+        .name(format!("verify-repack-{id}"))
+        .spawn(move || {
+            let outcome = super::repackjob::run(&owner, &job, &left, &right, &scope, bits);
+            super::jobs::Jobs::finish(&job, outcome);
+        });
+    match spawned {
+        Ok(_) => ok(json!({ "id": id })),
+        Err(e) => err(500, format!("could not start the job: {e}")),
+    }
+}
+
+/// `POST /api/jobs/values?left=SPEC&right=SPEC&<scope>[&values=1][&histogram=1][&bins=N][&dtype=V][&jobs=N][&tensor=NAME]`
+///
+/// The browser's `diff --values` / `--histogram` / `--tensor`: do the *numbers* differ, not just the
+/// structure? Reads every selected tensor on both sides, so a job (see [`super::jobs`]).
+///
+/// At least one of `values` / `histogram` must be asked for — a job that computed neither would read
+/// every tensor and report nothing.
+pub(crate) fn start_values(current: &Arc<super::Current>, q: &Query) -> Reply {
+    let Some(left) = q.get("left").map(String::as_str).filter(|s| !s.is_empty()) else {
+        return err(400, "values needs ?left=SPEC&right=SPEC");
+    };
+    let right = q.get("right").map_or("", String::as_str);
+    if right.is_empty() {
+        return err(400, "values needs ?right=SPEC as well as ?left=SPEC");
+    }
+    let scope = match super::diffscope::DiffScope::from_query(q) {
+        Ok(scope) => scope,
+        Err(e) => return err(400, format!("{e:#}")),
+    };
+    // A `#subtree` re-root is structure-only here: the value comparison reads tensors by their real
+    // names, and re-rooting changes only the *match key*. Refused rather than ignored — a job that
+    // quietly compared the whole checkpoint would answer a different question than the screen asked.
+    if scope.reroots() {
+        return err(
+            400,
+            "a #subtree comparison is structure-only here — clear the subtree fields to compare values",
+        );
+    }
+    let (want_values, want_hist) = match (switch(q, "values"), switch(q, "histogram")) {
+        (Ok(v), Ok(h)) => (v, h),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    // `--tensor` compares values by definition, so it implies them rather than needing both flags.
+    let one = q
+        .get("tensor")
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+    if !want_values && !want_hist && one.is_none() {
+        return err(
+            400,
+            "ask for values=1 and/or histogram=1 (or tensor=NAME) — otherwise this would read every \
+             tensor and report nothing",
+        );
+    }
+    let bins = match q.get("bins").map(|v| v.parse::<usize>()) {
+        None => None,
+        Some(Ok(n)) if (1..=512).contains(&n) => Some(n),
+        Some(_) => return err(400, "bins must be a whole number from 1 to 512"),
+    };
+    // `view_of` is what every `/api/tensor/*` route uses, so `dtype` spells the same thing everywhere.
+    let view = match view_of(q) {
+        Ok(view) => view,
+        Err(reply) => return reply,
+    };
+    // Default parallelism = logical CPUs, as the CLI does; `jobs=0` is treated as sequential.
+    let jobs = match q.get("jobs").map(|v| v.parse::<usize>()) {
+        None => std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
+        Some(Ok(n)) => n.max(1),
+        Some(Err(_)) => return err(400, "jobs must be a whole number"),
+    };
+
+    let what = super::valuesjob::What {
+        values: want_values || one.is_some(),
+        histogram: want_hist,
+        bins,
+        view,
+        jobs,
+        tensor: one.map(str::to_string),
+    };
+    let job = current.jobs().start("values");
+    let id = job.id;
+    let (owner, left, right) = (Arc::clone(current), left.to_string(), right.to_string());
+    let spawned = std::thread::Builder::new()
+        .name(format!("values-{id}"))
+        .spawn(move || {
+            let outcome = super::valuesjob::run(&owner, &job, &left, &right, &scope, &what);
+            super::jobs::Jobs::finish(&job, outcome);
+        });
+    match spawned {
+        Ok(_) => ok(json!({ "id": id })),
+        Err(e) => err(500, format!("could not start the job: {e}")),
+    }
+}
+
+/// `GET /api/jobs/<id>` — where a job has got to, and what it has found so far.
+pub(crate) fn job_status(current: &super::Current, id: u64) -> Reply {
+    // 404, not 409: an id that was never handed out, or one evicted long after finishing.
+    current.jobs().get(id).map_or_else(
+        || err(404, format!("no job {id}")),
+        |job| ok(job.snapshot()),
+    )
+}
+
+/// `DELETE /api/jobs/<id>` — ask a job to stop.
+///
+/// Cooperative, like every other cancellation here: it sets the flag the remote reader checks between
+/// chunks. The reply says the request was accepted, not that the work has already stopped — a poll
+/// reports `cancelled` once it has.
+pub(crate) fn cancel_job(current: &super::Current, id: u64) -> Reply {
+    current.jobs().get(id).map_or_else(
+        || err(404, format!("no job {id}")),
+        |job| {
+            job.read_progress().cancel();
+            ok(job.snapshot())
+        },
+    )
 }
 
 // ---- metadata / derived-view routes (served from precomputed state) ----
@@ -273,7 +774,7 @@ pub(crate) fn check(s: &WebState) -> Reply {
 /// The result is **not** cached. Every other cacheable endpoint is keyed by something
 /// fixed at startup; this one is keyed by a path from the request, so a cache would grow
 /// without bound under a client that asks about many paths. Re-reading headers is cheap.
-pub(crate) fn diff(s: &WebState, q: &Query) -> Reply {
+pub(crate) fn diff(s: &WebState, q: &Query, opts: &crate::opening::Options) -> Reply {
     let Some(against) = q
         .get("against")
         .map(String::as_str)
@@ -281,24 +782,146 @@ pub(crate) fn diff(s: &WebState, q: &Query) -> Reply {
     else {
         return err(
             400,
-            "diff needs ?against=PATH (a checkpoint to compare with)",
+            "diff needs ?against=SPEC (a checkpoint to compare with)",
         );
     };
+    // Resolved through `opening`, so this route accepts exactly what `/api/compare` accepts. It used
+    // to take a bare filesystem path, which made the two diff features disagree about what a
+    // checkpoint address even is.
+    let scope = match super::diffscope::DiffScope::from_query(q) {
+        Ok(scope) => scope,
+        // A bad glob or rename rule is a client mistake worth naming: the alternative is an empty diff
+        // that looks like "nothing matched".
+        Err(e) => return err(400, format!("{e:#}")),
+    };
+    // Read before the baseline is: a mistyped switch is answered in milliseconds, rather than after a
+    // checkpoint has been fetched over an ssh proxy only to be described the wrong way round.
+    let swapped = match switch(q, "swap") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let baseline = match crate::compare::summarize_baseline(against, opts) {
+        Ok(sum) => sum,
+        // A spec that doesn't resolve to a checkpoint is a client mistake, not a server fault: the
+        // message is what the UI shows next to the input.
+        Err(e) => return err(400, format!("{e:#}")),
+    };
     let metadata = s.checkpoint.metadata_vec();
-    match crate::compare::structural_diff(&s.tensors, &metadata, std::path::Path::new(against)) {
-        Ok(report) => ok(json!({
-            "against": against,
-            "verdict": crate::compare::verdict(&report),
-            // The equivalent CLI invocation, so a browser finding can be reproduced (and
-            // extended with --values) in a terminal. `null` when the served files span
-            // directories, since then no single path names this side of the comparison.
-            "command": crate::compare::cli_diff_command(std::path::Path::new(against), &s.files),
-            "report": report,
-        })),
-        // A path that doesn't resolve to a checkpoint is a client mistake, not a server
-        // fault: the message is what the UI shows next to the input.
-        Err(e) => err(400, format!("{e:#}")),
+    let mut served = crate::diff::CheckpointSummary::from_loaded(&s.tensors, &metadata);
+    let mut baseline = baseline;
+    // `#subtree`, per side and before anything else: it re-keys a side's tensors to their sub-path, so
+    // two checkpoints under different namespaces line up. A prefix that selects nothing is a typo, and
+    // the message says which side it was on rather than showing an empty report.
+    if let Err(e) = scope.reroot_sides(&mut baseline.summary, &mut served) {
+        return err(400, format!("{e:#}"));
     }
+    // `?swap=1` turns the comparison round: the open checkpoint becomes the baseline. A diff is
+    // directional — what was added one way is removed the other — and the side-by-side has always had
+    // a swap while the report had none, so seeing the same pair the other way meant editing a URL.
+    //
+    // Everything downstream follows from this one pair, including the rename rules (which always
+    // rewrite the *old* side's names, whichever checkpoint that now is) and the CLI command offered
+    // at the bottom.
+    let sides = if swapped {
+        crate::compare::Sides::OpenFirst
+    } else {
+        crate::compare::Sides::BaselineFirst
+    };
+    let (old, new, old_s3, new_s3) = match sides {
+        crate::compare::Sides::BaselineFirst => (
+            baseline.summary,
+            served,
+            baseline.s3.as_ref(),
+            s.checkpoint.s3.as_ref(),
+        ),
+        crate::compare::Sides::OpenFirst => (
+            served,
+            baseline.summary,
+            s.checkpoint.s3.as_ref(),
+            baseline.s3.as_ref(),
+        ),
+    };
+    // Rename, then filter, then compare — `crate::web::diffscope`, shared with the CLI's own order.
+    let mut scoped = scope.compare(old, new);
+    // For an s3-vs-s3 pair, the objects themselves: ETag, size, checksums, tags. The same call the
+    // `diff` subcommand makes, so the browser stops being the one surface that compares two `s3://`
+    // checkpoints without mentioning their object-level differences.
+    let s3_note = crate::compare::attach_s3(&mut scoped.report, old_s3, new_s3);
+    // The section as the terminal words it — one implementation of what a multipart `ETag` proves.
+    //
+    // Grouped, which is the CLI's own default here: a re-quantization changes an object per expert per
+    // layer, and 361 lines reading `model.layers.N.…codebook (etag)` say less than six lines reading
+    // `model.layers.{1-60}.…codebook (×60)`. (The tensor sections are ungrouped because the client
+    // filters and caps them; these are a fixed informational block.)
+    let s3_lines = scoped
+        .report
+        .s3
+        .as_ref()
+        .map(|s3| s3.summary_lines(true, scope.is_filtered()));
+    ok(json!({
+        "against": against,
+        // Which way round this report reads, so the view labels its two sides from the server's answer
+        // rather than from its own copy of the parameter.
+        "swapped": sides == crate::compare::Sides::OpenFirst,
+        "verdict": crate::compare::verdict(&scoped.report),
+        // Why the metadata section is empty, when it is — the CLI's `not compared (filtered subset)`.
+        // `null` means it really was compared and really has nothing in it.
+        "metadata_note": scope.metadata_note(),
+        // The same sections with index-templated families collapsed onto one row each — what the
+        // terminal prints by default (`--full` turns it off). Both lists are sent: grouping is the
+        // cheap part, and which one to show is the reader's choice, made without a round trip.
+        "grouped": scoped.report.grouped(),
+        // What an unfused/fused alignment folded: `name → [old parts, new parts]`, so a row can read
+        // `×256 → ×1` the way the terminal's does. Empty unless `align_fused=1` changed something.
+        "folded": scoped.report.folded.iter()
+            .map(|(n, (o, w))| (n.clone(), json!([o, w])))
+            .collect::<serde_json::Map<_, _>>(),
+        "aligns_fused": scope.aligns_fused(),
+        // What to call the two totals lines. Under a filter the report's `old_bytes` / `new_bytes` cover
+        // the **matched tensors** (`TensorFilter::apply` narrows the footprints with the signatures), so
+        // a bare `size:` would read as the checkpoint's size. The server words it — `diff::totals_labels`,
+        // shared with the terminal — rather than the browser re-deriving the rule from the parameters.
+        "totals_labels": {
+            "size": crate::diff::totals_labels(scope.is_filtered()).0,
+            "params": crate::diff::totals_labels(scope.is_filtered()).1,
+        },
+        // What the S3 object comparison did, or why it did not happen. `null` when neither side is
+        // `s3://`, which is the ordinary local case.
+        "s3_note": s3_note,
+        "s3_lines": s3_lines,
+        // `modified: OLD → NEW`, humanised by the same rule the terminal uses. `null` unless both
+        // sides carry timestamps.
+        "modified_line": scoped.report.modified_line(false),
+        // The equivalent CLI invocation, so a browser finding can be reproduced (and
+        // extended with --values) in a terminal. `null` when the served files span
+        // directories, since then no single path names this side of the comparison.
+        // Carries the scope, so the command compares what is on screen rather than everything.
+        "command": crate::compare::cli_diff_command(
+            std::path::Path::new(against),
+            &s.files,
+            // `--full` when the reader has expanded the families, so the command reproduces the screen
+            // rather than the default the screen is not showing.
+            &{
+                let mut args = scope.cli_args();
+                if switch(q, "full").unwrap_or(false) {
+                    args.push("--full".to_string());
+                }
+                args
+            },
+            sides,
+            scope.subtrees(),
+        ),
+        // What the scope selected, for the CLI's `filter [...] matched 19 of 117664` line. `null` when
+        // nothing narrowed the comparison.
+        "matched": scoped.matched.as_ref().map(|m| json!({
+            "selected": m.selected,
+            "total": m.total,
+            "names": m.names,
+        })),
+        // Two old names that map onto one lose a tensor from the comparison. The CLI warns; so does this.
+        "rename_collisions": scoped.rename_collisions,
+        "report": scoped.report,
+    }))
 }
 
 pub(crate) fn model(s: &WebState) -> Reply {
@@ -395,23 +1018,33 @@ pub(crate) fn tensor_sample(s: &WebState, q: &Query) -> Reply {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let rows = num(q, "rows", 32);
-    let cols = num(q, "cols", 32);
-    let slice = num(q, "slice", 0);
-    let mode = match q.get("mode").map(String::as_str) {
-        Some("window") => SampleMode::Window {
-            row_off: num(q, "row_off", 0),
-            col_off: num(q, "col_off", 0),
+    // A window of no rows is not a window, so both are at least one.
+    let (rows, cols, slice) = match (
+        whole(q, "rows", 32, 1),
+        whole(q, "cols", 32, 1),
+        whole(q, "slice", 0, 0),
+    ) {
+        (Ok(rows), Ok(cols), Ok(slice)) => (rows, cols, slice),
+        (Err(e), ..) | (_, Err(e), _) | (.., Err(e)) => return e,
+    };
+    let mode = match one_of(q, "mode", &["grid", "window", "edges", "max"], "grid") {
+        Ok("window") => match (whole(q, "row_off", 0, 0), whole(q, "col_off", 0, 0)) {
+            (Ok(row_off), Ok(col_off)) => SampleMode::Window { row_off, col_off },
+            (Err(e), _) | (_, Err(e)) => return e,
         },
-        Some("edges") => SampleMode::Edges {
-            row_tail: fnum(q, "row_tail", 0.5),
-            col_tail: fnum(q, "col_tail", 0.5),
+        Ok("edges") => match (fraction(q, "row_tail", 0.5), fraction(q, "col_tail", 0.5)) {
+            (Ok(row_tail), Ok(col_tail)) => SampleMode::Edges { row_tail, col_tail },
+            (Err(e), _) | (_, Err(e)) => return e,
         },
-        Some("max") => SampleMode::GridMax,
-        _ => SampleMode::Grid,
+        Ok("max") => SampleMode::GridMax,
+        Ok(_) => SampleMode::Grid,
+        Err(e) => return e,
     };
     let schema = s.schemas.get(name_of(q));
-    let include_raw = matches!(q.get("raw").map(String::as_str), Some("1" | "true"));
+    let include_raw = match switch(q, "raw") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     match sample::sample_tensor(t, rows, cols, slice, view, mode, schema) {
         Ok(sample) => ok(SampleDto::from_sample(&sample, &t.dtype, include_raw)),
         Err(e) => err(500, e),
@@ -423,7 +1056,14 @@ pub(crate) fn tensor_histogram(s: &WebState, q: &Query) -> Reply {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let bins = q.get("bins").and_then(|b| b.parse::<usize>().ok());
+    // Absent means "choose for me"; present and unreadable is a mistake, not a request to choose.
+    let bins = match q.get("bins") {
+        None => None,
+        Some(_) => match whole(q, "bins", 0, 1) {
+            Ok(n) => Some(n),
+            Err(e) => return e,
+        },
+    };
 
     // Float / wide-int bins need the value range; reuse the cached stats or scan.
     let range = match scan_stats(s, t, view) {
@@ -510,12 +1150,84 @@ fn name_of(q: &Query) -> &str {
     q.get("name").map_or("", String::as_str)
 }
 
-fn num<T: std::str::FromStr>(q: &Query, key: &str, default: T) -> T {
-    q.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+// ---- query values ----
+//
+// **A malformed value is refused, not defaulted.** The router already refuses an unknown parameter
+// *name* — `?nmae=…` is a typo, not a filter — for the reason `clap` refuses an unknown flag. The
+// values had the opposite rule: `?rows=lots` sampled 32 rows, `?mode=windwo` returned a grid,
+// `?bins=many` chose the bin count itself, and each answered `200`. A confident wrong answer to a
+// question nobody asked is the failure that is hardest to notice, and it was reachable by one typo.
+//
+// Each of these returns the default when the parameter is absent, and a `400` naming the parameter,
+// what arrived and what is allowed when it is present and wrong.
+
+/// A whole-number parameter, at least `least`.
+fn whole(q: &Query, key: &str, default: usize, least: usize) -> Result<usize, Reply> {
+    let Some(raw) = q.get(key) else {
+        return Ok(default);
+    };
+    match raw.parse::<usize>() {
+        Ok(n) if n >= least => Ok(n),
+        Ok(n) => Err(err(
+            400,
+            format!("{key}={n} is too small — it must be at least {least}"),
+        )),
+        Err(_) => Err(err(
+            400,
+            format!("{key}={raw:?} is not a whole number (expected a count like {default})"),
+        )),
+    }
 }
 
-fn fnum(q: &Query, key: &str, default: f32) -> f32 {
-    q.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+/// A fraction parameter, within `0.0..=1.0`.
+fn fraction(q: &Query, key: &str, default: f32) -> Result<f32, Reply> {
+    let Some(raw) = q.get(key) else {
+        return Ok(default);
+    };
+    match raw.parse::<f32>() {
+        Ok(f) if (0.0..=1.0).contains(&f) => Ok(f),
+        Ok(f) => Err(err(
+            400,
+            format!("{key}={f} is out of range — it is a fraction of the axis, from 0 to 1"),
+        )),
+        Err(_) => Err(err(
+            400,
+            format!("{key}={raw:?} is not a number (expected a fraction like {default})"),
+        )),
+    }
+}
+
+/// One of a fixed set of words.
+fn one_of<'q>(
+    q: &'q Query,
+    key: &str,
+    allowed: &[&str],
+    default: &'q str,
+) -> Result<&'q str, Reply> {
+    let Some(raw) = q.get(key).map(String::as_str) else {
+        return Ok(default);
+    };
+    if allowed.contains(&raw) {
+        return Ok(raw);
+    }
+    Err(err(
+        400,
+        format!("{key}={raw:?} is not one of {}", allowed.join(", ")),
+    ))
+}
+
+/// A switch: `1`/`true` on, `0`/`false` off. Anything else is a mistake, not "off" — `?full=yes`
+/// silently meaning `full=0` is the same silent wrong answer as a mistyped number.
+fn switch(q: &Query, key: &str) -> Result<bool, Reply> {
+    match q.get(key).map(String::as_str) {
+        None => Ok(false),
+        Some("1" | "true") => Ok(true),
+        Some("0" | "false") => Ok(false),
+        Some(other) => Err(err(
+            400,
+            format!("{key}={other:?} is not a switch — use {key}=1 or {key}=0"),
+        )),
+    }
 }
 
 fn basename(path: &str) -> &str {

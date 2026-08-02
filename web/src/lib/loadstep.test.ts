@@ -3,14 +3,7 @@
 // error, not a wait that never ends.
 
 import { describe, expect, it } from 'vitest';
-import {
-  currentStep,
-  resolvedSpec,
-  stepDetail,
-  stepLabel,
-  stepSubject,
-  type LoadInputs,
-} from './loadstep';
+import { currentStep, resolvedSpec, shortSpec, stepDetail, stepLabel, stepSubject, type LoadInputs } from './loadstep';
 import { startedNow } from './progress';
 
 const IDLE: LoadInputs = {
@@ -125,5 +118,67 @@ describe('what each step says', () => {
     [':/opt/m', '', ':/opt/m'],
   ])('resolves %s with proxy %s to %s', (spec, host, want) => {
     expect(resolvedSpec(spec, host)).toBe(want);
+  });
+});
+
+describe('the three phases of a comparison', () => {
+  const p = null;
+
+  // Each phase names *whose* work it is, because they drag for unrelated reasons: a slow remote
+  // checkpoint, a slow link, or this tab parsing 91 MB. The bar used to sit at 100% for the whole of
+  // the third with a frozen timer, which read as a hang.
+  it('names each phase and whose work it is', () => {
+    expect(stepLabel({ kind: 'comparing', spec: '/base', right: '/newer', progress: p })).toBe(
+      'reading both checkpoints',
+    );
+    expect(stepLabel({ kind: 'difftree', progress: p })).toBe('reading the comparison');
+    expect(stepLabel({ kind: 'building', progress: p })).toBe('building the comparison');
+
+    expect(stepDetail({ kind: 'comparing', spec: 's3://b/k', right: '/newer', progress: p })).toBe('S3 → this server');
+    expect(stepDetail({ kind: 'difftree', progress: p })).toBe('this server → your browser');
+    expect(stepDetail({ kind: 'building', progress: p })).toBe(
+      'aligning both trees into rows, in this tab',
+    );
+  });
+
+  // The baseline is the side actually being fetched, so it is the one worth naming — resolved, so a
+  // `:` shorthand reads as the host it means.
+  it('shows the baseline being read, as the address it resolves to', () => {
+    expect(stepSubject({ kind: 'comparing', spec: ':/models/ckpt', right: '/newer', progress: p }, 'lab@host')).toBe(
+      'lab@host:/models/ckpt',
+    );
+    // The two downloads have no single subject: both sides are already named on screen.
+    expect(stepSubject({ kind: 'difftree', progress: p })).toBe('');
+    expect(stepSubject({ kind: 'building', progress: p })).toBe('');
+  });
+});
+
+// An address field is a thing you edit, and there the proxy host is the same 52 characters on every
+// line — it pushes the part that differs out of the box. A *wait* is the other way round (see
+// `resolvedSpec`): naming the machine is the point then.
+describe('shortening a remote address for a box you type in', () => {
+  const HOST = 'lab@build-host.example.com';
+
+  it('drops the host when it is the configured proxy', () => {
+    expect(shortSpec(`${HOST}:/opt/models/m`, HOST)).toBe(':/opt/models/m');
+  });
+
+  it('leaves another host alone — that one is not "the proxy"', () => {
+    expect(shortSpec('other@elsewhere:/opt/models/m', HOST)).toBe('other@elsewhere:/opt/models/m');
+  });
+
+  it('leaves local paths, URIs and the shorthand itself alone', () => {
+    expect(shortSpec('/net/models/m', HOST)).toBe('/net/models/m');
+    expect(shortSpec('s3://bucket/key', HOST)).toBe('s3://bucket/key');
+    expect(shortSpec(':/opt/models/m', HOST)).toBe(':/opt/models/m');
+  });
+
+  it('changes nothing when the server has no proxy to be short about', () => {
+    expect(shortSpec(`${HOST}:/opt/models/m`)).toBe(`${HOST}:/opt/models/m`);
+  });
+
+  it('round-trips with resolvedSpec', () => {
+    const full = `${HOST}:/opt/models/m`;
+    expect(resolvedSpec(shortSpec(full, HOST), HOST)).toBe(full);
   });
 });

@@ -94,17 +94,9 @@ const COPY_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
 /// click (which opens it); a lone click just selects it (visible feedback).
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// What [`Explorer::gather_checkpoint`] returns: tensors, metadata, the parsed
-/// `config.json`, the shards' on-disk footprint, and any remote health reports
-/// (index/file mismatch — empty for a local read, whose health is gathered up
-/// front instead).
-pub(crate) type CheckpointParts = (
-    Vec<TensorInfo>,
-    Vec<MetadataInfo>,
-    Option<crate::config::ModelConfig>,
-    Option<crate::stats::DiskUsage>,
-    Vec<crate::health::HealthReport>,
-);
+// `CheckpointParts` used to live here, as a five-element tuple. It is `opening::CheckpointParts` now,
+// with named fields: the code that produces it (`source`, `opening`) serves the CLI and the web
+// server too, so a shared layer had no business depending on a type owned by the TUI.
 
 /// The bottom status bar's text: `(icon, primary line, secondary line)`.
 type StatusBar = (&'static str, String, String);
@@ -353,6 +345,14 @@ enum ScanOutcome {
 #[derive(Clone)]
 enum Screen {
     Tree,
+    /// Side-by-side comparison against `against`, browsed in lockstep. `scroll` is recorded back
+    /// into the history on leaving, so stepping away and back returns to the same place — and so is
+    /// `families`, which is what `y` needs to reproduce the screen (`--diff-full`).
+    Compare {
+        against: String,
+        scroll: usize,
+        families: modes::Families,
+    },
     /// The file browser: a tree of the checkpoint's directory (files + sizes),
     /// toggled with `Tab`. Its state (selection, scroll, fold) lives on the
     /// [`Explorer`] like the tensor tree's, so the variant carries no fields.
@@ -587,7 +587,8 @@ trait Mode {
 // dispatch below and only referenced within this module tree.
 mod modes;
 use modes::{
-    DataMode, DetailMode, DiffMode, FilesMode, LayoutMode, RenameMode2, StatsMode, TreeMode,
+    CompareMode, DataMode, DetailMode, DiffMode, FilesMode, LayoutMode, RenameMode2, StatsMode,
+    TreeMode,
 };
 
 /// A command the palette lists and runs, and the single action every tree
@@ -601,6 +602,8 @@ enum Cmd {
     Diff,
     /// Read a different checkpoint into this session, without restarting.
     Open,
+    /// Browse another checkpoint beside this one, in lockstep.
+    Compare,
     /// Fold uniform layer / expert stacks (the compact tree).
     CompactToggle,
     /// Cycle which facet the flat (search / filter) list is ordered by.
@@ -758,6 +761,13 @@ const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
     (Cmd::CollapseAll, "Tree", "Collapse all groups", '\u{0}'),
     (Cmd::ViewFiles, "View", "File browser", '\t'),
     (Cmd::Diff, "View", "Compare with another checkpoint…", 'd'),
+    // Palette-only, like `Open`: it takes a path, and the tree's letters are spoken for.
+    (
+        Cmd::Compare,
+        "View",
+        "Compare side by side (browse two in lockstep)…",
+        '\u{0}',
+    ),
     // Palette-only (blank-label sentinel → no footer chip / hotkey), like `Cmd::Filter`.
     // Changing checkpoint is a deliberate, occasional act; giving it a single letter would
     // mean one fat-finger away from throwing out the tree you were reading — and the tree's
@@ -1459,6 +1469,12 @@ impl Explorer {
         self
     }
 
+    /// The read switches, for anything that resolves a *second* checkpoint mid-session — a diff's
+    /// baseline reads the same way the open one did.
+    pub(crate) fn read_options(&self) -> &crate::opening::Options {
+        &self.read_opts
+    }
+
     /// Use the recents list that persists across runs — the interactive session's choice. Kept
     /// out of [`Self::new`] on purpose: an explorer built for a test or a one-shot export must
     /// not write to the user's config directory.
@@ -1763,6 +1779,12 @@ impl Explorer {
         let want_layout = self.open.as_ref().and_then(|r| r.layout_file.clone());
         let want_rename = self.open.as_ref().is_some_and(|r| r.rename);
         let want_diff = self.open.as_ref().and_then(|r| r.diff_against.clone());
+        let want_compare = self.open.as_ref().and_then(|r| r.compare_with.clone());
+        let compare_families = if self.open.as_ref().is_some_and(|r| r.compare_full) {
+            modes::Families::Full
+        } else {
+            modes::Families::Folded
+        };
         if let Some(sort) = self.open.as_ref().and_then(|r| r.sort) {
             self.tree_state.sort = sort;
         }
@@ -1837,12 +1859,58 @@ impl Explorer {
         // this one.
         if let Some(against) = &want_diff {
             let metadata = self.metadata().to_vec();
-            let against = Path::new(against);
-            let report = crate::compare::structural_diff(self.tensors(), &metadata, against)?;
-            let (old_label, new_label) = (against.display().to_string(), self.root_label());
+            let report = crate::compare::structural_diff(
+                self.tensors(),
+                &metadata,
+                against,
+                &self.read_opts,
+            )?;
+            let (old_label, new_label) = (against.clone(), self.root_label());
             let verdict = crate::compare::verdict(&report);
             let text = crate::tui::headless_render(120, 40, |f| {
                 UI::render_diff(f, &old_label, &new_label, &verdict, &report, 0, false);
+                if want_legend {
+                    UI::render_legend_band(f, Legend::Diff);
+                }
+            })?;
+            println!("{text}");
+            return Ok(());
+        }
+        // `--compare-with PATH`: the side-by-side, rendered headlessly like the rest — the same
+        // aligned tree the interactive screen draws, with the same folding.
+        if let Some(against) = &want_compare {
+            let (base_label, aligned) = self.aligned_against(against)?;
+            let rows = match compare_families {
+                modes::Families::Folded => crate::difftree::fold_families(&aligned),
+                modes::Families::Full => aligned,
+            };
+            let expanded = crate::difftree::expand_to_differences(&rows);
+            let differing = crate::difftree::tally(&rows).differing();
+            let stops = crate::difftree::differences(&rows).len();
+            let flat: Vec<crate::ui::compare::CompareRow<'_>> =
+                crate::difftree::flatten(&rows, &expanded)
+                    .into_iter()
+                    .map(|r| crate::ui::compare::CompareRow {
+                        node: r.node,
+                        depth: r.depth,
+                        expanded: r.expanded,
+                    })
+                    .collect();
+            let new_label = self.root_label();
+            let text = crate::tui::headless_render(120, 40, |f| {
+                crate::ui::compare::render(
+                    f,
+                    &crate::ui::compare::CompareFrame {
+                        base_label: &base_label,
+                        new_label: &new_label,
+                        rows: &flat,
+                        cursor: 0,
+                        scroll: 0,
+                        differences: differing,
+                        stops,
+                        cursor_of: None,
+                    },
+                );
                 if want_legend {
                     UI::render_legend_band(f, Legend::Diff);
                 }
@@ -2038,6 +2106,23 @@ impl Explorer {
                 parts.extend(self.checkpoint_path_parts());
                 parts.push("--diff-against".to_string());
                 parts.push(shell_quote(against));
+                parts.join(" ")
+            }
+            // `--compare-with PATH` reopens *this* screen (`--diff-against` opens the one-page report
+            // of the same pair, which is what `y` here used to copy — a command that opened the other
+            // view of the comparison). `--compare-full` carries the fold state: with families folded,
+            // 62 identical layers are one row, so a command that dropped it would reopen a different
+            // screen.
+            Screen::Compare {
+                against, families, ..
+            } => {
+                let mut parts = self.command_prefix();
+                parts.extend(self.checkpoint_path_parts());
+                parts.push("--compare-with".to_string());
+                parts.push(shell_quote(against));
+                if matches!(families, modes::Families::Full) {
+                    parts.push("--compare-full".to_string());
+                }
                 parts.join(" ")
             }
             Screen::Stats {
@@ -2287,6 +2372,14 @@ impl Explorer {
         // `--rename-rule 'SRC=>TGT'` pairs. Local safetensors only.
         let want_rename = self.open.as_ref().is_some_and(|r| r.rename);
         let want_diff = self.open.as_ref().and_then(|r| r.diff_against.clone());
+        // `--compare-with PATH [--compare-full]`: the side-by-side, and its fold state — what `y`
+        // there copies, so the screen it names is the screen it reproduces.
+        let want_compare = self.open.as_ref().and_then(|r| r.compare_with.clone());
+        let compare_families = if self.open.as_ref().is_some_and(|r| r.compare_full) {
+            modes::Families::Full
+        } else {
+            modes::Families::Folded
+        };
         // The requested order, set before the flat rows are built so `--search` /
         // `--filter` land already sorted (and so `y` reproduces the screen).
         if let Some(sort) = self.open.as_ref().and_then(|r| r.sort) {
@@ -2367,6 +2460,16 @@ impl Explorer {
             history.push(Screen::Diff { against, scroll: 0 });
             cursor = history.len() - 1;
         }
+        // `--compare-with PATH`: the side-by-side view of the same pair.
+        if let Some(against) = want_compare {
+            self.ensure_full_load()?;
+            history.push(Screen::Compare {
+                against,
+                scroll: 0,
+                families: compare_families,
+            });
+            cursor = history.len() - 1;
+        }
         // `--files`: open the file browser on top of the tree, so `Tab`/Backspace
         // drop back to it. Pushed last so it wins even alongside `--tensor`. The
         // file views are local-only, so skip them for a remote checkpoint.
@@ -2434,7 +2537,8 @@ impl Explorer {
                 | Screen::Layout { .. }
                 | Screen::Rename { .. }
                 | Screen::Stats { .. }
-                | Screen::Diff { .. } => None,
+                | Screen::Diff { .. }
+                | Screen::Compare { .. } => None,
             };
 
             let nav = match current {
@@ -2499,6 +2603,18 @@ impl Explorer {
                     // Record the fold state / scroll where the user left them, so
                     // back/forward (and the `--stats` reopen command) restore it.
                     let mut mode = StatsMode::new(shards_expanded, scroll);
+                    let nav = self.run_mode(&mut mode)?;
+                    if let Some(slot) = history.get_mut(cursor) {
+                        *slot = mode.residual();
+                    }
+                    nav
+                }
+                Screen::Compare {
+                    against,
+                    scroll,
+                    families,
+                } => {
+                    let mut mode = CompareMode::new(against, scroll, families);
                     let nav = self.run_mode(&mut mode)?;
                     if let Some(slot) = history.get_mut(cursor) {
                         *slot = mode.residual();
@@ -3202,6 +3318,37 @@ impl Explorer {
         }
     }
 
+    /// Read `spec` and align it against the open checkpoint, for the side-by-side screen.
+    ///
+    /// Returns the baseline's label (for the left pane's heading) and the aligned tree. Reads
+    /// through [`crate::opening`] like every other open, so the compare screen accepts the same
+    /// spellings the address bar and the command line do.
+    fn aligned_against(
+        &mut self,
+        spec: &str,
+    ) -> Result<(String, Vec<crate::difftree::AlignedNode>)> {
+        let target = self.resolve_open(spec)?;
+        let label = crate::model::root_label(target.source_paths_for_label());
+        let files = target.resolved.clone();
+        let opened = target.read(
+            crate::opening::Want::Parts,
+            &crate::hf::ReadProgress::default(),
+        )?;
+        let crate::opening::CheckpointParts {
+            tensors,
+            metadata,
+            config,
+            ..
+        } = opened.parts;
+        // A Session gives the baseline the same rooted, deduped, natural-sorted tree the open
+        // checkpoint has — aligning a raw read against a canonicalised one would report ordering
+        // and duplicate differences that are not there.
+        let session = crate::kernel::Session::from_parts(tensors, metadata, config);
+        let base_tree = session.build_rooted_tree(&files);
+        let rows = crate::difftree::align_rooted(&base_tree, &self.tree_state.tree);
+        Ok((label, rows))
+    }
+
     /// Perform a tree command, from its key or the palette. Returns `Some(Nav)` for
     /// a command that leaves the tree (only `Quit` so far), else `None`. Pop-up
     /// commands draw through the passed-in `term`.
@@ -3211,6 +3358,9 @@ impl Explorer {
             Cmd::Filter => self.run_filter_prompt(term),
             Cmd::Diff => return Self::run_diff_prompt(term).map(Nav::Open),
             Cmd::Open => self.run_open_prompt(term),
+            Cmd::Compare => {
+                return Self::run_compare_prompt(term, self.recents.list()).map(Nav::Open);
+            }
             Cmd::CompactToggle => {
                 self.set_compact(!self.compact);
                 self.copied_flash = Some((
@@ -3308,6 +3458,7 @@ impl Explorer {
                 | Cmd::Filter
                 | Cmd::Diff
                 | Cmd::Open
+                | Cmd::Compare
                 | Cmd::CompactToggle
                 | Cmd::ExpandToggle
                 | Cmd::ExpandAll
@@ -5044,7 +5195,9 @@ impl Explorer {
                 | Screen::Files
                 | Screen::Layout { .. }
                 | Screen::Rename { .. }
-                | Screen::Stats { .. } => {}
+                | Screen::Stats { .. }
+                // Interactive-only: the panes are for browsing, and `--exit` has the report.
+                | Screen::Compare { .. } => {}
             }
             return Ok(None);
         }
@@ -5768,8 +5921,14 @@ impl Explorer {
         }
         self.index_specs = specs;
         self.health_reports.clear();
-        let ((tensors, metadata, config, disk, health), checkpoint) =
-            Self::gather_checkpoint(&self.files, self.remote_read())?;
+        let (parts, checkpoint) = Self::gather_checkpoint(&self.files, self.remote_read())?;
+        let crate::opening::CheckpointParts {
+            tensors,
+            metadata,
+            config,
+            disk_usage: disk,
+            health,
+        } = parts;
         if let Some(rc) = self.remote.as_mut() {
             rc.disk = disk;
         }
@@ -5990,6 +6149,37 @@ impl Explorer {
         }
         self.recents.record(&spec);
         self.copied_flash = Some((format!("opened {spec}"), std::time::Instant::now()));
+    }
+
+    /// Prompt for a checkpoint to browse beside this one, then open the side-by-side screen.
+    ///
+    /// Validation is deliberately light — non-empty only. The read happens on the screen, which has
+    /// somewhere to report a failure; validating by reading here would read the baseline twice.
+    fn run_compare_prompt(
+        term: &mut crate::tui::LiveTerminal,
+        recents: Vec<String>,
+    ) -> Option<Screen> {
+        let against = run_text_prompt_with_history(
+            term,
+            "Compare side by side with (file, directory, glob, hf://repo, host:/path)",
+            String::new(),
+            &recents,
+            |_| {},
+            |input| {
+                if input.trim().is_empty() {
+                    Submit::Reject("give a checkpoint to compare with".to_string())
+                } else {
+                    Submit::Accept(input.trim().to_string())
+                }
+            },
+        )?;
+        // Folded, like the browser's checkbox and the report: the irregular layer is what a comparison
+        // is opened to find.
+        Some(Screen::Compare {
+            against,
+            scroll: 0,
+            families: modes::Families::Folded,
+        })
     }
 
     /// Prompt for a checkpoint to compare against, then open the compare screen. The

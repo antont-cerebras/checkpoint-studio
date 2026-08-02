@@ -17,8 +17,12 @@ mod assets;
 pub(crate) mod current;
 #[cfg(test)]
 mod current_tests;
+pub(crate) mod diffscope;
 pub(crate) mod dto;
 pub(crate) mod handlers;
+pub(crate) mod jobs;
+pub(crate) mod repackjob;
+pub(crate) mod valuesjob;
 
 pub(crate) use current::Current;
 
@@ -468,7 +472,9 @@ struct Prepared {
     identity_len: Option<u64>,
 }
 
-fn handle(current: &Current, req: tiny_http::Request) {
+/// `&Arc<Current>` rather than `&Current`: starting a job hands a clone to a worker thread that outlives
+/// the request, so the reference count has to be reachable from here.
+fn handle(current: &Arc<Current>, req: tiny_http::Request) {
     let url = req.url().to_string();
     let gzip = accepts_gzip(&req);
     // Every endpoint but one is a read, and a read is a GET. `/api/open` changes what the
@@ -517,7 +523,7 @@ fn handle(current: &Current, req: tiny_http::Request) {
 /// Resolve a request to bytes. Pure: touches no socket, so it is safe to run inside the
 /// panic boundary above.
 fn prepare(
-    current: &Current,
+    current: &Arc<Current>,
     method: &tiny_http::Method,
     path: &str,
     query_str: &str,
@@ -562,13 +568,135 @@ fn prepare(
     }
 }
 
+/// The selection parameters both diff routes take — exactly what
+/// [`diffscope::DiffScope::from_query`] reads.
+const SCOPE_PARAMS: &[&str] = &[
+    "align_fused",
+    // `SOURCE#subtree`, per side: compare from inside a subtree, so two checkpoints under different
+    // namespaces line up.
+    "subtree",
+    "subtree_new",
+    "name",
+    "names",
+    "names_list",
+    "dtype_is",
+    "shape_is",
+    "map",
+    "map_json",
+    "only_tensors",
+];
+
+/// Whether an endpoint also takes the `diff` selection parameters.
+enum Scoped {
+    Yes,
+    No,
+}
+
+/// What each endpoint accepts, so anything else is a refusal rather than a silent no-op.
+///
+/// A mistyped parameter is not a harmless extra: `?nmae=model.layers.1.*` is not a filter, it is a
+/// request for the *whole* comparison — answered with a confident `200` and 117,664 rows, which reads
+/// as "your filter matched everything". `clap` refuses an unknown `--flag` on the command line for
+/// exactly this reason, and the API is the same surface with the same typos available.
+///
+/// `None` means "no route this table knows about": leave it to the router, which answers for the path
+/// itself rather than complaining about the parameters of an endpoint that does not exist.
+fn accepted_params(path: &str) -> Option<(&'static [&'static str], Scoped)> {
+    Some(match path {
+        "open" => (&["path", "stop_other"], Scoped::No),
+        // GET reads the list; DELETE names the entry to drop.
+        "recents" => (&["path"], Scoped::No),
+        "compare" => (&["left", "right", "stop_other"], Scoped::No),
+        // `full` says the reader turned family folding off — every layer as its own row.
+        "difftree" => (&["id", "full"], Scoped::Yes),
+        // `swap` reads the pair the other way round; `full` says the reader expanded the families, which
+        // the offered command has to carry.
+        "diff" => (&["against", "swap", "full"], Scoped::Yes),
+        "jobs/verify-repack" => (&["left", "right", "repack_bits"], Scoped::Yes),
+        "jobs/values" => (
+            &[
+                "left",
+                "right",
+                "values",
+                "histogram",
+                "bins",
+                "dtype",
+                "jobs",
+                "tensor",
+            ],
+            Scoped::Yes,
+        ),
+        "tree" | "files" | "stats" | "health" | "check" | "model" | "reading" | "version" => {
+            (&[], Scoped::No)
+        }
+        "filter" | "compact" | "schema" => (&["q"], Scoped::No),
+        "tensor" => (&["name"], Scoped::No),
+        "layout" => (&["file"], Scoped::No),
+        "file" => (&["path"], Scoped::No),
+        "tensor/stats" => (&["name", "dtype"], Scoped::No),
+        "tensor/sample" => (
+            &[
+                "name", "dtype", "mode", "rows", "cols", "slice", "row_off", "col_off", "row_tail",
+                "col_tail", "raw",
+            ],
+            Scoped::No,
+        ),
+        "tensor/histogram" => (&["name", "dtype", "bins"], Scoped::No),
+        // `jobs/<id>` — polling and stopping take no parameters. An id that is not a number is the
+        // router's 404, not a parameter complaint.
+        other => {
+            other.strip_prefix("jobs/")?.parse::<u64>().ok()?;
+            (&[], Scoped::No)
+        }
+    })
+}
+
+/// A `400` naming every parameter this endpoint does not take, or `None` when they all check out.
+fn unknown_params(path: &str, q: &Query) -> Option<Reply> {
+    let (own, scoped) = accepted_params(path)?;
+    let scope: &[&str] = match scoped {
+        Scoped::Yes => SCOPE_PARAMS,
+        Scoped::No => &[],
+    };
+    let mut unknown: Vec<&str> = q
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !own.contains(k) && !scope.contains(k))
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    unknown.sort_unstable();
+    let mut accepted: Vec<&str> = own.iter().chain(scope).copied().collect();
+    accepted.sort_unstable();
+    let named = unknown.join(", ");
+    Some(handlers::err(
+        400,
+        format!(
+            "unknown query parameter{}: {named} — /api/{path} accepts {}",
+            if unknown.len() == 1 { "" } else { "s" },
+            if accepted.is_empty() {
+                "no parameters".to_string()
+            } else {
+                accepted.join(", ")
+            }
+        ),
+    ))
+}
+
 fn route_api(
-    current: &Current,
+    current: &Arc<Current>,
     s: &WebState,
     method: &tiny_http::Method,
     path: &str,
     q: &Query,
 ) -> Reply {
+    // A parameter this endpoint does not take is a mistake worth naming, not something to ignore —
+    // see `accepted_params`. Checked before dispatch so every route gets it, including the ones
+    // routed by verb below.
+    if let Some(refusal) = unknown_params(path, q) {
+        return refusal;
+    }
     // The one endpoint that changes server state gets the one non-GET method. A GET that
     // swapped the served checkpoint would be a link a browser could follow on its own — a
     // prefetch, a history restore, a crawler — and the checkpoint would change with nobody
@@ -581,6 +709,41 @@ fn route_api(
                 405,
                 "opening a checkpoint changes what this server serves — use POST /api/open?path=…",
             )
+        };
+    }
+    // Long-running work: started with POST, polled with GET, stopped with DELETE. `jobs/verify-repack`
+    // is the start route; `jobs/<id>` is one job.
+    if let Some(rest) = path.strip_prefix("jobs/") {
+        #[allow(clippy::wildcard_enum_match_arm)] // foreign enum; see FOREIGN_ENUM_WILDCARDS
+        return match (rest, method) {
+            ("verify-repack", tiny_http::Method::Post) => handlers::start_verify_repack(current, q),
+            ("values", tiny_http::Method::Post) => handlers::start_values(current, q),
+            ("verify-repack" | "values", _) => handlers::err(
+                405,
+                "starting a job changes what this server is doing — use \
+                 POST /api/jobs/verify-repack or POST /api/jobs/values",
+            ),
+            (id, m) => id.parse::<u64>().map_or_else(
+                |_| handlers::err(404, format!("no such job route: jobs/{id}")),
+                |id| match *m {
+                    tiny_http::Method::Get => handlers::job_status(current, id),
+                    tiny_http::Method::Delete => handlers::cancel_job(current, id),
+                    _ => handlers::err(405, "GET /api/jobs/<id> to poll, DELETE to stop it"),
+                },
+            ),
+        };
+    }
+    // The baseline is set with POST and dropped with DELETE — the same verb rule as the rest: a
+    // GET never changes what the server holds.
+    if path == "compare" {
+        #[allow(clippy::wildcard_enum_match_arm)] // foreign enum; see FOREIGN_ENUM_WILDCARDS
+        return match *method {
+            tiny_http::Method::Post => handlers::set_comparison(current, q),
+            tiny_http::Method::Delete => handlers::clear_comparison(current),
+            _ => handlers::err(
+                405,
+                "POST /api/compare?left=…&right=… to set a comparison up, DELETE to drop it",
+            ),
         };
     }
     // The recents list is read with GET and pruned with DELETE; anything else on it is a 405, so
@@ -601,6 +764,13 @@ fn route_api(
     }
     match path {
         "tree" => handlers::tree(s),
+        // How the read someone is waiting on is going. Polled, so it must stay cheap: it reads two
+        // atomics and a clone of the spec.
+        "reading" => handlers::reading(current),
+        // Which build this is, for a tab checking whether it has gone stale.
+        "version" => handlers::version(s),
+        // The two checkpoints aligned into one tree — the whole side-by-side in one response.
+        "difftree" => handlers::difftree(current, s, q),
         "files" => handlers::files(s),
         "filter" => handlers::filter(s, q),
         "compact" => handlers::compact(s, q),
@@ -612,7 +782,7 @@ fn route_api(
         "tensor" => handlers::tensor(s, q),
         "layout" => handlers::layout(s, q),
         "file" => handlers::file(s, q),
-        "diff" => handlers::diff(s, q),
+        "diff" => handlers::diff(s, q, current.read_options()),
         "tensor/stats" => handlers::tensor_stats(s, q),
         "tensor/sample" => handlers::tensor_sample(s, q),
         "tensor/histogram" => handlers::tensor_histogram(s, q),
@@ -802,14 +972,21 @@ mod tests {
         .expect("the served state builds")
     }
 
-    /// A GET, which is what every route but `/api/open` takes.
-    fn get(c: &Current, path: &str, query: &str, gzip: bool) -> Prepared {
+    /// The served state, shared — jobs outlive their request, so the tests hold what the server holds.
+    fn serving_shared() -> std::sync::Arc<Current> {
+        std::sync::Arc::new(serving())
+    }
+
+    /// A GET, which is what every route but `/api/open` and the job starts take.
+    ///
+    /// `&Arc<Current>` because starting a job hands a clone to a thread that outlives the request.
+    fn get(c: &std::sync::Arc<Current>, path: &str, query: &str, gzip: bool) -> Prepared {
         prepare(c, &tiny_http::Method::Get, path, query, gzip)
     }
 
     #[test]
     fn every_api_route_answers_with_json() {
-        let c = serving();
+        let c = serving_shared();
         let state = c.snapshot();
         let name = state.tensors[0].name.clone();
         // The layout endpoint takes a shard basename, which is what the tensors carry.
@@ -841,9 +1018,254 @@ mod tests {
         }
     }
 
+    /// A parameter whose *value* is malformed is refused too, and the message says what is allowed.
+    ///
+    /// The name check above and this one are the same rule: a request the server cannot honour as
+    /// asked gets an explanation, not a confident answer to a different question. `?rows=lots` used
+    /// to sample 32 rows, `?mode=windwo` returned a grid rather than the window that was asked for,
+    /// `?bins=many` chose the bin count itself, and `?full=yes` folded the families it was told to
+    /// expand — every one of them a `200`.
+    #[test]
+    fn a_malformed_parameter_value_is_refused_with_a_reason() {
+        let c = serving_shared();
+        // A tensor the fixture really has: the name is resolved before the values are parsed, so a
+        // made-up one would be a 404 and prove nothing about the numbers.
+        let name = "model.embed_tokens.weight";
+        for (path, query, wanted) in [
+            // A count that is not a number, and one that cannot be a count.
+            (
+                "/api/tensor/sample",
+                format!("name={name}&rows=lots"),
+                "rows",
+            ),
+            (
+                "/api/tensor/sample",
+                format!("name={name}&rows=0"),
+                "at least 1",
+            ),
+            // A mode that is not one of the four.
+            (
+                "/api/tensor/sample",
+                format!("name={name}&mode=windwo"),
+                "not one of",
+            ),
+            // A fraction outside the axis.
+            (
+                "/api/tensor/sample",
+                format!("name={name}&mode=edges&row_tail=7"),
+                "out of range",
+            ),
+            // A bin count that is not a number — "choose for me" is *absent*, not unreadable.
+            (
+                "/api/tensor/histogram",
+                format!("name={name}&bins=many"),
+                "bins",
+            ),
+            // A switch that is neither on nor off.
+            ("/api/difftree", "id=1&full=yes".to_string(), "not a switch"),
+            (
+                "/api/diff",
+                "against=x&swap=maybe".to_string(),
+                "not a switch",
+            ),
+            (
+                "/api/diff",
+                "against=x&only_tensors=please".to_string(),
+                "not a switch",
+            ),
+        ] {
+            let out = get(&c, path, &query, false);
+            assert_eq!(out.status, 400, "{path}?{query} → {}", out.status);
+            let body: serde_json::Value =
+                serde_json::from_slice(out.body.as_slice()).expect("an error envelope is JSON");
+            let msg = body["error"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains(wanted),
+                "{path}?{query} should explain the value: got {msg:?}"
+            );
+        }
+    }
+
+    /// The values these routes are *given* still work — a strict parser that refused a legitimate
+    /// request would be a worse bug than the one it fixes.
+    #[test]
+    fn the_values_the_client_sends_are_all_accepted() {
+        let c = serving_shared();
+        // A tensor the fixture really has: the name is resolved before the values are parsed, so a
+        // made-up one would be a 404 and prove nothing about the numbers.
+        let name = "model.embed_tokens.weight";
+        for query in [
+            format!("name={name}"),
+            format!("name={name}&rows=8&cols=8"),
+            format!("name={name}&mode=window&row_off=1&col_off=2"),
+            format!("name={name}&mode=edges&row_tail=0.25&col_tail=1"),
+            format!("name={name}&mode=max"),
+            format!("name={name}&mode=grid&raw=1"),
+        ] {
+            let out = get(&c, "/api/tensor/sample", &query, false);
+            assert_eq!(out.status, 200, "sample?{query} → {}", out.status);
+        }
+        for query in [format!("name={name}"), format!("name={name}&bins=16")] {
+            let out = get(&c, "/api/tensor/histogram", &query, false);
+            assert_eq!(out.status, 200, "histogram?{query} → {}", out.status);
+        }
+    }
+
+    /// A parameter an endpoint does not take is a `400` naming it, on every route.
+    ///
+    /// The reported bug: `&bogus=1` was ignored and the endpoint answered `200` with the full payload.
+    /// That is harmless for `bogus` and not at all harmless for `nmae=model.layers.1.*`, which asks for
+    /// nineteen tensors and is answered with all 117,664 — a mistyped filter reads as a filter that
+    /// matched everything. The command line refuses an unknown `--flag`; so does this.
+    #[test]
+    fn an_unknown_query_parameter_is_refused_by_every_endpoint() {
+        let c = serving_shared();
+        for path in ROUTES.iter().map(|r| format!("/api/{r}")) {
+            let path = path.as_str();
+            let out = get(&c, path, "bogus=1", false);
+            assert_eq!(out.status, 400, "{path}?bogus=1 → {}", out.status);
+            let body: serde_json::Value =
+                serde_json::from_slice(out.body.as_slice()).expect("an error envelope is JSON");
+            let msg = body["error"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains("bogus"),
+                "the refusal should name the parameter: {msg}"
+            );
+        }
+        // A near-miss of a real parameter, which is the case that matters: silently dropping this one
+        // returns every tensor under a heading that says the filter was applied.
+        let out = get(&c, "/api/diff", "against=/tmp/x&nmae=layers.1", false);
+        assert_eq!(out.status, 400);
+        let body: serde_json::Value = serde_json::from_slice(out.body.as_slice()).expect("JSON");
+        let msg = body["error"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("nmae") && msg.contains("name"),
+            "the refusal should name the typo and list what is accepted: {msg}"
+        );
+    }
+
+    /// Every route with a query allowlist — the refusal test walks it, and the fixture below is
+    /// generated from it, so a new endpoint is covered by both the moment it is listed.
+    const ROUTES: &[&str] = &[
+        "tree",
+        "files",
+        "stats",
+        "health",
+        "check",
+        "model",
+        "tensor",
+        "layout",
+        "filter",
+        "schema",
+        "compact",
+        "diff",
+        "difftree",
+        "file",
+        "tensor/stats",
+        "tensor/sample",
+        "tensor/histogram",
+        "recents",
+        "reading",
+        "version",
+        "open",
+        "compare",
+        "jobs/values",
+        "jobs/verify-repack",
+    ];
+
+    /// The allowlist, written out for the browser to check itself against.
+    ///
+    /// **Why a fixture and not a list in this file.** The check this replaces held a hand-copied copy
+    /// of the keys `web/src/lib/api.ts` and `diffscope.ts` put on the wire — and by the time it was
+    /// looked at, that copy was missing `align_fused`, `subtree`, `subtree_new`, `full`, `names_list`
+    /// and `map_json`. It passed anyway, because a stale copy of the client agrees with itself. A
+    /// client parameter the server does not accept turns a working screen into a `400`, and the only
+    /// way to catch it is to compare against what the client *actually sends*, which lives on the
+    /// other side of a language boundary.
+    ///
+    /// So this generates `shared/parity/queryparams.json` from the allowlist itself — Rust is the
+    /// reference, as with `shared/parity/format.json` — and `web/src/lib/queryparams.test.ts` drives
+    /// the real `api.*` calls through a stubbed `fetch` and asserts every key it puts on a URL is in
+    /// here. Neither side can drift without one of the two failing.
+    ///
+    /// Regenerate after an intentional change:
+    ///
+    /// ```text
+    /// UPDATE_PARITY=1 cargo test --features hdf5 the_accepted_parameters
+    /// ```
+    #[test]
+    fn the_accepted_parameters_are_published_for_the_client_to_check() {
+        // Every route the table knows, with its scope parameters folded in — which is exactly what
+        // `unknown_params` compares against, so the fixture cannot describe a different rule.
+        let routes: std::collections::BTreeMap<String, Vec<&str>> = ROUTES
+            .iter()
+            .filter_map(|path| {
+                let (own, scoped) = super::accepted_params(path)?;
+                let mut keys: Vec<&str> = own.to_vec();
+                if matches!(scoped, super::Scoped::Yes) {
+                    keys.extend_from_slice(super::SCOPE_PARAMS);
+                }
+                keys.sort_unstable();
+                Some(((*path).to_string(), keys))
+            })
+            .collect();
+        let generated = serde_json::to_string_pretty(&serde_json::json!({
+            "note": concat!(
+                "Generated by `UPDATE_PARITY=1 cargo test the_accepted_parameters` ",
+                "(src/web/mod.rs); checked by web/src/lib/queryparams.test.ts. Do not edit by hand."
+            ),
+            "scope": super::SCOPE_PARAMS,
+            "routes": routes,
+        }))
+        .expect("the allowlist serializes")
+            + "\n";
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shared/parity/queryparams.json");
+        if std::env::var("UPDATE_PARITY").is_ok() {
+            std::fs::write(&path, &generated).expect("the fixture is writable");
+            return;
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            committed, generated,
+            "the accepted parameters have changed — regenerate with \
+             `UPDATE_PARITY=1 cargo test the_accepted_parameters`, and check the browser still \
+             sends only what is in the new list"
+        );
+    }
+
+    /// **The build id the server reports is the bundle it actually serves.**
+    ///
+    /// A tab compares this against the script it is running, and acts on a mismatch by telling someone
+    /// to reload — so an id that drifts from the served assets is worse than no id at all. Derived from
+    /// the `index.html` being served rather than stamped in at build time, and this is that property:
+    /// the name it reports is a real asset, and it is the one the shell loads.
+    #[test]
+    fn the_reported_build_is_the_bundle_being_served() {
+        let c = serving_shared();
+        let out = get(&c, "/api/version", "", false);
+        assert_eq!(out.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(out.body.as_slice()).expect("JSON");
+        let assets = body["assets"].as_str().unwrap_or_default();
+        // Vite's own naming, which is what both sides key on — the extension is fixed, not a
+        // filesystem lookup, so it is compared literally.
+        assert!(
+            assets.starts_with("index-")
+                && std::path::Path::new(assets).extension() == Some("js".as_ref()),
+            "expected a hashed entry script, got {body}"
+        );
+
+        // It is in the shell…
+        let shell = String::from_utf8_lossy(get(&c, "/", "", false).body.as_slice()).into_owned();
+        assert!(shell.contains(assets), "the shell does not load {assets}");
+        // …and it is a file this server will serve.
+        let served = get(&c, &format!("/assets/{assets}"), "", false);
+        assert_eq!(served.status, 200, "{assets} is not served");
+    }
+
     #[test]
     fn an_unknown_api_route_is_a_404_with_an_error_envelope() {
-        let c = serving();
+        let c = serving_shared();
         let out = get(&c, "/api/nope", "", false);
         assert_eq!(out.status, 404);
         let body: serde_json::Value =
@@ -853,7 +1275,7 @@ mod tests {
 
     #[test]
     fn a_missing_tensor_is_reported_not_guessed() {
-        let c = serving();
+        let c = serving_shared();
         let out = get(&c, "/api/tensor", "name=no.such.tensor", false);
         assert!(
             out.status >= 400,
@@ -869,7 +1291,7 @@ mod tests {
         // A client-routed URL (`/#detail?...` arrives as a path on reload) must get
         // index.html, not a 404 — otherwise a deep link breaks on refresh.
         for path in ["/", "/index.html", "/tree", "/some/client/route"] {
-            let out = get(&serving(), path, "", false);
+            let out = get(&serving_shared(), path, "", false);
             assert_eq!(out.status, 200, "{path} → {}", out.status);
             assert!(
                 out.body.as_slice().starts_with(b"<!") || out.body.as_slice().starts_with(b"<html"),
@@ -880,7 +1302,7 @@ mod tests {
 
     #[test]
     fn assets_are_served_with_a_content_type_and_are_cacheable() {
-        let c = serving();
+        let c = serving_shared();
         let index = String::from_utf8_lossy(get(&c, "/", "", false).body.as_slice()).to_string();
         // Pull the hashed bundle names out of the shell and fetch them.
         for ext in ["js", "css"] {
@@ -901,7 +1323,7 @@ mod tests {
 
     #[test]
     fn gzip_is_applied_only_when_the_client_asks_and_it_helps() {
-        let c = serving();
+        let c = serving_shared();
         // A large JSON body compresses, and the compressed form is what's sent.
         let plain = get(&c, "/api/model", "", false);
         let zipped = get(&c, "/api/model", "", true);
@@ -924,7 +1346,7 @@ mod tests {
 
     #[test]
     fn the_precomputed_bodies_are_cached_and_shared() {
-        let c = serving();
+        let c = serving_shared();
         // The second request for a static endpoint must reuse the first body rather than
         // re-serialising it — an unbounded rebuild per request leaked 2 GB before.
         let first = get(&c, "/api/tree", "", false);

@@ -2185,6 +2185,351 @@ fn scroll_wheel(scroll: &mut usize, max: usize, kind: MouseEventKind) -> MouseOu
     }
 }
 
+/// The **side-by-side** compare screen ([`Screen::Compare`]) as a [`Mode`].
+///
+/// Two panes over one aligned tree (`checkpoint_studio_core::difftree`) — the same model the browser
+/// renders, so the terminal and the browser cannot disagree about what differs. One tree means one
+/// fold state and one cursor, which is what makes the panes move together with nothing to reconcile.
+/// Whether uniform index families are folded onto one row each — a named state rather than a `bool`,
+/// because both halves are a real reading of the comparison.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Families {
+    /// 62 identical layers as one `{0-61}` row, so the irregular one stands out. The default, as in
+    /// the report and the browser.
+    Folded,
+    /// Every layer as its own row (`--full`).
+    Full,
+}
+
+pub(super) struct CompareMode {
+    against: String,
+    /// The alignment as read (and possibly swapped) — the source the drawn rows are derived from, so
+    /// folding and unfolding costs no re-read.
+    aligned: Vec<crate::difftree::AlignedNode>,
+    /// Whether the drawn rows fold uniform families.
+    families: Families,
+    /// The rows actually drawn: `aligned`, with families folded unless the reader asked for all of them.
+    rows: Vec<crate::difftree::AlignedNode>,
+    /// Differing rows in draw order, by path — what `n`/`N` step through.
+    differences: Vec<String>,
+    /// Differing **tensors**, from the tally over the whole alignment. Not the length of `differences`:
+    /// folding puts 62 differing tensors on one row, and the headline counts tensors on both surfaces.
+    differing: usize,
+    expanded: std::collections::HashSet<String>,
+    /// The baseline's label for the left pane's heading.
+    base_label: String,
+    /// Whether the sides are currently shown flipped. Only the labels need it — the rows are
+    /// transformed in place — but the heading has to agree with the columns.
+    flipped: bool,
+    /// The failure from reading the baseline, shown in place of the panes.
+    error: Option<String>,
+    /// Index into the *visible* rows.
+    cursor: usize,
+    scroll: usize,
+    scroll_max: Cell<usize>,
+    /// Visible body height from the last render, so `PageDown` and the cursor can stay on screen
+    /// without the key handler redoing the layout.
+    body: Cell<usize>,
+}
+
+impl CompareMode {
+    pub(super) fn new(against: String, scroll: usize, families: Families) -> Self {
+        Self {
+            against,
+            aligned: Vec::new(),
+            families,
+            rows: Vec::new(),
+            differences: Vec::new(),
+            differing: 0,
+            expanded: std::collections::HashSet::new(),
+            base_label: String::new(),
+            flipped: false,
+            error: None,
+            cursor: 0,
+            scroll,
+            scroll_max: Cell::new(0),
+            body: Cell::new(20),
+        }
+    }
+
+    /// The visible rows for the current fold state.
+    fn visible(&self) -> Vec<crate::difftree::FlatRow<'_>> {
+        crate::difftree::flatten(&self.rows, &self.expanded)
+    }
+
+    /// Re-derive the drawn rows from the alignment, and everything that indexes them.
+    ///
+    /// The fold state and the jump list are keyed by *path*, and a family's path (`layers.{0-61}`) is
+    /// not one of the paths its members have — so both are rebuilt here rather than carried across a
+    /// toggle, and the cursor is put back on the first difference.
+    fn rebuild(&mut self) {
+        // Over the whole alignment, before folding: a view control must not change what the comparison
+        // says it found.
+        self.differing = crate::difftree::tally(&self.aligned).differing();
+        self.rows = match self.families {
+            Families::Folded => crate::difftree::fold_families(&self.aligned),
+            Families::Full => self.aligned.clone(),
+        };
+        self.differences = crate::difftree::differences(&self.rows);
+        // Open the way to every difference, and nothing else.
+        self.expanded = crate::difftree::expand_to_differences(&self.rows);
+        self.cursor = 0;
+        if let Some(first) = self.differences.first().cloned() {
+            self.go_to(&first);
+        }
+    }
+
+    /// Where the cursor's path sits among the differences, for the `3 of 12` readout.
+    fn cursor_of(&self) -> Option<usize> {
+        let rows = self.visible();
+        let path = &rows.get(self.cursor)?.node.path;
+        self.differences.iter().position(|d| d == path)
+    }
+
+    /// Move the cursor to `path`, unfolding whatever hides it and scrolling it into view.
+    ///
+    /// Unfold first: moving the cursor to a row inside a folded group would leave it off screen,
+    /// which reads as the key having done nothing.
+    fn go_to(&mut self, path: &str) {
+        for a in ancestor_paths(&self.rows, path) {
+            self.expanded.insert(a);
+        }
+        if let Some(i) = self.visible().iter().position(|r| r.node.path == path) {
+            self.cursor = i;
+            let body = self.body.get().max(1);
+            if self.cursor < self.scroll {
+                self.scroll = self.cursor;
+            } else if self.cursor >= self.scroll + body {
+                self.scroll = self.cursor + 1 - body;
+            }
+        }
+    }
+
+    /// Step to the next/previous difference, wrapping. Wrapping rather than stopping: with a handful
+    /// of changes in a 31k-tensor checkpoint, a `next` that dead-ends means scrolling back by hand.
+    fn step(&mut self, forward: bool) {
+        if self.differences.is_empty() {
+            return;
+        }
+        let here = self.cursor_of();
+        let n = self.differences.len();
+        let to = match here {
+            Some(i) if forward => (i + 1) % n,
+            Some(i) => (i + n - 1) % n,
+            None if forward => 0,
+            None => n - 1,
+        };
+        let Some(path) = self.differences.get(to).cloned() else {
+            return;
+        };
+        self.go_to(&path);
+    }
+
+    /// Fold or unfold the row under the cursor.
+    fn toggle(&mut self) {
+        let Some(path) = self
+            .visible()
+            .get(self.cursor)
+            .filter(|r| r.node.is_group())
+            .map(|r| r.node.path.clone())
+        else {
+            return;
+        };
+        if !self.expanded.remove(&path) {
+            self.expanded.insert(path);
+        }
+    }
+}
+
+/// The group paths that have to unfold for `path` to be visible.
+fn ancestor_paths(rows: &[crate::difftree::AlignedNode], path: &str) -> Vec<String> {
+    fn walk(
+        rows: &[crate::difftree::AlignedNode],
+        path: &str,
+        trail: &mut Vec<String>,
+        out: &mut Vec<String>,
+    ) -> bool {
+        for n in rows {
+            if n.path == path {
+                out.extend(trail.iter().cloned());
+                return true;
+            }
+            if n.is_group() {
+                trail.push(n.path.clone());
+                let found = walk(&n.children, path, trail, out);
+                trail.pop();
+                if found {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    let mut out = Vec::new();
+    walk(rows, path, &mut Vec::new(), &mut out);
+    out
+}
+
+impl Mode for CompareMode {
+    fn help_ctx(&self) -> HelpCtx {
+        // Shares the compare screen's help context: both are "comparing with another checkpoint",
+        // and a context of its own would mean an arm in every exhaustive match over `HelpCtx` for
+        // no difference the reader would notice.
+        HelpCtx::Diff
+    }
+
+    fn on_enter(
+        &mut self,
+        ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+    ) -> Result<Outcome> {
+        if !self.rows.is_empty() || self.error.is_some() {
+            return Ok(Outcome::Stay); // already read (returning via history)
+        }
+        match ex.aligned_against(&self.against) {
+            Ok((label, rows)) => {
+                self.base_label = label;
+                self.aligned = rows;
+                // Folds the families, lists the differences, and starts on the first — which is what
+                // the screen was opened for.
+                self.rebuild();
+            }
+            Err(e) => self.error = Some(format!("{e:#}")),
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
+        if let Some(msg) = &self.error {
+            UI::render_message(f, "Cannot compare", msg);
+            return;
+        }
+        let open_label = ex.root_label();
+        let rows: Vec<crate::ui::compare::CompareRow<'_>> = self
+            .visible()
+            .into_iter()
+            .map(|r| crate::ui::compare::CompareRow {
+                node: r.node,
+                depth: r.depth,
+                expanded: r.expanded,
+            })
+            .collect();
+        let max = crate::ui::compare::render(
+            f,
+            &crate::ui::compare::CompareFrame {
+                // The headings follow the columns: after a flip the open checkpoint is the
+                // baseline side, and a label that stayed put would name the wrong pane.
+                base_label: if self.flipped {
+                    &open_label
+                } else {
+                    &self.base_label
+                },
+                new_label: if self.flipped {
+                    &self.base_label
+                } else {
+                    &open_label
+                },
+                rows: &rows,
+                cursor: self.cursor,
+                scroll: self.scroll,
+                // Tensors, from the tally — the number the browser and the report print. The *stops*
+                // are the rows `n`/`N` visit, which a folded family makes fewer of.
+                differences: self.differing,
+                stops: self.differences.len(),
+                cursor_of: self.cursor_of(),
+            },
+        );
+        self.scroll_max.set(max);
+        self.body
+            .set(crate::ui::compare::body_rows(f.area().height));
+    }
+
+    fn open_palette(
+        &mut self,
+        _ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+    ) -> PaletteResult {
+        // No palette of its own yet: the screen's whole vocabulary is on the footer (`n`/`N`, the
+        // arrows, `Esc`), so a picker listing three keys would be a step to reach them, not a way
+        // to discover them.
+        PaletteResult::Handled
+    }
+
+    fn handle_key(
+        &mut self,
+        _ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+        key: KeyEvent,
+    ) -> Result<Outcome> {
+        let visible = self.visible().len();
+        let body = self.body.get().max(1);
+        // A foreign key enum; see FOREIGN_ENUM_WILDCARDS.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match key.code {
+            KeyCode::Char('n') => self.step(true),
+            KeyCode::Char('N') => self.step(false),
+            // Flip which side is which. Free — both checkpoints are already aligned, so this is a
+            // transform of the rows rather than a re-read (see `difftree::swap`).
+            KeyCode::Char('s') => {
+                // Both, in place: `swap` preserves row order and paths, so the cursor and the fold
+                // state survive a flip — which they would not if the view were re-derived.
+                self.aligned = crate::difftree::swap(&self.aligned);
+                self.rows = crate::difftree::swap(&self.rows);
+                self.flipped = !self.flipped;
+            }
+            // Fold the uniform families away, or show every layer — the tree screen's key for the same
+            // idea (`compact`), and the browser's `Collapse families` checkbox.
+            KeyCode::Char('k') => {
+                self.families = match self.families {
+                    Families::Folded => Families::Full,
+                    Families::Full => Families::Folded,
+                };
+                self.rebuild();
+            }
+            KeyCode::Down => self.cursor = (self.cursor + 1).min(visible.saturating_sub(1)),
+            KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::PageDown => {
+                self.cursor = (self.cursor + body).min(visible.saturating_sub(1));
+            }
+            KeyCode::PageUp => self.cursor = self.cursor.saturating_sub(body),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = visible.saturating_sub(1),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Left => self.toggle(),
+            KeyCode::Esc | KeyCode::Backspace => return Ok(Outcome::Leave(Nav::Back)),
+            KeyCode::Char('q') => return Ok(Outcome::Leave(Nav::Quit)),
+            _ => {}
+        }
+        // Keep the cursor on screen after any move.
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + body {
+            self.scroll = self.cursor + 1 - body;
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn handle_mouse(
+        &mut self,
+        _ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+        m: MouseEvent,
+    ) -> MouseOutcome {
+        scroll_wheel(&mut self.scroll, self.scroll_max.get(), m.kind)
+    }
+
+    fn set_scroll(&mut self, _ex: &mut Explorer, offset: usize) {
+        self.scroll = offset;
+    }
+
+    fn residual(&self) -> Screen {
+        Screen::Compare {
+            against: self.against.clone(),
+            scroll: self.scroll,
+            families: self.families,
+        }
+    }
+}
+
 /// The compare screen ([`Screen::Diff`]) as a [`Mode`]: a structural diff of the open
 /// checkpoint against another one, scrollable.
 ///
@@ -2235,7 +2580,11 @@ impl Mode for DiffMode {
             return Ok(Outcome::Stay); // already computed (returning via history)
         }
         let metadata = ex.metadata().to_vec();
-        match crate::compare::structural_diff(ex.tensors(), &metadata, &self.against) {
+        // The spec as typed, resolved by `opening` like every other address this app takes — so the
+        // terminal's diff screen accepts the remote spellings the browser's does.
+        let against = self.against.to_string_lossy().into_owned();
+        match crate::compare::structural_diff(ex.tensors(), &metadata, &against, ex.read_options())
+        {
             Ok(report) => self.report = Some(report),
             Err(e) => self.error = Some(format!("{e:#}")),
         }
@@ -2783,6 +3132,7 @@ mod tests {
                 Screen::Rename { .. } => "rename".into(),
                 Screen::Stats { .. } => "stats".into(),
                 Screen::Diff { against, .. } => format!("diff:{against}"),
+                Screen::Compare { against, .. } => format!("compare:{against}"),
             },
         }
     }
@@ -3287,7 +3637,8 @@ mod tests {
             | Screen::Detail { .. }
             | Screen::Data { .. }
             | Screen::Rename { .. }
-            | Screen::Diff { .. }) => panic!(
+            | Screen::Diff { .. }
+            | Screen::Compare { .. }) => panic!(
                 "stats mode must reside as Stats, got {}",
                 outcome(&Outcome::Leave(Nav::Open(other)))
             ),
@@ -3633,7 +3984,8 @@ mod tests {
             | Screen::Detail { .. }
             | Screen::Data { .. }
             | Screen::Rename { .. }
-            | Screen::Stats { .. } => {
+            | Screen::Stats { .. }
+            | Screen::Compare { .. } => {
                 panic!("the compare screen's residual should be Screen::Diff")
             }
         }
@@ -3792,5 +4144,104 @@ mod tests {
             ))),
             "stats"
         );
+    }
+}
+
+#[cfg(test)]
+mod compare_mode_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    /// The screen's whole job: read a second checkpoint, align it, and step between differences.
+    #[test]
+    fn stepping_moves_the_cursor_between_differences() {
+        let mut ex = Explorer::new(
+            vec![fixture("diff_new.safetensors")],
+            Vec::new(),
+            None,
+            false,
+        );
+        ex.load_quiet().expect("the fixture loads");
+        let mut mode = CompareMode::new(
+            fixture("diff_old.safetensors").display().to_string(),
+            0,
+            Families::Folded,
+        );
+        let mut term = crate::tui::test_terminal(90, 30);
+
+        mode.on_enter(&mut ex, &mut term)
+            .expect("reads the baseline");
+        assert!(mode.error.is_none(), "read failed: {:?}", mode.error);
+        assert!(!mode.differences.is_empty(), "the fixtures differ");
+        assert_eq!(mode.cursor_of(), Some(0), "opens on the first difference");
+
+        let press = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        mode.handle_key(&mut ex, &mut term, press('n'))
+            .expect("n steps");
+        assert_eq!(mode.cursor_of(), Some(1), "n moves to the next difference");
+
+        mode.handle_key(&mut ex, &mut term, press('N'))
+            .expect("N steps back");
+        assert_eq!(mode.cursor_of(), Some(0), "N moves back");
+    }
+
+    /// Swapping is the same comparison read the other way, and costs no read — both checkpoints are
+    /// already aligned.
+    #[test]
+    fn swapping_sides_flips_the_panes_without_rereading() {
+        let mut ex = Explorer::new(
+            vec![fixture("diff_new.safetensors")],
+            Vec::new(),
+            None,
+            false,
+        );
+        ex.load_quiet().expect("the fixture loads");
+        let mut mode = CompareMode::new(
+            fixture("diff_old.safetensors").display().to_string(),
+            0,
+            Families::Folded,
+        );
+        let mut term = crate::tui::test_terminal(90, 30);
+        mode.on_enter(&mut ex, &mut term)
+            .expect("reads the baseline");
+
+        let before: Vec<_> = mode
+            .rows
+            .iter()
+            .map(|r| (r.name.clone(), r.status))
+            .collect();
+        let count = mode.differences.len();
+
+        let press = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        mode.handle_key(&mut ex, &mut term, press('s'))
+            .expect("s swaps");
+        assert!(mode.flipped, "the labels follow the columns");
+        let after: Vec<_> = mode
+            .rows
+            .iter()
+            .map(|r| (r.name.clone(), r.status))
+            .collect();
+        assert_ne!(before, after, "at least one side-only row changed sides");
+        assert_eq!(
+            mode.differences.len(),
+            count,
+            "the same rows differ either way round"
+        );
+
+        mode.handle_key(&mut ex, &mut term, press('s'))
+            .expect("s swaps back");
+        assert!(!mode.flipped);
+        let back: Vec<_> = mode
+            .rows
+            .iter()
+            .map(|r| (r.name.clone(), r.status))
+            .collect();
+        assert_eq!(back, before, "twice is where you started");
     }
 }

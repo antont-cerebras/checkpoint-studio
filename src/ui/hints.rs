@@ -765,6 +765,31 @@ pub(crate) fn diff_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) 
     wrap_hint_items(items, width)
 }
 
+/// The side-by-side compare screen's footer.
+///
+/// `n`/`N` are the keys the screen exists for, so they come first — a footer that listed only
+/// scrolling would leave the one thing you came here to do undiscoverable.
+pub(crate) fn compare_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
+    use KeyCode::Enter;
+    let items: Vec<(Vec<Seg>, &str)> = vec![
+        (
+            pair("n", hint_key('n'), "N", hint_key('N')),
+            "next/prev difference",
+        ),
+        (letter("s"), "swap sides"),
+        (letter("k"), "families"),
+        (nav_updown(), "move"),
+        (nav_pages(), "page"),
+        (
+            vec![Seg::Key("Enter", KeyEvent::new(Enter, KeyModifiers::NONE))],
+            "fold/unfold",
+        ),
+        (history_keys(), "back"),
+        (letter("q"), "quit"),
+    ];
+    wrap_hint_items(items, width)
+}
+
 pub(crate) fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
     use KeyCode::{Enter, Tab};
     let plain = KeyModifiers::NONE;

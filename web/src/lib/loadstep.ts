@@ -22,7 +22,26 @@ export type LoadStep =
   /** The tensor tree is downloading — the one wait with a real byte total. */
   | { kind: 'tree'; progress: Progress | null }
   /** Uniform layers and experts are being folded into families. */
-  | { kind: 'folding'; progress: Progress | null };
+  | { kind: 'folding'; progress: Progress | null }
+  /**
+   * The server is reading a comparison's **two** checkpoints, before it can align them.
+   *
+   * Both specs, not one: they are read one after another and at wildly different speeds — a local
+   * directory in a second, an `s3://` prefix in twenty — so a single bar named after the baseline said
+   * nothing about which of the two you were waiting for. The screen draws a row per side.
+   */
+  | { kind: 'comparing'; spec: string; right: string; progress: Progress | null }
+  /** The aligned tree is downloading — the largest body this API serves. */
+  | { kind: 'difftree'; progress: Progress | null }
+  /**
+   * The browser is turning that response into rows.
+   *
+   * Its own step because it is the *slowest* one for a large comparison and used to be invisible:
+   * the bar sat at `87.0 MiB / 87.0 MiB · 100%` with a frozen timer for tens of seconds while the
+   * main thread parsed 91 MB of JSON and walked 373k nodes. A bar at 100% that keeps going reads as
+   * a hung program, which is exactly what it was mistaken for.
+   */
+  | { kind: 'building'; progress: Progress | null };
 
 /** What the inputs to [`currentStep`] are — the stores it reads, as plain values. */
 export interface LoadInputs {
@@ -74,6 +93,12 @@ export function stepLabel(s: LoadStep): string {
       return 'reading the tensor tree';
     case 'folding':
       return 'folding uniform layers into families';
+    case 'comparing':
+      return 'reading both checkpoints';
+    case 'difftree':
+      return 'reading the comparison';
+    case 'building':
+      return 'building the comparison';
   }
 }
 
@@ -94,6 +119,12 @@ export function stepDetail(s: LoadStep, proxyHost = ''): string {
       return 'this server → your browser';
     case 'folding':
       return 'grouping tensors whose names differ only by an index';
+    case 'comparing':
+      return `${sourceName(s.spec, proxyHost)} → this server`;
+    case 'difftree':
+      return 'this server → your browser';
+    case 'building':
+      return 'aligning both trees into rows, in this tab';
   }
 }
 
@@ -130,8 +161,27 @@ export function resolvedSpec(spec: string, proxyHost = ''): string {
   return proxyHost && s.startsWith(':') ? `${proxyHost}:${s.slice(1)}` : s;
 }
 
+/**
+ * The inverse, for a box you type in: `host:/path` shown as `:/path` when the host **is** the
+ * configured proxy.
+ *
+ * Two different jobs, which is why both exist. A *wait* names the machine being read, because
+ * "which host is this coming from" is the question then. An *address field* is a thing you edit and
+ * retype, and there the host is 52 characters of the same answer on every line — it pushes the part
+ * that differs off the end of the box and out of the dropdown.
+ *
+ * Display only. What gets **stored** stays the scp form (`opening::recorded_spec`), because the
+ * shorthand resolves against a config file that can change and a stored entry has to name the same
+ * checkpoint later. The two forms resolve identically, so what is typed back is what was meant.
+ */
+export function shortSpec(spec: string, proxyHost = ''): string {
+  const s = spec.trim();
+  if (!proxyHost) return s;
+  return s.startsWith(`${proxyHost}:`) ? s.slice(proxyHost.length) : s;
+}
+
 /** What the step applies to, when that isn't obvious: the checkpoint being opened, as the
  * address it resolves to. */
 export function stepSubject(s: LoadStep, proxyHost = ''): string {
-  return s.kind === 'opening' ? resolvedSpec(s.spec, proxyHost) : '';
+  return s.kind === 'opening' || s.kind === 'comparing' ? resolvedSpec(s.spec, proxyHost) : '';
 }

@@ -7,6 +7,38 @@
 // invocation for the same state. `stores/view.ts` owns the stores and the
 // `location.hash` / `history` plumbing and calls in here.
 
+import {
+  isScopeActive,
+  scopeFromQuery,
+  scopeToQuery,
+  type DiffScopeParams,
+} from './diffscope';
+
+/**
+ * The parsed scope, but only when the URL actually carries one.
+ *
+ * Omitted rather than always present: an unscoped screen is then the same value it has always been, so
+ * `hash → parse → hash` is an identity for every existing link and nothing has to special-case an
+ * "empty" scope object. Matches the field's own meaning — absent *is* unscoped.
+ */
+function scopeIfAny(q: URLSearchParams): { scope?: DiffScopeParams } {
+  const scope = scopeFromQuery(q);
+  return isScopeActive(scope) ? { scope } : {};
+}
+
+/**
+ * The scope as a hash-query tail — `&name=…&dtype_is=…`, or nothing at all.
+ *
+ * Emitted only for what is set, so an unscoped comparison keeps the short URL it always had.
+ */
+function scopeQuery(s: DiffScopeParams | undefined): string {
+  return s === undefined
+    ? ''
+    : scopeToQuery(s)
+        .map(([k, v]) => `&${k}=${encodeURIComponent(v)}`)
+        .join('');
+}
+
 /** Which pane of the tensor detail is showing. */
 export type DataTab = 'info' | 'heatmap' | 'values' | 'histogram';
 const DATA_TABS: readonly string[] = ['info', 'heatmap', 'values', 'histogram'];
@@ -39,7 +71,38 @@ export type Screen =
   | { kind: 'layout'; file?: string | undefined }
   | { kind: 'stats' }
   | { kind: 'health' }
-  | { kind: 'diff'; against: string }
+  // `scope` is the CLI's selection flags (`--name`, `--dtype-is`, …). Optional because absent *means*
+  // unscoped: the palette entry and the report's own link have no selection to carry, and requiring one
+  // would put `scope: emptyScope()` at a dozen call sites that have nothing to do with scoping.
+  // `swapped` turns the report round: the open checkpoint becomes the baseline. In the URL because it
+  // changes what the report *says* — added and removed trade places — so a link has to carry it.
+  | {
+      kind: 'diff';
+      against: string;
+      scope?: DiffScopeParams | undefined;
+      swapped?: boolean | undefined;
+      /** `--full`: show every tensor rather than collapsing index-templated families onto one row.
+       * In the URL because it changes what the report *shows*, and because the copyable command has to
+       * carry it. */
+      full?: boolean | undefined;
+      /** Sections the reader has folded away, by key. In the URL so a reload — or a link — lands on the
+       * report as it was being read, which is the whole point of folding a 31,247-row section away. */
+      closed?: string[] | undefined;
+    }
+  // Side-by-side comparison. `against` is the baseline; the other side is whatever the server
+  // serves, which the `ckpt` global already names — so the pair is fully in the URL.
+  | {
+      kind: 'compare';
+      against: string;
+      right: string;
+      scope?: DiffScopeParams | undefined;
+      /** `--full`: every layer as its own row, rather than uniform families folded onto one each.
+       * In the URL for the reason every view control is: a link shows what the sender was reading. */
+      full?: boolean;
+      /** Which way round the pair is read. The *operands* stay canonical — the scope is directional,
+       * so swapping them would describe a comparison the server would answer differently. */
+      swapped?: boolean;
+    }
   | { kind: 'preview'; path: string; name: string }
   // The open prompt carries no state of its own: what it does is change the *server*, and a
   // URL cannot capture that. It round-trips as a bare `open` so a reload lands on the prompt
@@ -107,8 +170,17 @@ export function screenToHash(s: Screen): string {
       return 'stats';
     case 'health':
       return 'health';
-    case 'diff':
-      return `diff?against=${enc(s.against)}`;
+    case 'diff': {
+      const closed = s.closed?.length ? `&closed=${s.closed.map(enc).join(',')}` : '';
+      return `diff?against=${enc(s.against)}${s.swapped ? '&swap=1' : ''}${s.full ? '&full=1' : ''}${closed}${scopeQuery(s.scope)}`;
+    }
+    case 'compare': {
+      const right = s.right ? `&right=${enc(s.right)}` : '';
+      const full = s.full ? '&full=1' : '';
+      // `swap`, the same spelling the report uses for the same idea.
+      const swap = s.swapped ? '&swap=1' : '';
+      return `compare?against=${enc(s.against)}${right}${swap}${full}${scopeQuery(s.scope)}`;
+    }
     case 'preview':
       return `preview?path=${enc(s.path)}&name=${enc(s.name)}`;
     case 'open':
@@ -144,12 +216,33 @@ export function parseScreen(hash: string): Screen {
       return { kind: 'stats' };
     case 'health':
       return { kind: 'health' };
-    case 'diff': {
-      // No baseline means no comparison to show, so fall through to the tree rather
-      // than opening a screen that can only say "pick something".
-      const against = q.get('against');
-      if (against) return { kind: 'diff', against };
-      break;
+    case 'diff':
+      // Opens with an empty baseline, because the screen carries its own path box — the same reason
+      // the side-by-side does. Falling through to the tree instead made the palette's "Diff report"
+      // entry do nothing at all: it navigates with no baseline, so the screen it asked for was
+      // silently replaced by the one you were already on.
+      return {
+        kind: 'diff',
+        against: q.get('against') ?? '',
+        ...(q.get('swap') === '1' ? { swapped: true } : {}),
+        ...(q.get('full') === '1' ? { full: true } : {}),
+        ...(q.get('closed')
+          ? { closed: (q.get('closed') ?? '').split(',').filter((k) => k !== '') }
+          : {}),
+        ...scopeIfAny(q),
+      };
+    case 'compare': {
+      // No baseline means no comparison to draw, but the screen is still where you pick one — so
+      // it opens empty rather than falling through to the tree.
+      // `right` absent means "the checkpoint that is open" — the common case, and a short URL.
+      return {
+        kind: 'compare',
+        against: q.get('against') ?? '',
+        right: q.get('right') ?? '',
+        ...(q.get('swap') === '1' ? { swapped: true } : {}),
+        ...(q.get('full') === '1' ? { full: true } : {}),
+        ...scopeIfAny(q),
+      };
     }
     case 'preview': {
       const path = q.get('path');

@@ -336,6 +336,7 @@ export function navigate(s: Screen, replace = false): void {
     history.replaceState(history.state, '', h);
   } else if (location.hash !== h) {
     location.hash = h; // pushes a history entry (hashchange also confirms the store)
+    pushedOwnEntry = true;
   }
   screen.set(s); // optimistic; the hashchange listener confirms on the push path
 }
@@ -354,9 +355,25 @@ sortDir.subscribe(syncHash);
 compact.subscribe(syncHash);
 search.subscribe(syncHash);
 searching.subscribe(syncHash);
+/**
+ * Leave the current screen.
+ *
+ * `history.back()` only when this app pushed the entry we would go back *to*. A link opened in a
+ * fresh tab has no in-app entry behind it, so a bare `history.back()` left the app altogether — and
+ * took the shared link with it, which is the one thing a shared link must survive. With nothing of
+ * ours behind us, "back" means the tree, and it *replaces* rather than pushing, so Esc cannot build
+ * a history of its own.
+ */
 export function back(): void {
-  history.back();
+  if (pushedOwnEntry) {
+    history.back();
+    return;
+  }
+  navigate({ kind: 'tree' }, true);
 }
+
+/** Whether this app has pushed a history entry, so `back` knows there is one to return to. */
+let pushedOwnEntry = false;
 export function forward(): void {
   history.forward();
 }

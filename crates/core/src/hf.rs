@@ -54,18 +54,57 @@ const PARALLEL_READS: usize = 16;
 /// caller shows a spinner), then it is the shard count and `done` climbs to it. Shard count
 /// rather than bytes because every header read costs about the same, so the count is the
 /// honest unit — a bytes-based bar over 96 wildly different shard *sizes* would jump.
+/// Also the read's **control** channel: see [`ReadProgress::cancel`]. It is already shared with, and
+/// threaded through, every layer of a read, which is exactly what a stop request needs to reach.
+///
+/// **The count itself lives in [`crate::progress::LoadProgress`]**, which every reader here already
+/// knows how to fill — including the unit (`shards`, `S3 objects`) and the stage. Wrapping it rather
+/// than keeping a second pair of counters is what lets a browser show the same
+/// `44 / 66 shards · reading shard headers` a terminal does: the web's read had a timer and no numbers,
+/// while the numbers existed one layer down and were thrown away with the CLI's bars.
 #[derive(Debug, Default)]
 pub struct ReadProgress {
-    pub done: std::sync::atomic::AtomicUsize,
-    pub total: std::sync::atomic::AtomicUsize,
+    /// How far the read has got, and what it is counting.
+    load: crate::progress::LoadProgress,
+    /// Set to ask this read to give up as soon as it notices.
+    ///
+    /// Cooperative, because a read is a blocking call into ssh or the filesystem and there is nothing
+    /// to interrupt from outside. The remote reader checks it between chunks of the script's output and
+    /// drops the channel, which tears the remote command down
+    /// (`RemoteSession::exec_capture_abortable`) — so a cancelled `s3://` read stops within a chunk
+    /// rather than running to completion with nobody waiting for it.
+    cancelled: std::sync::atomic::AtomicBool,
 }
 
 impl ReadProgress {
     /// `(done, total)`; `total == 0` means the listing hasn't landed yet.
     #[must_use]
     pub fn get(&self) -> (usize, usize) {
-        use std::sync::atomic::Ordering::Relaxed;
-        (self.done.load(Relaxed), self.total.load(Relaxed))
+        self.load.snapshot()
+    }
+
+    /// The counts, for a reader that fills them or a caller that draws them.
+    #[must_use]
+    pub fn load(&self) -> &crate::progress::LoadProgress {
+        &self.load
+    }
+
+    /// Ask this read to stop. Idempotent, and safe to call from another thread.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a stop has been asked for.
+    #[must_use]
+    pub fn cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The flag itself, for the layers that take an `Option<&AtomicBool>` abort.
+    #[must_use]
+    pub fn abort_flag(&self) -> &std::sync::atomic::AtomicBool {
+        &self.cancelled
     }
 }
 
@@ -396,9 +435,9 @@ pub fn read_checkpoint(repo: &RepoRef, progress: &ReadProgress) -> Result<Checkp
     let agent = agent();
     // The denominator is known now, before any header read — which is what makes this a
     // real bar rather than a spinner.
-    progress
-        .total
-        .store(shards.len(), std::sync::atomic::Ordering::Relaxed);
+    progress.load().set_total(shards.len());
+    progress.load().set_unit(crate::progress::Unit::Shards);
+    progress.load().set_stage(crate::progress::Stage::Shards);
     // A bounded pool: `PARALLEL_READS` in flight, which is what keeps a 96-shard repo to a
     // few seconds without hammering the Hub.
     let pool = rayon::ThreadPoolBuilder::new()
@@ -421,9 +460,7 @@ pub fn read_checkpoint(repo: &RepoRef, progress: &ReadProgress) -> Result<Checkp
                             error: format!("{e:#}"),
                         }
                     });
-                    progress
-                        .done
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    progress.load().advance();
                     h
                 })
                 .collect()

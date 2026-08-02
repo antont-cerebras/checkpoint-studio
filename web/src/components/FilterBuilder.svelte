@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   // A mouse-driven view of the filter query that stays in sync with the raw text
   // input: it parses the current query into facet controls, and every control edits
   // the query live (rebuilding it), so raw ⇄ builder are two views of one query.
@@ -6,6 +7,7 @@
   import { dtypesPresent } from '../stores/server';
   import { filterQuery } from '../stores/view';
   import { dtypeInfo } from '../lib/dtype';
+  import TextField from './TextField.svelte';
 
   $: present = $dtypesPresent;
 
@@ -215,11 +217,15 @@
     commit();
   }
 
-  // Move keyboard focus into the builder on open, and keep its keystrokes from
-  // triggering the tree's global shortcuts.
-  function focusOnMount(node: HTMLElement) {
-    node.focus();
+  // Move keyboard focus into the builder on open. Its keystrokes stay out of the tree's shortcuts by
+  // themselves now: every box here is a `TextField`, which owns the keys it is given.
+  let nameEl: HTMLInputElement | HTMLTextAreaElement | null = null;
+  // A named function, not an inline arrow: `onMount(() => nameEl?.focus())` returns whatever `focus()`
+  // evaluates to, and `onMount` reads a returned value as a cleanup function.
+  function focusName() {
+    nameEl?.focus();
   }
+  onMount(focusName);
 </script>
 
 <!-- svelte-ignore a11y-no-static-element-interactions -->
@@ -247,41 +253,96 @@
       <option value="re">regex</option>
       <option value="glob">glob</option>
     </select>
-    <input class="v" use:focusOnMount spellcheck="false" placeholder="q_proj  /  ^model\.layers  /  *.weight" bind:value={fields.name} on:input={commit} />
+    <TextField
+      variant="dense"
+      bind:el={nameEl}
+      spellcheck="false"
+      placeholder="q_proj  /  ^model\.layers  /  *.weight"
+      bind:value={fields.name}
+      on:input={commit}
+    />
   </div>
 
   <div class="row">
     <button type="button" class="neg" class:on={fields.neg.shape} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('shape')}>not</button>
     <span class="k">shape</span>
-    <input class="v" spellcheck="false" placeholder="6,_,42   (_ = any dim, .. = any run)" bind:value={fields.shape} on:input={commit} />
+    <TextField
+      variant="dense"
+      spellcheck="false"
+      placeholder="6,_,42   (_ = any dim, .. = any run)"
+      bind:value={fields.shape}
+      on:input={commit}
+    />
   </div>
 
   <div class="row">
     <button type="button" class="neg" class:on={fields.neg.dim} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('dim')}>not</button>
     <span class="k">dim</span>
-    <input class="v short" spellcheck="false" placeholder="4096  /  >1000" bind:value={fields.dim} on:input={commit} />
+    <TextField
+      variant="dense" grow={false} width="84px"
+      spellcheck="false"
+      placeholder="4096  /  >1000"
+      bind:value={fields.dim}
+      on:input={commit}
+    />
     <button type="button" class="neg" class:on={fields.neg.rank} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('rank')}>not</button>
     <span class="k">rank</span>
-    <input class="v short" spellcheck="false" placeholder="2  /  >=3" bind:value={fields.rank} on:input={commit} />
+    <TextField
+      variant="dense" grow={false} width="84px"
+      spellcheck="false"
+      placeholder="2  /  >=3"
+      bind:value={fields.rank}
+      on:input={commit}
+    />
   </div>
 
   <div class="row">
     <button type="button" class="neg" class:on={fields.neg.size} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('size')}>not</button>
     <span class="k">size</span>
-    <input class="v short" spellcheck="false" placeholder="1MiB" bind:value={fields.sizeMin} on:input={commit} />
+    <TextField
+      variant="dense" grow={false} width="84px"
+      spellcheck="false"
+      placeholder="1MiB"
+      bind:value={fields.sizeMin}
+      on:input={commit}
+    />
     <span class="to">…</span>
-    <input class="v short" spellcheck="false" placeholder="1GiB" bind:value={fields.sizeMax} on:input={commit} />
+    <TextField
+      variant="dense" grow={false} width="84px"
+      spellcheck="false"
+      placeholder="1GiB"
+      bind:value={fields.sizeMax}
+      on:input={commit}
+    />
     <button type="button" class="neg" class:on={fields.neg.params} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('params')}>not</button>
     <span class="k">params</span>
-    <input class="v short" spellcheck="false" placeholder="1M" bind:value={fields.paramsMin} on:input={commit} />
+    <TextField
+      variant="dense" grow={false} width="84px"
+      spellcheck="false"
+      placeholder="1M"
+      bind:value={fields.paramsMin}
+      on:input={commit}
+    />
     <span class="to">…</span>
-    <input class="v short" spellcheck="false" placeholder="1B" bind:value={fields.paramsMax} on:input={commit} />
+    <TextField
+      variant="dense" grow={false} width="84px"
+      spellcheck="false"
+      placeholder="1B"
+      bind:value={fields.paramsMax}
+      on:input={commit}
+    />
   </div>
 
   <div class="row">
     <button type="button" class="neg" class:on={fields.neg.shard} title="Negate — match tensors that do NOT satisfy this" on:click={() => toggleNeg('shard')}>not</button>
     <span class="k">shard</span>
-    <input class="v" spellcheck="false" placeholder="00001  /  model-00001" bind:value={fields.shard} on:input={commit} />
+    <TextField
+      variant="dense"
+      spellcheck="false"
+      placeholder="00001  /  model-00001"
+      bind:value={fields.shard}
+      on:input={commit}
+    />
   </div>
 </div>
 
@@ -361,15 +422,8 @@
     background: color-mix(in srgb, var(--accent) 22%, transparent);
     border-color: var(--accent);
   }
-  .v {
-    flex: 1 1 200px;
-    min-width: 0;
-    font-family: ui-monospace, monospace;
-    font-size: 12px;
-  }
-  .v.short {
-    flex: 0 0 84px;
-  }
+  /* The boxes are `TextField` (variant `dense`), which owns their look — the same field the scope
+     bar and the address boxes use. */
   .to {
     color: var(--fg-dim);
   }

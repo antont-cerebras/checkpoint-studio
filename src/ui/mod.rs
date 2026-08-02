@@ -33,6 +33,8 @@ pub(crate) use crate::viewstate::{NumBase, StripeMode, parse_num_base, parse_str
 
 mod badge;
 mod check;
+/// The side-by-side compare screen: two checkpoints in two panes (see the module docs).
+pub(crate) mod compare;
 mod data;
 mod detail;
 mod diff;

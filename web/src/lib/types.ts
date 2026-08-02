@@ -225,15 +225,95 @@ export interface DiffReport {
   new_bytes: number;
   old_params: number;
   new_params: number;
+  /** Each side's last-modified — the newest object under the prefix. `null` unless both sides are
+   * `s3://`, which is the only pair that has per-object timestamps. */
+  old_modified: string | null;
+  new_modified: string | null;
 }
 
 /** `/api/diff`'s envelope: the baseline it compared against, the shared one-line
  * verdict, the equivalent CLI command, and the report. */
 export interface DiffResponse {
   against: string;
+  /** Which way round the report reads: `true` means the open checkpoint is the baseline (`?swap=1`).
+   * Answered by the server so the view labels the report it actually got, not the one it asked for. */
+  swapped: boolean;
   verdict: string;
+  /** The `diff` invocation that reproduces this report, scope included. */
   command: string;
+  /** What a scope selected, as the CLI's `matched M of N`; `null` when nothing narrowed it. */
+  matched: { selected: number; total: number; names: string[] } | null;
+  /** Names two rename rules mapped onto one, so a tensor silently left the comparison. */
+  rename_collisions: string[];
+  /**
+   * Why the metadata was *not* compared (`filtered subset` / `--only-tensors`), or `null` when it was.
+   *
+   * From the server, because the rule is the server's: any filter suppresses the metadata comparison,
+   * not only `--only-tensors`. Without it an empty section reads as "nothing differs" — the opposite
+   * of what happened.
+   */
+  metadata_note: string | null;
+  /** What the S3 object comparison did, or why it did not happen. `null` for a non-`s3://` pair. */
+  s3_note: string | null;
+  /** The S3 object section as the terminal prints it. `null` unless both sides are `s3://`. */
+  s3_lines: S3Line[] | null;
+  /** `modified: OLD → NEW`, humanised server-side. `null` unless both sides carry timestamps. */
+  modified_line: string | null;
+  /** What to call the two totals lines. Under a filter they cover the *matched* tensors, so they read
+   * `size (filtered subset)` — worded by the server, which owns the rule. */
+  totals_labels: TotalsLabels;
+  /**
+   * What an unfused/fused alignment folded: `name → [old parts, new parts]`.
+   *
+   * `×256 → ×1` on a row means 256 per-expert tensors on the old side correspond to the one fused
+   * tensor on the new side — the answer to "did the conversion keep every expert", on the row that
+   * compares them. Empty unless `align_fused=1` folded something.
+   */
+  folded: Record<string, [number, number]>;
+  /** Whether the unfused/fused alignment is in force. */
+  aligns_fused: boolean;
+  /** The same tensor sections with index-templated families collapsed onto one row each — what the
+   * terminal prints by default. Grouped by the server because the templating rule lives there and
+   * driving the terminal's output; a second implementation here would be a second answer. */
+  grouped: GroupedReport;
   report: DiffReport;
+}
+
+/** One row of the grouped report: a name template and how many tensors it stands for. */
+export interface GroupedEntry {
+  /** `model.layers.{0-61}.inv_freq_default` — ranges filled in. */
+  name: string;
+  count: number;
+  sig: TensorSig;
+}
+
+/** One grouped *changed* row. `fold` is `[old parts, new parts]` when an alignment folded them all. */
+export interface GroupedChange {
+  name: string;
+  count: number;
+  old: TensorSig;
+  new: TensorSig;
+  fold: [number, number] | null;
+}
+
+export interface GroupedReport {
+  tensors_added: GroupedEntry[];
+  tensors_removed: GroupedEntry[];
+  tensors_changed: GroupedChange[];
+}
+
+/** The headings for the `size:` / `params:` lines — see `DiffResponse.totals_labels`. */
+export interface TotalsLabels {
+  size: string;
+  params: string;
+}
+
+/** One line of the S3 object section, to be styled by kind — the words come from Rust
+ * (`S3Diff::summary_lines`), because what a matching multipart ETag proves is not a claim to make
+ * twice. */
+export interface S3Line {
+  kind: 'heading' | 'removed' | 'added' | 'changed' | 'note';
+  text: string;
 }
 
 /** Which of a family's attributes disagree across its members. */

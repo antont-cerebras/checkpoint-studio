@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isEditable } from '../lib/keys';
   import { tick } from 'svelte';
   import { cachedSample } from '../stores/server';
   import { getDataView, setDataView, type DvParams } from '../stores/view';
@@ -348,8 +349,7 @@
   // normally to the global shortcuts.
   function onKey(e: KeyboardEvent) {
     if (mode !== 'window' || e.ctrlKey || e.metaKey || e.altKey) return;
-    const tag = (e.target as HTMLElement)?.tagName;
-    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+    if (isEditable(e.target)) return;
     switch (e.key) {
       case 'ArrowUp': pan(-1, 0); break;
       case 'ArrowDown': pan(1, 0); break;

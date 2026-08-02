@@ -26,9 +26,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-use crate::explorer::CheckpointParts;
 use crate::hf::ReadProgress;
 use crate::model::Checkpoint;
+use crate::tree::{MetadataInfo, TensorInfo};
 use crate::{cli_config, health, remote};
 
 /// What a caller needs out of a read.
@@ -83,6 +83,26 @@ pub(crate) struct Target {
     pub index_specs: Vec<health::IndexSpec>,
     /// The proxy to read over, if this is a remote target.
     pub remote: Option<remote::RemoteRead>,
+}
+
+/// What a read produced, in the flat form every screen works from.
+///
+/// **Named fields, and owned here.** This was `explorer::CheckpointParts`, a five-element tuple —
+/// so every construction and destructuring site depended on position, several of the elements are
+/// collections or options whose types would happily swap, and adding a sixth meant touching every
+/// `let (a, b, ..) =` in three modules. It also lived in the *TUI*, while the code that produces it
+/// (`source`, `opening`) serves the web server and the CLI as well: the one place in this tree where
+/// a shared layer pointed at a frontend.
+pub(crate) struct CheckpointParts {
+    pub tensors: Vec<TensorInfo>,
+    pub metadata: Vec<MetadataInfo>,
+    /// The parsed `config.json`, when the source has one.
+    pub config: Option<crate::config::ModelConfig>,
+    /// The shards' on-disk footprint, when the source can measure it.
+    pub disk_usage: Option<crate::stats::DiskUsage>,
+    /// Index/file mismatches found while reading — empty for a local read, whose health is gathered
+    /// up front instead.
+    pub health: Vec<health::HealthReport>,
 }
 
 /// A checkpoint that has been read and is ready for a frontend to install.
@@ -209,6 +229,16 @@ impl Target {
         spec_of_paths(&self.requested)
     }
 
+    /// The paths to label this target by: the walked files when there are any, else what was asked
+    /// for (a remote read has no local files to name).
+    pub(crate) fn source_paths_for_label(&self) -> &[PathBuf] {
+        if self.resolved.is_empty() {
+            &self.requested
+        } else {
+            &self.resolved
+        }
+    }
+
     /// Which kind of spec this is, for [`recorded_spec`].
     ///
     /// A URI wins over the proxy: an `s3://` prefix read *through* a proxy is still named by its
@@ -260,14 +290,21 @@ impl Target {
                         self.requested.len()
                     );
                 };
-                let cp = r.read_checkpoint(&one.to_string_lossy(), remote::ObjectMeta::Fetch)?;
-                let parts = (
-                    cp.tensors_vec(),
-                    cp.metadata_vec(),
-                    cp.config.clone(),
-                    None,
-                    Vec::new(),
-                );
+                // The counts go into the caller's `progress`, so whoever is waiting on this read
+                // can show `1155/1155 S3 objects` rather than a bare timer — a browser, today.
+                let cp = r.read_checkpoint(
+                    &one.to_string_lossy(),
+                    remote::ObjectMeta::Fetch,
+                    Some(progress.abort_flag()),
+                    Some(progress.load()),
+                )?;
+                let parts = CheckpointParts {
+                    tensors: cp.tensors_vec(),
+                    metadata: cp.metadata_vec(),
+                    config: cp.config.clone(),
+                    disk_usage: None,
+                    health: Vec::new(),
+                };
                 Ok(Opened {
                     target: self,
                     parts,
@@ -368,6 +405,24 @@ pub(crate) enum SpecSource {
     Uri,
 }
 
+/// Collapse a host prefixed onto a path that already had one: `H:H:/p` → `H:/p`.
+///
+/// A repair for entries already on disk. An earlier resolver kept the host on the path *and* prefixed
+/// the proxy host onto it, and the result is not merely ugly — it names no checkpoint, so the row sat
+/// in the recents list as one that could never be opened. Fixed at the source
+/// (`split_off_scp_host`); healed here, because a list is read far more often than it is written and
+/// nobody should have to edit TOML to get rid of a row this app created.
+fn undouble_host(spec: &str) -> String {
+    let Some((host, rest)) = crate::split_scp(spec) else {
+        return spec.to_string();
+    };
+    match crate::split_scp(&rest) {
+        // The same host twice: the inner spelling is the whole answer.
+        Some((inner, _)) if inner == host => undouble_host(&rest),
+        _ => spec.to_string(),
+    }
+}
+
 /// How an open should be remembered — see [`SpecSource`] for why each form.
 pub(crate) fn recorded_spec(paths: &[PathBuf], typed: &str, source: SpecSource) -> String {
     match source {
@@ -376,10 +431,21 @@ pub(crate) fn recorded_spec(paths: &[PathBuf], typed: &str, source: SpecSource) 
             spec_of_paths(&absolute)
         }
         SpecSource::Remote(host) => {
-            // The remote paths as the reader gets them, prefixed with the host that serves them.
+            // The remote paths as the reader gets them, prefixed with the host that serves them —
+            // unless a path already carries one, which is left alone. Prefixing regardless produced
+            // `host:host:/path`: an entry in the recents list that could never be opened again. The
+            // resolver strips the host before it gets here (`split_off_scp_host`), so this is the
+            // second line of defence rather than the only one.
             paths
                 .iter()
-                .map(|p| format!("{host}:{}", normalise_spec(&p.to_string_lossy())))
+                .map(|p| {
+                    let path = normalise_spec(&p.to_string_lossy());
+                    if crate::split_scp(&path).is_some() {
+                        path
+                    } else {
+                        format!("{host}:{path}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         }
@@ -516,7 +582,7 @@ impl Recents {
             // Normalised on the way in as well as on the way out, so an entry written before this
             // rule (or added by hand with a trailing slash) collapses onto the same one line
             // instead of sitting beside its twin.
-            let spec = normalise_spec(&spec);
+            let spec = undouble_host(&normalise_spec(&spec));
             if !spec.is_empty() && !out.contains(&spec) {
                 out.push(spec);
             }
@@ -611,6 +677,40 @@ impl Recents {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// **A host is never prefixed onto a path that already has one.**
+    ///
+    /// `--ssh-proxy H` together with `H:/path` used to record `H:H:/path` — a recents row naming no
+    /// checkpoint, which could never be opened again, and a read that failed with "no safetensors
+    /// files found at H:H:/path". The resolver strips the host first; this is the second line.
+    #[test]
+    fn a_recorded_remote_spec_carries_its_host_exactly_once() {
+        let once = recorded_spec(
+            &[PathBuf::from("/opt/models/m")],
+            "host:/opt/models/m",
+            SpecSource::Remote("host".to_string()),
+        );
+        assert_eq!(once, "host:/opt/models/m");
+        // A path that arrives *with* its host (a caller that did not strip it) is left as it is.
+        let already = recorded_spec(
+            &[PathBuf::from("host:/opt/models/m")],
+            "host:/opt/models/m",
+            SpecSource::Remote("host".to_string()),
+        );
+        assert_eq!(already, "host:/opt/models/m");
+    }
+
+    /// And a list already holding the doubled form heals itself when read.
+    #[test]
+    fn a_doubled_host_in_the_stored_list_is_collapsed() {
+        assert_eq!(undouble_host("h:h:/opt/m"), "h:/opt/m");
+        assert_eq!(undouble_host("h:h:h:/opt/m"), "h:/opt/m");
+        // Two *different* hosts are not a doubling — that is a path on `a` whose name contains a
+        // colon, and rewriting it would invent a checkpoint.
+        assert_eq!(undouble_host("a:b:/opt/m"), "a:b:/opt/m");
+        assert_eq!(undouble_host("h:/opt/m"), "h:/opt/m");
+        assert_eq!(undouble_host("/opt/m"), "/opt/m");
+        assert_eq!(undouble_host("s3://bucket/key"), "s3://bucket/key");
+    }
 
     #[test]
     fn a_recent_open_moves_to_the_front_rather_than_repeating() {

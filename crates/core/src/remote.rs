@@ -180,7 +180,7 @@ pub struct RemoteTensorDiff {
 /// the caller can show how much data was read and how fast. `elapsed_s` is measured
 /// on the remote (compute + S3 read), so it excludes the SSH handshake and the
 /// transfer of the small result JSON.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct RemoteValueStats {
     /// Tensor pairs requested.
     pub tensors: usize,
@@ -197,7 +197,9 @@ pub struct RemoteValueStats {
 /// `fold` 3-bit indices per word, folded along dim 0) encode the same indices? Plus
 /// format sanity: `sparse_bad` / `dense_bad` count words whose bits above the used
 /// range are non-zero (a non-zero count means the format assumption is wrong).
-#[derive(Debug, Default, Clone)]
+// `Serialize` so a web job can report per-tensor findings as they land — the same results the CLI
+// prints, in JSON.
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct RepackResult {
     /// Logical 3-bit indices compared (`E × prod(inner_dims)`).
     pub elements: u64,
@@ -252,7 +254,7 @@ pub struct RepackResult {
 /// The value diff of a sibling float tensor (codebook / scale) between the two
 /// checkpoints — these have the same shape on both sides, so the structural diff
 /// shows them "unchanged" even when their values differ.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RepackAux {
     /// The tensor names actually looked up (old side, new side) — so the report can
     /// show exactly what was compared. Equal when there was no rename.
@@ -281,7 +283,7 @@ impl RepackAux {
 
 /// A decoded 2-D window of indices for both sides — the top-left is
 /// `(expert e0, inner-offset off0)`, `cols` columns wide.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RepackSample {
     pub e0: u64,
     pub off0: u64,
@@ -292,7 +294,7 @@ pub struct RepackSample {
 /// A plain stored-dtype *value* comparison used when the top-bits format check
 /// fails, so a codebooked tensor that turns out **not** to be packed indices is
 /// still meaningfully diffed (the auto `--values` fallback).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RepackFallback {
     /// The stored dtype the words were reinterpreted as (e.g. `F16`).
     pub dtype: String,
@@ -467,6 +469,44 @@ pub struct RemoteRead {
     pub venv: String,
 }
 
+/// Where a read reports its progress: onto a terminal, or into a counter the caller is watching.
+///
+/// The two entry points below used to draw a [`crate::progress::Bars`] unconditionally and announce
+/// themselves on stderr. That is right for a command line and wrong for a server: the web's read showed
+/// a timer and no numbers, while these very numbers were being animated onto the log of a process
+/// nobody was looking at. Given a caller's `LoadProgress`, the counts go there and nothing is printed.
+enum Drawn<'a> {
+    /// A terminal: our own bar, and a line saying what is happening.
+    Bar(crate::progress::Bars),
+    /// A caller watching from elsewhere — a browser polling the server, today.
+    Into(&'a LoadProgress),
+}
+
+impl<'a> Drawn<'a> {
+    fn start(src: &str, into: Option<&'a LoadProgress>) -> Self {
+        let Some(p) = into else {
+            eprintln!("checkpoint-studio: reading tensor metadata over ssh …");
+            return Self::Bar(crate::progress::Bars::start(&[src.to_string()]));
+        };
+        Self::Into(p)
+    }
+
+    /// The counter for [`RemoteRead::read`] to fill.
+    fn progress(&self) -> Option<&LoadProgress> {
+        match self {
+            Self::Bar(bars) => bars.progress_ref(0),
+            Self::Into(p) => Some(p),
+        }
+    }
+
+    fn finish(self, ok: bool) {
+        if let Self::Bar(bars) = self {
+            bars.finish(0, ok);
+            bars.join();
+        }
+    }
+}
+
 impl RemoteRead {
     #[must_use]
     pub fn new(host: String, venv: String) -> Self {
@@ -480,24 +520,27 @@ impl RemoteRead {
     /// cstorch checkpoint (no HF `config.json`) or when the sidecar is
     /// absent/unreadable. For several reads sharing one session/prompt (e.g.
     /// `diff`), use [`Self::open_with`] + [`Self::read`] directly.
-    pub fn fetch_with_config(&self, src: &str) -> Result<FetchedCheckpoint> {
+    /// `abort` as in [`Self::read_checkpoint`].
+    pub fn fetch_with_config(
+        &self,
+        src: &str,
+        abort: Option<&std::sync::atomic::AtomicBool>,
+        into: Option<&LoadProgress>,
+    ) -> Result<FetchedCheckpoint> {
         let mut password = None;
         let session = self.open_with(&mut password)?;
-        eprintln!("checkpoint-studio: reading tensor metadata over ssh …");
-        let bars = crate::progress::Bars::start(&[src.to_string()]);
-        let progress = bars.progress(0);
+        let drawn = Drawn::start(src, into);
         // A structure-only read (`--print-model`, the diff's local-side helper): no
         // S3 section to fill and no cross-check to report, so skip the per-object HEADs.
         let out = self.read(
             &session,
             src,
             &password,
-            progress.as_deref(),
+            drawn.progress(),
             ObjectMeta::Skip,
-            None,
+            abort,
         );
-        bars.finish(0, out.is_ok());
-        bars.join();
+        drawn.finish(out.is_ok());
         let rc = out?;
         let config = self.read_config(&session, src);
         // The index/file health was computed by `read` from the same pass (no
@@ -516,19 +559,20 @@ impl RemoteRead {
     /// `objects` decides whether each S3 object's metadata comes too: the web server
     /// wants it (it fills the stats screen's S3 section and the index-vs-object
     /// cross-check, matching the TUI), `--print-model` doesn't.
+    /// `abort`, when given, asks the read to stop as soon as it notices — see
+    /// [`crate::hf::ReadProgress::cancel`]. `None` for callers that have nothing to cancel from.
     pub fn read_checkpoint(
         &self,
         src: &str,
         objects: ObjectMeta,
+        abort: Option<&std::sync::atomic::AtomicBool>,
+        into: Option<&LoadProgress>,
     ) -> Result<crate::model::Checkpoint> {
         let mut password = None;
         let session = self.open_with(&mut password)?;
-        eprintln!("checkpoint-studio: reading tensor metadata over ssh …");
-        let bars = crate::progress::Bars::start(&[src.to_string()]);
-        let progress = bars.progress(0);
-        let out = self.read(&session, src, &password, progress.as_deref(), objects, None);
-        bars.finish(0, out.is_ok());
-        bars.join();
+        let drawn = Drawn::start(src, into);
+        let out = self.read(&session, src, &password, drawn.progress(), objects, abort);
+        drawn.finish(out.is_ok());
         let rc = out?;
         let config = self.read_config(&session, src);
         let disk_shards = rc.disk.map(|d| d.shards).unwrap_or_default();

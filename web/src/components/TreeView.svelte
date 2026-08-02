@@ -3,6 +3,7 @@
   import { unindexed } from '../stores/server';
   import type { Row } from '../lib/flatten';
   import { humanCount, humanSize, pyShape } from '../lib/format';
+  import { rowGlyph } from '../lib/glyphs';
   import { copyText } from '../lib/clipboard';
   import Dtype from './Dtype.svelte';
   import Shape from './Shape.svelte';
@@ -68,6 +69,13 @@
       terminal puts the same mark in place of a tensor's `·` bullet. */
   function isExtra(row: Row): boolean {
     return row.node.kind === 'tensor' && $unindexed.has(row.node.info.source_path);
+  }
+
+  /** The glyph this row leads with — the terminal's set, from one place (`lib/glyphs`). */
+  function glyphOf(row: Row, open: boolean): string {
+    if (row.hasChildren) return rowGlyph({ kind: 'group', fold: open ? 'open' : 'closed' });
+    if (row.node.kind === 'metadata') return rowGlyph({ kind: 'metadata' });
+    return rowGlyph({ kind: 'tensor', listing: isExtra(row) ? 'unlisted' : 'listed' });
   }
   $: tipStyle = tipRow
     ? `left:${Math.min(tipLeft + 8, window.innerWidth - 330)}px; top:${Math.max(8, Math.min(tipTop, window.innerHeight - 230))}px`
@@ -139,8 +147,10 @@
         on:mouseenter={(e) => openTip(e, row)}
         on:mouseleave={leaveRow}
       >
+        <!-- The terminal's glyph for what this row is (`lib/glyphs`), including the `·` a tensor row
+             used to leave blank — an empty slot is not "no glyph", it is a different tree. -->
         <span class="caret" class:extra={isExtra(row)} title={isExtra(row) ? 'on disk but not listed in model.safetensors.index.json' : undefined}
-          >{row.hasChildren ? ($expanded.has(row.id) ? '▾' : '▸') : isExtra(row) ? '✚' : ''}</span
+          >{glyphOf(row, $expanded.has(row.id))}</span
         >
         <span class="lbl">{label(row, flat)}</span>
         {#if row.node.kind === 'tensor'}

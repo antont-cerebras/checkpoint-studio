@@ -6,7 +6,9 @@
   --bg-sel: #2d4b6e;
   --border: #2a2e39;
   --fg: #d6dae3;
-  --fg-dim: #7f8796;
+  /* 4.61:1 on --bg-panel. Was #7f8796 — 4.26:1, under AA for normal text, and this token carries
+     most of the app's secondary text as well as the header's ‹ › navigation. */
+  --fg-dim: #858d9c;
   --accent: #5fd7ff;
   --group: #5fd7ff;
   --tensor: #c6ccd6;
@@ -59,7 +61,8 @@
   --bg-sel: #cfe3ff;
   --border: #d3d7de;
   --fg: #1c2027;
-  --fg-dim: #67707d;
+  /* 4.83:1 on --bg-panel; #67707d sat exactly on the 4.5:1 line, which is not a margin. */
+  --fg-dim: #636c78;
   --accent: #0a6fbf;
   --group: #0a6fbf;
   --tensor: #2b313b;
@@ -67,7 +70,9 @@
   --meta: #7a3fa0;
   --danger: #c0392b;
   --warn: #8a6d00;
-  --ok: #3f8c2f;
+  /* 4.88:1 on the panel, 5.38:1 on white. Was #3f8c2f — 3.81:1 and 4.20:1, below AA for normal
+     text, and this is the colour that says "added" on the busiest screen in the app. */
+  --ok: #2b7a1b;
   --unindexed: #d40000;
   color-scheme: light;
 }
@@ -99,15 +104,23 @@
   --meta: #5cffb2;
   --danger: #ff7a5c;
   --warn: #ffe066;
-  --ok: #35e46a;
+  /* Brighter than --fg (#35e46a), which this used to equal exactly. A single-hue phosphor theme
+     separates by brightness (see the dtype families above), and an "added" colour identical to body
+     text separates by nothing — which left the diff's two sides distinguishable only by the
+     one-character gutter. */
+  --ok: #9dff5e;
   /* The one place the phosphor theme breaks its own hue: an extra file on disk is a
      thing to notice, and a green-on-green mark is exactly what nobody notices. */
   --unindexed: #ff5b3d;
   color-scheme: dark;
 }
-/* Subtle phosphor glow. */
+/* Subtle phosphor glow, in each element's *own* colour.
+   `var(--fg)` here put a green halo on every glyph in the app, inherited from `body` — which
+   re-tinted the one place colour carries meaning. The diff's red "removed" side glowed green at
+   12px and read as green, so old and new looked alike and the only surviving signal was the
+   one-character +/-/~ gutter. `currentColor` keeps the CRT bloom and lets a red row bloom red. */
 :root[data-theme='fallout'] body {
-  text-shadow: 0 0 2px color-mix(in srgb, var(--fg) 45%, transparent);
+  text-shadow: 0 0 2px color-mix(in srgb, currentColor 45%, transparent);
 }
 
 * {

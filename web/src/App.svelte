@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { isEditable } from './lib/keys';
+  import { staleBuild, watchBuild } from './stores/version';
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import {
@@ -62,6 +64,7 @@
   import LoadingScreen from './components/LoadingScreen.svelte';
   import CheckpointBar from './components/CheckpointBar.svelte';
   import OpenView from './components/OpenView.svelte';
+  import CompareView from './components/CompareView.svelte';
   import Palette from './components/Palette.svelte';
   import FilterBuilder from './components/FilterBuilder.svelte';
   import CompactView from './components/CompactView.svelte';
@@ -71,6 +74,10 @@
   import type { TreeNode } from './lib/types';
 
   let builderOpen = false;
+
+  // Ask whether this page is still the page the server serves — now, and whenever the tab comes back
+  // to the front. `onMount`'s return is the unsubscribe.
+  onMount(watchBuild);
 
   onMount(async () => {
     // A link can name a checkpoint (`#tree?ckpt=…`). If it names one the server is not serving,
@@ -134,11 +141,17 @@
       case 'health':
         return '› Health';
       case 'diff':
-        return s.against ? `› Compare: ${s.against}` : '› Compare';
+        return s.against ? `› Diff report: ${s.against}` : '› Diff report';
       case 'preview':
         return `› ${s.name}`;
       case 'open':
         return '› Open';
+      case 'compare':
+        // Both sides, because a swap exchanges them: naming only the baseline meant the crumb still
+        // read as the pre-swap orientation after `s` had reversed the panes.
+        return s.against
+          ? `› Compare: ${s.against} ↔ ${s.right || 'the open checkpoint'}`
+          : '› Compare';
     }
   }
 
@@ -200,10 +213,7 @@
     // Cmd/Ctrl-A on the tensor list → copy the (filtered) tensor names, not the
     // whole page's text. Elsewhere (or while typing) leave the browser default.
     if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === 'a' || e.key === 'A')) {
-      const tgt = e.target as HTMLElement | null;
-      const typing =
-        !!tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'SELECT' || tgt.tagName === 'TEXTAREA');
-      if (get(screen).kind === 'tree' && !typing) {
+      if (get(screen).kind === 'tree' && !isEditable(e.target)) {
         e.preventDefault();
         copyTensorList();
       }
@@ -214,13 +224,6 @@
     // The palette owns the keyboard while open (its input handles keys).
     if (get(paletteOpen)) return;
     const s = get(screen);
-
-    // --- command palette: `:` anywhere, or Space on the tree ---
-    if (e.key === ':' || (e.key === ' ' && s.kind === 'tree' && !get(searching))) {
-      e.preventDefault();
-      paletteOpen.set(true);
-      return;
-    }
 
     // --- search mode: the input is focused; only steal a few keys ---
     // Only while the tree is showing: once a result opens a detail (or any other
@@ -248,19 +251,26 @@
       return; // everything else types into the search box
     }
 
-    // A focused text field owns the keyboard from here on. Without this, the global
-    // shortcuts below steal its keys — Backspace navigated *back* instead of deleting a
-    // character in the compare screen's path box. Placed after the search block on
-    // purpose: the search input deliberately gives up ↑/↓/Enter/Esc to the tree, and it
-    // returns above, so this cannot take those away from it.
-    const focused = e.target as HTMLElement | null;
-    if (
-      focused &&
-      (focused.tagName === 'INPUT' || focused.tagName === 'TEXTAREA' || focused.isContentEditable)
-    ) {
+    // **A focused text field owns every key.** Nothing below may take one.
+    //
+    // This used to sit *below* the palette shortcut, which meant `:` opened the command palette
+    // instead of typing a colon — so `:/opt/…`, the proxy shorthand this app advertises in its own
+    // placeholder, could not be typed into any box. (Space had the same problem on the tree screen.)
+    // Backspace was an earlier instance of the same mistake: it navigated back instead of deleting.
+    //
+    // The rule is the order, and the order is the point: search first (that input deliberately gives
+    // ↑/↓/Enter/Esc back to the tree, and returns above), then this, then everything else.
+    if (isEditable(e.target)) {
       // Escape still gets you out of the field (and, with nothing focused, the next
       // Escape leaves the screen) — everything else is text.
-      if (e.key === 'Escape') focused.blur();
+      if (e.key === 'Escape') (e.target as HTMLElement).blur();
+      return;
+    }
+
+    // --- command palette: `:` anywhere, or Space on the tree ---
+    if (e.key === ':' || (e.key === ' ' && s.kind === 'tree' && !get(searching))) {
+      e.preventDefault();
+      paletteOpen.set(true);
       return;
     }
 
@@ -395,6 +405,19 @@
        loopback, say so on the page as well as in the terminal it was started from — the
        person looking at the browser is not necessarily the person who read the banner.
        One narrow strip, not dismissible: the condition lasts as long as the server does. -->
+  <!-- The server has been rebuilt under this tab, so its JavaScript is not the JavaScript being
+       served. Not dismissible and above everything else, because the failure it prevents is silent:
+       an old client reading a newer response shape once declared two unrelated checkpoints
+       "structurally identical" rather than erroring (see `lib/build`). -->
+  {#if $staleBuild}
+    <div class="stale-build" role="alert">
+      <span
+        >This tab is running an older build of the interface than the server is serving. Reload to
+        pick up the current one.</span
+      >
+      <button class="reload" type="button" on:click={() => location.reload()}>Reload</button>
+    </div>
+  {/if}
   {#if $tree?.access_warning && !$warningDismissed}
     <div class="access-warning" role="alert">
       <span>{$tree.access_warning}</span>
@@ -419,6 +442,20 @@
     <!-- The checkpoint address: a real input, so copy/paste/select work, with the recents
          list on `↓`. Editing it opens another checkpoint (see CheckpointBar). -->
     <CheckpointBar />
+    <!-- Compare: the one action that needs a *second* checkpoint, so it sits beside the address
+         bar rather than being buried in the palette. -->
+    <button
+      class="cmp"
+      type="button"
+      title="Compare with another checkpoint, side by side"
+      on:click={() =>
+        navigate({
+          kind: 'compare',
+          against: $screen.kind === 'compare' ? $screen.against : '',
+          right: $screen.kind === 'compare' ? $screen.right : '',
+        })}
+      >Compare</button
+    >
     {#if $searching && $screen.kind === 'tree'}
       <span class="search">
         /
@@ -545,9 +582,24 @@
     {:else if $screen.kind === 'health'}
       <HealthView />
     {:else if $screen.kind === 'diff'}
-      <DiffView against={$screen.against} root={$tree.root} />
+      <DiffView
+        against={$screen.against}
+        scope={$screen.scope}
+        swapped={$screen.swapped ?? false}
+        full={$screen.full ?? false}
+        closed={$screen.closed ?? []}
+        root={$tree.root}
+      />
     {:else if $screen.kind === 'preview'}
       <FilePreview path={$screen.path} name={$screen.name} />
+    {:else if $screen.kind === 'compare'}
+      <CompareView
+        against={$screen.against}
+        right={$screen.right}
+        scope={$screen.scope}
+        full={$screen.full ?? false}
+        swapped={$screen.swapped ?? false}
+      />
     {/if}
   </main>
 
@@ -560,6 +612,28 @@
 <style>
   /* Light red on a tinted strip: a standing caution, not an error — it must not read as
      something that broke. Narrow enough not to cost content height. */
+  /* The same narrow strip as the access warning, in the warning colour: one condition, one line,
+     no dismissal — it lasts until the page is reloaded, which is the button beside it. */
+  .stale-build {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 10px;
+    font-size: 12px;
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 16%, var(--bg-panel));
+    border-bottom: 1px solid var(--border);
+  }
+  .stale-build .reload {
+    font: inherit;
+    font-size: 12px;
+    color: var(--fg);
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 9px;
+    cursor: pointer;
+  }
   .access-warning {
     display: flex;
     align-items: baseline;
@@ -745,6 +819,21 @@
   }
   /* The way out of a checkpoint that didn't load: without it the error screen is a dead end
      that only a restart clears. */
+  .cmp {
+    flex: 0 0 auto;
+    font: inherit;
+    font-size: 12px;
+    color: var(--fg-dim);
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 9px;
+    cursor: pointer;
+  }
+  .cmp:hover {
+    color: var(--fg);
+    background: var(--bg-hover);
+  }
   .recover {
     display: block;
     margin-top: 10px;
