@@ -42,6 +42,9 @@ pub mod codec;
 pub mod compact;
 pub mod config;
 pub mod diff;
+/// Two checkpoints aligned into one tree — the model behind side-by-side comparison,
+/// lockstep browsing and jump-to-next-difference. See the module docs.
+pub mod difftree;
 pub mod filetree;
 pub mod filter;
 pub mod gguf;

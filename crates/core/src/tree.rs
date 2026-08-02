@@ -49,6 +49,10 @@ pub struct TensorInfo {
     pub layout: Layout,
 }
 
+/// What the metadata group is called on screen. Named once, so a tree built elsewhere — a renamed side
+/// for a diff, see `difftree::tree_from_tensors` — puts its metadata under the same row.
+pub const METADATA_GROUP: &str = "🔧 Metadata";
+
 impl TensorInfo {
     /// The size actually occupied on disk: the compressed size when stored
     /// compressed, otherwise the logical size.
@@ -333,7 +337,7 @@ impl TreeBuilder {
             tree.insert(
                 0,
                 TreeNode::Group {
-                    name: "🔧 Metadata".to_string(),
+                    name: METADATA_GROUP.to_string(),
                     children,
                     expanded: false,
                     tensor_count: 0,

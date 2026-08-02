@@ -91,37 +91,108 @@ fn paint(text: &str, on: bool, code: &str) -> String {
     }
 }
 
+/// What to call the two overall-total lines: the checkpoints' totals, or the matched subset's.
+///
+/// A filter narrows the totals with the tensors ([`TensorFilter::apply`]), which is what makes them
+/// describe the report — and makes the bare label wrong, because `size:` above nineteen tensors reads as
+/// the checkpoint's size. Both UIs ask this, so neither can label a scoped comparison as a whole one.
+/// The wording matches the metadata section's `not compared (filtered subset)`.
+#[must_use]
+pub fn totals_labels(filtered: bool) -> (&'static str, &'static str) {
+    if filtered {
+        ("size (filtered subset)", "params (filtered subset)")
+    } else {
+        ("size", "params")
+    }
+}
+
 /// A `label: old → new (±abs, ±rel%)` line summarizing an overall total's change
 /// (checkpoint size or parameter count), formatting values with `fmt`. Shows
 /// "(unchanged)" when equal, and omits the percentage when the old side is zero
 /// (no baseline). Coloured like the tensor diff — the old value red, the new value
 /// green — while the parenthetical delta is dimmed (a convenience; its sign
 /// already shows the direction).
-fn totals_line(
+///
+/// Public because the web UI's report shows the same line, and showed it without the delta:
+/// `451.8 GiB → 32 B` left the reader to work out a change the terminal states. The browser cannot
+/// call this, so the agreement is the cross-language parity fixture (`shared/parity/format.json`,
+/// generated here by `cargo test --test parity` and checked against the TypeScript in
+/// `web/src/lib/parity.test.ts`) — including the `{:.1}` tie rule, which is the part two languages
+/// round differently.
+#[must_use]
+pub fn totals_line(
     label: &str,
     old: usize,
     new: usize,
     color: bool,
     fmt: fn(usize) -> String,
 ) -> String {
+    let parts = totals_parts(old, new, fmt);
+    let Some(change) = &parts.change else {
+        return format!("{label}: {} (unchanged)", parts.new);
+    };
+    let old_s = paint(&parts.old, color, RED);
+    let new_s = paint(&parts.new, color, GREEN);
+    let delta_s = paint(&format!("{}{}", change.delta, change.percent), color, DIM);
+    format!("{label}: {old_s} → {new_s} ({delta_s})")
+}
+
+/// The pieces [`totals_line`] assembles: the two values, and how they differ.
+///
+/// Split out so a *screen* can lay them out its own way — the diff screen's header puts a size and a
+/// parameter count on one line with no percentage — while the arithmetic and the wording of the delta
+/// stay in one place. Two functions computing one delta is the drift the parity fixture exists to
+/// stop, and the browser's `totalsParts` is deliberately the same shape.
+#[derive(Debug, Clone)]
+pub struct TotalsParts {
+    /// The old value, formatted.
+    pub old: String,
+    /// The new value, formatted.
+    pub new: String,
+    /// `None` when the two sides are equal — there is no change to describe.
+    pub change: Option<TotalsChange>,
+}
+
+/// How two totals differ.
+#[derive(Debug, Clone)]
+pub struct TotalsChange {
+    /// The signed change, formatted: `-72 B`, `+20`.
+    pub delta: String,
+    /// `, -43.9%` — with its leading separator, so a renderer that wants it can concatenate and one
+    /// that does not can drop it. Empty when the old side is zero: there is no baseline to be a
+    /// percentage of.
+    pub percent: String,
+    /// Whether the new side is the larger one, for colour.
+    pub grew: bool,
+}
+
+/// The two totals and their difference, as parts.
+#[must_use]
+pub fn totals_parts(old: usize, new: usize, fmt: fn(usize) -> String) -> TotalsParts {
+    let parts = TotalsParts {
+        old: fmt(old),
+        new: fmt(new),
+        change: None,
+    };
     if old == new {
-        return format!("{label}: {} (unchanged)", fmt(new));
+        return parts;
     }
     let delta = new as i128 - old as i128;
     let sign = if delta >= 0 { "+" } else { "-" };
-    let mag = fmt(delta.unsigned_abs() as usize);
-    let rel = if old == 0 {
+    let magnitude = delta.unsigned_abs() as usize;
+    let percent = if old == 0 {
         String::new()
     } else {
-        format!(
-            ", {sign}{:.1}%",
-            delta.unsigned_abs() as f64 / old as f64 * 100.0
-        )
+        format!(", {sign}{:.1}%", magnitude as f64 / old as f64 * 100.0)
     };
-    let old_s = paint(&fmt(old), color, RED);
-    let new_s = paint(&fmt(new), color, GREEN);
-    let delta_s = paint(&format!("{sign}{mag}{rel}"), color, DIM);
-    format!("{label}: {old_s} → {new_s} ({delta_s})")
+    TotalsParts {
+        change: Some(TotalsChange {
+            delta: format!("{sign}{}", fmt(magnitude)),
+            percent,
+            grew: delta >= 0,
+        }),
+        ..parts
+    }
 }
 
 /// Format an ISO-8601 timestamp (`2026-06-26T14:32:01+00:00`) as
@@ -392,7 +463,10 @@ fn display_name(template: &str, indices: &[Vec<String>]) -> String {
 
 /// One placeholder's index values as a compact string: the lone value when they're
 /// all equal, else `{0-47}` / `{0-3,5}` (integer ranges) or `{a,b}` (sorted list).
-fn summarize_indices(values: &[String]) -> String {
+///
+/// Shared with [`crate::difftree::fold_families`], which labels a folded run of layers the same way —
+/// one wording for "these indices", wherever a family is collapsed.
+pub(crate) fn summarize_indices(values: &[String]) -> String {
     use std::collections::BTreeSet;
     let distinct: BTreeSet<&str> = values.iter().map(String::as_str).collect();
     // One distinct value means at least one value.
@@ -453,6 +527,9 @@ fn count_suffix(count: usize) -> String {
 struct ChangedGroup {
     template: String,
     indices: Vec<Vec<String>>,
+    /// The names this row stands for. Kept so a per-name fact — the fold count — can be reported for a
+    /// grouped row only when every member agrees about it (see `DiffReport::fold_note`).
+    names: Vec<String>,
     count: usize,
     old: TensorSig,
     new: TensorSig,
@@ -509,6 +586,7 @@ fn group_changed(items: &[TensorChange], group: bool) -> Vec<ChangedGroup> {
             groups.push(ChangedGroup {
                 template,
                 indices: vec![Vec::new(); idx.len()],
+                names: Vec::new(),
                 count: 0,
                 old: c.old.clone(),
                 new: c.new.clone(),
@@ -524,6 +602,7 @@ fn group_changed(items: &[TensorChange], group: bool) -> Vec<ChangedGroup> {
             continue;
         };
         g.count += 1;
+        g.names.push(c.name.clone());
         for (bucket, v) in g.indices.iter_mut().zip(idx) {
             bucket.push(v);
         }
@@ -578,20 +657,105 @@ pub struct MetaVal {
     pub value_type: String,
 }
 
-/// One checkpoint reduced to what the structural diff compares. Both maps are
+/// What one entry of a summary contributes to its totals, and how many tensors it stands for.
+#[derive(Clone, Copy, serde::Serialize)]
+pub struct Footprint {
+    /// Its stored size, as the source reports it — not re-derived from dtype × shape, which is wrong
+    /// for a packed weight.
+    pub bytes: usize,
+    /// Its element count.
+    pub params: usize,
+    /// How many tensors this entry stands for: `1` ordinarily, more when an alignment **folded** several
+    /// onto one name — 256 per-expert tensors onto the one fused tensor that holds them
+    /// ([`OnCollision::Fold`]). The point of counting rather than collapsing silently: a row reading
+    /// `×256 → ×1` is the answer to "did the conversion keep everything", and a row reading `×255` is a
+    /// missing expert.
+    pub parts: usize,
+}
+
+impl Default for Footprint {
+    /// One tensor, contributing nothing — the identity for a fold.
+    fn default() -> Self {
+        Self {
+            bytes: 0,
+            params: 0,
+            parts: 1,
+        }
+    }
+}
+
+/// One checkpoint reduced to what the structural diff compares. Every map is
 /// keyed by name and ordered, so the diff output is deterministic and alphabetical.
 #[derive(serde::Serialize)]
 pub struct CheckpointSummary {
     pub tensors: BTreeMap<String, TensorSig>,
     pub metadata: BTreeMap<String, MetaVal>,
-    /// Total size in bytes and total parameter count, summed over the deduped
-    /// tensors (so a sharded checkpoint isn't double-counted) — for the diff's
-    /// overall size/params comparison.
-    pub total_bytes: usize,
-    pub total_params: usize,
+    /// Per tensor, keyed exactly like `tensors`.
+    ///
+    /// **Kept per name rather than pre-summed, so narrowing the comparison narrows the totals.** A
+    /// `--name` filter retains a subset of `tensors`; a stored sum stayed behind and described the whole
+    /// checkpoints, so a report about nineteen tensors was headed `size: 1966.5 GiB → 451.8 GiB`. The
+    /// totals are now [`Self::total_bytes`] / [`Self::total_params`], derived from this map, and
+    /// [`Self::retain_tensors`] is the one way to drop tensors — which is what keeps the two in step.
+    pub footprints: BTreeMap<String, Footprint>,
 }
 
 impl CheckpointSummary {
+    /// The summed stored size of the tensors **in scope**.
+    #[must_use]
+    pub fn total_bytes(&self) -> usize {
+        self.footprints.values().map(|f| f.bytes).sum()
+    }
+
+    /// The summed element count of the tensors **in scope**.
+    #[must_use]
+    pub fn total_params(&self) -> usize {
+        self.footprints.values().map(|f| f.params).sum()
+    }
+
+    /// Names that stand for more than one tensor, and how many — see [`Footprint::parts`].
+    #[must_use]
+    pub fn folds(&self) -> BTreeMap<String, usize> {
+        self.footprints
+            .iter()
+            .filter(|(_, f)| f.parts > 1)
+            .map(|(n, f)| (n.clone(), f.parts))
+            .collect()
+    }
+
+    /// Keep only the tensors whose name `keep` accepts — signatures and footprints together.
+    ///
+    /// The only way to narrow a summary, deliberately: `tensors.retain(…)` on its own would leave the
+    /// footprints (and so the totals) describing tensors the report no longer mentions.
+    pub fn retain_tensors(&mut self, keep: impl Fn(&str) -> bool) {
+        self.tensors.retain(|name, _| keep(name));
+        self.footprints.retain(|name, _| keep(name));
+    }
+
+    /// Re-root this summary at `prefix`: drop the tensors outside that subtree and key the rest by
+    /// their sub-path. Answers how many were kept, so a prefix matching nothing can be reported as the
+    /// typo it probably is.
+    ///
+    /// This is what `OLD#language_model` means — a **scope change, not a rename**: the names move so
+    /// that `language_model.model.layers.0.w` lines up with the other side's `model.layers.0.w`, and
+    /// the totals then describe the subtree rather than the checkpoint. Siblings (`vision_tower.…`)
+    /// are out of scope, not "removed".
+    ///
+    /// Metadata is left alone: an entry's key is not a tensor path, so no prefix applies to it.
+    pub fn reroot(&mut self, prefix: &str) -> usize {
+        let prefix = format!("{}.", prefix.trim_end_matches('.'));
+        let inside = |name: &str| name.strip_prefix(&prefix).map(str::to_string);
+        self.tensors = std::mem::take(&mut self.tensors)
+            .into_iter()
+            .filter_map(|(name, sig)| inside(&name).map(|sub| (sub, sig)))
+            .collect();
+        self.footprints = std::mem::take(&mut self.footprints)
+            .into_iter()
+            .filter_map(|(name, f)| inside(&name).map(|sub| (sub, f)))
+            .collect();
+        self.tensors.len()
+    }
+
     /// Reduce a freshly-loaded checkpoint to its comparable structure. A sharded
     /// checkpoint can list a name in more than one file; the last one wins (the
     /// same name+shape is expected across shards, so this only matters if they
@@ -599,15 +763,20 @@ impl CheckpointSummary {
     #[must_use]
     pub fn from_loaded(tensors: &[TensorInfo], metadata: &[MetadataInfo]) -> Self {
         let mut t = BTreeMap::new();
-        // Track size/params per name (last-wins, matching `t`) so totals are over
-        // the deduped set rather than counting a shared name once per shard.
-        let mut sizes: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        // Footprints are keyed and de-duplicated exactly like `t` (last-wins), so totals are over the
+        // deduped set rather than counting a shared name once per shard.
+        let mut footprints: BTreeMap<String, Footprint> = BTreeMap::new();
         for ti in tensors {
             t.insert(ti.name.clone(), TensorSig::of(ti));
-            sizes.insert(ti.name.clone(), (ti.size_bytes, ti.num_elements));
+            footprints.insert(
+                ti.name.clone(),
+                Footprint {
+                    bytes: ti.size_bytes,
+                    params: ti.num_elements,
+                    parts: 1,
+                },
+            );
         }
-        let total_bytes = sizes.values().map(|(b, _)| b).sum();
-        let total_params = sizes.values().map(|(_, p)| p).sum();
         let mut m = BTreeMap::new();
         for mi in metadata {
             m.insert(
@@ -621,10 +790,84 @@ impl CheckpointSummary {
         Self {
             tensors: t,
             metadata: m,
-            total_bytes,
-            total_params,
+            footprints,
         }
     }
+}
+
+/// The rules that line an **unfused** checkpoint up with its **fused** counterpart.
+///
+/// Two checkpoints can hold the same model in two layouts, and then a structural diff of them is
+/// useless in a specific way: they share no tensor name, so every tensor of both sides is one-sided and
+/// the difference count is their sum. 80,107 against 933, "nothing lines up" — a true statement that
+/// answers nothing. What the reader wants to know is whether the conversion kept everything.
+///
+/// Two kinds of difference are in the way, and these rules are exactly those two:
+///
+/// * **The expert index.** An unfused checkpoint stores one tensor per expert
+///   (`…experts.37.w2.weight`); a fused one stores all of them in a single tensor
+///   (`…experts.down_proj.weight`, whose leading dimension is the expert count). Dropping the index is
+///   what makes those correspond — as a *fold*, so the row reads `×256 → ×1` rather than 255 removals.
+/// * **The naming conventions.** `w1`/`w2`/`w3` (Mixtral-style) against `gate_proj`/`down_proj`/
+///   `up_proj` (HF-style) against the fused `gate_up_proj`/`down_proj`; a `.weight.qscale` suffix
+///   against `.qscale`; three attention projections against one `qkv_proj`;
+///   `e_score_correction_bias` against `gate.bias`; a `language_model.` prefix, or none.
+///
+/// **Applied to both sides**, because each rule is a no-op on a checkpoint already in the fused
+/// layout — `\.experts\.\d+\.` does not match it, and it has no `w2` to rename. So "align these two"
+/// needs no answer to "which one is which".
+///
+/// Returned as data, and printed by the `diff` subcommand when it applies them, because a
+/// transformation you cannot see is one you cannot check: the pairs below are exactly what `--map`
+/// takes, so a checkpoint these rules mis-align can be aligned by hand from here.
+#[must_use]
+pub fn fused_layout_rules() -> Vec<(String, String)> {
+    // Order matters: the more specific name goes first, since each rule rewrites the running name.
+    [
+        // A quantized weight's sidecars, whose suffix moves: `…w2.weight.qscale` → `…w2.qscale`.
+        (r"\.weight\.qscale$", ".qscale"),
+        (r"\.weight\.codebook$", ".codebook"),
+        // The expert index. Folded: several tensors, one fused counterpart.
+        (r"\.experts\.\d+\.", ".experts."),
+        // The two projections a fused checkpoint concatenates, in both naming schemes.
+        (r"\.w1__w3\.", ".gate_up_proj."),
+        (r"\.gate_proj__up_proj\.", ".gate_up_proj."),
+        (r"\.w1\.", ".gate_up_proj."),
+        (r"\.w3\.", ".gate_up_proj."),
+        (r"\.gate_proj\.", ".gate_up_proj."),
+        (r"\.up_proj\.", ".gate_up_proj."),
+        // …and the one it keeps to itself.
+        (r"\.w2\.", ".down_proj."),
+        // The MoE container, which the two schemes name differently.
+        (r"\.mlp\.experts\.", ".block_sparse_moe.experts."),
+        (r"\.mlp\.gate\.", ".block_sparse_moe.gate."),
+        // The router's bias, ditto.
+        (
+            r"\.block_sparse_moe\.e_score_correction_bias$",
+            ".block_sparse_moe.gate.bias",
+        ),
+        // Attention: three projections against one.
+        (r"\.self_attn\.q_proj\.", ".self_attn.qkv_proj."),
+        (r"\.self_attn\.k_proj\.", ".self_attn.qkv_proj."),
+        (r"\.self_attn\.v_proj\.", ".self_attn.qkv_proj."),
+        // A multimodal wrapper prefixes the language model; the fused side does not.
+        (r"^language_model\.model\.", "model."),
+        (r"^language_model\.lm_head\.", "lm_head."),
+    ]
+    .into_iter()
+    .map(|(pat, rep)| (pat.to_string(), rep.to_string()))
+    .collect()
+}
+
+/// What it means for several names to land on one, when renaming.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OnCollision {
+    /// A rule was too broad: report it, and keep one of the tensors. The `--map` default, because a
+    /// tensor silently leaving a comparison is the failure worth naming.
+    Warn,
+    /// Several tensors *are* one tensor on the other side — the unfused-to-fused case. Merge them into
+    /// one entry that counts its parts and sums their footprints.
+    Fold,
 }
 
 /// An ordered list of regex rewrite rules that rename one checkpoint's tensor
@@ -708,19 +951,63 @@ impl NameMap {
     /// names that two distinct source names collided onto — the map keeps the last
     /// (a `BTreeMap` insert), so the caller can warn that a rule is too broad.
     pub fn remap_summary(&self, sum: &mut CheckpointSummary) -> Vec<String> {
+        self.remap_summary_with(sum, OnCollision::Warn)
+    }
+
+    /// [`Self::remap_summary`], choosing what several names landing on one means.
+    ///
+    /// For a hand-written `--map` it is a mistake ([`OnCollision::Warn`]): two unrelated tensors on one
+    /// name means a rule was too broad, and a tensor has quietly left the comparison. For an alignment
+    /// between an unfused and a fused checkpoint it is the *point* ([`OnCollision::Fold`]): 256
+    /// per-expert tensors correspond to the one fused tensor that holds them, and the useful row says
+    /// so — `×256 → ×1` — rather than dropping 255 of them and calling it a collision.
+    pub fn remap_summary_with(
+        &self,
+        sum: &mut CheckpointSummary,
+        on_collision: OnCollision,
+    ) -> Vec<String> {
         if self.rules.is_empty() {
             return Vec::new();
         }
         // Classify from the original names *before* they collapse into `mapped`,
         // reusing the same collision detection the in-place rename relies on.
-        let collisions = self
-            .plan_renames(sum.tensors.keys().map(String::as_str))
-            .collisions;
+        let collisions = match on_collision {
+            OnCollision::Warn => {
+                self.plan_renames(sum.tensors.keys().map(String::as_str))
+                    .collisions
+            }
+            // Folding is what was asked for, so there is nothing to warn about.
+            OnCollision::Fold => Vec::new(),
+        };
         let mut mapped: BTreeMap<String, TensorSig> = BTreeMap::new();
         for (name, sig) in std::mem::take(&mut sum.tensors) {
-            mapped.insert(self.map(&name).into_owned(), sig); // keeps the last
+            // The first signature wins for a fold: the parts of one fused tensor are the same shape as
+            // each other, and which of 256 identical shapes is shown does not matter. (Where they are
+            // *not* identical the count still tells you how many there were.)
+            mapped.entry(self.map(&name).into_owned()).or_insert(sig);
         }
         sum.tensors = mapped;
+        // The footprints move with the names, or the totals would be keyed by names the summary no
+        // longer has. Merged rather than overwritten under `Fold`: the folded entry stands for all of
+        // them, so it carries their summed bytes and parameters and counts the parts.
+        let mut footprints: BTreeMap<String, Footprint> = BTreeMap::new();
+        for (name, f) in std::mem::take(&mut sum.footprints) {
+            let target = self.map(&name).into_owned();
+            match (footprints.get_mut(&target), on_collision) {
+                (Some(into), OnCollision::Fold) => {
+                    into.bytes += f.bytes;
+                    into.params += f.params;
+                    into.parts += f.parts;
+                }
+                // `Warn` keeps one entry, matching the signature map above — the collision it reports is
+                // the thing to act on.
+                (Some(_), OnCollision::Warn) => {}
+                (None, _) => {
+                    footprints.insert(target, f);
+                }
+            }
+        }
+        sum.footprints = footprints;
         collisions
     }
 
@@ -897,6 +1184,10 @@ impl TensorFilter {
     /// Restrict both summaries to the tensors that pass the filter. The union of
     /// names is tested, so a tensor present on only one side is kept iff it
     /// matches (and still shows as added/removed). No-op when inactive.
+    ///
+    /// Narrows the **totals** with the tensors ([`CheckpointSummary::retain_tensors`]): a report about
+    /// nineteen of 117,664 tensors used to be headed by the two checkpoints' whole sizes, which is a
+    /// true statement about something the reader is not looking at.
     pub fn apply(&self, old: &mut CheckpointSummary, new: &mut CheckpointSummary) {
         if !self.is_active() {
             return;
@@ -908,8 +1199,8 @@ impl TensorFilter {
             .filter(|n| self.matches(n, old.tensors.get(*n), new.tensors.get(*n)))
             .cloned()
             .collect();
-        old.tensors.retain(|k, _| keep.contains(k));
-        new.tensors.retain(|k, _| keep.contains(k));
+        old.retain_tensors(|n| keep.contains(n));
+        new.retain_tensors(|n| keep.contains(n));
     }
 
     /// A one-line, human-readable summary of the active constraints (for the
@@ -989,6 +1280,13 @@ pub struct DiffReport {
     /// shown in the size/params summary. `Some` only for an s3-vs-s3 diff.
     pub old_modified: Option<String>,
     pub new_modified: Option<String>,
+    /// Names that stand for several tensors after an alignment folded them: `name → (old parts, new
+    /// parts)`. Empty unless something folded.
+    ///
+    /// This is what makes an unfused-to-fused comparison readable: the row for
+    /// `…experts.down_proj.weight` reports `×256 → ×1`, so "did the conversion keep every expert" is
+    /// answered on the row rather than inferred from a count of removals.
+    pub folded: BTreeMap<String, (usize, usize)>,
 }
 
 impl DiffReport {
@@ -1015,6 +1313,56 @@ impl DiffReport {
     #[must_use]
     pub fn has_differences(&self) -> bool {
         self.has_differences_with(true)
+    }
+
+    /// `  (×256 → ×1)` for a row an alignment folded, or `""` for the ordinary one-to-one row.
+    ///
+    /// Takes the group's member names because a grouped line can stand for many; a group whose members
+    /// folded identically reports the fold once, and a group whose members disagree reports nothing
+    /// rather than one member's count as if it spoke for all of them.
+    fn fold_note(&self, names: &[String]) -> String {
+        match self.fold_of(names) {
+            Some([old, new]) => format!("  (×{old} → ×{new})"),
+            None => String::new(),
+        }
+    }
+
+    /// The fold every one of `names` agrees about, or `None`.
+    ///
+    /// `None` for a group whose members disagree, deliberately: one member's count presented for a row
+    /// standing for sixty would be a claim about the other fifty-nine.
+    fn fold_of(&self, names: &[String]) -> Option<[usize; 2]> {
+        if self.folded.is_empty() {
+            return None;
+        }
+        let mut counts = names.iter().filter_map(|n| self.folded.get(n));
+        let first = counts.next()?;
+        if counts.any(|c| c != first) {
+            return None;
+        }
+        let (old, new) = *first;
+        (old != new).then_some([old, new])
+    }
+
+    /// The `modified: OLD → NEW` line for an s3-vs-s3 pair, or `None` when the sides carry no
+    /// timestamps (every other kind of source).
+    ///
+    /// Its own function because the browser shows this line too, and the timestamps are *humanised*
+    /// (`2026-06-26T14:32:01Z` → `2026-06-26 14:32:01 UTC`) — a rule worth having once rather than
+    /// mirrored in TypeScript for one line.
+    #[must_use]
+    pub fn modified_line(&self, color: bool) -> Option<String> {
+        let (o, n) = (self.old_modified.as_ref()?, self.new_modified.as_ref()?);
+        let (os, ns) = (fmt_timestamp(o), fmt_timestamp(n));
+        Some(if os == ns {
+            format!("modified: {os} (unchanged)")
+        } else {
+            format!(
+                "modified: {} → {}",
+                paint(&os, color, RED),
+                paint(&ns, color, GREEN),
+            )
+        })
     }
 
     /// Render the report as plain text: a `---`/`+++` header naming the two sides,
@@ -1057,12 +1405,17 @@ impl DiffReport {
 
         // Overall change: total on-disk size and parameter count (absolute +
         // relative %); the per-tensor breakdown follows.
+        //
+        // Under a filter these describe the **matched tensors**, not the checkpoints, so they say so —
+        // the same words the metadata section uses for the same reason. `1966.5 GiB → 451.8 GiB` above
+        // nineteen of 117,664 tensors is true of something the reader is not looking at.
         let _ = writeln!(s);
+        let (size_label, params_label) = totals_labels(opts.filtered);
         let _ = writeln!(
             s,
             "{}",
             totals_line(
-                "size",
+                size_label,
                 self.old_bytes,
                 self.new_bytes,
                 opts.color,
@@ -1073,7 +1426,7 @@ impl DiffReport {
             s,
             "{}",
             totals_line(
-                "params",
+                params_label,
                 self.old_params,
                 self.new_params,
                 opts.color,
@@ -1082,17 +1435,7 @@ impl DiffReport {
         );
         // For an s3-vs-s3 diff, the checkpoints' last-modified (newest object under
         // each prefix) — old red, new green, like the size/params values.
-        if let (Some(o), Some(n)) = (&self.old_modified, &self.new_modified) {
-            let (os, ns) = (fmt_timestamp(o), fmt_timestamp(n));
-            let line = if os == ns {
-                format!("modified: {os} (unchanged)")
-            } else {
-                format!(
-                    "modified: {} → {}",
-                    paint(&os, opts.color, RED),
-                    paint(&ns, opts.color, GREEN),
-                )
-            };
+        if let Some(line) = self.modified_line(opts.color) {
             let _ = writeln!(s, "{line}");
         }
 
@@ -1143,7 +1486,11 @@ impl DiffReport {
                 let _ = writeln!(s, "  ~ {name}  [{}]  ({reason}){suffix}", g.old.render());
             } else {
                 let (old, new) = render_change(&g.old, &g.new, opts.color);
-                let _ = writeln!(s, "  ~ {name}  [{old}] → [{new}]{suffix}");
+                // `×256 → ×1` when an alignment folded one side: what the fused tensor stands for, on
+                // the row that compares it. Without it the shapes alone look like an unexplained
+                // change of rank.
+                let fold = self.fold_note(&g.names);
+                let _ = writeln!(s, "  ~ {name}  [{old}] → [{new}]{fold}{suffix}");
             }
             if opts.values {
                 match &g.values {
@@ -1273,168 +1620,24 @@ impl DiffReport {
             let _ = writeln!(s, "\nmetadata: not compared ({reason})");
         }
 
-        // S3 object metadata (s3-vs-s3 only).
+        // S3 object metadata (s3-vs-s3 only). The lines come from `S3Diff::summary_lines`, shared
+        // with the JSON API — the browser shows this section too, and what a matching multipart
+        // ETag does and does not prove is not a claim to make twice.
         if let Some(s3) = &self.s3 {
-            let _ = writeln!(
-                s,
-                "\nS3 objects: -{} +{} ~{} ({} unchanged)",
-                s3.removed.len(),
-                s3.added.len(),
-                s3.changed.len(),
-                s3.unchanged,
-            );
-            // Spell out exactly what was compared per object, so "N unchanged" isn't
-            // ambiguous: ETag + size always carry a signal; checksums only when the
-            // objects stored one; tags only when readable.
-            let sc = &s3.scope;
-            let m = sc.matched;
-            // ETag confidence: a single-part ETag is a full MD5 content hash; a
-            // multipart one is a part-layout-dependent composite (not a content hash).
-            let etag = if m == 0 {
-                "ETag".to_string()
-            } else if sc.etag_multipart == m {
-                "ETag (multipart composite)".to_string()
-            } else if sc.etag_multipart == 0 {
-                "ETag (single-part MD5)".to_string()
-            } else {
-                format!(
-                    "ETag ({} multipart, {} single-part)",
-                    sc.etag_multipart,
-                    m - sc.etag_multipart
-                )
-            };
-            let checksum = if sc.checksum_both == m && m > 0 {
-                "checksum".to_string()
-            } else {
-                format!("checksum ({}/{m} stored)", sc.checksum_both)
-            };
-            let umeta = if sc.user_meta_any > 0 {
-                format!("user metadata ({}/{m})", sc.user_meta_any)
-            } else {
-                "user metadata (none set)".to_string()
-            };
-            let tags = if sc.tags_compared {
-                "tags"
-            } else {
-                "tags (unavailable — not compared)"
-            };
-            let _ = writeln!(
-                s,
-                "{}",
-                paint(
-                    &format!("  checked per object: {etag}, size, {checksum}, {umeta}, {tags}"),
-                    opts.color,
-                    DIM
-                )
-            );
-            // How much "unchanged" is worth when no checksum backs it: with a
-            // single-part ETag it's a real content hash; with multipart it confirms
-            // sameness only when the part layout also matches.
-            if sc.checksum_both < m && m > 0 {
-                let note = if sc.etag_multipart == 0 {
-                    "no stored checksums — single-part ETags are full MD5 content hashes, so matching ETag + size means identical content"
-                } else {
-                    "no stored checksums — equality rests on the ETag; a multipart ETag matches only when content AND part layout match (upload with S3 checksums for a definitive compare)"
+            let _ = writeln!(s);
+            for line in s3.summary_lines(opts.group, opts.filtered) {
+                let (indent, code) = match line.kind {
+                    S3LineKind::Heading => ("", None),
+                    S3LineKind::Removed => ("  ", Some(RED)),
+                    S3LineKind::Added => ("  ", Some(GREEN)),
+                    S3LineKind::Changed => ("  ", None),
+                    S3LineKind::Note => ("  ", Some(DIM)),
                 };
-                let _ = writeln!(s, "{}", paint(&format!("  note: {note}"), opts.color, DIM));
-            }
-            // Collapse a set of object keys into index-templated lines with counts
-            // (e.g. `model.layers.{0-61}.….weight  (×62)`), like the tensor lists —
-            // or one line per key under `--full`. Keeps a 934-object list readable.
-            let collapse = |keys: &[&str]| -> Vec<(String, usize)> {
-                if opts.group {
-                    name_schema(keys)
-                } else {
-                    keys.iter().map(|k| ((*k).to_string(), 1)).collect()
-                }
-            };
-            let count = |n: usize| {
-                if n > 1 {
-                    format!("  (×{n})")
-                } else {
-                    String::new()
-                }
-            };
-            let removed: Vec<&str> = s3.removed.iter().map(String::as_str).collect();
-            for (tmpl, n) in collapse(&removed) {
-                let _ = writeln!(
-                    s,
-                    "{}",
-                    paint(&format!("  - {tmpl}{}", count(n)), opts.color, RED)
-                );
-            }
-            let added: Vec<&str> = s3.added.iter().map(String::as_str).collect();
-            for (tmpl, n) in collapse(&added) {
-                let _ = writeln!(
-                    s,
-                    "{}",
-                    paint(&format!("  + {tmpl}{}", count(n)), opts.color, GREEN)
-                );
-            }
-            // Group material changes by which fields differ, then collapse the keys
-            // within each group.
-            let mut by_fields: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-            for c in &s3.changed {
-                by_fields
-                    .entry(c.fields.join(", "))
-                    .or_default()
-                    .push(&c.key);
-            }
-            for (fields, keys) in &by_fields {
-                for (tmpl, n) in collapse(keys) {
-                    let _ = writeln!(s, "  ~ {tmpl}{}  ({fields})", count(n));
-                }
-            }
-            // Under a `--name` filter the diff is scoped to a subset of tensors, but
-            // the S3 comparison is always whole-prefix — so these object-level changes
-            // are outside the compared scope and don't drive the exit code (the value
-            // verdict / tensor diff of the subset does). Say so, or a `~1` above next
-            // to exit 0 looks contradictory.
-            if opts.filtered && !by_fields.is_empty() {
-                let _ = writeln!(
-                    s,
-                    "{}",
-                    paint(
-                        "  info: S3 object changes are whole-prefix — not counted for the exit code under a --name filter (compares the named subset only)",
-                        opts.color,
-                        DIM
-                    )
-                );
-            }
-            // Timestamp-only deltas are informational — never a difference. Summarise
-            // them by field-set (a per-object list of "differs only in last-modified"
-            // is pure noise); `--full` lists each.
-            if opts.group {
-                let mut info: BTreeMap<String, usize> = BTreeMap::new();
-                for i in &s3.info_only {
-                    *info.entry(i.fields.join(", ")).or_default() += 1;
-                }
-                for (fields, n) in &info {
-                    let _ = writeln!(
-                        s,
-                        "{}",
-                        paint(
-                            &format!("  info: {n} object(s) differ only in {fields}"),
-                            opts.color,
-                            DIM
-                        )
-                    );
-                }
-            } else {
-                for i in &s3.info_only {
-                    let _ = writeln!(
-                        s,
-                        "{}",
-                        paint(
-                            &format!("  info: {} differs only in {}", i.key, i.fields.join(", ")),
-                            opts.color,
-                            DIM
-                        )
-                    );
-                }
-            }
-            for w in &s3.warnings {
-                let _ = writeln!(s, "{}", paint(&format!("  note: {w}"), opts.color, DIM));
+                let text = format!("{indent}{}", line.text);
+                let _ = match code {
+                    Some(code) => writeln!(s, "{}", paint(&text, opts.color, code)),
+                    None => writeln!(s, "{text}"),
+                };
             }
         }
         s
@@ -1506,12 +1709,194 @@ pub struct S3Diff {
     pub warnings: Vec<String>,
 }
 
+/// What one line of the S3 section is, so each surface can style it in its own medium: the terminal
+/// paints it, the browser gives it a class. The *words* come from [`S3Diff::summary_lines`] either
+/// way — there is one implementation of them.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum S3LineKind {
+    /// The counts line that opens the section.
+    Heading,
+    /// An object only in the baseline.
+    Removed,
+    /// An object only in the newer side.
+    Added,
+    /// An object whose material fields differ.
+    Changed,
+    /// What was checked, a confidence caveat, a timestamp-only delta, a warning — never a difference.
+    Note,
+}
+
+/// One line of the S3 object section: what it says, and what kind of line it is.
+#[derive(Clone, serde::Serialize)]
+pub struct S3Line {
+    pub kind: S3LineKind,
+    pub text: String,
+}
+
 impl S3Diff {
     /// Material changes only — timestamp-only deltas never count (never affect the
     /// exit code).
     #[must_use]
     pub fn has_material_changes(&self) -> bool {
         !self.added.is_empty() || !self.removed.is_empty() || !self.changed.is_empty()
+    }
+
+    /// The S3 object section, line by line and uncoloured.
+    ///
+    /// One implementation for two surfaces: [`DiffReport::render`] paints these for a terminal and
+    /// `/api/diff` sends them to the browser, which had no S3 section at all — the one part of a
+    /// checkpoint comparison the web could not show for the `s3://` pairs it exists to compare. The
+    /// wording is subtle enough (what a multipart `ETag` proves, what "unchanged" is worth without a
+    /// stored checksum) that a second implementation would be a second set of claims about evidence.
+    ///
+    /// `group` collapses key lists into index templates (`--full` turns it off); `filtered` adds the
+    /// note that whole-prefix object changes are outside a `--name` scope.
+    #[must_use]
+    pub fn summary_lines(&self, group: bool, filtered: bool) -> Vec<S3Line> {
+        let mut out = Vec::new();
+        let mut push = |kind: S3LineKind, text: String| out.push(S3Line { kind, text });
+        push(
+            S3LineKind::Heading,
+            format!(
+                "S3 objects: -{} +{} ~{} ({} unchanged)",
+                self.removed.len(),
+                self.added.len(),
+                self.changed.len(),
+                self.unchanged,
+            ),
+        );
+        // Spell out exactly what was compared per object, so "N unchanged" isn't
+        // ambiguous: ETag + size always carry a signal; checksums only when the
+        // objects stored one; tags only when readable.
+        let sc = &self.scope;
+        let m = sc.matched;
+        // ETag confidence: a single-part ETag is a full MD5 content hash; a
+        // multipart one is a part-layout-dependent composite (not a content hash).
+        let etag = if m == 0 {
+            "ETag".to_string()
+        } else if sc.etag_multipart == m {
+            "ETag (multipart composite)".to_string()
+        } else if sc.etag_multipart == 0 {
+            "ETag (single-part MD5)".to_string()
+        } else {
+            format!(
+                "ETag ({} multipart, {} single-part)",
+                sc.etag_multipart,
+                m - sc.etag_multipart
+            )
+        };
+        let checksum = if sc.checksum_both == m && m > 0 {
+            "checksum".to_string()
+        } else {
+            format!("checksum ({}/{m} stored)", sc.checksum_both)
+        };
+        let umeta = if sc.user_meta_any > 0 {
+            format!("user metadata ({}/{m})", sc.user_meta_any)
+        } else {
+            "user metadata (none set)".to_string()
+        };
+        let tags = if sc.tags_compared {
+            "tags"
+        } else {
+            "tags (unavailable — not compared)"
+        };
+        push(
+            S3LineKind::Note,
+            format!("checked per object: {etag}, size, {checksum}, {umeta}, {tags}"),
+        );
+        // How much "unchanged" is worth when no checksum backs it: with a
+        // single-part ETag it's a real content hash; with multipart it confirms
+        // sameness only when the part layout also matches.
+        if sc.checksum_both < m && m > 0 {
+            let note = if sc.etag_multipart == 0 {
+                "no stored checksums — single-part ETags are full MD5 content hashes, so matching ETag + size means identical content"
+            } else {
+                "no stored checksums — equality rests on the ETag; a multipart ETag matches only when content AND part layout match (upload with S3 checksums for a definitive compare)"
+            };
+            push(S3LineKind::Note, format!("note: {note}"));
+        }
+        // Collapse a set of object keys into index-templated lines with counts
+        // (e.g. `model.layers.{0-61}.….weight  (×62)`), like the tensor lists —
+        // or one line per key under `--full`. Keeps a 934-object list readable.
+        let collapse = |keys: &[&str]| -> Vec<(String, usize)> {
+            if group {
+                name_schema(keys)
+            } else {
+                keys.iter().map(|k| ((*k).to_string(), 1)).collect()
+            }
+        };
+        let count = |n: usize| {
+            if n > 1 {
+                format!("  (×{n})")
+            } else {
+                String::new()
+            }
+        };
+        let removed: Vec<&str> = self.removed.iter().map(String::as_str).collect();
+        for (tmpl, n) in collapse(&removed) {
+            push(S3LineKind::Removed, format!("- {tmpl}{}", count(n)));
+        }
+        let added: Vec<&str> = self.added.iter().map(String::as_str).collect();
+        for (tmpl, n) in collapse(&added) {
+            push(S3LineKind::Added, format!("+ {tmpl}{}", count(n)));
+        }
+        // Group material changes by which fields differ, then collapse the keys
+        // within each group.
+        let mut by_fields: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for c in &self.changed {
+            by_fields
+                .entry(c.fields.join(", "))
+                .or_default()
+                .push(&c.key);
+        }
+        for (fields, keys) in &by_fields {
+            for (tmpl, n) in collapse(keys) {
+                push(
+                    S3LineKind::Changed,
+                    format!("~ {tmpl}{}  ({fields})", count(n)),
+                );
+            }
+        }
+        // Under a `--name` filter the diff is scoped to a subset of tensors, but
+        // the S3 comparison is always whole-prefix — so these object-level changes
+        // are outside the compared scope and don't drive the exit code (the value
+        // verdict / tensor diff of the subset does). Say so, or a `~1` above next
+        // to exit 0 looks contradictory.
+        if filtered && !by_fields.is_empty() {
+            push(
+                S3LineKind::Note,
+                "info: S3 object changes are whole-prefix — not counted for the exit code under a \
+                 --name filter (compares the named subset only)"
+                    .to_string(),
+            );
+        }
+        // Timestamp-only deltas are informational — never a difference. Summarise
+        // them by field-set (a per-object list of "differs only in last-modified"
+        // is pure noise); `--full` lists each.
+        if group {
+            let mut info: BTreeMap<String, usize> = BTreeMap::new();
+            for i in &self.info_only {
+                *info.entry(i.fields.join(", ")).or_default() += 1;
+            }
+            for (fields, n) in &info {
+                push(
+                    S3LineKind::Note,
+                    format!("info: {n} object(s) differ only in {fields}"),
+                );
+            }
+        } else {
+            for i in &self.info_only {
+                push(
+                    S3LineKind::Note,
+                    format!("info: {} differs only in {}", i.key, i.fields.join(", ")),
+                );
+            }
+        }
+        for w in &self.warnings {
+            push(S3LineKind::Note, format!("note: {w}"));
+        }
+        out
     }
 }
 
@@ -1734,7 +2119,7 @@ pub fn compare_with(
             tensors_unchanged += 1;
         }
     }
-    let tensors_added: Vec<_> = new
+    let mut tensors_added: Vec<_> = new
         .tensors
         .iter()
         .filter(|(name, _)| !old.tensors.contains_key(*name))
@@ -1755,12 +2140,26 @@ pub fn compare_with(
             }),
         }
     }
-    let meta_added: Vec<_> = new
+    let mut meta_added: Vec<_> = new
         .metadata
         .iter()
         .filter(|(name, _)| !old.metadata.contains_key(*name))
         .map(|(name, v)| (name.clone(), v.clone()))
         .collect();
+
+    // Natural order, not the `BTreeMap`'s lexicographic one.
+    //
+    // Iterating the maps gives `experts.0, experts.1, experts.10, experts.100, experts.101, …`, which
+    // for a checkpoint whose whole structure is indexed by layer and expert makes a 31k-line report
+    // unreadable — and disagrees with the tensor tree and the side-by-side view, which both sort
+    // naturally. The same key those use (`tree::natural_sort_key`) is what makes them agree.
+    let by_name = |name: &str| crate::tree::natural_sort_key(name);
+    tensors_removed.sort_by_cached_key(|(name, _)| by_name(name));
+    tensors_added.sort_by_cached_key(|(name, _)| by_name(name));
+    tensors_changed.sort_by_cached_key(|c| by_name(&c.name));
+    meta_removed.sort_by_cached_key(|(name, _)| by_name(name));
+    meta_added.sort_by_cached_key(|(name, _)| by_name(name));
+    meta_changed.sort_by_cached_key(|c| by_name(&c.name));
 
     DiffReport {
         tensors_removed,
@@ -1771,13 +2170,105 @@ pub fn compare_with(
         meta_added,
         meta_changed,
         meta_unchanged,
-        old_bytes: old.total_bytes,
-        new_bytes: new.total_bytes,
-        old_params: old.total_params,
-        new_params: new.total_params,
+        // Over the tensors **in scope**: a filtered summary carries only the footprints it kept.
+        old_bytes: old.total_bytes(),
+        new_bytes: new.total_bytes(),
+        old_params: old.total_params(),
+        new_params: new.total_params(),
         s3: None, // attached by the caller for an s3-vs-s3 diff
         old_modified: None,
         new_modified: None,
+        folded: {
+            // Every name either side folded, with both sides' counts — `1` where that side has one
+            // tensor for it, `0` where it has none at all.
+            let (of, nf) = (old.folds(), new.folds());
+            let mut names: Vec<&String> = of.keys().chain(nf.keys()).collect();
+            names.sort_unstable();
+            names.dedup();
+            names
+                .into_iter()
+                .map(|n| {
+                    let side = |sum: &CheckpointSummary, folds: &BTreeMap<String, usize>| {
+                        folds
+                            .get(n)
+                            .copied()
+                            .unwrap_or_else(|| usize::from(sum.tensors.contains_key(n)))
+                    };
+                    (n.clone(), (side(old, &of), side(new, &nf)))
+                })
+                .collect()
+        },
+    }
+}
+
+/// One row of the **grouped** report: a name template and how many tensors it stands for.
+///
+/// `model.layers.{0-61}.inv_freq_default` with `count: 62`, rather than 62 rows that differ only by a
+/// number. This is what the `diff` subcommand prints by default; `--full` is what turns it off.
+#[derive(serde::Serialize)]
+pub struct GroupedEntry {
+    /// The display name, with each index run filled in as its value or range.
+    pub name: String,
+    /// How many tensors this row stands for. `1` for a name with nothing to group with.
+    pub count: usize,
+    pub sig: TensorSig,
+}
+
+/// One row of the grouped report's *changed* section.
+#[derive(serde::Serialize)]
+pub struct GroupedChange {
+    pub name: String,
+    pub count: usize,
+    pub old: TensorSig,
+    pub new: TensorSig,
+    /// `[old parts, new parts]` when an alignment folded these rows and every member agrees about it —
+    /// see [`DiffReport::folded`]. `None` otherwise, including for a group whose members disagree,
+    /// where one member's count would be a claim about the others.
+    pub fold: Option<[usize; 2]>,
+}
+
+/// The report with its tensor sections collapsed into index-templated families.
+///
+/// **Why the server does this.** The templating rule is subtle — which digit runs become placeholders,
+/// how `{0-3,5}` summarises a set, when two names may merge (same template *and* same change) — and it
+/// already exists here, driving what the terminal prints. A second implementation in the browser would
+/// be a second answer to "are these the same family", and the two would drift. So the browser is sent
+/// the grouped rows and chooses which list to show.
+#[derive(serde::Serialize)]
+pub struct GroupedReport {
+    pub tensors_added: Vec<GroupedEntry>,
+    pub tensors_removed: Vec<GroupedEntry>,
+    pub tensors_changed: Vec<GroupedChange>,
+}
+
+impl DiffReport {
+    /// Collapse the tensor sections into families — the same grouping the terminal renders.
+    #[must_use]
+    pub fn grouped(&self) -> GroupedReport {
+        let entries = |items: &[(String, TensorSig)]| -> Vec<GroupedEntry> {
+            group_entries(items)
+                .into_iter()
+                .map(|g| GroupedEntry {
+                    name: display_name(&g.template, &g.indices),
+                    count: g.count,
+                    sig: g.key,
+                })
+                .collect()
+        };
+        GroupedReport {
+            tensors_added: entries(&self.tensors_added),
+            tensors_removed: entries(&self.tensors_removed),
+            tensors_changed: group_changed(&self.tensors_changed, true)
+                .into_iter()
+                .map(|g| GroupedChange {
+                    name: display_name(&g.template, &g.indices),
+                    count: g.count,
+                    old: g.old,
+                    new: g.new,
+                    fold: self.fold_of(&g.names),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -2636,6 +3127,8 @@ mod tests {
             value_type: ty.to_string(),
         }
     }
+    /// A summary with a footprint per tensor — one element per unit of shape, one byte per element —
+    /// so a test can narrow it and watch the totals narrow with it.
     fn summary(tensors: &[(&str, TensorSig)], metadata: &[(&str, MetaVal)]) -> CheckpointSummary {
         CheckpointSummary {
             tensors: tensors
@@ -2646,9 +3139,70 @@ mod tests {
                 .iter()
                 .map(|(n, v)| (n.to_string(), v.clone()))
                 .collect(),
-            total_bytes: 0,
-            total_params: 0,
+            footprints: tensors
+                .iter()
+                .map(|(n, s)| {
+                    let params: usize = s.shape.iter().product();
+                    (
+                        n.to_string(),
+                        Footprint {
+                            bytes: params,
+                            params,
+                            parts: 1,
+                        },
+                    )
+                })
+                .collect(),
         }
+    }
+
+    /// The report lists names in *natural* order, like every other view of a checkpoint.
+    ///
+    /// The lists are built by walking `BTreeMap`s, which is lexicographic: `experts.0, experts.1,
+    /// experts.10, experts.100, …`. For a checkpoint indexed by layer and expert that makes a long
+    /// report unreadable, and it disagreed with the tensor tree and the side-by-side view, which both
+    /// sort naturally. A map iteration order is easy to reintroduce, hence a test.
+    #[test]
+    fn the_report_lists_names_in_natural_order() {
+        let names = [
+            "layers.0.w",
+            "layers.1.w",
+            "layers.2.w",
+            "layers.10.w",
+            "layers.11.w",
+            "layers.100.w",
+        ];
+        // The baseline has none of them, so every one lands in `tensors_added`.
+        let old = summary(&[], &[]);
+        let new = summary(
+            &names
+                .iter()
+                .map(|n| (*n, sig("F16", &[2])))
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        let report = compare(&old, &new);
+        assert_eq!(
+            report
+                .tensors_added
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            names,
+            "added tensors should read 0, 1, 2, 10, 11, 100 — not 0, 1, 10, 100, 11, 2"
+        );
+
+        // Removals take the same route, in the other direction.
+        let report = compare(&new, &old);
+        assert_eq!(
+            report
+                .tensors_removed
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            names,
+            "removed tensors should be naturally ordered too"
+        );
     }
 
     #[test]
@@ -3000,8 +3554,19 @@ mod tests {
                 .map(|n| (n.to_string(), sig("U8", &[4])))
                 .collect(),
             metadata: BTreeMap::default(),
-            total_bytes: 0,
-            total_params: 0,
+            footprints: names
+                .iter()
+                .map(|n| {
+                    (
+                        n.to_string(),
+                        Footprint {
+                            bytes: 4,
+                            params: 4,
+                            parts: 1,
+                        },
+                    )
+                })
+                .collect(),
         };
         let per = ValueDiff {
             elements: 4,
@@ -3060,17 +3625,30 @@ mod tests {
                 .map(|n| (format!("model.layers.{n}.mlp.weight"), sig(dt, &[8])))
                 .collect::<Vec<_>>()
         };
+        let footprints = || -> BTreeMap<String, Footprint> {
+            mk("F16")
+                .into_iter()
+                .map(|(n, _)| {
+                    (
+                        n,
+                        Footprint {
+                            bytes: 8,
+                            params: 8,
+                            parts: 1,
+                        },
+                    )
+                })
+                .collect()
+        };
         let old = CheckpointSummary {
             tensors: mk("F16").into_iter().collect(),
             metadata: BTreeMap::default(),
-            total_bytes: 0,
-            total_params: 0,
+            footprints: footprints(),
         };
         let new = CheckpointSummary {
             tensors: mk("BF16").into_iter().collect(),
             metadata: BTreeMap::default(),
-            total_bytes: 0,
-            total_params: 0,
+            footprints: footprints(),
         };
         let r = compare(&old, &new);
         // Grouped (default): one collapsed line with the range and ×count.
@@ -3497,6 +4075,337 @@ mod tests {
         assert_eq!(r.tensors_unchanged, 1);
         assert_eq!(r.tensors_removed.len(), 1);
         assert_eq!(r.tensors_added.len(), 1);
+    }
+
+    /// **The grouped report and the terminal's own lines agree.**
+    ///
+    /// The browser is sent grouped rows rather than grouping them itself, because the templating rule is
+    /// subtle and already exists here — driving what the terminal prints. This is that claim as a test:
+    /// the same names, the same counts, in the same order as the rendered lines.
+    #[test]
+    fn the_grouped_report_matches_the_rendered_lines() {
+        let names: Vec<String> = (0..62)
+            .map(|n| format!("model.layers.{n}.inv_freq_default"))
+            .collect();
+        let mut old_t: Vec<(&str, TensorSig)> = Vec::new();
+        let mut new_t: Vec<(&str, TensorSig)> = Vec::new();
+        // 62 layers of one name, retyped — the case that fills a screen with rows differing by a number.
+        for n in &names {
+            old_t.push((n, sig("F32", &[8, 128])));
+            new_t.push((n, sig("F16", &[8, 128])));
+        }
+        // …and one name that stands alone, added on the new side.
+        new_t.push(("lm_head.weight", sig("F16", &[4, 4])));
+        let (old, new) = (summary(&old_t, &[]), summary(&new_t, &[]));
+        let report = compare(&old, &new);
+        let grouped = report.grouped();
+
+        assert_eq!(grouped.tensors_changed.len(), 1, "62 rows collapse to one");
+        assert_eq!(
+            grouped.tensors_changed[0].name,
+            "model.layers.{0-61}.inv_freq_default"
+        );
+        assert_eq!(grouped.tensors_changed[0].count, 62);
+        assert_eq!(grouped.tensors_added.len(), 1);
+        assert_eq!(grouped.tensors_added[0].name, "lm_head.weight");
+        assert_eq!(
+            grouped.tensors_added[0].count, 1,
+            "a lone name stands for itself"
+        );
+
+        // And the terminal prints those very lines, so the two surfaces cannot collapse differently.
+        let rendered = report.render("o", "n", PLAIN);
+        assert!(
+            rendered.contains("~ model.layers.{0-61}.inv_freq_default"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("(×62)"), "{rendered}");
+        assert!(rendered.contains("+ lm_head.weight"), "{rendered}");
+    }
+
+    /// A folded family reports the fold once — and would report nothing if its members disagreed, since
+    /// one member's count would be a claim about the rest.
+    #[test]
+    fn a_grouped_row_reports_a_fold_only_when_every_member_agrees() {
+        let rules = NameMap::from_pairs(fused_layout_rules()).expect("compile");
+        let unfused: Vec<(&str, TensorSig)> = vec![
+            (
+                "model.layers.0.block_sparse_moe.experts.0.w2.weight",
+                sig("U8", &[8, 4]),
+            ),
+            (
+                "model.layers.0.block_sparse_moe.experts.1.w2.weight",
+                sig("U8", &[8, 4]),
+            ),
+            (
+                "model.layers.1.block_sparse_moe.experts.0.w2.weight",
+                sig("U8", &[8, 4]),
+            ),
+            (
+                "model.layers.1.block_sparse_moe.experts.1.w2.weight",
+                sig("U8", &[8, 4]),
+            ),
+        ];
+        let fused: Vec<(&str, TensorSig)> = vec![
+            (
+                "model.layers.0.block_sparse_moe.experts.down_proj.weight",
+                sig("U8", &[2, 8, 4]),
+            ),
+            (
+                "model.layers.1.block_sparse_moe.experts.down_proj.weight",
+                sig("U8", &[2, 8, 4]),
+            ),
+        ];
+        let mut old = summary(&unfused, &[]);
+        rules.remap_summary_with(&mut old, OnCollision::Fold);
+        let new = summary(&fused, &[]);
+        let grouped = compare(&old, &new).grouped();
+        assert_eq!(
+            grouped.tensors_changed.len(),
+            1,
+            "the two layers are one family"
+        );
+        assert_eq!(grouped.tensors_changed[0].count, 2);
+        assert_eq!(
+            grouped.tensors_changed[0].fold,
+            Some([2, 1]),
+            "both members folded two into one"
+        );
+    }
+
+    /// **An unfused checkpoint lines up with its fused counterpart.**
+    ///
+    /// The reported case: two layouts of one model share no tensor name, so a plain comparison reports
+    /// every tensor of both sides as one-sided — 80,107 against 933 — which is true and answers nothing.
+    /// The rules drop the expert index and rename the layout synonyms; the fold is what makes 256
+    /// per-expert tensors *correspond to* the one fused tensor that holds them rather than being 255
+    /// removals and a change.
+    #[test]
+    fn the_unfused_layout_folds_onto_the_fused_one() {
+        let rules = NameMap::from_pairs(fused_layout_rules()).expect("the canonical rules compile");
+        // Two experts of one layer, in the unfused (Mixtral-style) naming.
+        let unfused: Vec<(&str, TensorSig)> = vec![
+            (
+                "model.layers.0.block_sparse_moe.experts.0.w2.weight",
+                sig("U8", &[8, 4]),
+            ),
+            (
+                "model.layers.0.block_sparse_moe.experts.1.w2.weight",
+                sig("U8", &[8, 4]),
+            ),
+            (
+                "model.layers.0.block_sparse_moe.experts.0.w1.weight",
+                sig("U8", &[4, 8]),
+            ),
+            (
+                "model.layers.0.block_sparse_moe.experts.1.w1.weight",
+                sig("U8", &[4, 8]),
+            ),
+            (
+                "model.layers.0.block_sparse_moe.experts.0.w3.weight",
+                sig("U8", &[4, 8]),
+            ),
+            (
+                "model.layers.0.block_sparse_moe.experts.1.w3.weight",
+                sig("U8", &[4, 8]),
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                sig("BF16", &[4, 4]),
+            ),
+            (
+                "model.layers.0.self_attn.k_proj.weight",
+                sig("BF16", &[4, 4]),
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.weight",
+                sig("BF16", &[4, 4]),
+            ),
+        ];
+        let mut old = summary(&unfused, &[]);
+        rules.remap_summary_with(&mut old, OnCollision::Fold);
+
+        // Three names, each standing for what folded onto it.
+        assert_eq!(
+            old.tensors.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "model.layers.0.block_sparse_moe.experts.down_proj.weight",
+                "model.layers.0.block_sparse_moe.experts.gate_up_proj.weight",
+                "model.layers.0.self_attn.qkv_proj.weight",
+            ]
+        );
+        let folds = old.folds();
+        assert_eq!(
+            folds.get("model.layers.0.block_sparse_moe.experts.down_proj.weight"),
+            Some(&2)
+        );
+        // gate and up, for two experts: four tensors behind one fused name.
+        assert_eq!(
+            folds.get("model.layers.0.block_sparse_moe.experts.gate_up_proj.weight"),
+            Some(&4)
+        );
+        assert_eq!(
+            folds.get("model.layers.0.self_attn.qkv_proj.weight"),
+            Some(&3)
+        );
+        // Nothing was dropped: the folded totals are the sum of the parts (the helper gives each
+        // tensor one byte per element).
+        // 2 × (8·4) + 4 × (4·8) + 3 × (4·4) — the parts, all still counted.
+        assert_eq!(
+            old.total_params(),
+            64 + 128 + 48,
+            "every part still counted"
+        );
+
+        // And against the fused side, the report says how many folded onto each row.
+        let fused: Vec<(&str, TensorSig)> = vec![
+            (
+                "model.layers.0.block_sparse_moe.experts.down_proj.weight",
+                sig("U8", &[2, 8, 4]),
+            ),
+            (
+                "model.layers.0.block_sparse_moe.experts.gate_up_proj.weight",
+                sig("U8", &[2, 8, 8]),
+            ),
+            (
+                "model.layers.0.self_attn.qkv_proj.weight",
+                sig("BF16", &[12, 4]),
+            ),
+        ];
+        let mut new = summary(&fused, &[]);
+        // The rules are applied to both sides, and are a no-op on one already fused.
+        rules.remap_summary_with(&mut new, OnCollision::Fold);
+        assert!(new.folds().is_empty(), "nothing to fold on the fused side");
+
+        let report = compare(&old, &new);
+        assert_eq!(
+            report.tensors_changed.len(),
+            3,
+            "three rows, not 9 removals"
+        );
+        assert!(report.tensors_removed.is_empty() && report.tensors_added.is_empty());
+        let rendered = report.render("unfused", "fused", PLAIN);
+        assert!(rendered.contains("(×2 → ×1)"), "{rendered}");
+        assert!(rendered.contains("(×4 → ×1)"), "{rendered}");
+        assert!(rendered.contains("(×3 → ×1)"), "{rendered}");
+    }
+
+    /// The rules are a no-op on a checkpoint already in the fused layout, which is what lets them be
+    /// applied to both sides without asking which is which.
+    #[test]
+    fn aligning_an_already_fused_checkpoint_changes_nothing() {
+        let rules = NameMap::from_pairs(fused_layout_rules()).expect("compile");
+        let fused: Vec<(&str, TensorSig)> = vec![
+            (
+                "model.layers.3.block_sparse_moe.experts.down_proj.weight",
+                sig("U8", &[2, 8, 4]),
+            ),
+            (
+                "model.layers.3.block_sparse_moe.experts.down_proj.qscale",
+                sig("F16", &[2, 8]),
+            ),
+            (
+                "model.layers.3.block_sparse_moe.gate.bias",
+                sig("F32", &[2]),
+            ),
+            (
+                "model.layers.3.self_attn.qkv_proj.weight",
+                sig("BF16", &[12, 4]),
+            ),
+            ("lm_head.weight", sig("F16", &[4, 4])),
+        ];
+        let before = summary(&fused, &[]);
+        let mut after = summary(&fused, &[]);
+        rules.remap_summary_with(&mut after, OnCollision::Fold);
+        assert_eq!(
+            after.tensors.keys().cloned().collect::<Vec<_>>(),
+            before.tensors.keys().cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(after.total_params(), before.total_params());
+    }
+
+    /// **A filter narrows the totals with the tensors.**
+    ///
+    /// It used to narrow only the signatures: the summed size and parameter count were computed once at
+    /// load and stayed behind, so a report about nineteen of 117,664 tensors was headed
+    /// `size: 1966.5 GiB → 451.8 GiB` — the checkpoints' sizes, which is a true statement about
+    /// something the reader is not looking at. The `summary` helper gives each tensor one byte per
+    /// element, so these numbers are the element counts of what survived the filter.
+    #[test]
+    fn a_filtered_comparison_totals_only_the_tensors_it_kept() {
+        let tensors = |dt: &str| {
+            [
+                ("keep.down_proj.weight", sig(dt, &[8, 4])), // 32
+                ("skip.gate_proj.weight", sig(dt, &[100])),  // 100, and excluded
+            ]
+        };
+        let (mut old, mut new) = (
+            summary(&tensors("BF16"), &[]),
+            summary(&tensors("F16"), &[]),
+        );
+        assert_eq!(old.total_params(), 132, "before: both tensors");
+        assert_eq!(old.total_bytes(), 132);
+
+        let f = TensorFilter {
+            names: NameFilter {
+                include: vec![glob("*.down_proj.weight")],
+                exclude: vec![],
+            },
+            ..Default::default()
+        };
+        f.apply(&mut old, &mut new);
+        assert_eq!(old.total_params(), 32, "after: the kept tensor only");
+        assert_eq!(new.total_bytes(), 32);
+        // And the report carries those, not the checkpoints'.
+        let r = compare(&old, &new);
+        assert_eq!((r.old_bytes, r.new_bytes), (32, 32));
+        assert_eq!((r.old_params, r.new_params), (32, 32));
+        // Which is why the line is labelled: `size:` above a subset reads as the checkpoint's size.
+        let filtered = r.render(
+            "o",
+            "n",
+            DiffOpts {
+                filtered: true,
+                ..PLAIN
+            },
+        );
+        assert!(
+            filtered.contains("size (filtered subset): 32 B (unchanged)"),
+            "{filtered}"
+        );
+        // Unfiltered, the label stays bare.
+        assert!(
+            r.render("o", "n", PLAIN).contains("\nsize: 32 B"),
+            "{r:?}",
+            r = r.render("o", "n", PLAIN)
+        );
+    }
+
+    /// A rename moves each tensor's footprint with its name, so the totals still describe the tensors
+    /// the summary now has — and two names collapsing onto one stop being counted twice.
+    #[test]
+    fn renaming_carries_the_footprints() {
+        let mut sum = summary(
+            &[
+                ("old.a.weight", sig("F16", &[10])),
+                ("old.b.weight", sig("F16", &[5])),
+            ],
+            &[],
+        );
+        assert_eq!(sum.total_params(), 15);
+        let map = NameMap::from_pairs([(r"^old\.".to_string(), "new.".to_string())])
+            .expect("a valid rule");
+        map.remap_summary(&mut sum);
+        assert_eq!(
+            sum.tensors.keys().cloned().collect::<Vec<_>>(),
+            vec!["new.a.weight", "new.b.weight"]
+        );
+        assert_eq!(
+            sum.footprints.keys().cloned().collect::<Vec<_>>(),
+            vec!["new.a.weight", "new.b.weight"],
+            "the footprints follow the names, or the totals describe names that are gone"
+        );
+        assert_eq!(sum.total_params(), 15);
     }
 
     #[test]
