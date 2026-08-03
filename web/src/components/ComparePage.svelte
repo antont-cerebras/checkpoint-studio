@@ -24,7 +24,7 @@
     establishComparison,
     stopComparing,
   } from '../stores/compare';
-  import { clearReport, diffReport } from '../stores/report';
+  import { clearReport, diffReport, loadReport } from '../stores/report';
   import { loadRecents, proxied, proxyHost, tree } from '../stores/server';
   import { navigate } from '../stores/view';
   import { middleTruncate, specHelp } from '../lib/format';
@@ -100,6 +100,13 @@
   // minutes over an ssh proxy) and the summary compared against whatever the server had *open*
   // rather than against the candidate.
   $: if (lhs) void establishComparison({ left: lhs, right: rhs });
+  // **The Data view sizes its run from the report**, whose totals follow the scope — so it needs one
+  // even though it does not draw it. Only the Summary asked for it, so arriving straight at the Data
+  // view (a link with `view=data`, or the tab) left it sizing a run from nothing: `0 tensors selected ·
+  // about 0 B to read`, which is a claim about the pair rather than an admission of not knowing yet.
+  // The same four arguments the Summary passes, so the two share one cached answer and switching views
+  // costs no request.
+  $: if (view === 'data') void loadReport($comparison?.id ?? null, scope, swapped, full);
 
   $: busy = $diffStep !== null;
   /** What an address box accepts, and which host `:PATH` resolves to — named rather than left to be

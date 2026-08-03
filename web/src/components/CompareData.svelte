@@ -18,7 +18,7 @@
   import { humanCount, humanSize } from '../lib/format';
   import { cancelJob, clearJob, job, jobError, startJob, type JobKind } from '../stores/jobs';
   import { diffTree } from '../stores/compare';
-  import { diffReport } from '../stores/report';
+  import { diffReport, reportError } from '../stores/report';
   import { onMount } from 'svelte';
   import { api } from '../lib/api';
   import type { DiffScopeParams } from '../lib/diffscope';
@@ -55,6 +55,14 @@
   // from, so sizing the run must not depend on having fetched the 91 MB aligned tree first.
   /** Why the values cannot be compared, from the server — `''` when they can. */
   $: valuesNote = $diffReport?.values_note ?? '';
+  /**
+   * Is the size of the run actually known?
+   *
+   * Neither result loaded means nobody has counted yet — and `0 tensors selected · about 0 B to read`
+   * is not that sentence. `ComparePage` asks for the report when this view is showing, so the honest
+   * states are *counting*, *counted*, and *could not be read*.
+   */
+  $: sized = $diffTree !== null || $diffReport !== null;
   $: matched = $diffTree?.matched ?? $diffReport?.matched ?? null;
   $: selected = matched?.selected ?? $diffTree?.base.tensor_count ?? reportTensors($diffReport);
   $: bytes =
@@ -301,10 +309,17 @@
       </div>
     {/if}
 
-    <!-- What it will cost, before it is started. -->
+    <!-- What it will cost, before it is started — or that it is not known yet, which is a different
+         statement from "nothing". -->
     <p class="cost dim">
-      {humanCount(selected)} tensor{selected === 1 ? '' : 's'} selected · about {humanSize(bytes)} to
-      read across both sides{matched ? ` (of ${humanCount(matched.total)} in the checkpoints)` : ''}
+      {#if sized}
+        {humanCount(selected)} tensor{selected === 1 ? '' : 's'} selected · about {humanSize(bytes)} to
+        read across both sides{matched ? ` (of ${humanCount(matched.total)} in the checkpoints)` : ''}
+      {:else if $reportError}
+        The size of this run is not known — the comparison could not be read: {$reportError}
+      {:else}
+        sizing the run…
+      {/if}
     </p>
   {/if}
 
