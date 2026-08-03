@@ -682,13 +682,18 @@ fn stopping_a_comparison_stops_both_of_its_reads() {
     assert!(taker.join().expect("the taker thread finished"));
 }
 
-/// **A value comparison a remote pair cannot do is refused before it reads anything.**
+/// **A value comparison the server cannot do is refused before it reads anything.**
 ///
-/// The reported failure: the job accepted an `s3://` pair, read both checkpoints — minutes over an ssh
-/// proxy — and then said a remote source serves no tensor data. The addresses alone answer that, so the
-/// refusal belongs at the door.
+/// The reported failure: the job accepted a remote pair, read both checkpoints — minutes over an ssh
+/// proxy — and then said it had no tensor data to compare. The addresses answer that, so the refusal
+/// belongs at the door.
+///
+/// A *mixed* pair is the case that is refused wherever this runs: a remote safetensors directory has no
+/// reader on either side of the wire, whatever proxy is configured. The pair a proxy *can* compare (two
+/// `s3://` cstorch checkpoints) is covered where the rule lives — `compare::values_supported` takes the
+/// proxy as an argument, which is the only way to test both answers without one.
 #[test]
-fn a_remote_pair_is_refused_a_value_comparison_at_the_door() {
+fn a_pair_with_no_readable_data_is_refused_a_value_comparison_at_the_door() {
     let current = std::sync::Arc::new(serving("tiny.safetensors"));
     let ask = |left: &str, right: &str| -> (u16, String) {
         let q: crate::web::handlers::Query = [("left", left), ("right", right), ("values", "1")]
@@ -703,18 +708,15 @@ fn a_remote_pair_is_refused_a_value_comparison_at_the_door() {
         )
     };
 
-    let (status, msg) = ask("s3://bucket/old", "s3://bucket/new");
+    let (status, msg) = ask("lab@host:/opt/models/a", "/tmp/local");
     assert_eq!(status, 400, "refused, and immediately: {msg}");
     assert!(
-        msg.contains("which the terminal can compare on the proxy"),
-        "and pointed at what does work for this pair: {msg}"
-    );
-
-    let (status, msg) = ask("lab@host:/opt/models/a", "/tmp/local");
-    assert_eq!(status, 400);
-    assert!(
         msg.contains("lab@host:/opt/models/a") && !msg.contains("/tmp/local"),
-        "the refusal names the side without bytes, not the one with them: {msg}"
+        "the refusal names the side without readable data, not the one with it: {msg}"
+    );
+    assert!(
+        msg.contains("a remote safetensors directory cannot be yet"),
+        "and says which case is unsupported anywhere: {msg}"
     );
 
     // Two local paths are accepted here — they do not resolve, so the *job* fails, which is the

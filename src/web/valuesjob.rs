@@ -36,10 +36,31 @@ pub(crate) struct What {
     pub tensor: Option<String>,
 }
 
+/// Where the values are compared.
+///
+/// Decided from the two sides once they are read, and named rather than inferred at each use: the two
+/// arms read *different data in different places*, and the remote one never sees a tensor byte here.
+enum Mode {
+    /// Both sides local: read and compare in this process.
+    Local,
+    /// Two `s3://` cstorch checkpoints: compared by a script on the proxy, which has the credentials and
+    /// the data. Only counts and per-tensor results come back. The same call the `diff` subcommand makes
+    /// (`remote::RemoteRead::value_diff`), so a browser run and a terminal run answer alike.
+    Proxy {
+        proxy: crate::remote::RemoteRead,
+        old_uri: String,
+        new_uri: String,
+    },
+}
+
 /// One side, read far enough to compare values: tensors with byte access, plus packing schemas.
 struct Side {
     tensors: Vec<crate::tree::TensorInfo>,
     metadata: Vec<crate::tree::MetadataInfo>,
+    /// The `s3://` URI, when this side is one — the proxy's comparison addresses objects by URI.
+    s3_uri: Option<String>,
+    /// The proxy this side is read through, when it is remote.
+    remote: Option<crate::remote::RemoteRead>,
     schemas: HashMap<String, crate::sample::PackingSchema>,
     local: bool,
 }
@@ -47,9 +68,16 @@ struct Side {
 fn read_side(spec: &str, opts: &crate::opening::Options, job: &Job) -> Result<Side> {
     let target =
         crate::opening::resolve(spec, opts).with_context(|| format!("resolving {spec}"))?;
-    // Value comparison needs the *bytes*, which only a local source can give: a remote read carries
-    // structure alone. Reported here rather than as a failure per tensor.
+    // Where this side's *bytes* can be read: here, if it is local. A remote read carries structure
+    // alone — but an `s3://` cstorch checkpoint can be compared **on the proxy**, which is what
+    // `s3_uri` and `remote` are kept for.
     let local = target.remote.is_none();
+    let s3_uri = target
+        .requested
+        .first()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|s| s.starts_with("s3://"));
+    let remote = target.remote.clone();
     let opened = target
         .read(crate::opening::Want::Model, job.read_progress())
         .with_context(|| format!("reading {spec}"))?;
@@ -59,6 +87,8 @@ fn read_side(spec: &str, opts: &crate::opening::Options, job: &Job) -> Result<Si
     Ok(Side {
         tensors,
         metadata,
+        s3_uri,
+        remote,
         schemas,
         local,
     })
@@ -77,7 +107,7 @@ pub(crate) fn run(
     // Before either read: a remote side serves no tensor data, and finding that out after two
     // multi-minute reads is the failure this check exists to prevent. The start handler asks the same
     // question, so this is the second line of defence rather than the only one.
-    crate::compare::values_supported(left, right)?;
+    crate::compare::values_supported(left, right, current.is_proxied())?;
     job.progress_to(0, left);
     let old = read_side(left, opts, job)?;
     if job.cancelled() {
@@ -88,18 +118,34 @@ pub(crate) fn run(
     if job.cancelled() {
         return Ok(());
     }
-    // The specs said both sides are local (`values_supported`, above); this catches a resolution that
-    // disagreed — a glob that reached a remote path, say — before the comparison reads a byte.
-    if !old.local || !new.local {
-        anyhow::bail!(
-            crate::compare::values_supported(left, right)
-                .err()
-                .map_or_else(
-                    || "one side turned out not to be local".to_string(),
-                    |e| format!("{e:#}")
-                )
-        );
-    }
+    // **Where the comparison happens**, decided from what the two sides turned out to be.
+    //
+    // Two local checkpoints are read here. Two `s3://` cstorch checkpoints are compared **on the ssh
+    // proxy**, which holds the credentials and the data: only the per-tensor results cross the wire.
+    // Anything else has no path to the bytes, and `values_supported` says so in the words both surfaces
+    // use — checked at the door as well (the route refuses before this job starts), so reaching it here
+    // means a spec resolved to something its address did not promise.
+    let mode = match (
+        old.local && new.local,
+        old.s3_uri.as_deref().zip(new.s3_uri.as_deref()),
+        old.remote.as_ref().or(new.remote.as_ref()),
+    ) {
+        (true, _, _) => Mode::Local,
+        (false, Some((old_uri, new_uri)), Some(proxy)) => Mode::Proxy {
+            proxy: proxy.clone(),
+            old_uri: old_uri.to_string(),
+            new_uri: new_uri.to_string(),
+        },
+        _ => {
+            return Err(
+                crate::compare::values_supported(left, right, current.is_proxied())
+                    .err()
+                    .unwrap_or_else(|| {
+                        anyhow::anyhow!("one side turned out to have no readable tensor data")
+                    }),
+            );
+        }
+    };
 
     // Rename rules first, as the CLI does — otherwise two lined-up schemes read as every tensor added
     // and removed, and nothing gets its values compared at all.
@@ -172,6 +218,18 @@ pub(crate) fn run(
         new_schemas: &new.schemas,
     };
 
+    // The remote arm compares the whole selection in one call — the proxy loads both checkpoints once and
+    // walks the pairs itself, so asking per tensor would pay for that load per tensor.
+    if let Mode::Proxy {
+        proxy,
+        old_uri,
+        new_uri,
+    } = &mode
+    {
+        let extras = compare_on_proxy(job, proxy, old_uri, new_uri, &common, what)?;
+        return finish(job, old_sum, new_sum, extras);
+    }
+
     let done = std::sync::atomic::AtomicUsize::new(0);
     let compute = |name: &String| -> (String, crate::diff::TensorExtras) {
         if job.cancelled() {
@@ -216,18 +274,28 @@ pub(crate) fn run(
             )
     };
     job.progress_to(common.len(), "");
+    finish(job, old_sum, new_sum, computed.into_iter().collect())
+}
 
+/// The run's verdict and report, from whatever the comparison produced — the same tail for both modes,
+/// so a remote run and a local one are reported in the same shape.
+fn finish(
+    job: &Job,
+    old_sum: crate::diff::CheckpointSummary,
+    new_sum: crate::diff::CheckpointSummary,
+    computed: HashMap<String, crate::diff::TensorExtras>,
+) -> Result<()> {
     let compared = computed.len();
     let differ = computed
-        .iter()
-        .filter(|(_, e)| {
+        .values()
+        .filter(|e| {
             e.values.is_some_and(|v| v.differing > 0) || e.histogram.is_some_and(|h| h.tvd > 0.0)
         })
         .count();
     // `RefCell` because `compare_with` takes an `Fn`: each name is asked for exactly once, so the entry
     // is *moved* out rather than cloned — the same trick the CLI uses for the same reason.
     let extras: std::cell::RefCell<HashMap<String, crate::diff::TensorExtras>> =
-        std::cell::RefCell::new(computed.into_iter().collect());
+        std::cell::RefCell::new(computed);
     // The report, with the value findings folded in — so a tensor whose dtype and shape match but whose
     // numbers differ reads as *changed* rather than unchanged, which is the whole point of `--values`.
     let report = crate::diff::compare_with(&old_sum, &new_sum, |name| {
@@ -241,4 +309,112 @@ pub(crate) fn run(
         "report": report,
     }));
     Ok(())
+}
+
+/// Compare the selection **on the ssh proxy**, streaming its progress into the job.
+///
+/// The same call the `diff` subcommand makes for an s3-vs-s3 pair: a script on the proxy loads both
+/// checkpoints, realises each pair of tensors and streams row-blocks through the comparison there. No
+/// tensor data crosses the wire — only the byte counts the bars are drawn from and the small per-tensor
+/// result. The browser had no path to this at all and refused the pair outright, while a terminal on the
+/// same machine could do it.
+fn compare_on_proxy(
+    job: &Job,
+    proxy: &crate::remote::RemoteRead,
+    old_uri: &str,
+    new_uri: &str,
+    names: &[String],
+    what: &What,
+) -> Result<HashMap<String, crate::diff::TensorExtras>> {
+    // The proxy pairs by name: the selection is already keyed by the *renamed* old name, which is the
+    // new side's name — the same key the report is built from.
+    let pairs: Vec<(String, String)> = names.iter().map(|n| (n.clone(), n.clone())).collect();
+    let vopts = crate::remote::RemoteValueOpts {
+        values: what.values,
+        histogram: what.histogram,
+        bins: what.bins,
+        // The per-bin table is for a single tensor's detail view; a run over many wants the summary.
+        full_hist: what.tensor.is_some(),
+        jobs: what.jobs.clamp(1, 32),
+    };
+    let mut password = None;
+    let session = proxy
+        .open_with(&mut password)
+        .with_context(|| format!("opening an ssh session to {}", proxy.host))?;
+    let mut counted = ProxyBytes::default();
+    let (map, _stats) = proxy.value_diff(&session, old_uri, new_uri, &pairs, &vopts, |ev| {
+        proxy_event(job, &ev, &mut counted);
+    })?;
+    let mut out: HashMap<String, crate::diff::TensorExtras> = HashMap::new();
+    for (name, diff) in map {
+        if let Some(e) = &diff.error {
+            job.add_finding(json!({ "kind": "tensor", "name": name, "error": e }));
+            continue;
+        }
+        let extras = crate::diff::TensorExtras {
+            values: diff.values,
+            histogram: diff
+                .hist_shift
+                .map(|(tvd, bins)| crate::diff::HistShift { tvd, bins }),
+        };
+        if extras.values.is_some() || extras.histogram.is_some() {
+            job.add_finding(json!({
+                "kind": "tensor",
+                "name": name,
+                "values": extras.values.map(|v| json!({
+                    "differing": v.differing,
+                    "elements": v.elements,
+                    "nonfinite_mismatch": v.nonfinite_mismatch,
+                    "max_abs": v.max_abs,
+                    "mean_abs": v.mean_abs,
+                })),
+                "histogram": extras.histogram.map(|h| json!({ "tvd": h.tvd, "bins": h.bins })),
+            }));
+        }
+        out.insert(name, extras);
+    }
+    Ok(out)
+}
+
+/// Bytes read across a whole remote run, from per-tensor counters that restart at zero.
+///
+/// Without the running total the counter jumps backwards mid-run — `27.14 GB`, then `0.01 GB` — which
+/// reads as a bug in the tool rather than as the next tensor starting. (The repack job keeps its own for
+/// the same reason; the two events are different types.)
+#[derive(Default)]
+struct ProxyBytes {
+    base: u64,
+    current: (String, u64),
+}
+
+impl ProxyBytes {
+    fn observe(&mut self, name: &str, bytes: u64) -> u64 {
+        if self.current.0 != name {
+            self.base += self.current.1;
+            self.current = (name.to_string(), 0);
+        }
+        // `max`, not assignment: the two sides report independently and can arrive out of order.
+        self.current.1 = self.current.1.max(bytes);
+        self.base + self.current.1
+    }
+}
+
+/// One remote progress event, as job progress. Bytes matter: a single expert weight can be gigabytes, so
+/// "tensor 3 of 19" alone would sit still for minutes.
+fn proxy_event(job: &Job, ev: &crate::remote::RepackEvent<'_>, counted: &mut ProxyBytes) {
+    match *ev {
+        crate::remote::RepackEvent::Loading(which) => job.progress_to(0, which),
+        crate::remote::RepackEvent::Start { done, total, name } => {
+            job.set_total(total);
+            job.progress_to(done, name);
+        }
+        crate::remote::RepackEvent::Bytes {
+            name,
+            old_done,
+            new_done,
+        } => job.set_bytes(counted.observe(name, old_done + new_done)),
+        crate::remote::RepackEvent::Size { .. }
+        | crate::remote::RepackEvent::Comparing(_)
+        | crate::remote::RepackEvent::Done { .. } => {}
+    }
 }
