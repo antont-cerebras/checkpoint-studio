@@ -72,6 +72,9 @@ pub(crate) fn run(
     right: &str,
     scope: &DiffScope,
     bits: Option<usize>,
+    // How each side packs its indices, as written — see `compare::RepackSchemas`. These checkpoints
+    // declare their packing nowhere, so for a sparse-vs-merged pair it has to be said.
+    schemas: crate::compare::RepackSchemas<'_>,
 ) -> Result<()> {
     let opts = current.read_options();
     job.progress_to(0, left);
@@ -119,7 +122,7 @@ pub(crate) fn run(
         Mode::Local
     };
 
-    let plan = crate::compare::plan_repack(&old_sum, &new_sum, bits)?;
+    let plan = crate::compare::plan_repack(&old_sum, &new_sum, bits, schemas)?;
     job.set_total(plan.pairs.len());
 
     let results = match mode {
@@ -147,6 +150,10 @@ pub(crate) fn run(
     job.add_finding(json!({
         "kind": "verdict",
         "bits": plan.bits,
+        // How each side was decoded, in the CLI's words (`compare::RepackPlan::packing_note`). A
+        // verdict is only as good as this assumption, and `at 4-bit` is false of a `[3,4,4,4]`
+        // candidate — the same wording the terminal's own header carries.
+        "packing": plan.packing_note(),
         "pairs": plan.pairs.len(),
         "equivalent": equivalent,
         // Whether anything *outside* the verified pairs differs. The pairs always read as "changed"
@@ -179,6 +186,7 @@ fn verify_on_proxy(
         new_uri,
         &plan.pairs,
         plan.bits,
+        plan.widths(),
         false,
         // The job's own flag, so *Stop* tears the channel down and the remote verification ends with
         // it — rather than stopping the waiting while the proxy carries on alone.
@@ -253,7 +261,7 @@ fn verify_locally(
     plan: &crate::compare::RepackPlan,
 ) -> std::collections::HashMap<String, crate::remote::RepackResult> {
     job.progress_to(0, "decoding both packings");
-    let out = crate::local_repack(old_t, new_t, &plan.pairs, plan.bits, None);
+    let out = crate::local_repack(old_t, new_t, &plan.pairs, plan.bits, plan.schemas(), None);
     job.progress_to(plan.pairs.len(), "");
     record(job, plan, &out);
     out

@@ -619,7 +619,17 @@ fn accepted_params(path: &str) -> Option<(&'static [&'static str], Scoped)> {
         "subtrees" => (&["id", "side", "q", "limit"], Scoped::No),
         // The two operands; the checks come from the table this route renders from.
         "command" => (&["left", "right"], Scoped::AndCheck),
-        "jobs/verify-repack" => (&["left", "right", "repack_bits"], Scoped::Yes),
+        // The packings too: the one input the decode cannot infer, per side.
+        "jobs/verify-repack" => (
+            &[
+                "left",
+                "right",
+                "repack_bits",
+                "repack_schema",
+                "repack_schema_new",
+            ],
+            Scoped::Yes,
+        ),
         "jobs/values" => (
             &[
                 "left",

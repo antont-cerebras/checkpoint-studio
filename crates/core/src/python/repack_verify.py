@@ -25,6 +25,13 @@ OLD = PARAMS["old"]
 NEW = PARAMS["new"]
 PAIRS = PARAMS["pairs"]
 BITS = PARAMS["bits"]
+# How each side packs its expert indices into a 16-bit word, as a list of bit widths — the schema.
+# `[4]` is the sparse encoding: no merging, one index per word, only the four low bits used. `[3,3,3,3,3]`
+# is five consecutive experts in one word, each shifted three bits past the last. Absent (`None`) means
+# "infer as before": the sparse side is one `BITS`-wide index per word and the merged side is `fold` of
+# them, which is the uniform case of exactly this.
+OLD_WIDTHS = PARAMS.get("old_widths")
+NEW_WIDTHS = PARAMS.get("new_widths")
 JOBS = PARAMS["jobs"]
 AUTO = PARAMS["auto"]      # sparse<->sparse auto (--values): same shape both sides, fold 1
 DL = 16 << 20        # S3 download chunk
@@ -207,8 +214,15 @@ def work(idx: int) -> None:
             fold = (E + W - 1) // W
             if (E + fold - 1) // fold != W:
                 res["error"] = "fold mismatch (E=%d W=%d -> fold=%d)" % (E, W, fold); emit(res); return
-        if fold * BITS > 16:
-            res["error"] = "fold*bits=%d exceeds the 16-bit word" % (fold * BITS); emit(res); return
+        # The two schemas, either as given or as the fold implies. Everything below reads them rather
+        # than a single width, so a sparse side and a merged side are described separately — which is
+        # what they are.
+        ow = list(OLD_WIDTHS) if OLD_WIDTHS else [BITS]
+        nw = list(NEW_WIDTHS) if NEW_WIDTHS else [BITS] * fold
+        if sum(ow) > 16 or sum(nw) > 16:
+            res["error"] = "a schema exceeds the 16-bit word (old %r sums to %d, new %r to %d)" % (
+                ow, sum(ow), nw, sum(nw))
+            emit(res); return
         lo = resolve(da); ln = resolve(db)
         odone = [0]; ndone = [0]; last = [0]
         def bump() -> None:
@@ -242,24 +256,46 @@ def work(idx: int) -> None:
             tb = int(ao.nbytes) + int(bo.nbytes)
             stat("size\t%s\t%d\t%d" % (nname, int(ao.nbytes), int(bo.nbytes)))
             comparing()
-        ao = ao.reshape(E, -1); bo = bo.reshape(W, -1)
+        # Words per side, from each schema: `len(ow)` experts share one old word, `len(nw)` one new word.
+        # `E` is the expert count, which is the old side's rows × its own packing.
+        lpo = len(ow); lpn = len(nw)
+        experts = ashape[0] * lpo
+        if bshape[0] * lpn < experts:
+            res["error"] = "the schemas do not span the pair: old %r over %d rows is %d experts, new %r over %d rows is %d" % (
+                ow, ashape[0], experts, nw, bshape[0], bshape[0] * lpn)
+            emit(res); return
+        ao = ao.reshape(ashape[0], -1); bo = bo.reshape(bshape[0], -1)
         N = ao.shape[1]
-        we = (np.arange(E) // fold)
-        se = ((np.arange(E) % fold) * BITS).astype(np.uint16)
-        # Format checks: old words' bits above BITS, new words' bits above fold*BITS,
-        # must all be zero (else the packing assumption is wrong). When fold*BITS==16
-        # (e.g. 4-bit ×4) there are no unused high bits — and shifting a uint16 by 16
-        # is undefined — so skip the dense check.
-        sparse_bad = int(np.count_nonzero(ao >> np.uint16(BITS)))
-        dshift = fold * BITS
-        dense_bad = 0 if dshift >= 16 else int(np.count_nonzero(bo >> np.uint16(dshift)))
+        E = experts
+        # Per expert: which word holds it, how far it is shifted, and how wide it is — on each side.
+        # This is the same arithmetic the uniform case did (`e // fold`, `(e % fold) * BITS`), written
+        # from the schema so a non-uniform list works too.
+        def offsets(widths: list[int]) -> list[int]:
+            out = []
+            at = 0
+            for w in widths:
+                out.append(at); at += w
+            return out
+        oo = offsets(ow); no = offsets(nw)
+        idx = np.arange(E)
+        wo_i = idx // lpo
+        so_i = np.array([oo[k] for k in (idx % lpo)], dtype=np.uint16)
+        mo_i = np.array([(1 << ow[k]) - 1 for k in (idx % lpo)], dtype=np.uint16)
+        wn_i = idx // lpn
+        sn_i = np.array([no[k] for k in (idx % lpn)], dtype=np.uint16)
+        mn_i = np.array([(1 << nw[k]) - 1 for k in (idx % lpn)], dtype=np.uint16)
+        # Format checks: bits above each schema's total must be zero, or the schema is wrong for this
+        # checkpoint. Shifting a uint16 by 16 is undefined, so a schema that fills the word has no
+        # unused bits to check.
+        sparse_bad = 0 if sum(ow) >= 16 else int(np.count_nonzero(ao >> np.uint16(sum(ow))))
+        dense_bad = 0 if sum(nw) >= 16 else int(np.count_nonzero(bo >> np.uint16(sum(nw))))
         differing = 0; first = None; maxdelta = 0; big = 0
         sum_abs = 0; sum_old = 0; sum_new = 0; zeros = 0
         blk = max(1, CMP // max(1, E))
         for n0 in range(0, N, blk):
             n1 = min(n0 + blk, N)
-            o = ao[:, n0:n1] & mask
-            nd = (bo[we, n0:n1] >> se[:, None]) & mask
+            o = (ao[wo_i, n0:n1] >> so_i[:, None]) & mo_i[:, None]
+            nd = (bo[wn_i, n0:n1] >> sn_i[:, None]) & mn_i[:, None]
             # Aggregate |Δ| and per-side sums (for mean |Δ|/parameter + mean index).
             dd = o.astype(np.int64) - nd.astype(np.int64)
             ad = np.abs(dd)
@@ -278,7 +314,7 @@ def work(idx: int) -> None:
                 p = np.argwhere(ne)[0]; e = int(p[0]); col = n0 + int(p[1])
                 first = [e, col, int(o[p[0], p[1]]), int(nd[p[0], p[1]])]
         elems = E * N
-        res.update({"elements": elems, "differing": differing, "sparse_bad": sparse_bad, "dense_bad": dense_bad, "fold": fold, "bits": BITS, "bytes": tb, "maxdelta": maxdelta, "big": big,
+        res.update({"elements": elems, "differing": differing, "sparse_bad": sparse_bad, "dense_bad": dense_bad, "fold": fold, "bits": BITS, "old_schema": ow, "new_schema": nw, "bytes": tb, "maxdelta": maxdelta, "big": big,
                     "sum_abs": int(sum_abs),
                     "mean_abs": (sum_abs / elems) if elems else 0.0,
                     "mean_old": (sum_old / elems) if elems else 0.0,
@@ -335,7 +371,7 @@ def work(idx: int) -> None:
         se1 = min(E, se0 + 16); so1 = min(N, so0 + 48)
         ew = np.arange(se0, se1)
         sold = (ao[se0:se1, so0:so1] & mask).astype(np.uint16).tolist()
-        snew = ((bo[ew // fold][:, so0:so1] >> ((ew % fold) * BITS).astype(np.uint16)[:, None]) & mask).astype(np.uint16).tolist()
+        snew = ((bo[ew // lpn][:, so0:so1] >> np.array([no[k] for k in (ew % lpn)], dtype=np.uint16)[:, None]) & np.array([(1 << nw[k]) - 1 for k in (ew % lpn)], dtype=np.uint16)[:, None]).astype(np.uint16).tolist()
         res["sample"] = {"e0": int(se0), "off0": int(so0), "cols": int(so1 - so0), "old": sold, "new": snew}
         # Also diff the sibling codebook + scale tensors (float centroids/scales),
         # since these have the same shape/dtype on both sides and so don't show up in

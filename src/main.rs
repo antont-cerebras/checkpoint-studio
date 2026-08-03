@@ -727,6 +727,22 @@ enum Command {
         /// override for a non-max-density packing.
         #[arg(long = "repack-bits", value_name = "N")]
         repack_bits: Option<usize>,
+        /// How the BASELINE packs its expert indices, when the checkpoint does not say.
+        ///
+        /// A list of bit widths, one per expert merged into a 16-bit word: `[4]` is the
+        /// sparse encoding — no merging, one index per word, only the four low bits used
+        /// — and `[3,3,3,3,3]` is five consecutive experts in one word, each shifted
+        /// three bits past the last. Accepts `4`, `3,3,3,3,3` and the printed `u3x5`.
+        ///
+        /// Omit when the packing can be inferred from the fold (`--repack-bits` is the
+        /// single-width form of the same thing). These checkpoints declare their packing
+        /// nowhere, so for a sparse-vs-merged pair it has to be said.
+        #[arg(long = "repack-schema", value_name = "WIDTHS")]
+        repack_schema: Option<String>,
+        /// The same for the CANDIDATE. The two sides are what differ in a repack, so each
+        /// is said separately; omit either to infer it.
+        #[arg(long = "repack-schema-new", value_name = "WIDTHS")]
+        repack_schema_new: Option<String>,
         /// Line an UNFUSED checkpoint up with its FUSED counterpart before comparing.
         ///
         /// Two layouts of one model share no tensor name, so a plain diff reports every
@@ -907,6 +923,8 @@ fn main() -> Result<()> {
             map_from,
             verify_repack,
             repack_bits,
+            repack_schema,
+            repack_schema_new,
             align_fused,
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
@@ -1005,6 +1023,10 @@ fn main() -> Result<()> {
                 remote.as_ref(),
                 verify_repack,
                 repack_bits,
+                compare::RepackSchemas {
+                    old: repack_schema.as_deref(),
+                    new: repack_schema_new.as_deref(),
+                },
                 old_root.as_deref(),
                 new_root.as_deref(),
                 align.as_ref(),
@@ -1767,6 +1789,7 @@ fn run_diff(
     remote: Option<&remote::RemoteRead>,
     verify_repack: bool,
     repack_bits: Option<usize>,
+    repack_schemas: compare::RepackSchemas<'_>,
     old_root: Option<&str>,
     new_root: Option<&str>,
     // `--align-fused`: the canonical unfused→fused rules, applied to **both** sides with folding.
@@ -2463,6 +2486,7 @@ fn run_diff(
             &old_sum,
             &new_sum,
             repack_bits,
+            repack_schemas,
         );
     }
     // Auto-detected sparse-packed expert weights (`--values`): their index / value
@@ -2497,21 +2521,34 @@ fn run_repack_verify(
     old_sum: &diff::CheckpointSummary,
     new_sum: &diff::CheckpointSummary,
     repack_bits: Option<usize>,
+    schemas: compare::RepackSchemas<'_>,
 ) -> i32 {
     // Candidate pairs, bit width and "does anything else differ" — shared with the web's job, so the
     // browser verifies exactly the pairs a terminal would (`compare::plan_repack`).
-    let plan = match compare::plan_repack(old_sum, new_sum, repack_bits) {
+    let plan = match compare::plan_repack(old_sum, new_sum, repack_bits, schemas) {
         Ok(plan) => plan,
         Err(e) => {
             eprintln!("checkpoint-studio diff: --verify-repack: {e:#}");
             return 2;
         }
     };
-    let (pairs, bits, other_differs) = (plan.pairs, plan.bits, plan.other_differs);
-
+    // Which packing each side is read with — stated once, by the remote note below and by the verdict's
+    // own header (`compare::RepackPlan::packing_note`).
+    let packing = plan.packing_note();
     let results = if let Some(r) = remote {
-        let labels = repack_bar_labels(&pairs, old_t, new_t);
-        match fetch_remote_repack(r, password, old_uri, new_uri, &pairs, &labels, bits, false) {
+        let labels = repack_bar_labels(&plan.pairs, old_t, new_t);
+        match fetch_remote_repack(
+            r,
+            password,
+            old_uri,
+            new_uri,
+            &plan.pairs,
+            &labels,
+            plan.bits,
+            &packing,
+            plan.widths(),
+            false,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("checkpoint-studio diff: {e:#}");
@@ -2519,9 +2556,10 @@ fn run_repack_verify(
             }
         }
     } else {
-        local_repack(old_t, new_t, &pairs, bits, None)
+        local_repack(old_t, new_t, &plan.pairs, plan.bits, plan.schemas(), None)
     };
-    render_repack_verdict(&pairs, &results, bits, other_differs)
+    let (pairs, other_differs) = (plan.pairs, plan.other_differs);
+    render_repack_verdict(&pairs, &results, &packing, other_differs)
 }
 
 /// Verify the fold-pairs locally (reading the checkpoint files here): decode both
@@ -2532,6 +2570,13 @@ fn local_repack(
     new_t: &[TensorInfo],
     pairs: &[(String, String)],
     bits: usize,
+    // Each side's packing when it was said — see `compare::RepackPlan`. The local decode reads these
+    // exactly as the proxy's does, so a schema means the same thing whichever side of the ssh hop the
+    // bytes are on.
+    schemas: (
+        Option<&sample::PackingSchema>,
+        Option<&sample::PackingSchema>,
+    ),
     fold_override: Option<usize>,
 ) -> HashMap<String, remote::RepackResult> {
     let find = |ts: &[TensorInfo], n: &str| ts.iter().find(|t| t.name == n).cloned();
@@ -2558,6 +2603,7 @@ fn local_repack(
             &nw,
             fold,
             bits,
+            schemas,
             (
                 &ocb,
                 &ncb,
@@ -2664,6 +2710,10 @@ fn fetch_remote_repack(
     pairs: &[(String, String)],
     bar_labels: &[String],
     bits: usize,
+    // How each side is decoded, for the note (`compare::RepackPlan::packing_note`).
+    packing: &str,
+    // Each side's packing as bit widths, when it was said (`compare::RepackPlan::widths`).
+    schemas: (Option<&[u32]>, Option<&[u32]>),
     auto_sparse: bool,
 ) -> Result<HashMap<String, remote::RepackResult>> {
     let session = r.open_with(password)?;
@@ -2681,8 +2731,8 @@ fn fetch_remote_repack(
         utils::eprint_note(
             "checkpoint-studio diff: ",
             &format!(
-                "verifying repack of {} tensor(s) on {}, decoding {bits}-bit indices on the \
-                 remote (reads the full tensors, {} at a time):",
+                "verifying repack of {} tensor(s) on {}, decoding {packing} on the remote \
+                 (reads the full tensors, {} at a time):",
                 pairs.len(),
                 r.host,
                 pairs.len().clamp(1, 4),
@@ -2708,6 +2758,7 @@ fn fetch_remote_repack(
         new_uri,
         pairs,
         bits,
+        schemas,
         auto_sparse,
         None,
         |ev| bar.borrow_mut().on(ev),
@@ -2742,7 +2793,9 @@ fn fetch_remote_repack(
 fn render_repack_verdict(
     pairs: &[(String, String)],
     results: &HashMap<String, remote::RepackResult>,
-    bits: usize,
+    // How the sides were decoded — a `[3,4,4,4]` candidate is not "4-bit expert indices", which is what
+    // this header used to claim whatever the run actually did.
+    packing: &str,
     other_differs: bool,
 ) -> i32 {
     use std::io::IsTerminal;
@@ -2752,7 +2805,7 @@ fn render_repack_verdict(
     } else {
         ("", "", "", "", "")
     };
-    println!("\nrepack verification ({bits}-bit expert indices, folded along dim 0):");
+    println!("\nrepack verification, folded along dim 0: {packing}");
     let mut all_ok = true;
     // Few lines (gated by --name), so list them plainly, sorted.
     let mut names: Vec<&String> = pairs.iter().map(|(_, n)| n).collect();
@@ -2872,10 +2925,25 @@ fn run_auto_sparse(
         );
         HashMap::new()
     } else {
-        local_repack(old_t, new_t, pairs, bits, Some(1))
+        // The auto sparse↔sparse path: both sides are stored the same way, so there is no packing
+        // difference to describe — the schemas belong to `--verify-repack`, which is where they are said.
+        local_repack(old_t, new_t, pairs, bits, (None, None), Some(1))
     }, |r| {
         let labels = repack_bar_labels(pairs, old_t, new_t);
-        match fetch_remote_repack(r, password, old_uri, new_uri, pairs, &labels, bits, true) {
+        match fetch_remote_repack(
+            r,
+            password,
+            old_uri,
+            new_uri,
+            pairs,
+            &labels,
+            bits,
+            // Sparse↔sparse: both sides are stored the same way, so there is no packing difference to
+            // describe — the schemas belong to `--verify-repack`.
+            &format!("u{bits}×1 on both sides"),
+            (None, None),
+            true,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("checkpoint-studio diff: sparse index compare: {e:#}");

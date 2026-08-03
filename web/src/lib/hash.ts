@@ -13,6 +13,7 @@ import {
   scopeToQuery,
   type DiffScopeParams,
 } from './diffscope';
+import { packingFromQuery, packingToQuery, type Packing } from './packing';
 
 /**
  * The parsed scope, but only when the URL actually carries one.
@@ -24,6 +25,12 @@ import {
 function scopeIfAny(q: URLSearchParams): { scope?: DiffScopeParams } {
   const scope = scopeFromQuery(q);
   return isScopeActive(scope) ? { scope } : {};
+}
+
+/** The packing, but only when the URL says one — absent *is* "infer it", as it has always been. */
+function packingIfAny(q: URLSearchParams): { packing?: Packing } {
+  const packing = packingFromQuery(q);
+  return packing ? { packing } : {};
 }
 
 /**
@@ -98,6 +105,10 @@ export type Screen =
       /** Summary sections the reader has folded away, by key. In the URL so a reload — or a link —
        * lands on the report as it was being read, which is the point of folding away 31,247 rows. */
       closed?: string[] | undefined;
+      /** How each side packs its expert indices, for a repack verification (`lib/packing`). In the URL
+       * because it changes what the verification *decodes* — a link to a verified pair that dropped it
+       * would answer the same question differently. */
+      packing?: Packing | undefined;
     }
   | { kind: 'preview'; path: string; name: string }
   // The open prompt carries no state of its own: what it does is change the *server*, and a
@@ -180,7 +191,10 @@ export function screenToHash(s: Screen): string {
       const swap = s.swapped ? '&swap=1' : '';
       const full = s.full ? '&full=1' : '';
       const closed = s.closed?.length ? `&closed=${s.closed.map(enc).join(',')}` : '';
-      return `compare?lhs=${enc(s.lhs)}${rhs}${view}${swap}${full}${closed}${scopeQuery(s.scope)}`;
+      const pack = packingToQuery(s.packing)
+        .map(([k, v]) => `&${k}=${enc(v)}`)
+        .join('');
+      return `compare?lhs=${enc(s.lhs)}${rhs}${view}${swap}${full}${closed}${pack}${scopeQuery(s.scope)}`;
     }
     case 'preview':
       return `preview?path=${enc(s.path)}&name=${enc(s.name)}`;
@@ -232,6 +246,7 @@ export function parseScreen(hash: string): Screen {
         ...(q.get('closed')
           ? { closed: (q.get('closed') ?? '').split(',').filter((k) => k !== '') }
           : {}),
+        ...packingIfAny(q),
         ...scopeIfAny(q),
       };
     }

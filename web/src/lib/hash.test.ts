@@ -440,6 +440,30 @@ describe("the comparison screen", () => {
   });
 });
 
+describe("the packing schemas in a URL", () => {
+  // A verification's answer depends on how each side was decoded, so a link to one has to carry it —
+  // otherwise the same URL shows a different verdict to the same question.
+  it("carries each side, and nothing when neither is said", () => {
+    expect(screenToHash({ kind: "compare", lhs: "/a", rhs: "" })).toBe("compare?lhs=%2Fa");
+    expect(
+      screenToHash({
+        kind: "compare",
+        lhs: "/a",
+        rhs: "",
+        packing: { baseline: "[4]", candidate: "[3,3,3,3,3]" },
+      }),
+    ).toBe("compare?lhs=%2Fa&repack_schema=%5B4%5D&repack_schema_new=%5B3%2C3%2C3%2C3%2C3%5D");
+    expect(
+      parseScreen("#compare?lhs=%2Fa&repack_schema=%5B4%5D&repack_schema_new=3%2C3%2C3%2C3%2C3"),
+    ).toEqual({
+      kind: "compare",
+      lhs: "/a",
+      rhs: "",
+      packing: { baseline: "[4]", candidate: "3,3,3,3,3" },
+    });
+  });
+});
+
 describe("the side-by-side comparison in a URL", () => {
   it("carries the family fold state, and only when it is off", () => {
     expect(screenToHash({ kind: "compare", lhs: "/a", rhs: "" })).toBe(

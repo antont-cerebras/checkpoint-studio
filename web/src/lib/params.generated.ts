@@ -20,6 +20,8 @@ export const CHECK_PARAMS = [
   { field: 'bins', key: 'bins', kind: 'text' },
   { field: 'verifyRepack', key: 'verify_repack', kind: 'switch' },
   { field: 'repackBits', key: 'repack_bits', kind: 'text' },
+  { field: 'repackSchema', key: 'repack_schema', kind: 'text' },
+  { field: 'repackSchemaNew', key: 'repack_schema_new', kind: 'text' },
   { field: 'tensor', key: 'tensor', kind: 'text' },
   { field: 'jobs', key: 'jobs', kind: 'text' },
   { field: 'full', key: 'full', kind: 'switch' },

@@ -50,6 +50,53 @@ impl PackingSchema {
         })
     }
 
+    /// A schema from a written spec — what a `--repack-schema` flag or a UI field carries.
+    ///
+    /// The forms are the ones a person writes and the ones this type *prints* (see [`Self::label`]), so
+    /// what the tool shows can be typed back: `[3,3,3,3,3]`, `3,3,3,3,3`, `u3x5`, `3×5`, `[4]`, `4`.
+    ///
+    /// **Why this is an input at all.** These checkpoints do not declare their packing anywhere: the
+    /// sparse encoding (`[4]` — one index per word, only the low four bits used) and the merged one
+    /// (`[3,3,3,3,3]` — five consecutive experts in one word, each shifted three bits) are conventions
+    /// between the tools that wrote them. Inferring a single width from the fold ratio happens to be
+    /// right for a uniform merge and says nothing about a sparse side, so the schema has to be sayable.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let text = spec
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim();
+        if text.is_empty() {
+            return Err("no bit widths given".to_string());
+        }
+        // `3x5` / `u3×5`: the printed form — one width repeated.
+        let repeated = text.trim_start_matches('u').split_once(['x', 'X', '×']);
+        if let Some((w, n)) = repeated {
+            let width: u32 = w
+                .trim()
+                .parse()
+                .map_err(|_| format!("{w:?} is not a bit width"))?;
+            let count: usize = n
+                .trim()
+                .parse()
+                .map_err(|_| format!("{n:?} is not a field count"))?;
+            if count == 0 {
+                return Err("a schema needs at least one field".to_string());
+            }
+            return Self::new(vec![width; count], None);
+        }
+        let widths = text
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                p.parse::<u32>()
+                    .map_err(|_| format!("{p:?} is not a bit width"))
+            })
+            .collect::<Result<Vec<u32>, String>>()?;
+        Self::new(widths, None)
+    }
+
     /// Experts packed per stored word (`lenP`).
     #[must_use]
     pub fn len_p(&self) -> usize {
@@ -479,6 +526,34 @@ fn parse_schema_json(v: &serde_json::Value) -> Option<PackingSchema> {
     PackingSchema::new(bit_widths, quant_mode).ok()
 }
 
+/// The sibling tensors a packed weight is decoded **with** — the float centroids and the per-group
+/// scales. Never packed indices, whatever their dtype.
+const DECODE_SIBLINGS: [&str; 2] = ["codebook", "qscale"];
+
+/// Could this tensor hold packed expert indices?
+///
+/// A packed-index tensor is a tensor of **16-bit words**, and the writers do not agree on what to call
+/// them: current checkpoints say `U16`, older ones say `F16` (the words were never floats — the dtype
+/// was whatever the framework had to hand). Gating on `U16` alone silently skipped every older
+/// checkpoint's schema, which then looked like a checkpoint with no packing at all.
+///
+/// The siblings are then named out, because widening the dtype rule alone made *them* candidates: a
+/// `codebook` is `F16` because it really is floats, and a top-level schema keyed by projection matched
+/// every 16-bit tensor under that projection — so the tree started reporting `F16 as u3×5, (4, 4, 2) as
+/// (20, 4, 2)` for a codebook, unpacking a float into five three-bit fields.
+fn packs_indices(t: &TensorInfo) -> bool {
+    if !matches!(t.dtype.as_str(), "U16" | "F16" | "I16") {
+        return false;
+    }
+    // `__` is the other separator these names use (`experts__down_proj__weight`), so normalise before
+    // taking the last segment.
+    !t.name
+        .replace("__", ".")
+        .rsplit('.')
+        .next()
+        .is_some_and(|last| DECODE_SIBLINGS.contains(&last))
+}
+
 /// Match tensors to their fused-codebook [`PackingSchema`] from checkpoint
 /// metadata. Two storage shapes are supported, per-tensor preferred:
 /// 1. per-tensor `<tensor>.__metadata__` (or `.quantization_schema[.__metadata__]`)
@@ -493,9 +568,9 @@ pub fn parse_packing_schemas(
     metadata: &[MetadataInfo],
 ) -> HashMap<String, PackingSchema> {
     let mut out: HashMap<String, PackingSchema> = HashMap::new();
-    let is_u16: HashSet<&str> = tensors
+    let is_word16: HashSet<&str> = tensors
         .iter()
-        .filter(|t| t.dtype == "U16")
+        .filter(|t| packs_indices(t))
         .map(|t| t.name.as_str())
         .collect();
 
@@ -509,7 +584,7 @@ pub fn parse_packing_schemas(
         else {
             continue;
         };
-        if !is_u16.contains(stem) || out.contains_key(stem) {
+        if !is_word16.contains(stem) || out.contains_key(stem) {
             continue;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&m.value)
@@ -530,7 +605,8 @@ pub fn parse_packing_schemas(
                 continue;
             };
             for t in tensors {
-                if t.dtype != "U16" || out.contains_key(&t.name) {
+                // The same rule as above (`packs_indices`), via the set built from it.
+                if !is_word16.contains(t.name.as_str()) || out.contains_key(&t.name) {
                     continue;
                 }
                 // Match the projection as a path segment (`.`/`__`-separated).
@@ -3663,6 +3739,147 @@ mod tests {
         assert_eq!(nu.uniform_width(), None);
         assert_eq!(nu.max_width(), 6);
         assert_eq!(nu.label(), "[4,3,3,6]");
+    }
+
+    /// **A schema can be written down**, in the forms a person types and the ones this type prints.
+    ///
+    /// These checkpoints declare their packing nowhere: the sparse encoding (`[4]` — one index per word,
+    /// four low bits) and the merged one (`[3,3,3,3,3]` — five experts per word, each shifted three
+    /// bits) are conventions between the tools that wrote them, so the schema has to be sayable.
+    #[test]
+    fn a_schema_can_be_written_and_reads_back_as_it_prints() {
+        let sparse = PackingSchema::parse("[4]").expect("a sparse schema");
+        assert_eq!(sparse.len_p(), 1, "no merging: one expert per word");
+        assert_eq!(sparse.width(0), 4);
+        assert_eq!(sparse.extract(0b1011, 0), 0b1011);
+
+        let merged = PackingSchema::parse("[3,3,3,3,3]").expect("a merged schema");
+        assert_eq!(merged.len_p(), 5, "five consecutive experts in one word");
+        for k in 0..5 {
+            assert_eq!(
+                merged.offset(k),
+                3 * k as u32,
+                "each next one shifted three bits"
+            );
+        }
+        // Word holding indices 1,2,3,4,5 at three bits each.
+        let word = 1 | (2 << 3) | (3 << 6) | (4 << 9) | (5 << 12);
+        assert_eq!(
+            (0..5).map(|k| merged.extract(word, k)).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+
+        // Every spelling of the same thing, including what `label` prints.
+        for spec in [
+            "[3,3,3,3,3]",
+            "3,3,3,3,3",
+            "3 3 3 3 3",
+            "3x5",
+            "u3×5",
+            &merged.label(),
+        ] {
+            assert_eq!(
+                PackingSchema::parse(spec).map(|s| s.bit_widths),
+                Ok(vec![3; 5]),
+                "{spec:?}"
+            );
+        }
+        // Non-uniform widths are a list, and the label says so.
+        let mixed = PackingSchema::parse("4,4,4,3").expect("a mixed schema");
+        assert_eq!(mixed.label(), "[4,4,4,3]");
+        assert_eq!(
+            PackingSchema::parse(&mixed.label()).map(|s| s.bit_widths),
+            Ok(vec![4, 4, 4, 3])
+        );
+
+        // Refusals a reader can act on.
+        assert!(PackingSchema::parse("").is_err());
+        assert!(PackingSchema::parse("[]").is_err());
+        assert!(PackingSchema::parse("three").is_err());
+        assert!(PackingSchema::parse("3x0").is_err());
+        // Past the word: five 4-bit fields do not fit in sixteen bits.
+        assert!(PackingSchema::parse("4x5").is_err());
+    }
+
+    /// A packed-index tensor is a tensor of **16-bit words**, and the writers disagree about the name:
+    /// current checkpoints say `U16`, older ones `F16`. Gating on `U16` skipped every older
+    /// checkpoint's schema, which then looked like a checkpoint with no packing at all.
+    #[test]
+    fn a_schema_attaches_to_sixteen_bit_words_whatever_they_are_called() {
+        let p = std::path::Path::new("/x");
+        let schema = serde_json::json!({"bit_widths": [3, 3, 3, 3, 3]}).to_string();
+        for dtype in ["U16", "F16", "I16"] {
+            let tensors = vec![fixture_dtype(
+                p,
+                "m.experts.down_proj.weight",
+                dtype,
+                &[4, 4, 4],
+                (0, 0),
+            )];
+            let metadata = vec![MetadataInfo {
+                name: "m.experts.down_proj.weight.__metadata__".to_string(),
+                value: schema.clone(),
+                value_type: "string".to_string(),
+            }];
+            let found = parse_packing_schemas(&tensors, &metadata);
+            assert_eq!(
+                found
+                    .get("m.experts.down_proj.weight")
+                    .map(PackingSchema::len_p),
+                Some(5),
+                "a {dtype} word carries a schema"
+            );
+        }
+        // A 32-bit tensor is not a packed word, whatever its metadata claims.
+        let tensors = vec![fixture_dtype(
+            p,
+            "m.experts.down_proj.weight",
+            "F32",
+            &[4, 4, 4],
+            (0, 0),
+        )];
+        let metadata = vec![MetadataInfo {
+            name: "m.experts.down_proj.weight.__metadata__".to_string(),
+            value: schema,
+            value_type: "string".to_string(),
+        }];
+        assert!(parse_packing_schemas(&tensors, &metadata).is_empty());
+    }
+
+    /// The codebook and the scales are what a packed weight is decoded *with* — F16 because they are
+    /// floats. Once `F16` counted as a 16-bit word, a top-level schema keyed by `down_proj` matched them
+    /// too, and the tree offered to unpack a centroid into five three-bit fields.
+    #[test]
+    fn the_decode_siblings_are_never_treated_as_packed_words() {
+        let p = std::path::Path::new("/x");
+        let tensors = vec![
+            fixture_dtype(p, "m.experts.down_proj.weight", "U16", &[6, 3, 4], (0, 0)),
+            fixture_dtype(
+                p,
+                "m.experts.down_proj.weight.codebook",
+                "F16",
+                &[4, 4, 2],
+                (0, 0),
+            ),
+            fixture_dtype(
+                p,
+                "m.experts.down_proj.weight.qscale",
+                "F16",
+                &[6, 4, 4],
+                (0, 0),
+            ),
+        ];
+        let metadata = vec![MetadataInfo {
+            name: "codebook_packing_schema".to_string(),
+            value: serde_json::json!({"down_proj": {"bit_widths": [3, 3, 3, 3, 3]}}).to_string(),
+            value_type: "string".to_string(),
+        }];
+        let found = parse_packing_schemas(&tensors, &metadata);
+        assert_eq!(
+            found.keys().collect::<Vec<_>>(),
+            vec!["m.experts.down_proj.weight"],
+            "only the weight packs indices"
+        );
     }
 
     #[test]

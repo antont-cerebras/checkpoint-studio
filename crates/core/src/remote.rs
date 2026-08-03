@@ -1037,12 +1037,15 @@ impl RemoteRead {
         new_uri: &str,
         pairs: &[(String, String)],
         bits: usize,
+        // How each side packs its expert indices, when the checkpoint does not say — `(old, new)`, each
+        // a list of bit widths. `None` infers the uniform case from `bits` and the shape fold.
+        schemas: (Option<&[u32]>, Option<&[u32]>),
         auto_sparse: bool,
         // Set to stop — see `value_diff`'s note; the same reasoning, the same fix.
         abort: Option<&std::sync::atomic::AtomicBool>,
         mut on_event: impl FnMut(RepackEvent<'_>),
     ) -> Result<(HashMap<String, RepackResult>, Option<RemoteValueStats>)> {
-        let script = repack_verify_script(old_uri, new_uri, pairs, bits, auto_sparse);
+        let script = repack_verify_script(old_uri, new_uri, pairs, bits, schemas, auto_sparse);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
         let out = session.exec_capture_abortable(&command, &script, abort, |line| {
             dispatch_stream_line(line, &repack_status, &mut on_event);
@@ -1315,6 +1318,7 @@ fn repack_verify_script(
     new_uri: &str,
     pairs: &[(String, String)],
     bits: usize,
+    schemas: (Option<&[u32]>, Option<&[u32]>),
     auto_sparse: bool,
 ) -> String {
     with_params(
@@ -1324,6 +1328,10 @@ fn repack_verify_script(
             "new": new_uri,
             "pairs": pairs,
             "bits": bits.max(1),
+            // How each side packs its indices, when it was said. `null` leaves the script inferring the
+            // uniform case from `bits` and the fold, exactly as before.
+            "old_widths": schemas.0,
+            "new_widths": schemas.1,
             "jobs": pairs.len().clamp(1, 4),
             "auto": auto_sparse,
             "sentinel": SENTINEL,
@@ -2029,6 +2037,10 @@ fn merge_shards(shards: &[ShardParse]) -> (Vec<TensorInfo>, Vec<MetadataInfo>) {
 
 #[cfg(test)]
 mod tests {
+    /// No packing schema given — the script infers the uniform case from `bits` and the fold, which is
+    /// what most of these cases exercise.
+    const INFERRED: (Option<&[u32]>, Option<&[u32]>) = (None, None);
+
     /// The commonest side in these tests, said once.
     fn s3(uri: &str) -> RemoteSide {
         RemoteSide::S3(uri.to_string())
@@ -2084,7 +2096,7 @@ mod tests {
             ),
             (
                 "repack_verify",
-                repack_verify_script("s3://b/o", "s3://b/n", &[], 3, true),
+                repack_verify_script("s3://b/o", "s3://b/n", &[], 3, INFERRED, true),
             ),
         ] {
             // Statement position only — the prelude's docstring *mentions* the future
@@ -2191,7 +2203,7 @@ mod tests {
             (
                 "repack_verify.py",
                 include_str!("python/repack_verify.py"),
-                repack_verify_script("s3://b/o", "s3://b/n", &pairs, 3, true),
+                repack_verify_script("s3://b/o", "s3://b/n", &pairs, 3, INFERRED, true),
             ),
         ] {
             let wanted = keys_read(src);
@@ -2213,6 +2225,32 @@ mod tests {
         }
     }
 
+    /// Each side's packing reaches the script as its own width list, and `None` stays absent so the
+    /// script keeps inferring the uniform case. Without this the override would be accepted by the CLI
+    /// and quietly dropped at the ssh hop — the verdict would look the same and mean something else.
+    #[test]
+    fn a_packing_schema_reaches_the_remote_decoder_per_side() {
+        let pairs = vec![("w".to_string(), "w".to_string())];
+        let sparse: &[u32] = &[4];
+        let merged: &[u32] = &[3, 3, 3, 3, 3];
+        let s = repack_verify_script(
+            "s3://b/o",
+            "s3://b/n",
+            &pairs,
+            3,
+            (Some(sparse), Some(merged)),
+            false,
+        );
+        let p = script_params(&s);
+        assert_eq!(p["old_widths"], serde_json::json!([4]));
+        assert_eq!(p["new_widths"], serde_json::json!([3, 3, 3, 3, 3]));
+        // Nothing said: the parameters are present but null, which is the script's "infer it" case.
+        let none = script_params(&repack_verify_script(
+            "s3://b/o", "s3://b/n", &pairs, 3, INFERRED, false,
+        ));
+        assert!(none["old_widths"].is_null() && none["new_widths"].is_null());
+    }
+
     #[test]
     fn cstorch_script_embeds_source_safely() {
         let s = dump_script("s3://b/k", false);
@@ -2230,7 +2268,7 @@ mod tests {
         assert_eq!(script_params(&dump_script(nasty, true))["uri"], nasty);
         assert_eq!(script_params(&list_script(nasty))["uri"], nasty);
         let pairs = vec![(nasty.to_string(), "n\"2".to_string())];
-        let s = repack_verify_script("s3://b/o", "s3://b/n", &pairs, 3, false);
+        let s = repack_verify_script("s3://b/o", "s3://b/n", &pairs, 3, INFERRED, false);
         assert_eq!(script_params(&s)["pairs"][0][0], nasty);
         assert_eq!(script_params(&s)["pairs"][0][1], "n\"2");
     }
@@ -2523,7 +2561,7 @@ mod tests {
     #[test]
     fn repack_verify_script_embeds_inputs_and_checks_format() {
         let pairs = vec![("w.down".to_string(), "w.down".to_string())];
-        let s = repack_verify_script("s3://b/old", "s3://b/new", &pairs, 3, false);
+        let s = repack_verify_script("s3://b/old", "s3://b/new", &pairs, 3, INFERRED, false);
         let p = script_params(&s);
         assert_eq!(p["old"], "s3://b/old");
         assert_eq!(p["pairs"], serde_json::json!([["w.down", "w.down"]]));

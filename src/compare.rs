@@ -334,6 +334,50 @@ pub(crate) fn detect_fold(old: &[usize], new: &[usize]) -> Option<usize> {
     Some(fold)
 }
 
+/// The packing schemas a run was **told**, as written — one per side, either omitted.
+///
+/// Strings rather than parsed values so the one place that validates them is the one place that reports
+/// a bad one: a flag, a query parameter and a UI field all hand over text, and each turning it into a
+/// schema itself is three chances to phrase the refusal differently.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RepackSchemas<'a> {
+    pub old: Option<&'a str>,
+    pub new: Option<&'a str>,
+}
+
+impl RepackSchemas<'_> {
+    /// Just the check: are both sides' specs usable? For a caller that wants to refuse early — the web's
+    /// start handler, which turns a bad list into a `400` rather than a job that fails on the proxy.
+    pub(crate) fn validate(self) -> Result<()> {
+        self.parse().map(|_| ())
+    }
+
+    /// Both sides parsed, naming the side and the spec when one will not.
+    fn parse(
+        self,
+    ) -> Result<(
+        Option<crate::sample::PackingSchema>,
+        Option<crate::sample::PackingSchema>,
+    )> {
+        let one = |side: &str,
+                   spec: Option<&str>|
+         -> Result<Option<crate::sample::PackingSchema>> {
+            spec.filter(|s| !s.trim().is_empty())
+                .map(|s| {
+                    crate::sample::PackingSchema::parse(s).map_err(|e| {
+                        anyhow::anyhow!(
+                            "the {side} packing schema {s:?} is not usable: {e} — write it as a list of \
+                             bit widths, `[4]` for the sparse encoding or `[3,3,3,3,3]` for five \
+                             experts merged into one word"
+                        )
+                    })
+                })
+                .transpose()
+        };
+        Ok((one("baseline", self.old)?, one("candidate", self.new)?))
+    }
+}
+
 /// What a `--verify-repack` run will do: which tensors to verify, at what bit width, and whether
 /// anything *else* differs.
 pub(crate) struct RepackPlan {
@@ -343,6 +387,15 @@ pub(crate) struct RepackPlan {
     /// Index bit width: as asked, else the max-density packing for the detected fold (`16 / fold`, so
     /// fold 5 ⇒ 3-bit, fold 4 ⇒ 4-bit).
     pub bits: usize,
+    /// How each side packs its indices, when it was **said** — `[4]` for the sparse encoding (one index
+    /// per word, four low bits used), `[3,3,3,3,3]` for the merged one (five consecutive experts in one
+    /// word, each shifted three bits).
+    ///
+    /// `None` falls back to the inference above, which reads a single width off the fold ratio. That is
+    /// right for a uniform merge and silent about a sparse side, and these checkpoints declare their
+    /// packing nowhere — so it has to be sayable, per side, because the two sides are what differ.
+    pub old_schema: Option<crate::sample::PackingSchema>,
+    pub new_schema: Option<crate::sample::PackingSchema>,
     /// Whether anything other than the verified fold-pairs differs — an add, a removal, a non-fold
     /// signature change, or a metadata change.
     ///
@@ -350,6 +403,50 @@ pub(crate) struct RepackPlan {
     /// they are excluded: if they verify equivalent and nothing else differs, the two checkpoints are
     /// the same weights in different packings.
     pub other_differs: bool,
+}
+
+impl RepackPlan {
+    /// Each side's schema as the decoders want it: borrowed, `None` where nothing was said.
+    ///
+    /// Two shapes of the same answer, because the two decoders take different arguments — the local one
+    /// (`repack::verify_local`) holds the schema type, and the remote one hands bit-width lists to a
+    /// Python script over JSON. Deriving both here is what keeps them the same schema.
+    pub(crate) fn schemas(
+        &self,
+    ) -> (
+        Option<&crate::sample::PackingSchema>,
+        Option<&crate::sample::PackingSchema>,
+    ) {
+        (self.old_schema.as_ref(), self.new_schema.as_ref())
+    }
+
+    /// The same pair as bit-width lists, for the remote script's parameters.
+    pub(crate) fn widths(&self) -> (Option<&[u32]>, Option<&[u32]>) {
+        let (o, n) = self.schemas();
+        (
+            o.map(crate::sample::PackingSchema::bit_widths),
+            n.map(crate::sample::PackingSchema::bit_widths),
+        )
+    }
+
+    /// How the decode reads each side — the schemas when they were said, else what shape detection
+    /// alone can assume.
+    ///
+    /// **Said once, in both wordings' place.** A verdict is only as good as this assumption, and it was
+    /// previously implicit in a bit count ("4-bit expert indices") that a non-uniform schema makes
+    /// false. One string, used by the note above a remote run and by the verdict's own header, so the
+    /// two cannot describe different decodes.
+    pub(crate) fn packing_note(&self) -> String {
+        let old = self.old_schema.as_ref().map_or_else(
+            || format!("u{}×1", self.bits),
+            |s| format!("{} (given)", s.label()),
+        );
+        let new = self.new_schema.as_ref().map_or_else(
+            || format!("u{} fields, as many as each pair folds", self.bits),
+            |s| format!("{} (given)", s.label()),
+        );
+        format!("baseline {old} → candidate {new}")
+    }
 }
 
 /// Can a `--verify-repack` run happen at all, given where the two checkpoints live?
@@ -480,6 +577,7 @@ pub(crate) fn plan_repack(
     old: &CheckpointSummary,
     new: &CheckpointSummary,
     repack_bits: Option<usize>,
+    schemas: RepackSchemas<'_>,
 ) -> Result<RepackPlan> {
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut fold0 = None;
@@ -505,9 +603,12 @@ pub(crate) fn plan_repack(
     let other_changed = old.tensors.iter().any(|(k, osig)| {
         new.tensors.get(k).is_some_and(|nsig| nsig != osig) && !verified.contains(k)
     });
+    let (old_schema, new_schema) = schemas.parse()?;
     Ok(RepackPlan {
         pairs,
         bits,
+        old_schema,
+        new_schema,
         other_differs: added || removed || other_changed || old.metadata != new.metadata,
     })
 }

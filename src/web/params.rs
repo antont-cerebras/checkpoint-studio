@@ -122,6 +122,18 @@ pub(crate) const CHECK: &[Param] = &[
         Cli::Value("--repack-bits"),
         Some("repackBits"),
     ),
+    // One row per side, because the two sides are exactly what differs: a sparse baseline (`[4]`) is
+    // being verified against a merged candidate (`[3,3,3,3,3]`), and no single width describes both.
+    p(
+        "repack_schema",
+        Cli::Value("--repack-schema"),
+        Some("repackSchema"),
+    ),
+    p(
+        "repack_schema_new",
+        Cli::Value("--repack-schema-new"),
+        Some("repackSchemaNew"),
+    ),
     p("tensor", Cli::Value("--tensor"), Some("tensor")),
     p("jobs", Cli::Value("--jobs"), Some("jobs")),
     // Every layer as its own row: it decides how the *structural report* prints, so it is an argument.

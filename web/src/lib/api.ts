@@ -5,6 +5,7 @@ import { noteServedBuild } from './build';
 import { CHECK_PARAMS } from './params.generated';
 import { totalBytes } from './progress';
 import { scopeToQuery, type DiffScopeParams } from './diffscope';
+import { packingToQuery, type Packing } from './packing';
 import type { JobStatus } from '../stores/jobs';
 import type { ReadingProgress } from '../stores/reading';
 import type { ComparisonSet, DiffTreeResponse } from './difftree';
@@ -184,6 +185,13 @@ const WIRE = Object.fromEntries(CHECK_PARAMS.map((p) => [p.field, p.key])) as Re
   (typeof CHECK_PARAMS)[number]['field'],
   string
 >;
+
+/** The packing as a query tail — only what is set, and only the verification reads it. */
+function packingTail(packing: Packing | undefined): string {
+  return packingToQuery(packing)
+    .map(([k, v]) => `&${k}=${enc(v)}`)
+    .join('');
+}
 
 /** A scope as a query tail, or nothing. One place, so the two diff routes cannot encode it differently. */
 function scopeTail(scope: DiffScopeParams | undefined): string {
@@ -400,9 +408,10 @@ export const api = {
     scope?: DiffScopeParams,
     check?: CheckKind,
     full = false,
+    packing?: Packing,
   ) =>
     getJson<{ command: string | null }>(
-      `/api/command?left=${enc(left)}&right=${enc(right)}${checkTail(check, full)}${scopeTail(scope)}`,
+      `/api/command?left=${enc(left)}&right=${enc(right)}${checkTail(check, full)}${packingTail(packing)}${scopeTail(scope)}`,
     ),
   /** Forget one checkpoint. Returns the list without it; rejects with a 404 if it wasn't there. */
   forgetRecent: (spec: string) =>

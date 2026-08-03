@@ -235,12 +235,18 @@ describe("urls", () => {
     await api.command("/a", "/b", undefined, "histogram");
     await api.command("/a", "/b", undefined, "verifyRepack");
     await api.command("/a", "/b", undefined, undefined, true);
+    // The verification's own input: a packing per side, which no other check reads.
+    await api.command("/a", "/b", undefined, "verifyRepack", false, {
+      baseline: "[4]",
+      candidate: "3,3,3,3,3",
+    });
     expect(urls).toEqual([
       "/api/command?left=%2Fa&right=%2Fb",
       "/api/command?left=%2Fa&right=%2Fb&values=1&names=lm_head.weight",
       "/api/command?left=%2Fa&right=%2Fb&histogram=1",
       "/api/command?left=%2Fa&right=%2Fb&verify_repack=1",
       "/api/command?left=%2Fa&right=%2Fb&full=1",
+      "/api/command?left=%2Fa&right=%2Fb&verify_repack=1&repack_schema=%5B4%5D&repack_schema_new=3%2C3%2C3%2C3%2C3",
     ]);
   });
 

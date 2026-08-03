@@ -483,6 +483,20 @@ pub(crate) fn start_verify_repack(current: &Arc<super::Current>, q: &Query) -> R
         Some(_) => return err(400, "repack_bits must be a whole number from 1 to 16"),
     };
 
+    // The schemas as written, validated here for the same reason: a bad list is a 400 with the spec in
+    // it, not a job that fails on the proxy.
+    let (schema_old, schema_new) = (
+        q.get("repack_schema").cloned(),
+        q.get("repack_schema_new").cloned(),
+    );
+    let asked = crate::compare::RepackSchemas {
+        old: schema_old.as_deref(),
+        new: schema_new.as_deref(),
+    };
+    if let Err(e) = asked.validate() {
+        return err(400, format!("{e:#}"));
+    }
+
     let job = current.jobs().start("verify-repack");
     let id = job.id;
     let (owner, left, right) = (Arc::clone(current), left.to_string(), right.to_string());
@@ -490,7 +504,18 @@ pub(crate) fn start_verify_repack(current: &Arc<super::Current>, q: &Query) -> R
     let spawned = std::thread::Builder::new()
         .name(format!("verify-repack-{id}"))
         .spawn(move || {
-            let outcome = super::repackjob::run(&owner, &job, &left, &right, &scope, bits);
+            let outcome = super::repackjob::run(
+                &owner,
+                &job,
+                &left,
+                &right,
+                &scope,
+                bits,
+                crate::compare::RepackSchemas {
+                    old: schema_old.as_deref(),
+                    new: schema_new.as_deref(),
+                },
+            );
             super::jobs::Jobs::finish(&job, outcome);
         });
     match spawned {

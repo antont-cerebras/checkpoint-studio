@@ -2,21 +2,70 @@
 //! [`crate::remote::RemoteRead::verify_repack`] runs on the ssh proxy for `s3://`
 //! cstorch checkpoints, but for local checkpoint files (`.safetensors` / `.hdf5`).
 //!
-//! Two expert-weight tensors encode the same 3-bit indices in different packings:
-//! the **sparse** side stores one index per 16-bit word (`w & mask`); the **dense**
-//! side folds `fold` experts along dim 0 into one word (`fold` indices per word, the
-//! expert `e` at word `e / fold`, bit shift `(e % fold) * bits`). This module reads
-//! the raw 16-bit words locally, decodes both sides, checks they match, and
-//! validates the packing (the old words' bits above `bits` and the new words' bits
-//! above `fold * bits` must be zero). It also diffs the sibling codebook / scale
-//! tensors' values. Results are the same [`RepackResult`] the remote path produces,
-//! so the reporting is shared.
+//! Two expert-weight tensors encode the same indices in different packings. Each side's packing is a
+//! [`crate::sample::PackingSchema`] — a list of bit widths: the **sparse** encoding is `[4]` (one index
+//! per 16-bit word, only the low four bits used) and a **merged** one is `[3,3,3,3,3]` (five consecutive
+//! experts in one word, each shifted three bits past the last). Expert `e` then lives in word
+//! `e / lenP` at bit offset `offset(e % lenP)`, which for the uniform case is the familiar
+//! `e / fold`, `(e % fold) * bits`.
+//!
+//! This module reads the raw 16-bit words locally, decodes both sides *by their own schema*, checks
+//! they match, and validates each packing (bits above a side's total width must be zero). It also
+//! diffs the sibling codebook / scale tensors' values. Results are the same [`RepackResult`] the
+//! remote path produces, so the reporting is shared.
 
 use crate::remote::{RepackAux, RepackFallback, RepackResult, RepackSample};
+use crate::sample::PackingSchema;
 use crate::tree::TensorInfo;
+
+/// How each side packs its expert indices — the pair a decode needs.
+///
+/// A pair rather than one schema plus a fold, because the two sides are exactly what differs: the point
+/// of the verification is that the same indices are packed *differently* on each side.
+#[derive(Clone, Debug)]
+pub struct Packing {
+    pub old: PackingSchema,
+    pub new: PackingSchema,
+}
+
+impl Packing {
+    /// The uniform pair a fold ratio implies: one `bits`-wide index per old word, `fold` of them per
+    /// new word. This is what shape detection alone can say, and what every caller used before a
+    /// schema could be given.
+    pub fn uniform(fold: usize, bits: usize) -> Result<Self, String> {
+        let bits = u32::try_from(bits).map_err(|_| format!("bit width {bits} is not a width"))?;
+        Ok(Self {
+            old: PackingSchema::new(vec![bits], None)?,
+            new: PackingSchema::new(vec![bits; fold.max(1)], None)?,
+        })
+    }
+
+    /// Where expert `ei` is on one side: the word index, the shift within it, and the field's mask.
+    fn place(schema: &PackingSchema, ei: usize) -> (usize, u16, u16) {
+        let lp = schema.len_p().max(1);
+        let k = ei % lp;
+        // `sum(widths) <= 16` is a schema invariant, so both the shift and the mask fit a `u16`.
+        let shift = u16::try_from(schema.offset(k)).unwrap_or(0);
+        let mask = u16::try_from((1u32 << schema.width(k)) - 1).unwrap_or(u16::MAX);
+        (ei / lp, shift, mask)
+    }
+
+    /// Words with a set bit above the schema's total width — the packing assumption is wrong if any.
+    ///
+    /// A schema that fills the word has no unused bits (and shifting a `u16` by 16 would panic), so
+    /// that case answers zero without looking.
+    fn unused_bits_set(schema: &PackingSchema, words: &[u16]) -> u64 {
+        let total = schema.offset(schema.len_p());
+        if total >= 16 {
+            return 0;
+        }
+        words.iter().filter(|&&x| (x >> total) != 0).count() as u64
+    }
+}
 
 /// The index-comparison outcome (everything a [`RepackResult`] needs except the
 /// codebook/scale diffs, `fold`, `bytes`, and `error`).
+#[derive(Default)]
 pub struct IdxCompare {
     pub elements: u64,
     pub differing: u64,
@@ -34,9 +83,8 @@ pub struct IdxCompare {
     pub sample: Option<RepackSample>,
 }
 
-/// Decode + compare the two sides' 16-bit words. `old` is `e × inner` words (one
-/// index each); `new` is `w × inner` words (`fold` indices each, `w = ceil(e/fold)`).
-/// Pure — unit-tested with synthetic slices.
+/// Decode + compare the two sides' 16-bit words for the uniform packing a fold ratio implies — one
+/// `bits`-wide index per old word, `fold` of them per new word. [`compare_packed`] is the general form.
 #[must_use]
 pub fn compare_indices(
     old: &[u16],
@@ -46,25 +94,42 @@ pub fn compare_indices(
     fold: usize,
     bits: usize,
 ) -> IdxCompare {
-    let mask = (1u16 << bits) - 1;
-    // Format checks: no bits above `bits` (old) / `fold*bits` (new). A shift equal to
-    // the word width has no unused bits (and would panic), so guard it.
-    let sparse_bad = old.iter().filter(|&&x| (x >> bits) != 0).count() as u64;
-    let dense_shift = fold * bits;
-    let dense_bad = if dense_shift >= 16 {
-        0
-    } else {
-        new.iter().filter(|&&x| (x >> dense_shift) != 0).count() as u64
+    // An unusable fold/bits pair decodes nothing; the format counters then say the words did not fit
+    // the assumption, which is what a caller checks before believing an "equivalent" verdict.
+    let Ok(packing) = Packing::uniform(fold, bits) else {
+        return IdxCompare {
+            sparse_bad: old.len() as u64,
+            dense_bad: new.len() as u64,
+            ..IdxCompare::default()
+        };
     };
+    compare_packed(old, new, e, inner, &packing)
+}
+
+/// Decode + compare the two sides' 16-bit words, each side by **its own** schema.
+///
+/// `e` is the expert count; `inner` the elements per expert. The old side is `ceil(e / oldP) × inner`
+/// words and the new side `ceil(e / newP) × inner`. Pure — unit-tested with synthetic slices.
+#[must_use]
+pub fn compare_packed(
+    old: &[u16],
+    new: &[u16],
+    e: usize,
+    inner: usize,
+    packing: &Packing,
+) -> IdxCompare {
+    let sparse_bad = Packing::unused_bits_set(&packing.old, old);
+    let dense_bad = Packing::unused_bits_set(&packing.new, new);
 
     let (mut differing, mut sum_abs, mut sum_old, mut sum_new) = (0u64, 0u64, 0u64, 0u64);
     let (mut max_delta, mut differing_gt1) = (0u32, 0u64);
     let mut zeros = 0u64;
     let mut first: Option<(u64, u64, u32, u32)> = None;
-    // `old` is one row per expert and `new` one row per folded word, so walk the sparse
-    // side by rows and look the matching dense row up. `verify_local` has already checked
-    // both lengths against the shapes; the `else break` is what makes that structural
-    // rather than a comment (a short slice ends the compare instead of panicking).
+    // Both sides are walked by expert, each looking up its own row: with the sparse schema `[4]` the
+    // old lookup is the identity (one expert per row) and the new one folds, which is the case this
+    // started as. `verify_local` has already checked both lengths against the shapes; the `else break`
+    // is what makes that structural rather than a comment (a short slice ends the compare instead of
+    // panicking).
     //
     // The dense rows are collected ONCE: `chunks_exact(..).nth(word)` inside the loop would
     // rescan from the start for every expert, turning a linear compare into a quadratic one
@@ -82,15 +147,15 @@ pub fn compare_indices(
     } else {
         old.chunks_exact(inner).collect()
     };
-    for (ei, orow) in orows.iter().enumerate().take(e) {
-        let word = ei / fold;
-        let shift = ((ei % fold) * bits) as u16;
-        let Some(nrow) = nrows.get(word) else {
+    for ei in 0..e {
+        let (oword, oshift, omask) = Packing::place(&packing.old, ei);
+        let (nword, nshift, nmask) = Packing::place(&packing.new, ei);
+        let (Some(orow), Some(nrow)) = (orows.get(oword), nrows.get(nword)) else {
             break;
         };
         for (n, (o, nd)) in orow.iter().zip(nrow.iter()).enumerate() {
-            let o = i64::from(*o & mask);
-            let nd = i64::from((*nd >> shift) & mask);
+            let o = i64::from((*o >> oshift) & omask);
+            let nd = i64::from((*nd >> nshift) & nmask);
             sum_old += o as u64;
             sum_new += nd as u64;
             zeros += u64::from(o == 0) + u64::from(nd == 0);
@@ -110,7 +175,7 @@ pub fn compare_indices(
             }
         }
     }
-    let sample = build_sample(old, new, e, inner, fold, bits, mask, first);
+    let sample = build_sample(old, new, e, inner, packing, first);
     IdxCompare {
         elements: (e * inner) as u64,
         differing,
@@ -130,15 +195,12 @@ pub fn compare_indices(
 /// A small decoded window (16 experts × 48 inner offsets), centred on the first
 /// mismatch (or the top-left corner), so the caller can show where old and new
 /// diverge — matching the remote script's sample.
-#[allow(clippy::too_many_arguments)]
 fn build_sample(
     old: &[u16],
     new: &[u16],
     e: usize,
     inner: usize,
-    fold: usize,
-    bits: usize,
-    mask: u16,
+    packing: &Packing,
     first: Option<(u64, u64, u32, u32)>,
 ) -> Option<RepackSample> {
     if e == 0 || inner == 0 {
@@ -158,20 +220,20 @@ fn build_sample(
     let orows: Vec<&[u16]> = old.chunks_exact(inner).collect();
     let nrows: Vec<&[u16]> = new.chunks_exact(inner).collect();
     for ei in e0..e1 {
-        let word = ei / fold;
-        let shift = ((ei % fold) * bits) as u16;
-        let (Some(orow), Some(nrow)) = (orows.get(ei), nrows.get(word)) else {
+        let (oword, oshift, omask) = Packing::place(&packing.old, ei);
+        let (nword, nshift, nmask) = Packing::place(&packing.new, ei);
+        let (Some(orow), Some(nrow)) = (orows.get(oword), nrows.get(nword)) else {
             break;
         };
-        let decode = |row: &[u16], shift: u16| -> Vec<u32> {
+        let decode = |row: &[u16], shift: u16, mask: u16| -> Vec<u32> {
             row.get(off0..off1)
                 .unwrap_or_default()
                 .iter()
                 .map(|w| u32::from((w >> shift) & mask))
                 .collect()
         };
-        oldg.push(decode(orow, 0));
-        newg.push(decode(nrow, shift));
+        oldg.push(decode(orow, oshift, omask));
+        newg.push(decode(nrow, nshift, nmask));
     }
     Some(RepackSample {
         e0: e0 as u64,
@@ -183,7 +245,8 @@ fn build_sample(
 
 /// Verify one local expert-weight pair (`old_w` sparse, `new_w` dense) and diff its
 /// sibling codebook / scale tensors. Reads the raw words locally via
-/// [`crate::sample`]. `fold`/`bits` come from the shape detection.
+/// [`crate::sample`]. `fold`/`bits` come from the shape detection; `schemas` overrides what each side's
+/// packing *is* when the checkpoint does not declare it (which is the normal case).
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn verify_local(
@@ -191,6 +254,7 @@ pub fn verify_local(
     new_w: &TensorInfo,
     fold: usize,
     bits: usize,
+    schemas: (Option<&PackingSchema>, Option<&PackingSchema>),
     codebook: (&str, &str, Option<&TensorInfo>, Option<&TensorInfo>),
     qscale: (&str, &str, Option<&TensorInfo>, Option<&TensorInfo>),
 ) -> RepackResult {
@@ -206,16 +270,38 @@ pub fn verify_local(
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => return err(e),
     };
-    let e = *old_w.shape.first().unwrap_or(&0);
+    // Each side's packing: as given, else the uniform pair the fold implies.
+    let mut packing = match Packing::uniform(fold, bits) {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    if let Some(o) = schemas.0 {
+        packing.old = o.clone();
+    }
+    if let Some(n) = schemas.1 {
+        packing.new = n.clone();
+    }
+    let rows = *old_w.shape.first().unwrap_or(&0);
     let inner: usize = old_w.shape.iter().skip(1).product();
-    if e == 0 || inner == 0 || ow.len() != e * inner {
+    if rows == 0 || inner == 0 || ow.len() != rows * inner {
         return err(format!("unexpected old shape {:?}", old_w.shape));
     }
     let w = *new_w.shape.first().unwrap_or(&0);
     if w == 0 || nw.len() != w * inner {
         return err(format!("unexpected new shape {:?}", new_w.shape));
     }
-    let c = compare_indices(&ow, &nw, e, inner, fold, bits);
+    // Experts, not rows: the old side's rows each hold `lenP` of them, which is one apiece for the
+    // sparse encoding and more for a merged baseline.
+    let e = rows * packing.old.len_p();
+    if w * packing.new.len_p() < e {
+        return err(format!(
+            "the schemas do not span the pair: {} over {rows} rows is {e} experts, {} over {w} is {}",
+            packing.old.label(),
+            packing.new.label(),
+            w * packing.new.len_p()
+        ));
+    }
+    let c = compare_packed(&ow, &nw, e, inner, &packing);
     let bytes = (ow.len() * 2 + nw.len() * 2) as u64;
     let mean = |s: u64| {
         if c.elements > 0 {
@@ -353,6 +439,10 @@ fn aux_local(
 mod tests {
     use super::*;
 
+    /// No schema given — decode with what the fold ratio implies, which is what every path did before
+    /// a schema could be said and what most of these cases exercise.
+    const INFERRED: (Option<&PackingSchema>, Option<&PackingSchema>) = (None, None);
+
     /// Build a `TensorInfo` for a tensor written into a real one-tensor-per-file
     /// safetensors fixture, so the read path (`sample::read_all_*`) is the real one.
     ///
@@ -419,6 +509,78 @@ mod tests {
             }
         }
         (sparse, dense, w)
+    }
+
+    /// Pack `idx` (expert-major) per an explicit schema: expert `ei` goes into word `ei / lenP` at the
+    /// field's own offset. The general form of `pack` above, so a non-uniform layout can be built.
+    fn pack_as(idx: &[Vec<u16>], schema: &PackingSchema) -> (Vec<u16>, usize) {
+        let (e, inner) = (idx.len(), idx[0].len());
+        let lp = schema.len_p();
+        let w = e.div_ceil(lp);
+        let mut out = vec![0u16; w * inner];
+        for (ei, row) in idx.iter().enumerate() {
+            let shift = u16::try_from(schema.offset(ei % lp)).unwrap();
+            for (n, &v) in row.iter().enumerate() {
+                out[(ei / lp) * inner + n] |= v << shift;
+            }
+        }
+        (out, w)
+    }
+
+    /// The pairing the user's checkpoints actually are: a **sparse** baseline (`[4]` — one index per
+    /// word, four low bits used) against a **merged** candidate (`[3,3,3,3,3]` — five experts per word).
+    /// The two sides' widths differ, which no single `bits` can describe, so this is the case the
+    /// schemas exist for.
+    #[test]
+    fn a_sparse_baseline_and_a_merged_candidate_compare_equal() {
+        let idx = vec![
+            vec![1u16, 5, 3, 7, 0, 2],
+            vec![4, 4, 1, 6, 2, 5],
+            vec![7, 0, 3, 3, 1, 4],
+            vec![2, 6, 5, 1, 0, 7],
+            vec![3, 3, 2, 4, 5, 1],
+            vec![6, 1, 0, 2, 7, 3], // 6 experts, 5 per merged word -> 2 words (1 pad slot)
+        ];
+        let packing = Packing {
+            old: PackingSchema::parse("[4]").unwrap(),
+            new: PackingSchema::parse("[3,3,3,3,3]").unwrap(),
+        };
+        let (sparse, ow) = pack_as(&idx, &packing.old);
+        let (merged, nw) = pack_as(&idx, &packing.new);
+        assert_eq!((ow, nw), (6, 2));
+        let c = compare_packed(&sparse, &merged, 6, 6, &packing);
+        assert_eq!((c.differing, c.elements), (0, 36));
+        assert_eq!((c.sparse_bad, c.dense_bad), (0, 0));
+        assert_eq!(c.sum_old, c.sum_new);
+
+        // And the point of *saying* the schema: the uniform assumption the fold implies (`16/2 = 8`
+        // bits, two per word) decodes the merged side from the wrong bits and finds differences —
+        // silently, if nobody could override it.
+        let wrong = compare_indices(&sparse, &merged, 6, 6, 2, 8);
+        assert!(
+            wrong.differing > 0,
+            "a wrong packing must not read as equal"
+        );
+    }
+
+    /// A schema whose fields differ in width — the offsets are a running sum, not `k * bits`, so a
+    /// uniform decoder reads every field after the first from the wrong bits.
+    #[test]
+    fn a_non_uniform_schema_decodes_each_field_at_its_own_width() {
+        // Widths [4,4,4,3]: the first three experts hold values up to 15, the last up to 7.
+        let schema = PackingSchema::parse("4,4,4,3").unwrap();
+        let idx = vec![vec![15u16, 9], vec![12, 0], vec![10, 15], vec![7, 5]];
+        let (merged, w) = pack_as(&idx, &schema);
+        assert_eq!(w, 1);
+        let packing = Packing {
+            old: PackingSchema::parse("[4]").unwrap(),
+            new: schema,
+        };
+        let (sparse, _) = pack_as(&idx, &packing.old);
+        let c = compare_packed(&sparse, &merged, 4, 2, &packing);
+        assert_eq!((c.differing, c.elements), (0, 8));
+        // 4+4+4+3 = 15 of the 16 bits: the top bit is unused and clear on both sides.
+        assert_eq!((c.sparse_bad, c.dense_bad), (0, 0));
     }
 
     #[test]
@@ -571,6 +733,7 @@ mod tests {
             &new,
             5,
             3,
+            INFERRED,
             ("cb_old", "cb_new", Some(&cb_old), Some(&cb_new)),
             ("qs_old", "qs_new", Some(&qs_old), Some(&qs_new)),
         );
@@ -606,6 +769,7 @@ mod tests {
             &new,
             1,
             3,
+            INFERRED,
             ("cb_old", "cb_new", None, None),
             ("qs_old", "qs_new", None, None),
         );
@@ -636,6 +800,7 @@ mod tests {
             &new,
             1,
             3,
+            INFERRED,
             ("cb_old", "cb_new", None, None),
             ("qs_old", "qs_new", None, None),
         );
@@ -656,7 +821,7 @@ mod tests {
         let aux = ("a", "b", None, None);
         // A leading dimension of zero: legal on disk, but there is nothing to decode.
         let empty = u16_tensor(&dir, "empty_w", &[0, 4], &[]);
-        let r = verify_local(&empty, &short, 5, 3, aux, aux);
+        let r = verify_local(&empty, &short, 5, 3, INFERRED, aux, aux);
         assert!(
             r.error.unwrap().contains("unexpected old shape"),
             "expected an old-shape error"
@@ -664,7 +829,7 @@ mod tests {
         // A `new` side whose inner extent disagrees with `old`'s: w=1 × inner 4 is wanted,
         // 3 words are stored.
         let narrow = u16_tensor(&dir, "narrow_w", &[1, 3], &[0u16; 3]);
-        let r = verify_local(&old, &narrow, 5, 3, aux, aux);
+        let r = verify_local(&old, &narrow, 5, 3, INFERRED, aux, aux);
         assert!(
             r.error.unwrap().contains("unexpected new shape"),
             "expected a new-shape error"
@@ -675,7 +840,9 @@ mod tests {
             shape: vec![9, 4],
             ..short.clone()
         };
-        let e = verify_local(&old, &lying, 5, 3, aux, aux).error.unwrap();
+        let e = verify_local(&old, &lying, 5, 3, INFERRED, aux, aux)
+            .error
+            .unwrap();
         assert!(e.contains("only 8 bytes are stored"), "{e}");
         // An unreadable side reports the read error rather than proceeding.
         let missing = TensorInfo {
@@ -683,7 +850,7 @@ mod tests {
             ..old
         };
         assert!(
-            verify_local(&missing, &short, 5, 3, aux, aux)
+            verify_local(&missing, &short, 5, 3, INFERRED, aux, aux)
                 .error
                 .is_some()
         );
@@ -709,6 +876,7 @@ mod tests {
             &new,
             5,
             3,
+            INFERRED,
             ("cb_old", "cb_new", Some(&cb_old), Some(&cb_new)),
             ("qs_old", "qs_new", Some(&qs_old), Some(&qs_new)),
         );
