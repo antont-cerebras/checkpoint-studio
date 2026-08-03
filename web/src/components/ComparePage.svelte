@@ -30,7 +30,6 @@
   import { middleTruncate, specHelp } from '../lib/format';
   import { isEditable } from '../lib/keys';
   import { emptyScope, type DiffScopeParams } from '../lib/diffscope';
-  import { isPackingSet, type Packing } from '../lib/packing';
   import type { CompareScreen, CompareView } from '../lib/hash';
   import CheckpointPicker from './CheckpointPicker.svelte';
   import SwapButton from './SwapButton.svelte';
@@ -50,8 +49,6 @@
   export let full = false;
   export let swapped = false;
   export let closed: string[] = [];
-  /** How each side packs its expert indices, for a repack verification — see `lib/packing`. */
-  export let packing: Packing | undefined = undefined;
 
   onMount(() => {
     void loadRecents();
@@ -113,18 +110,9 @@
    * discovered, since the `:PATH` shorthand is documented nowhere else. */
   $: help = specHelp($proxied, $proxyHost ?? '');
 
-  /** An edited packing schema, into the URL — replacing, so typing does not fill the history. Blank on
-   * both sides drops the parameter entirely, since absent *is* "infer it". */
-  function setPacking(p: Packing) {
-    go({ packing: isPackingSet(p) ? p : undefined }, true);
-  }
-
   /** Go to the same comparison, changing one thing about how it is read. */
   function go(change: Partial<Omit<CompareScreen, 'kind'>>, replace = false) {
-    navigate(
-      { kind: 'compare', lhs, rhs, view, scope, full, swapped, closed, packing, ...change },
-      replace,
-    );
+    navigate({ kind: 'compare', lhs, rhs, view, scope, full, swapped, closed, ...change }, replace);
   }
 
   function submit() {
@@ -332,13 +320,7 @@
     {:else if view === 'browse'}
       <BrowseView {lhs} {rhs} {scope} {full} {swapped} onFix={fix} onNavigate={go} />
     {:else if view === 'data'}
-      <CompareData
-        left={lhs}
-        right={rhs || $tree?.spec || ''}
-        {scope}
-        {packing}
-        onPacking={setPacking}
-      />
+      <CompareData left={lhs} right={rhs || $tree?.spec || ''} {scope} />
     {:else}
       <DiffView {scope} {full} {swapped} {closed} onNavigate={go} />
     {/if}

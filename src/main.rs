@@ -1814,14 +1814,6 @@ fn run_diff(
     // Both sides `s3://`: the pair the proxy can decode, and the pair whose S3 object
     // metadata is worth comparing.
     let s3_pair = old_str.starts_with("s3://") && new_str.starts_with("s3://");
-    // Whether `--verify-repack` can run at all — asked **before** either side is read.
-    // It depends on the two specs and the proxy, nothing else, and refusing after two
-    // slow structure reads and a printed diff looked like a run that simply found
-    // nothing to verify. Shared with the web's job, so both refuse in the same words.
-    if verify_repack && let Err(e) = compare::repack_supported(remote.is_some(), s3_pair) {
-        eprintln!("checkpoint-studio diff: {e:#}");
-        return 2;
-    }
     // Both checkpoints are read **in parallel**, remote or local: the two sides are independent, and
     // a comparison should cost the slower of them rather than their sum. Remote gets a session each
     // (ssh2 sessions aren't Sync) and a spinner line each; the password is entered once and reused,
@@ -2005,7 +1997,7 @@ fn run_diff(
     // path on that host (safetensors), and the proxy can open both. That is what makes a value
     // comparison possible for a pair that is *entirely* over there, which used to be refused unless
     // both sides were `s3://`. The browser asks the same question of specs that still carry their host
-    // (`compare::values_where`), so the two surfaces compare the same pairs.
+    // (`compare::data_where`), so the two surfaces compare the same pairs.
     let remote_sides = remote.map(|_| {
         (
             compare::proxy_side_of(&old_str),
@@ -2472,6 +2464,17 @@ fn run_diff(
         }
     }
 
+    // A packing schema with nothing that decodes: said, rather than silently dropped. The schemas are
+    // part of the *scope* (they describe how a side is read before anything is compared), so a command
+    // carrying them may well be a value comparison — which compares what is stored and applies no
+    // decode. Better to name that than to let a reader assume the numbers were unpacked.
+    if !verify_repack && (repack_schemas.old.is_some() || repack_schemas.new.is_some()) {
+        utils::eprint_note(
+            "checkpoint-studio diff: ",
+            "a packing schema was given, but only --verify-repack decodes packed indices — this run \
+             compares what each side stores",
+        );
+    }
     // `--verify-repack`: after the structural diff, confirm the shape-folded expert
     // tensors encode the same indices in old (sparse) vs new (dense) packing. Runs on
     // the proxy (s3-vs-s3). Its verdict drives the exit code when requested.
@@ -2509,7 +2512,9 @@ fn run_diff(
 /// matched tensor is equivalent (and nothing else differs), 1 otherwise, 2 on trouble.
 ///
 /// Where the data has to be reachable from was settled before the reads
-/// ([`compare::repack_supported`]), so a remote here is an s3-vs-s3 pair the proxy can decode.
+/// (`compare::data_where`, for the browser; for the CLI both operands are proxy-relative by the time
+/// they get here), so a remote pair is one the proxy can open — `s3://` URIs, paths on that host, or
+/// one of each.
 #[allow(clippy::too_many_arguments)]
 fn run_repack_verify(
     remote: Option<&remote::RemoteRead>,
@@ -2537,11 +2542,17 @@ fn run_repack_verify(
     let packing = plan.packing_note();
     let results = if let Some(r) = remote {
         let labels = repack_bar_labels(&plan.pairs, old_t, new_t);
+        // Both operands are already proxy-relative here (the host was split off before either was
+        // read), so each is either an `s3://` URI or a path on that host — and the proxy opens both.
+        let (old_side, new_side) = (
+            compare::proxy_side_of(old_uri),
+            compare::proxy_side_of(new_uri),
+        );
         match fetch_remote_repack(
             r,
             password,
-            old_uri,
-            new_uri,
+            &old_side,
+            &new_side,
             &plan.pairs,
             &labels,
             plan.bits,
@@ -2705,8 +2716,11 @@ fn repack_bar_labels(
 fn fetch_remote_repack(
     r: &remote::RemoteRead,
     password: &mut Option<String>,
-    old_uri: &str,
-    new_uri: &str,
+    // How the proxy reads each side — an `s3://` URI or a path on that host (`compare::proxy_side_of`).
+    // Not a URI pair any more: a repack verification of a safetensors directory on the proxy is the same
+    // work, and refusing it was a limitation of this call rather than of the verification.
+    old_side: &remote::RemoteSide,
+    new_side: &remote::RemoteSide,
     pairs: &[(String, String)],
     bar_labels: &[String],
     bits: usize,
@@ -2740,8 +2754,8 @@ fn fetch_remote_repack(
         );
         // The two URIs on their own lines: they are long, unbreakable, and the pair is
         // what you check first when a verify looks wrong.
-        eprintln!("  old (sparse) {old_uri}");
-        eprintln!("  new (dense)  {new_uri}");
+        eprintln!("  old (sparse) {}", old_side.address());
+        eprintln!("  new (dense)  {}", new_side.address());
     }
     // One bar for the whole verify, relabelled with the tensor being read — a bar per
     // tensor is thousands of them at checkpoint scale (see `ValueBar`).
@@ -2754,8 +2768,8 @@ fn fetch_remote_repack(
     // the waiting here.
     let out = r.verify_repack(
         &session,
-        old_uri,
-        new_uri,
+        old_side,
+        new_side,
         pairs,
         bits,
         schemas,
@@ -2930,11 +2944,15 @@ fn run_auto_sparse(
         local_repack(old_t, new_t, pairs, bits, (None, None), Some(1))
     }, |r| {
         let labels = repack_bar_labels(pairs, old_t, new_t);
+        let (old_side, new_side) = (
+            compare::proxy_side_of(old_uri),
+            compare::proxy_side_of(new_uri),
+        );
         match fetch_remote_repack(
             r,
             password,
-            old_uri,
-            new_uri,
+            &old_side,
+            &new_side,
             pairs,
             &labels,
             bits,

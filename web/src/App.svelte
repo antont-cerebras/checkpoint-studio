@@ -592,7 +592,6 @@
         full={$screen.full ?? false}
         swapped={$screen.swapped ?? false}
         closed={$screen.closed ?? []}
-        packing={$screen.packing}
       />
     {/if}
   </main>

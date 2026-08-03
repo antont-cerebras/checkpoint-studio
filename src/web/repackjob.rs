@@ -24,8 +24,13 @@ use super::jobs::Job;
 /// Where the decoding happens. Decided before planning, because the precondition is about the *sources*
 /// and reporting it as a planning failure names the wrong problem.
 enum Mode {
-    /// Two `s3://` checkpoints, decoded on the ssh proxy — only results cross the wire.
-    Proxy,
+    /// Both sides readable by the ssh proxy — decoded over there, only results cross the wire. Each
+    /// side is an `s3://` URI or a path on that host, which is what `RemoteSide` says.
+    Proxy {
+        proxy: crate::remote::RemoteRead,
+        old_side: crate::remote::RemoteSide,
+        new_side: crate::remote::RemoteSide,
+    },
     /// Local files on both sides, decoded here.
     Local,
 }
@@ -34,9 +39,28 @@ enum Mode {
 struct Side {
     tensors: Vec<crate::tree::TensorInfo>,
     metadata: Vec<crate::tree::MetadataInfo>,
-    /// The `s3://` URI, when this side is one — `verify_repack` addresses objects by URI.
+    /// The `s3://` URI, when this side is one — the proxy addresses cstorch objects by URI.
     s3_uri: Option<String>,
+    /// The path on the proxy, when this side is a remote safetensors file or directory. Without any
+    /// `host:` prefix: the session is already on that host.
+    remote_path: Option<String>,
+    /// The proxy this side is read through, when it is remote.
     remote: Option<crate::remote::RemoteRead>,
+    /// Whether this side's bytes are readable *here*.
+    local: bool,
+}
+
+impl Side {
+    /// How the proxy reads this side, or `None` when it cannot. The same two kinds
+    /// `valuesjob::Side::as_remote` answers with, because the proxy opens them the same way.
+    fn as_remote(&self) -> Option<crate::remote::RemoteSide> {
+        if let Some(uri) = &self.s3_uri {
+            return Some(crate::remote::RemoteSide::S3(uri.clone()));
+        }
+        self.remote_path
+            .as_ref()
+            .map(|p| crate::remote::RemoteSide::Safetensors(p.clone()))
+    }
 }
 
 /// Read a side, reporting the read through the job's own handle so cancelling reaches it.
@@ -49,6 +73,17 @@ fn read_side(spec: &str, opts: &crate::opening::Options, job: &Job) -> Result<Si
         .map(|p| p.to_string_lossy().into_owned())
         .filter(|s| s.starts_with("s3://"));
     let remote = target.remote.clone();
+    let local = remote.is_none();
+    // The path as the proxy sees it — what `safetensors` opens over there. `requested` is already the
+    // remote path: the host was split off when the spec was resolved.
+    let remote_path = (remote.is_some() && s3_uri.is_none())
+        .then(|| {
+            target
+                .requested
+                .first()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .flatten();
     let opened = target
         .read(crate::opening::Want::Parts, job.read_progress())
         .with_context(|| format!("reading {spec}"))?;
@@ -57,7 +92,9 @@ fn read_side(spec: &str, opts: &crate::opening::Options, job: &Job) -> Result<Si
         tensors,
         metadata,
         s3_uri,
+        remote_path,
         remote,
+        local,
     })
 }
 
@@ -77,6 +114,14 @@ pub(crate) fn run(
     schemas: crate::compare::RepackSchemas<'_>,
 ) -> Result<()> {
     let opts = current.read_options();
+    // Before either read: the same question the value job asks, of the same function — can both sides
+    // be read in one place? Finding that out after two multi-minute reads is the failure this prevents.
+    let at = crate::compare::data_where(
+        left,
+        right,
+        current.proxy_host(),
+        crate::compare::Work::Repack,
+    )?;
     job.progress_to(0, left);
     let old = read_side(left, opts, job)?;
     if job.cancelled() {
@@ -108,37 +153,43 @@ pub(crate) fn run(
         new_sum.retain_tensors(|n| keep.contains(n));
     }
 
-    // **Which mode, before planning.** Refusing an unsupported pair outright is the first thing that
-    // happens, because planning first would report "no fold-pair tensors matched" — a true statement
-    // about the wrong problem. The precondition itself is `compare::repack_supported`, shared with the
-    // `diff` subcommand so a pair either surface refuses is refused by both, in the same words.
-    let both_s3 = old.s3_uri.is_some() && new.s3_uri.is_some();
-    let anywhere_remote = old.remote.is_some() || new.remote.is_some();
-    crate::compare::repack_supported(anywhere_remote, both_s3)?;
-    let mode = if anywhere_remote {
-        Mode::Proxy
-    } else {
-        // Local files on both sides: decode here.
-        Mode::Local
+    // **Where the decoding happens**, from the answer the two addresses already gave (asked again at
+    // the start handler, before either read) — confirmed against what the sides turned out to be.
+    // Answered before planning, because planning first would report "no fold-pair tensors matched", a
+    // true statement about the wrong problem.
+    let mode = match at {
+        crate::compare::ValuesAt::Here if old.local && new.local => Mode::Local,
+        crate::compare::ValuesAt::OnProxy => {
+            let (Some(proxy), Some(old_side), Some(new_side)) = (
+                old.remote.as_ref().or(new.remote.as_ref()),
+                old.as_remote(),
+                new.as_remote(),
+            ) else {
+                bail!(
+                    "verifying these on the proxy needs both sides addressed as the proxy reads them — \
+                     an s3:// URI or a path on that host"
+                );
+            };
+            Mode::Proxy {
+                proxy: proxy.clone(),
+                old_side,
+                new_side,
+            }
+        }
+        crate::compare::ValuesAt::Here => bail!(
+            "one side turned out not to be readable here after all — its address said it was local"
+        ),
     };
 
     let plan = crate::compare::plan_repack(&old_sum, &new_sum, bits, schemas)?;
     job.set_total(plan.pairs.len());
 
-    let results = match mode {
-        Mode::Proxy => {
-            let (Some(r), Some(old_uri), Some(new_uri)) = (
-                old.remote.as_ref(),
-                old.s3_uri.as_deref(),
-                new.s3_uri.as_deref(),
-            ) else {
-                bail!(
-                    "verifying two s3:// checkpoints needs an ssh proxy to decode on — start the \
-                     server with --ssh-proxy, or set ssh_proxy in the config"
-                );
-            };
-            verify_on_proxy(r, job, old_uri, new_uri, &plan)?
-        }
+    let results = match &mode {
+        Mode::Proxy {
+            proxy,
+            old_side,
+            new_side,
+        } => verify_on_proxy(proxy, job, old_side, new_side, &plan)?,
         Mode::Local => verify_locally(job, &old.tensors, &new.tensors, &plan),
     };
 
@@ -168,8 +219,8 @@ pub(crate) fn run(
 fn verify_on_proxy(
     r: &crate::remote::RemoteRead,
     job: &Job,
-    old_uri: &str,
-    new_uri: &str,
+    old_side: &crate::remote::RemoteSide,
+    new_side: &crate::remote::RemoteSide,
     plan: &crate::compare::RepackPlan,
 ) -> Result<std::collections::HashMap<String, crate::remote::RepackResult>> {
     let mut password = None;
@@ -182,8 +233,8 @@ fn verify_on_proxy(
     let mut counted = ByteTally::default();
     let (map, _stats) = r.verify_repack(
         &session,
-        old_uri,
-        new_uri,
+        old_side,
+        new_side,
         &plan.pairs,
         plan.bits,
         plan.widths(),

@@ -34,6 +34,10 @@ import { SCOPE_PARAMS } from './params.generated';
  *   Two layouts of one model share no tensor name, so a plain comparison reports every tensor of both
  *   sides as one-sided; this drops the per-expert index (256 tensors fold onto the one fused tensor,
  *   shown as `×256`) and applies the standard layout synonyms, to both sides.
+ * - `repackSchema` / `repackSchemaNew` — `--repack-schema` / `--repack-schema-new`, per side: how that
+ *   side packs expert indices into a 16-bit word, as a list of bit widths (`[4]` sparse, `[3,3,3,3,3]`
+ *   five experts merged). A *decode* applied before comparing, which is why it belongs with the scope
+ *   rather than with a particular run; blank means infer it from the shapes.
  * - `subtree` / `subtreeNew` — `SOURCE#subtree`, per side: compare *from inside* a subtree, so a
  *   multimodal checkpoint's `language_model.model.…` lines up with a converted `model.…` and the
  *   siblings (`vision_tower.…`) are out of scope rather than removed. The CLI spells this on the
@@ -130,5 +134,9 @@ export function scopeSummary(s: DiffScopeParams): string {
   if (s.alignFused) parts.push('unfused ↔ fused aligned');
   if (s.subtree.trim() !== '') parts.push(`baseline from #${s.subtree.trim()}`);
   if (s.subtreeNew.trim() !== '') parts.push(`candidate from #${s.subtreeNew.trim()}`);
+  // The packings are said, not counted: which bit widths a side is read with is the whole content of
+  // the setting, and a verdict that depends on it should not have to be traced back to a panel.
+  if (s.repackSchema.trim() !== '') parts.push(`baseline packed ${s.repackSchema.trim()}`);
+  if (s.repackSchemaNew.trim() !== '') parts.push(`candidate packed ${s.repackSchemaNew.trim()}`);
   return parts.join(' · ');
 }

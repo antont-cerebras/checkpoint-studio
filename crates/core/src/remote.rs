@@ -1021,20 +1021,22 @@ impl RemoteRead {
         parse_value_diff(&out, &self.host)
     }
 
-    /// Verify that shape-folded expert tensors in two `s3://` cstorch checkpoints
-    /// encode the *same* 3-bit indices in different packings (old: one index per
-    /// 16-bit word; new: `fold` indices per word, folded along dim 0). Runs on the
-    /// proxy: per pair it streams both tensors' S3 objects (in parallel, with byte
-    /// progress), reinterprets the raw 16-bit words, decodes the indices, checks
-    /// equality, and validates the format (old words' top bits and new words' MSB
-    /// must be zero). Emits [`RepackEvent`]s for the live per-tensor download bars.
-    /// Returns per-tensor [`RepackResult`]s keyed by name. **Read-only.**
+    /// Verify that shape-folded expert tensors in two checkpoints **the proxy can read** encode the
+    /// *same* indices in different packings (one side one index per 16-bit word, the other several
+    /// folded along dim 0). Each side is an `s3://` cstorch checkpoint or a safetensors file/directory
+    /// on the proxy — the same two kinds [`Self::value_diff`] takes, because the requirement is the
+    /// same: both sides readable in one place. An `s3://` side streams its objects with byte progress;
+    /// a safetensors side is read whole.
+    ///
+    /// Decodes the indices, checks equality, and validates each side's packing (no bits above its
+    /// schema's total width). Emits [`RepackEvent`]s for the live per-tensor bars and returns
+    /// per-tensor [`RepackResult`]s keyed by name. **Read-only.**
     #[allow(clippy::too_many_arguments)]
     pub fn verify_repack(
         &self,
         session: &RemoteSession,
-        old_uri: &str,
-        new_uri: &str,
+        old: &RemoteSide,
+        new: &RemoteSide,
         pairs: &[(String, String)],
         bits: usize,
         // How each side packs its expert indices, when the checkpoint does not say — `(old, new)`, each
@@ -1045,7 +1047,7 @@ impl RemoteRead {
         abort: Option<&std::sync::atomic::AtomicBool>,
         mut on_event: impl FnMut(RepackEvent<'_>),
     ) -> Result<(HashMap<String, RepackResult>, Option<RemoteValueStats>)> {
-        let script = repack_verify_script(old_uri, new_uri, pairs, bits, schemas, auto_sparse);
+        let script = repack_verify_script(old, new, pairs, bits, schemas, auto_sparse);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
         let out = session.exec_capture_abortable(&command, &script, abort, |line| {
             dispatch_stream_line(line, &repack_status, &mut on_event);
@@ -1303,7 +1305,8 @@ fn value_diff_script(
     )
 }
 
-/// The repack-equivalence script for two `s3://` cstorch checkpoints: for each
+/// The repack-equivalence script for a pair the proxy can read — two `s3://` cstorch checkpoints, a
+/// safetensors directory on the proxy, or one of each: for each
 /// `(old_name, new_name)` pair whose shapes fold along dim 0, reinterpret both
 /// tensors' raw 16-bit words, decode the `bits`-wide indices (old: one per word;
 /// new: `fold = ceil(E/W)` per word, expert `e` at word `e//fold` shift
@@ -1314,8 +1317,8 @@ fn value_diff_script(
 ///
 /// **Read-only:** only `cstorch.load` (lazy) + per-tensor materialize; no writes.
 fn repack_verify_script(
-    old_uri: &str,
-    new_uri: &str,
+    old: &RemoteSide,
+    new: &RemoteSide,
     pairs: &[(String, String)],
     bits: usize,
     schemas: (Option<&[u32]>, Option<&[u32]>),
@@ -1324,8 +1327,8 @@ fn repack_verify_script(
     with_params(
         &cstorch_prelude(include_str!("python/repack_verify.py")),
         &serde_json::json!({
-            "old": old_uri,
-            "new": new_uri,
+            "old": old.as_json(),
+            "new": new.as_json(),
             "pairs": pairs,
             "bits": bits.max(1),
             // How each side packs its indices, when it was said. `null` leaves the script inferring the
@@ -2096,7 +2099,7 @@ mod tests {
             ),
             (
                 "repack_verify",
-                repack_verify_script("s3://b/o", "s3://b/n", &[], 3, INFERRED, true),
+                repack_verify_script(&s3("s3://b/o"), &s3("s3://b/n"), &[], 3, INFERRED, true),
             ),
         ] {
             // Statement position only — the prelude's docstring *mentions* the future
@@ -2203,7 +2206,7 @@ mod tests {
             (
                 "repack_verify.py",
                 include_str!("python/repack_verify.py"),
-                repack_verify_script("s3://b/o", "s3://b/n", &pairs, 3, INFERRED, true),
+                repack_verify_script(&s3("s3://b/o"), &s3("s3://b/n"), &pairs, 3, INFERRED, true),
             ),
         ] {
             let wanted = keys_read(src);
@@ -2225,6 +2228,37 @@ mod tests {
         }
     }
 
+    /// A repack verification of a **safetensors directory on the proxy** against an `s3://` checkpoint:
+    /// the pair the old rule refused outright, while the value comparison was already reading exactly
+    /// these two kinds on exactly this host.
+    #[test]
+    fn repack_verify_script_reads_a_safetensors_side_on_the_proxy() {
+        let s = repack_verify_script(
+            &RemoteSide::Safetensors("/opt/models/boxes".to_string()),
+            &s3("s3://bucket/ckpt"),
+            &[("w".to_string(), "w".to_string())],
+            4,
+            INFERRED,
+            false,
+        );
+        let p = script_params(&s);
+        assert_eq!(
+            p["old"],
+            serde_json::json!({"kind": "safetensors", "path": "/opt/models/boxes"})
+        );
+        assert_eq!(
+            p["new"],
+            serde_json::json!({"kind": "s3", "path": "s3://bucket/ckpt"})
+        );
+        // Both readers are in the script; which one runs is decided from the side's kind — and a
+        // safetensors side answers shapes from the header, so a non-fold pair costs no read.
+        assert!(s.contains("from safetensors import safe_open"), "{s}");
+        assert!(s.contains("import cerebras.pytorch"), "{s}");
+        assert!(s.contains("get_slice(name).get_shape()"), "{s}");
+        // And it reads *words*, whatever the dtype calls them — the sibling floats have their own path.
+        assert!(s.contains("def words_of("), "{s}");
+    }
+
     /// Each side's packing reaches the script as its own width list, and `None` stays absent so the
     /// script keeps inferring the uniform case. Without this the override would be accepted by the CLI
     /// and quietly dropped at the ssh hop — the verdict would look the same and mean something else.
@@ -2234,8 +2268,8 @@ mod tests {
         let sparse: &[u32] = &[4];
         let merged: &[u32] = &[3, 3, 3, 3, 3];
         let s = repack_verify_script(
-            "s3://b/o",
-            "s3://b/n",
+            &s3("s3://b/o"),
+            &s3("s3://b/n"),
             &pairs,
             3,
             (Some(sparse), Some(merged)),
@@ -2246,7 +2280,12 @@ mod tests {
         assert_eq!(p["new_widths"], serde_json::json!([3, 3, 3, 3, 3]));
         // Nothing said: the parameters are present but null, which is the script's "infer it" case.
         let none = script_params(&repack_verify_script(
-            "s3://b/o", "s3://b/n", &pairs, 3, INFERRED, false,
+            &s3("s3://b/o"),
+            &s3("s3://b/n"),
+            &pairs,
+            3,
+            INFERRED,
+            false,
         ));
         assert!(none["old_widths"].is_null() && none["new_widths"].is_null());
     }
@@ -2268,7 +2307,7 @@ mod tests {
         assert_eq!(script_params(&dump_script(nasty, true))["uri"], nasty);
         assert_eq!(script_params(&list_script(nasty))["uri"], nasty);
         let pairs = vec![(nasty.to_string(), "n\"2".to_string())];
-        let s = repack_verify_script("s3://b/o", "s3://b/n", &pairs, 3, INFERRED, false);
+        let s = repack_verify_script(&s3("s3://b/o"), &s3("s3://b/n"), &pairs, 3, INFERRED, false);
         assert_eq!(script_params(&s)["pairs"][0][0], nasty);
         assert_eq!(script_params(&s)["pairs"][0][1], "n\"2");
     }
@@ -2561,9 +2600,19 @@ mod tests {
     #[test]
     fn repack_verify_script_embeds_inputs_and_checks_format() {
         let pairs = vec![("w.down".to_string(), "w.down".to_string())];
-        let s = repack_verify_script("s3://b/old", "s3://b/new", &pairs, 3, INFERRED, false);
+        let s = repack_verify_script(
+            &s3("s3://b/old"),
+            &s3("s3://b/new"),
+            &pairs,
+            3,
+            INFERRED,
+            false,
+        );
         let p = script_params(&s);
-        assert_eq!(p["old"], "s3://b/old");
+        assert_eq!(
+            p["old"],
+            serde_json::json!({"kind": "s3", "path": "s3://b/old"})
+        );
         assert_eq!(p["pairs"], serde_json::json!([["w.down", "w.down"]]));
         assert_eq!(p["bits"], 3);
         // Derives the fold, decodes, and runs BOTH format checks.
@@ -2585,18 +2634,22 @@ mod tests {
         );
         assert!(s.contains(STATUS_TAG) && s.contains(SENTINEL));
         // Read-only: reads objects, never writes/uploads/deletes.
-        for forbidden in [
-            "cstorch.save",
-            "torch.save",
-            "put_object",
-            "delete_object",
-            "open(",
-        ] {
+        for forbidden in ["cstorch.save", "torch.save", "put_object", "delete_object"] {
             assert!(
                 !s.contains(forbidden),
                 "repack script must stay read-only: {forbidden}"
             );
         }
+        // `open(` as a **word**: `safe_open(…)` is safetensors' reader — read-only by construction, and
+        // the only way to open a shard at all — so banning the substring would ban the feature. A bare
+        // `open(` is what could write. Same rule as the value-diff script's check.
+        let bare_open = s.match_indices("open(").any(|(i, _)| {
+            s[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        });
+        assert!(!bare_open, "repack script must stay read-only: open(");
     }
 
     #[test]

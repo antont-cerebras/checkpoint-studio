@@ -23,17 +23,11 @@
   import { api } from '../lib/api';
   import type { DiffScopeParams } from '../lib/diffscope';
   import { copyText } from '../lib/clipboard';
-  import { emptyPacking, isPackingSet, type Packing } from '../lib/packing';
-  import TextField from './TextField.svelte';
 
   /** The two checkpoints, and the selection to apply. */
   export let left: string;
   export let right: string;
   export let scope: DiffScopeParams | undefined = undefined;
-  /** How each side packs its expert indices, for the repack verification (`lib/packing`). */
-  export let packing: Packing | undefined = undefined;
-  /** Told when either field is edited, so the URL carries it — this panel owns no state of its own. */
-  export let onPacking: (p: Packing) => void = () => {};
 
   $: running = $job?.state === 'running';
   // A denominator only once the work knows one; until then a spinner, as every other wait here does.
@@ -141,18 +135,6 @@
    * server renders it from the same parameter table that decides which parameters exist
    * (`GET /api/command`, `src/web/params.rs`).
    */
-  /**
-   * The packing panel: open when the reader asks, and whenever a schema is already set (a link that
-   * carries one must show it — an override the panel hid would be a run whose result nobody could
-   * explain).
-   */
-  let packingOpen = false;
-  $: fields = packing ?? emptyPacking();
-  function edited(which: keyof Packing, e: Event) {
-    const v = (e.currentTarget as HTMLInputElement).value;
-    onPacking({ ...fields, [which]: v });
-  }
-
   let command = '';
   $: void loadCommand(left, right, scope);
   async function loadCommand(l: string, r: string, s: DiffScopeParams | undefined) {
@@ -168,28 +150,6 @@
       command = '';
     }
   }
-  // The verification's own command, rendered only while the panel is open — it is the run these two
-  // fields configure, and the `--values` line above does not read them.
-  let repackCommand = '';
-  $: void loadRepackCommand(left, right, scope, packing, packingOpen);
-  async function loadRepackCommand(
-    l: string,
-    r: string,
-    sc: DiffScopeParams | undefined,
-    pk: Packing | undefined,
-    open: boolean,
-  ) {
-    if (!open || !l || !r) {
-      repackCommand = '';
-      return;
-    }
-    try {
-      repackCommand = (await api.command(l, r, sc, 'verifyRepack', false, pk)).command ?? '';
-    } catch {
-      repackCommand = '';
-    }
-  }
-
   let copied = false;
   function copy() {
     if (copyText(command)) {
@@ -243,7 +203,7 @@
                   disabled={running || !!blocked}
                   on:click={() => {
                     moreOpen = false;
-                    void startJob(k.kind, left, right, scope, undefined, packing);
+                    void startJob(k.kind, left, right, scope);
                   }}
                 >
                   {k.label} <code>{k.flag}</code>
@@ -253,61 +213,12 @@
           </ul>
         {/if}
       </div>
-      <button
-        type="button"
-        class="quiet"
-        aria-expanded={packingOpen}
-        title="How each side packs its expert indices into 16-bit words — what a repack verification decodes with."
-        on:click={() => (packingOpen = !packingOpen)}>Packing ▾</button
-      >
       {#if running}
         <button type="button" class="quiet" on:click={() => void cancelJob()}>Stop</button>
       {:else if $job}
         <button type="button" class="quiet" on:click={clearJob}>Clear results</button>
       {/if}
     </div>
-
-    <!-- **The one input a verification cannot infer.** Whether these are the same weights in different
-         packings can only be answered by decoding both sides, and these checkpoints declare their
-         packing nowhere: the sparse encoding is `[4]` (one index per word, four low bits used) and a
-         merged one is `[3,3,3,3,3]` (five consecutive experts per word, each shifted three bits). A
-         width guessed from the fold ratio describes a uniform merge and says nothing about a sparse
-         side — so it is said here, per side, and travels in the link. -->
-    {#if packingOpen || isPackingSet(packing)}
-      <div class="packing">
-        <p class="dim hint">
-          Packing schemas for <code>Verify repack</code> — a list of bit widths per 16-bit word. Leave a
-          side blank to infer it from the shapes.
-        </p>
-        <label class="dim" for="pack-baseline">baseline</label>
-        <TextField
-            id="pack-baseline"
-            variant="dense"
-            rows={0}
-            grow={false}
-            width="16ch"
-            value={fields.baseline}
-            on:input={(e) => edited('baseline', e)}
-            placeholder="[4]"
-            spellcheck="false"
-        />
-        <label class="dim" for="pack-candidate">candidate</label>
-        <TextField
-            id="pack-candidate"
-            variant="dense"
-            rows={0}
-            grow={false}
-            width="16ch"
-            value={fields.candidate}
-            on:input={(e) => edited('candidate', e)}
-            placeholder="[3,3,3,3,3]"
-            spellcheck="false"
-        />
-        {#if repackCommand}
-          <code class="mono cmdline">{repackCommand}</code>
-        {/if}
-      </div>
-    {/if}
 
     <!-- What it will cost, before it is started — or that it is not known yet, which is a different
          statement from "nothing". -->
@@ -432,34 +343,6 @@
 </div>
 
 <style>
-  /* The packing fields: a settings row, outlined by its background rather than by a border (the same
-     rule the scope bar's cards follow). */
-  .packing {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px 12px;
-    margin: 6px 0 0;
-    padding: 7px 9px;
-    border-radius: 4px;
-    background: var(--bg-elev);
-  }
-  .packing .hint {
-    flex: 1 0 100%;
-    margin: 0;
-    font-size: 11.5px;
-  }
-  .packing label {
-    font-size: 12px;
-  }
-  /* The verification's own command, wrapping rather than clipping — it carries two long addresses. */
-  .cmdline {
-    flex: 1 0 100%;
-    font-size: 11.5px;
-    color: var(--fg-dim);
-    word-break: break-all;
-  }
-
   /* Why a tensor could not be compared — a fact about the run, not a value. Coloured like a warning
      rather than an error: the run itself succeeded, and this is what it could not answer. */
   .why {

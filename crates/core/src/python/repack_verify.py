@@ -1,8 +1,14 @@
-"""Verify two `s3://` cstorch checkpoints hold the same weights in different packings.
+"""Verify two checkpoints hold the same weights in different packings.
 
 Driven by `remote.rs::repack_verify_script`. Decodes shape-folded / sparse-packed
 expert tensors (N-bit indices plus their codebook and qscale siblings) on the proxy
 and reports whether the unpacked values agree. Only verdicts cross ssh.
+
+Each side is either an `s3://` cstorch checkpoint (loaded with cstorch, which holds the S3 access) or a
+safetensors file / directory of shards **on this host** (read with `safetensors`) — the same two kinds
+`value_diff.py` reads, for the same reason: the proxy can reach both, so a pair that is entirely over
+here can be verified without moving tensor data anywhere. An `s3://` side streams its objects itself
+(chunked, with byte progress); a safetensors side is read whole, like the local path does.
 
 Read-only: loads and compares; never writes to either checkpoint.
 """
@@ -21,7 +27,7 @@ from typing import Any, Callable, NamedTuple
 # JSON object (see `remote.rs::with_params`). One substitution point keeps the rest
 # of this file ordinary Python that ruff and pyright can check.
 PARAMS = json.loads("__PARAMS__")
-OLD = PARAMS["old"]
+OLD = PARAMS["old"]      # {"kind": "s3"|"safetensors", "path": …}
 NEW = PARAMS["new"]
 PAIRS = PARAMS["pairs"]
 BITS = PARAMS["bits"]
@@ -47,22 +53,73 @@ def stat(s: str) -> None:
     with _lock:
         sys.stdout.write(ST + s + "\n"); sys.stdout.flush()
 try:
-    import cerebras.pytorch as cstorch
-except Exception as e:
-    emit({"error": "import cerebras.pytorch failed: %r" % (e,)}); sys.exit(0)
-try:
     import numpy as np
     import torch
-    import zstandard
 except Exception as e:
-    emit({"error": "import numpy/torch/zstandard failed: %r" % (e,)}); sys.exit(0)
+    emit({"error": "import numpy/torch failed: %r" % (e,)}); sys.exit(0)
+# Only what each side actually needs: a safetensors-only pair must not fail because the cluster's
+# cstorch is missing, and an s3-only pair must not fail for want of the safetensors package.
+KINDS = {OLD["kind"], NEW["kind"]}
+cstorch = None
+if "s3" in KINDS:
+    try:
+        import cerebras.pytorch as cstorch
+        import zstandard
+    except Exception as e:
+        emit({"error": "import cerebras.pytorch/zstandard failed (needed for an s3:// side): %r" % (e,)}); sys.exit(0)
+safe_open = None
+if "safetensors" in KINDS:
+    try:
+        from safetensors import safe_open
+    except Exception as e:
+        emit({"error": "import safetensors failed (needed for a safetensors side): %r" % (e,)}); sys.exit(0)
+
+
+class SafeSide:
+    """A safetensors file or directory of shards on this host, keyed by tensor name.
+
+    The same class `value_diff.py` reads a safetensors side with: whole tensors, since the decode below
+    walks them in column blocks anyway, and a header scan (a few kilobytes per shard) to find which
+    shard holds which name.
+    """
+
+    def __init__(self, path: str) -> None:
+        import pathlib
+        p = pathlib.Path(path)
+        files = sorted(p.glob("*.safetensors")) if p.is_dir() else [p]
+        if not files:
+            raise RuntimeError("no .safetensors files under %s" % (path,))
+        self.where: dict[str, str] = {}
+        for f in files:
+            with safe_open(str(f), framework="pt") as h:
+                for k in h.keys():  # noqa: SIM118  (safe_open is not a dict; `in` is not `keys()`)
+                    self.where.setdefault(k, str(f))
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.where
+
+    def shape(self, name: str) -> list[int]:
+        """From the header alone — `get_slice` reads no data, so a shape check is free."""
+        with safe_open(self.where[name], framework="pt") as h:
+            return [int(d) for d in h.get_slice(name).get_shape()]
+
+    def read(self, name: str) -> torch.Tensor:
+        with safe_open(self.where[name], framework="pt") as h:
+            return h.get_tensor(name)
+
+
+def open_side(side: dict[str, Any], which: str) -> Any:
+    stat("load\t%s" % (which,))
+    if side["kind"] == "s3":
+        return cstorch.load(side["path"], map_location=None)
+    return SafeSide(side["path"])
+
+
 try:
-    stat("load\told")
-    old_sd = cstorch.load(OLD, map_location=None)
-    stat("load\tnew")
-    new_sd = cstorch.load(NEW, map_location=None)
+    old_sd = open_side(OLD, "old")
+    new_sd = open_side(NEW, "new")
 except Exception as e:
-    emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
+    emit({"error": "opening a checkpoint failed: %r" % (e,)}); sys.exit(0)
 mask = np.uint16((1 << BITS) - 1)
 # Resolve a lazy tensor to its backing S3 object (thread-safe client + key) so we
 # can stream it ourselves with progress, rather than cstorch's one-shot read.
@@ -115,8 +172,17 @@ def decode_u16(buf: bytearray, *, compressed: bool) -> np.ndarray[Any, Any]:
     if compressed:
         return np.frombuffer(zstandard.decompress(bytes(buf)), dtype=np.uint16)
     return np.frombuffer(buf, dtype=np.uint16)     # raw 16-bit words, zero-copy
-def to_u16(dt: Any) -> np.ndarray[Any, Any]:   # fallback via cstorch (no byte progress)
+def to_u16(dt: Any) -> np.ndarray[Any, Any]:   # no byte progress: cstorch materialise, or a local read
     return dt.to("cpu").contiguous().view(torch.int16).numpy().view(np.uint16)
+def words_of(sd: Any, side: dict[str, Any], name: str, handle: Any) -> np.ndarray[Any, Any]:
+    """One tensor's raw 16-bit words, whichever kind of side it came from.
+
+    The dtype is not consulted: what is stored is a word, and the writers disagree about whether to
+    call it `U16`, `F16` or `I16` (see `sample::packs_indices`).
+    """
+    if side["kind"] == "safetensors":
+        return to_u16(sd.read(name))
+    return to_u16(handle)
 NPF = {"float16": np.float16, "float32": np.float32, "float64": np.float64}
 def aux_meta(loc: Loc) -> Aux | None:
     # Details for a numpy-float-stored sibling, else None.
@@ -131,9 +197,16 @@ def aux_meta(loc: Loc) -> Aux | None:
         return None
     return Aux(bool(meta.get("compressed")), NPF[nm["dtype"]],
                [int(x) for x in nm["shape"]], int(h.get("ContentLength", 0)))
-def stream_aux(sd: Any, name: str, on_side: Callable[[int], object]) -> tuple[np.ndarray[Any, Any], int]:
+def stream_aux(sd: Any, side: dict[str, Any], name: str,
+               on_side: Callable[[int], object]) -> tuple[np.ndarray[Any, Any], int]:
     # Read a sibling float tensor (codebook / scale) over S3 with byte progress → f64.
     # Falls back to cstorch materialise (no progress) if it isn't numpy-float-stored.
+    if side["kind"] == "safetensors":
+        # A local read has no chunks to report: it lands, and its size is what it turned out to be.
+        t = sd.read(name)
+        n = int(t.element_size() * t.nelement())
+        on_side(n)
+        return t.to(torch.float64).numpy(), n
     dt = sd[name]
     loc = resolve(dt)
     am = aux_meta(loc) if loc is not None else None
@@ -143,10 +216,12 @@ def stream_aux(sd: Any, name: str, on_side: Callable[[int], object]) -> tuple[np
     buf = download_raw(loc, on_side)
     raw = zstandard.decompress(bytes(buf)) if am.compressed else buf
     return np.frombuffer(raw, dtype=am.dtype).reshape(am.shape).astype(np.float64), am.size
-def aux_size(sd: Any, name: str) -> int:
+def aux_size(sd: Any, side: dict[str, Any], name: str) -> int:
     # (old_or_new) S3 byte size of a sibling float tensor, 0 if not resolvable — used
     # to size its bar UP FRONT (before it streams), so it never shows an unsized bar.
-    if name not in sd:
+    # A safetensors side reports 0: there is nothing to download, so the size is announced when the
+    # read lands rather than guessed from a header here.
+    if name not in sd or side["kind"] == "safetensors":
         return 0
     loc = resolve(sd[name])
     am = aux_meta(loc) if loc is not None else None
@@ -164,8 +239,12 @@ def cmp_aux(oname_a: str, nname_a: str, osz: int, nsz: int) -> dict[str, Any]:
         s = od[0] + nd[0]
         if s - last[0] >= EMIT:
             last[0] = s; stat("bytes\t%s\t%d\t%d" % (nname_a, od[0], nd[0]))
-    a, _ = stream_aux(old_sd, oname_a, lambda x: (od.__setitem__(0, x), bump()))
-    b, _ = stream_aux(new_sd, nname_a, lambda x: (nd.__setitem__(0, x), bump()))
+    a, oread = stream_aux(old_sd, OLD, oname_a, lambda x: (od.__setitem__(0, x), bump()))
+    b, nread = stream_aux(new_sd, NEW, nname_a, lambda x: (nd.__setitem__(0, x), bump()))
+    # A side with nothing to download had no size to announce before it was read; say it now, so the
+    # bar completes against a real total instead of finishing an unsized sweep.
+    osz = osz or oread; nsz = nsz or nread
+    stat("size\t%s\t%d\t%d" % (nname_a, osz, nsz))
     stat("bytes\t%s\t%d\t%d" % (nname_a, osz, nsz))
     stat("phase\t%s\tcomparing" % (nname_a,))   # decode + compare below
     with agg_lock:
@@ -195,12 +274,21 @@ def work(idx: int) -> None:
         for kind in ("codebook", "qscale"):
             oa = op + "." + kind; na = npx + "." + kind
             if oa in old_sd and na in new_sd:
-                osz = aux_size(old_sd, oa); nsz = aux_size(new_sd, na)
+                osz = aux_size(old_sd, OLD, oa); nsz = aux_size(new_sd, NEW, na)
                 aux_sz[na] = (osz, nsz)
                 stat("size\t%s\t%d\t%d" % (na, osz, nsz))
     try:
-        da = old_sd[oname]; db = new_sd[nname]
-        ashape = [int(x) for x in da.shape]; bshape = [int(x) for x in db.shape]
+        # Both sides' membership in one answer: an unknown name used to reach the read and come back
+        # as a `KeyError`, which says nothing about which side lacks it.
+        absent = [w for w, sd, n in (("baseline", old_sd, oname), ("candidate", new_sd, nname))
+                  if n not in sd]
+        if absent:
+            res["error"] = "not in the " + " or the ".join(absent); emit(res); return
+        # A lazy cstorch handle for an s3 side; a safetensors side has none, and answers from its header.
+        da = None if OLD["kind"] == "safetensors" else old_sd[oname]
+        db = None if NEW["kind"] == "safetensors" else new_sd[nname]
+        ashape = old_sd.shape(oname) if da is None else [int(x) for x in da.shape]
+        bshape = new_sd.shape(nname) if db is None else [int(x) for x in db.shape]
         E = ashape[0] if ashape else 0
         W = bshape[0] if bshape else 0
         if AUTO:
@@ -223,7 +311,8 @@ def work(idx: int) -> None:
             res["error"] = "a schema exceeds the 16-bit word (old %r sums to %d, new %r to %d)" % (
                 ow, sum(ow), nw, sum(nw))
             emit(res); return
-        lo = resolve(da); ln = resolve(db)
+        lo = resolve(da) if da is not None else None
+        ln = resolve(db) if db is not None else None
         odone = [0]; ndone = [0]; last = [0]
         def bump() -> None:
             s = odone[0] + ndone[0]
@@ -235,7 +324,17 @@ def work(idx: int) -> None:
             # so flag the phase BEFORE it, not after.
             stat("phase\t%s\tcomparing" % (nname,))
         # Each branch decodes its own words, so `ao`/`bo` are bound on every path.
-        if lo is not None and ln is not None:
+        if da is None or db is None:
+            # At least one side is safetensors on this host: read each side whole (the s3 path does the
+            # same in the end — it downloads the whole object), then the decode below walks them in
+            # column blocks. A local read has no chunks to report, so its size is announced complete.
+            ao = words_of(old_sd, OLD, oname, da); bo = words_of(new_sd, NEW, nname, db)
+            osz = int(ao.nbytes); nsz = int(bo.nbytes)
+            tb = osz + nsz
+            stat("size\t%s\t%d\t%d" % (nname, osz, nsz))
+            stat("bytes\t%s\t%d\t%d" % (nname, osz, nsz))
+            comparing()
+        elif lo is not None and ln is not None:
             osz, ocomp, onp = head(lo); nsz, ncomp, nnp = head(ln)
             stat("size\t%s\t%d\t%d" % (nname, osz, nsz))
             if onp and nnp:

@@ -690,7 +690,7 @@ fn stopping_a_comparison_stops_both_of_its_reads() {
 ///
 /// A *mixed* pair is the case refused wherever this runs: one side here and one over there means no
 /// single place holds both, whatever proxy is configured. The pairs a proxy *can* compare are covered
-/// where the rule lives — `compare::values_where` takes the proxy as an argument, which is the only way
+/// where the rule lives — `compare::data_where` takes the proxy as an argument, which is the only way
 /// to test every answer without one.
 #[test]
 fn a_pair_with_no_readable_data_is_refused_a_value_comparison_at_the_door() {

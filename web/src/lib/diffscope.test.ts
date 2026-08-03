@@ -156,6 +156,31 @@ describe("saying the scope in one line", () => {
   });
 });
 
+describe("the packing schemas", () => {
+  // They are part of the scope because they are applied *before* a comparison — the same kind of thing
+  // as a rename rule. So they travel with it, count as narrowing it, and appear in its one-line summary.
+  it("travel with the scope and say which side each applies to", () => {
+    const s = scope({ repackSchema: "[4]", repackSchemaNew: "3,3,3,3,3" });
+    expect(scopeToQuery(s)).toEqual([
+      ["repack_schema", "[4]"],
+      ["repack_schema_new", "3,3,3,3,3"],
+    ]);
+    expect(scopeFromQuery(new URLSearchParams(scopeToQuery(s)))).toEqual(s);
+    expect(isScopeActive(s)).toBe(true);
+    expect(scopeSummary(s)).toBe("baseline packed [4] · candidate packed 3,3,3,3,3");
+  });
+
+  it("say nothing when a side is left to be inferred", () => {
+    expect(scopeToQuery(scope({ repackSchemaNew: "[4,4,4,4]" }))).toEqual([
+      ["repack_schema_new", "[4,4,4,4]"],
+    ]);
+    expect(scopeSummary(scope({ repackSchemaNew: "[4,4,4,4]" }))).toBe(
+      "candidate packed [4,4,4,4]",
+    );
+    expect(isScopeActive(scope())).toBe(false);
+  });
+});
+
 describe("the subtree scope", () => {
   it("travels as a query parameter per side, and back", () => {
     const s = {

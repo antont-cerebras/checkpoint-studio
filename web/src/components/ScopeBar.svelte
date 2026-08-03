@@ -52,7 +52,7 @@
 
   /** A text field of the scope: which key it edits, what it is, and what one looks like. */
   interface Field {
-    key: 'name' | 'names' | 'dtypeIs' | 'shapeIs' | 'subtree' | 'subtreeNew';
+    key: 'name' | 'names' | 'dtypeIs' | 'shapeIs' | 'subtree' | 'subtreeNew' | 'repackSchema' | 'repackSchemaNew';
     label: string;
     /** The CLI flag it is, so the two surfaces are one thing to learn. */
     flag: string;
@@ -131,6 +131,40 @@
       placeholder: 'model',
       hint: 'The same, on the candidate. Either side, or both — whichever one hangs under an extra namespace.',
       examples: ['language_model', 'model'],
+    },
+  ];
+
+  /**
+   * How each side's packed tensors are **decoded**, before anything is compared.
+   *
+   * Here rather than beside the *Verify repack* button because that is what it is: a mapping applied to
+   * certain tensors ahead of a comparison, like the rename rules above and the fused alignment — not an
+   * option of one run. A packed expert weight stores indices into a codebook, several to a 16-bit word,
+   * and **the checkpoint says nowhere how**: `[4]` is the sparse encoding (one index per word, four low
+   * bits used) and `[3,3,3,3,3]` is five consecutive experts per word, each shifted three bits. A width
+   * guessed from the fold ratio describes a uniform merge and says nothing about a sparse side, so a
+   * sparse-vs-merged pair read as *not equivalent* with no way to say otherwise.
+   */
+  const PACKING: Field[] = [
+    {
+      key: 'repackSchema',
+      label: 'Baseline packing',
+      flag: '--repack-schema',
+      rows: 0,
+      narrow: true,
+      placeholder: '[4]',
+      hint: "Bit widths per 16-bit word, least-significant field first. Leave blank to infer it from the two shapes. Used when verifying a repack.",
+      examples: ['[4]', '3,3,3,3,3', 'u3×5'],
+    },
+    {
+      key: 'repackSchemaNew',
+      label: 'Candidate packing',
+      flag: '--repack-schema-new',
+      rows: 0,
+      narrow: true,
+      placeholder: '[3,3,3,3,3]',
+      hint: 'The same, for the candidate. The two sides are separate fields because a repack is exactly a change of packing — one side sparse, the other merged.',
+      examples: ['[3,3,3,3,3]', '[4,4,4,4]', '4'],
     },
   ];
 
@@ -658,6 +692,43 @@
             <span><strong>Tensors only</strong> <code>--only-tensors</code></span>
             <small class="dim">Skip checkpoint metadata. Applying any tensor filter also leaves metadata out.</small>
           </label>
+        </section>
+
+        <!-- **Decode last, because it is about the bytes.** The three steps above decide which tensors
+             are compared; this one decides how the packed ones are *read* when a comparison reaches
+             their bytes. It changes what a verification answers, so it lives with the settings and
+             travels in the link, rather than being an option of the button that starts the run. -->
+        <section class="card packing">
+          <header class="card-head">
+            <span class="step">4 · Decode</span>
+            <div>
+              <h3>Unpack quantized experts</h3>
+              <p>How each side packs expert indices into a 16-bit word.</p>
+            </div>
+          </header>
+          <div class="fields paired">
+            {#each PACKING as f (f.key)}
+              <label for="scope-{f.key}" class:narrow={f.narrow}>
+                <span class="what">{f.label} <code>{f.flag}</code></span>
+                <TextField
+                  variant="dense"
+                  rows={f.rows}
+                  id="scope-{f.key}"
+                  value={draft[f.key]}
+                  on:input={(e) => setText(f.key, eventValue(e))}
+                  placeholder={f.placeholder}
+                  spellcheck="false"
+                  readonly={busy}
+                />
+                <small class="dim">{f.hint}</small>
+                <small class="eg">
+                  <span class="dim">e.g.</span>
+                  {#each f.examples as e (e)}<code>{e}</code>{/each}
+                </small>
+              </label>
+            {/each}
+          </div>
+          <p class="tip dim">Nothing here declares its packing, so it is said: a sparse <code>[4]</code> baseline against a merged <code>[3,3,3,3,3]</code> candidate is one repack of the same weights.</p>
         </section>
 
       </div>

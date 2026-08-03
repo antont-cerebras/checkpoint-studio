@@ -83,6 +83,8 @@ const SCREENS: Screen[] = [
       alignFused: false,
       subtree: "",
       subtreeNew: "",
+      repackSchema: "",
+      repackSchemaNew: "",
     },
   },
   {
@@ -99,6 +101,8 @@ const SCREENS: Screen[] = [
       alignFused: false,
       subtree: "",
       subtreeNew: "",
+      repackSchema: "",
+      repackSchemaNew: "",
     },
   },
 ];
@@ -441,25 +445,27 @@ describe("the comparison screen", () => {
 });
 
 describe("the packing schemas in a URL", () => {
-  // A verification's answer depends on how each side was decoded, so a link to one has to carry it —
-  // otherwise the same URL shows a different verdict to the same question.
-  it("carries each side, and nothing when neither is said", () => {
+  // How each side's packed experts are decoded is part of the *scope* — a mapping applied before
+  // anything is compared, like the rename rules — so it round-trips with the rest of it. A link to a
+  // verification that dropped it would answer the same question differently.
+  it("carries each side with the scope, and nothing when neither is said", () => {
     expect(screenToHash({ kind: "compare", lhs: "/a", rhs: "" })).toBe("compare?lhs=%2Fa");
     expect(
       screenToHash({
         kind: "compare",
         lhs: "/a",
         rhs: "",
-        packing: { baseline: "[4]", candidate: "[3,3,3,3,3]" },
+        scope: { ...emptyScope(), repackSchema: "[4]", repackSchemaNew: "[3,3,3,3,3]" },
       }),
     ).toBe("compare?lhs=%2Fa&repack_schema=%5B4%5D&repack_schema_new=%5B3%2C3%2C3%2C3%2C3%5D");
-    expect(
-      parseScreen("#compare?lhs=%2Fa&repack_schema=%5B4%5D&repack_schema_new=3%2C3%2C3%2C3%2C3"),
-    ).toEqual({
+    const back = parseScreen(
+      "#compare?lhs=%2Fa&repack_schema=%5B4%5D&repack_schema_new=3%2C3%2C3%2C3%2C3",
+    );
+    expect(back).toEqual({
       kind: "compare",
       lhs: "/a",
       rhs: "",
-      packing: { baseline: "[4]", candidate: "3,3,3,3,3" },
+      scope: { ...emptyScope(), repackSchema: "[4]", repackSchemaNew: "3,3,3,3,3" },
     });
   });
 });

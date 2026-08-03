@@ -1473,17 +1473,16 @@ fn diff_accepts_a_scp_path_together_with_the_matching_proxy_flag() {
     );
 }
 
-/// `--verify-repack` decodes packed indices where the data is: on the ssh proxy, which addresses each
-/// side by its `s3://` URI. A remote *safetensors directory* has no URI to load, so the pair is
-/// refused — and refused **before** either side is read.
+/// `--verify-repack` decodes packed indices **where the data is** — and under `--ssh-proxy` that is the
+/// proxy, which can open both an `s3://` cstorch checkpoint and a path on its own filesystem.
 ///
-/// That ordering is the bug this test pins. The check used to live after two (slow, network) structure
-/// reads and after a printed structural diff, so a mixed `:/path` + `s3://` pair looked accepted and
-/// simply had no repack section — indistinguishable from a run that found no fold-pairs. Nothing here
-/// can connect (`example.invalid` does not resolve), so a run that reached the reads would fail with a
-/// connection error rather than this refusal.
+/// This pair used to be refused outright ("both sides must be s3://"), which was a limitation of the
+/// remote call rather than of the verification: the *value* comparison was already reading exactly
+/// these two kinds on exactly this host. So the pair is now attempted, and the only thing that stops
+/// it here is that `example.invalid` does not resolve — a connection error, naming the host, rather
+/// than a refusal about what the addresses are.
 #[test]
-fn diff_verify_repack_refuses_a_mixed_remote_pair_before_reading_anything() {
+fn diff_verify_repack_attempts_a_safetensors_side_on_the_proxy() {
     let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-studio"))
         .env("XDG_CONFIG_HOME", scratch_config())
         .args([
@@ -1497,18 +1496,14 @@ fn diff_verify_repack_refuses_a_mixed_remote_pair_before_reading_anything() {
         .output()
         .expect("run diff --verify-repack");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "an unsupported pair exits 2; {err}"
+    assert_eq!(out.status.code(), Some(2), "a failed run exits 2; {err}");
+    assert!(
+        !err.contains("s3:// cstorch checkpoints"),
+        "the pair is no longer refused for its address shape; stderr:\n{err}"
     );
     assert!(
-        err.contains("both sides to be s3:// cstorch checkpoints"),
-        "the refusal should name what is needed; stderr:\n{err}"
-    );
-    assert!(
-        !err.contains("connecting to") && !err.contains("reading each checkpoint"),
-        "the refusal must come before the reads; stderr:\n{err}"
+        err.contains("example.invalid"),
+        "what stopped it is the unreachable proxy, and the message should name it; stderr:\n{err}"
     );
 }
 

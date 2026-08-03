@@ -466,6 +466,16 @@ pub(crate) fn start_verify_repack(current: &Arc<super::Current>, q: &Query) -> R
     if right.is_empty() {
         return err(400, "verify-repack needs ?right=SPEC as well as ?left=SPEC");
     }
+    // Can both sides be read in one place? The same question the value job asks, of the same function —
+    // answered from the addresses, before either checkpoint is read.
+    if let Err(e) = crate::compare::data_where(
+        left,
+        right,
+        current.proxy_host(),
+        crate::compare::Work::Repack,
+    ) {
+        return err(400, format!("{e:#}"));
+    }
     let scope = match super::diffscope::DiffScope::from_query(q) {
         Ok(scope) => scope,
         Err(e) => return err(400, format!("{e:#}")),
@@ -541,9 +551,13 @@ pub(crate) fn start_values(current: &Arc<super::Current>, q: &Query) -> Reply {
     }
     // Refused **now**, from the two addresses, rather than after reading both checkpoints: a remote
     // source hands over no tensor data, and the job used to discover that having already spent the
-    // minutes the answer would have saved. `--verify-repack` has always checked its own support up
-    // front, for the same reason.
-    if let Err(e) = crate::compare::values_where(left, right, current.proxy_host()) {
+    // minutes the answer would have saved. The repack job asks the same question of the same function.
+    if let Err(e) = crate::compare::data_where(
+        left,
+        right,
+        current.proxy_host(),
+        crate::compare::Work::Values,
+    ) {
         return err(400, format!("{e:#}"));
     }
     let scope = match super::diffscope::DiffScope::from_query(q) {
@@ -1133,11 +1147,12 @@ pub(crate) fn diff(current: &super::Current, q: &Query) -> Reply {
         //
         // Asked of the two addresses, so the Data view can say it *before* a reader spends minutes on
         // a job that ends in a refusal — which is exactly how this was reported. One answer from the
-        // one function both surfaces use (`compare::values_supported`).
-        "values_note": crate::compare::values_where(
+        // one function both surfaces use (`compare::data_where`).
+        "values_note": crate::compare::data_where(
             &baseline_operand,
             &candidate_operand,
             current.proxy_host(),
+            crate::compare::Work::Values,
         )
             .err()
             .map(|e| format!("{e:#}")),

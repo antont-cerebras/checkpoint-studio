@@ -449,31 +449,32 @@ impl RepackPlan {
     }
 }
 
-/// Can a `--verify-repack` run happen at all, given where the two checkpoints live?
+/// Which comparison is being asked about.
 ///
-/// The verification decodes packed indices **where the data is**: on the ssh proxy, which addresses
-/// each side by its `s3://` URI, or here for two local files. A remote *safetensors directory* has no
-/// URI the proxy can load, so there is nothing to decode and the answer is a refusal.
-///
-/// Two properties this signature exists to hold:
-///
-/// * **One wording.** The web's job and the `diff` subcommand call this, so they cannot refuse the same
-///   pair in different words — or, worse, one refuse and the other accept.
-/// * **Before the reads.** It depends on the two *specs* and the proxy alone, never on their contents,
-///   so it is answerable before a byte is read. The CLI used to check it after two structure reads and
-///   a printed diff, which read as "accepted, nothing to verify" — indistinguishable from a run that
-///   found no fold-pairs.
-pub(crate) fn repack_supported(proxied: bool, s3_pair: bool) -> Result<()> {
-    if proxied && !s3_pair {
-        anyhow::bail!(
-            "--verify-repack over an ssh proxy needs both sides to be s3:// cstorch checkpoints \
-             (a remote safetensors dir isn't supported)"
-        );
-    }
-    Ok(())
+/// Only the *wording* of a refusal differs between them: the requirement is one requirement — both
+/// sides' bytes readable in one place — and it used to be asked twice, in two functions, with two
+/// answers. `--verify-repack` had its own rule that refused any pair whose sides were not both
+/// `s3://`, so a safetensors directory on the proxy was turned away by the repack path while the value
+/// path was already comparing it on that very host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Work {
+    /// `--values` / `--histogram`: compare what each side stores.
+    Values,
+    /// `--verify-repack`: decode each side's packed indices and compare those.
+    Repack,
 }
 
-/// Whether the two sides' **values** can be compared at all, and where — from their addresses alone.
+impl Work {
+    /// What the refusal says is being attempted.
+    fn doing(self) -> &'static str {
+        match self {
+            Self::Values => "comparing values",
+            Self::Repack => "verifying a repack",
+        }
+    }
+}
+
+/// Whether the two sides' **data** can be compared at all, and where — from their addresses alone.
 ///
 /// Asked before either side is read. The job used to read both checkpoints first — minutes over an ssh
 /// proxy — and only then discover it had no way to the bytes, so the answer arrived after the wait it
@@ -483,8 +484,14 @@ pub(crate) fn repack_supported(proxied: bool, s3_pair: bool) -> Result<()> {
 /// Three answers, and the middle one is the point: a comparison does not need the data *here*, it needs
 /// both sides readable **in one place**. The proxy holds the S3 credentials and the filesystem an
 /// `ssh` path names, so a pair that is entirely over there is compared over there
-/// ([`crate::remote::RemoteRead::value_diff`]) with only the results coming back.
-pub(crate) fn values_where(left: &str, right: &str, proxy: Option<&str>) -> Result<ValuesAt> {
+/// ([`crate::remote::RemoteRead::value_diff`], or [`crate::remote::RemoteRead::verify_repack`]) with
+/// only the results coming back.
+pub(crate) fn data_where(
+    left: &str,
+    right: &str,
+    proxy: Option<&str>,
+    work: Work,
+) -> Result<ValuesAt> {
     use crate::capability::Location;
     // `of_spec`, not `of_source_path`: these are addresses as typed, and `:PATH` means the proxy.
     let where_ = |spec: &str| Location::of_spec(spec);
@@ -515,8 +522,9 @@ pub(crate) fn values_where(left: &str, right: &str, proxy: Option<&str>) -> Resu
             .filter(|spec| !where_(spec).is_local())
             .collect();
         anyhow::bail!(
-            "comparing values needs both checkpoints in one place: {} {} here and {} {} not. Copy one \
+            "{} needs both checkpoints in one place: {} {} here and {} {} not. Copy one \
              down, or put both on the proxy.",
+            work.doing(),
             local.join(" and "),
             if local.len() == 1 { "is" } else { "are" },
             elsewhere.join(" and "),
@@ -528,8 +536,8 @@ pub(crate) fn values_where(left: &str, right: &str, proxy: Option<&str>) -> Resu
         .filter(|spec| !on_proxy(spec))
         .collect();
     anyhow::bail!(
-        "comparing values needs both checkpoints readable in one place, and {} {} not readable on the \
-         proxy.{}",
+        "{} needs both checkpoints readable in one place, and {} {} not readable on the proxy.{}",
+        work.doing(),
         unreachable.join(" and "),
         if unreachable.len() == 1 { "is" } else { "are" },
         if proxy.is_none() {
@@ -547,7 +555,7 @@ pub(crate) fn values_where(left: &str, right: &str, proxy: Option<&str>) -> Resu
 /// `--ssh-proxy` serves an scp-style pair), so by the time it needs this, a side is either an `s3://`
 /// URI or a path *on* the proxy — there is nothing left to decide about reachability, only which library
 /// opens it. The web's job builds the same two variants from what its read resolved
-/// (`web::valuesjob::Side::as_remote`), having asked [`values_where`] about the specs first.
+/// (`web::valuesjob::Side::as_remote`), having asked [`data_where`] about the specs first.
 pub(crate) fn proxy_side_of(spec: &str) -> crate::remote::RemoteSide {
     if spec.starts_with("s3://") {
         crate::remote::RemoteSide::S3(spec.to_string())
@@ -922,11 +930,11 @@ mod tests {
 
         // Both local: here, proxy or not.
         assert_eq!(
-            values_where("/models/a", "/models/b", None).ok(),
+            data_where("/models/a", "/models/b", None, Work::Values).ok(),
             Some(Here)
         );
         assert_eq!(
-            values_where("/models/a", "/models/b", Some("lab@host")).ok(),
+            data_where("/models/a", "/models/b", Some("lab@host"), Work::Values).ok(),
             Some(Here)
         );
 
@@ -939,22 +947,27 @@ mod tests {
             (":/opt/models/a", "lab@host:/opt/models/b"),
         ] {
             assert_eq!(
-                values_where(l, r, Some("lab@host")).ok(),
+                data_where(l, r, Some("lab@host"), Work::Values).ok(),
                 Some(OnProxy),
                 "{l} vs {r} is a pair the proxy can read"
             );
         }
 
         // A path on *another* host is not something this proxy can open.
-        let elsewhere = values_where("other@host2:/opt/a", "s3://bucket/new", Some("lab@host"))
-            .expect_err("the proxy cannot read another host's filesystem");
+        let elsewhere = data_where(
+            "other@host2:/opt/a",
+            "s3://bucket/new",
+            Some("lab@host"),
+            Work::Values,
+        )
+        .expect_err("the proxy cannot read another host's filesystem");
         let msg = format!("{elsewhere:#}");
         assert!(msg.contains("other@host2:/opt/a"), "{msg}");
         assert!(msg.contains("another host"), "{msg}");
 
         // No proxy: a remote pair has nowhere to be compared, and the message says which piece is
         // missing rather than implying the pair cannot be compared at all.
-        let none = values_where("s3://bucket/old", "s3://bucket/new", None)
+        let none = data_where("s3://bucket/old", "s3://bucket/new", None, Work::Values)
             .expect_err("there is nowhere to compare them");
         assert!(
             format!("{none:#}").contains("No ssh proxy is configured"),
@@ -963,8 +976,13 @@ mod tests {
 
         // Mixed local and remote: two readable sides and no single place holding both. The refusal names
         // *both*, since which one to move is the reader's choice.
-        let mixed = values_where("/models/a", "lab@host:/opt/b", Some("lab@host"))
-            .expect_err("no one place holds both");
+        let mixed = data_where(
+            "/models/a",
+            "lab@host:/opt/b",
+            Some("lab@host"),
+            Work::Values,
+        )
+        .expect_err("no one place holds both");
         let msg = format!("{mixed:#}");
         assert!(
             msg.contains("/models/a") && msg.contains("lab@host:/opt/b"),
@@ -976,29 +994,53 @@ mod tests {
         );
 
         // A Hub repo serves no bytes anywhere.
-        let hub = values_where("hf://owner/name", "s3://bucket/new", Some("lab@host"))
-            .expect_err("the Hub is structure only");
+        let hub = data_where(
+            "hf://owner/name",
+            "s3://bucket/new",
+            Some("lab@host"),
+            Work::Values,
+        )
+        .expect_err("the Hub is structure only");
         assert!(format!("{hub:#}").contains("hf://owner/name"), "{hub:#}");
     }
 
-    /// Which pairs `--verify-repack` can run over, in the one place both surfaces ask.    /// Which pairs `--verify-repack` can run over, in the one place both surfaces ask.
+    /// A repack verification asks the **same** question a value comparison does — can both sides be
+    /// read in one place — so it is the same function, differing only in what the refusal calls the
+    /// work.
     ///
-    /// The middle case is the reported bug: a `:PATH` (remote safetensors directory) against an
-    /// `s3://` checkpoint. The web refused it; the CLI checked the same condition only after two
-    /// structure reads and a printed diff, so it looked accepted. Both now call this, before reading.
+    /// The reported bug: a `:PATH` (a safetensors directory on the proxy) against an `s3://`
+    /// checkpoint. The repack path had its own rule that wanted two `s3://` sides and refused this,
+    /// while the value path was already comparing the very same pair on the very same host.
     #[test]
-    fn a_repack_needs_either_two_local_files_or_two_s3_uris() {
-        // Two local checkpoints: decoded here, no proxy involved.
-        assert!(repack_supported(false, false).is_ok());
-        // Two s3:// checkpoints over the proxy: what the mode exists for.
-        assert!(repack_supported(true, true).is_ok());
-        // Mixed: the proxy addresses each side by URI, so there is nothing to decode.
-        let refused = repack_supported(true, false).expect_err("a mixed remote pair is refused");
-        let msg = format!("{refused:#}");
-        assert!(
-            msg.contains("both sides to be s3:// cstorch checkpoints"),
-            "the refusal should say what is needed: {msg}"
+    fn a_repack_runs_wherever_a_value_comparison_would() {
+        use super::ValuesAt::{Here, OnProxy};
+
+        assert_eq!(
+            data_where("/models/a", "/models/b", None, Work::Repack).ok(),
+            Some(Here)
         );
+        for (l, r) in [
+            ("s3://bucket/old", "s3://bucket/new"),
+            ("lab@host:/opt/models/a", "s3://bucket/new"),
+            (":/opt/models/a", "lab@host:/opt/models/b"),
+        ] {
+            assert_eq!(
+                data_where(l, r, Some("lab@host"), Work::Repack).ok(),
+                Some(OnProxy),
+                "{l} vs {r} is a pair the proxy can read"
+            );
+        }
+        // The refusal names the work, so the reader is not told about "comparing values" by a run they
+        // started with *Verify repack*.
+        let mixed = data_where(
+            "/models/a",
+            "lab@host:/opt/b",
+            Some("lab@host"),
+            Work::Repack,
+        )
+        .expect_err("no one place holds both");
+        let msg = format!("{mixed:#}");
+        assert!(msg.starts_with("verifying a repack needs"), "{msg}");
     }
 
     /// How each side is named: a local checkpoint by the path that covers its files, a remote one by

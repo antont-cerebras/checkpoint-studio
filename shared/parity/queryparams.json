@@ -11,7 +11,9 @@
     "only_tensors",
     "align_fused",
     "subtree",
-    "subtree_new"
+    "subtree_new",
+    "repack_schema",
+    "repack_schema_new"
   ],
   "routes": {
     "check": [],
@@ -59,6 +61,8 @@
       "names",
       "names_list",
       "only_tensors",
+      "repack_schema",
+      "repack_schema_new",
       "shape_is",
       "subtree",
       "subtree_new",
@@ -76,6 +80,8 @@
       "names_list",
       "only_tensors",
       "q",
+      "repack_schema",
+      "repack_schema_new",
       "shape_is",
       "subtree",
       "subtree_new"
@@ -91,6 +97,8 @@
       "names",
       "names_list",
       "only_tensors",
+      "repack_schema",
+      "repack_schema_new",
       "shape_is",
       "subtree",
       "subtree_new"
@@ -117,6 +125,8 @@
       "names",
       "names_list",
       "only_tensors",
+      "repack_schema",
+      "repack_schema_new",
       "right",
       "shape_is",
       "subtree",

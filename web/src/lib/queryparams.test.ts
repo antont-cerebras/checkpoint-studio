@@ -46,6 +46,8 @@ const FULL_SCOPE: DiffScopeParams = {
   alignFused: true,
   subtree: 'language_model',
   subtreeNew: 'model',
+  repackSchema: '[4]',
+  repackSchemaNew: '[3,3,3,3,3]',
 };
 
 /** Record every URL requested; answer with something each caller can parse. */

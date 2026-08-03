@@ -235,11 +235,13 @@ describe("urls", () => {
     await api.command("/a", "/b", undefined, "histogram");
     await api.command("/a", "/b", undefined, "verifyRepack");
     await api.command("/a", "/b", undefined, undefined, true);
-    // The verification's own input: a packing per side, which no other check reads.
-    await api.command("/a", "/b", undefined, "verifyRepack", false, {
-      baseline: "[4]",
-      candidate: "3,3,3,3,3",
-    });
+    // The packing travels with the *scope*: it is how a side is decoded before anything is compared.
+    await api.command(
+      "/a",
+      "/b",
+      { ...emptyScope(), repackSchema: "[4]", repackSchemaNew: "3,3,3,3,3" },
+      "verifyRepack",
+    );
     expect(urls).toEqual([
       "/api/command?left=%2Fa&right=%2Fb",
       "/api/command?left=%2Fa&right=%2Fb&values=1&names=lm_head.weight",
@@ -343,6 +345,8 @@ describe("a scoped diff", () => {
     alignFused: false,
     subtree: "",
     subtreeNew: "",
+    repackSchema: "",
+    repackSchemaNew: "",
   };
 
   it("sends the selection on the report route", async () => {

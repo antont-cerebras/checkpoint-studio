@@ -103,6 +103,21 @@ pub(crate) const SCOPE: &[Param] = &[
         Cli::OnOperand(Side::Candidate),
         Some("subtreeNew"),
     ),
+    // **How each side's packed tensors are decoded**, one row per side. Part of the scope rather than of
+    // a particular check, because it is the same kind of thing as a rename rule or the fused alignment:
+    // something applied to a side *before* anything is compared. The two sides are separate rows because
+    // the two sides are exactly what differs — a sparse baseline (`[4]`) against a merged candidate
+    // (`[3,3,3,3,3]`), which no single width describes.
+    p(
+        "repack_schema",
+        Cli::Value("--repack-schema"),
+        Some("repackSchema"),
+    ),
+    p(
+        "repack_schema_new",
+        Cli::Value("--repack-schema-new"),
+        Some("repackSchemaNew"),
+    ),
 ];
 
 /// **The check**: which comparison to run over the selection, and how.
@@ -121,18 +136,6 @@ pub(crate) const CHECK: &[Param] = &[
         "repack_bits",
         Cli::Value("--repack-bits"),
         Some("repackBits"),
-    ),
-    // One row per side, because the two sides are exactly what differs: a sparse baseline (`[4]`) is
-    // being verified against a merged candidate (`[3,3,3,3,3]`), and no single width describes both.
-    p(
-        "repack_schema",
-        Cli::Value("--repack-schema"),
-        Some("repackSchema"),
-    ),
-    p(
-        "repack_schema_new",
-        Cli::Value("--repack-schema-new"),
-        Some("repackSchemaNew"),
     ),
     p("tensor", Cli::Value("--tensor"), Some("tensor")),
     p("jobs", Cli::Value("--jobs"), Some("jobs")),

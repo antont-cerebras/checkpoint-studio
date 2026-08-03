@@ -8,7 +8,6 @@
 import { get, writable } from 'svelte/store';
 import { api } from '../lib/api';
 import { scopeToQuery, type DiffScopeParams } from '../lib/diffscope';
-import { packingToQuery, type Packing } from '../lib/packing';
 
 /** What a poll reports. Mirrors `jobs::Job::snapshot`. */
 export interface JobStatus {
@@ -134,8 +133,6 @@ export async function startJob(
   right: string,
   scope: DiffScopeParams | undefined,
   tensor?: string,
-  /** How each side packs its indices — a repack verification's one un-inferable input. */
-  packing?: Packing,
 ): Promise<void> {
   stopPolling();
   jobError.set('');
@@ -148,9 +145,6 @@ export async function startJob(
   if (kind === 'values') params.push(['values', '1']);
   if (kind === 'histogram') params.push(['histogram', '1']);
   if (tensor) params.push(['tensor', tensor]);
-  // Only the verification decodes packings; sending them with a value compare would name a parameter
-  // that run does not read.
-  if (kind === 'verify-repack') params.push(...packingToQuery(packing));
   try {
     const started = await api.startJob(kind === 'verify-repack' ? 'verify-repack' : 'values', params);
     watch(started.id);

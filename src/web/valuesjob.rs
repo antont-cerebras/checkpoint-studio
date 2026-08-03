@@ -133,7 +133,12 @@ pub(crate) fn run(
     // Before either read: a remote side serves no tensor data, and finding that out after two
     // multi-minute reads is the failure this check exists to prevent. The start handler asks the same
     // question, so this is the second line of defence rather than the only one.
-    let at = crate::compare::values_where(left, right, current.proxy_host())?;
+    let at = crate::compare::data_where(
+        left,
+        right,
+        current.proxy_host(),
+        crate::compare::Work::Values,
+    )?;
     job.progress_to(0, left);
     let old = read_side(left, opts, job)?;
     if job.cancelled() {
