@@ -184,3 +184,30 @@ export function middleTruncate(s: string, max: number): string {
   const head = Math.floor(keep / 2);
   return `${s.slice(0, head)}…${s.slice(s.length - (keep - head))}`;
 }
+
+/**
+ * A checkpoint's short display name, from the address it was opened as.
+ *
+ * The **last** path segment for a filesystem path — the file, or the directory the shards sit in.
+ *
+ * The **first segment after the bucket** for a URI, because the last one is not a name there: a
+ * cstorch checkpoint is written as `s3://inference-opensource/minimax-m2.5/4bit/260402/checkpoint`,
+ * where the tail is a fixed word and the run number above it says nothing about which model this is.
+ * The segment that names it is the first. The same reading works for a Hub repo —
+ * `hf://Qwen/Qwen3-Coder-30B` is `Qwen3-Coder-30B`, the part after the owner.
+ *
+ * Contracted with Rust's `model::checkpoint_label` through `shared/parity/format.json`: two surfaces
+ * that shortened one address differently would have the tree header and the recents dropdown naming
+ * the same checkpoint two ways.
+ */
+export function checkpointLabel(spec: string): string {
+  const trimmed = spec.trim().replace(/\/+$/, '');
+  const scheme = trimmed.indexOf('://');
+  if (scheme >= 0) {
+    const parts = trimmed.slice(scheme + 3).split('/').filter(Boolean);
+    // The bucket itself when there is nothing under it — an address with no path has no better name.
+    return parts[1] ?? parts[0] ?? trimmed;
+  }
+  const segments = trimmed.split('/').filter(Boolean);
+  return segments[segments.length - 1] ?? trimmed;
+}

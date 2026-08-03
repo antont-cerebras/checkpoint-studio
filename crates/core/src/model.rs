@@ -326,12 +326,39 @@ pub fn checkpoint_path(files: &[std::path::PathBuf]) -> Option<&std::path::Path>
 /// is how that happens, so it is derived once, here.
 #[must_use]
 pub fn root_label(files: &[std::path::PathBuf]) -> String {
-    checkpoint_path(files)
-        .and_then(std::path::Path::file_name)
-        .map_or_else(
-            || "checkpoint".to_string(),
-            |s| s.to_string_lossy().into_owned(),
-        )
+    checkpoint_path(files).map_or_else(
+        || "checkpoint".to_string(),
+        |p| checkpoint_label(&p.to_string_lossy()),
+    )
+}
+
+/// A checkpoint's short display name, from the address it was opened as.
+///
+/// The **last** path segment for a filesystem path — the file, or the directory the shards sit in.
+///
+/// The **first segment after the bucket** for a URI, because the last one is not a name there: a
+/// cstorch checkpoint is written as `s3://inference-opensource/minimax-m2.5/4bit/260402/checkpoint`,
+/// where the tail is a fixed word and the run number above it is nobody's idea of which model this is.
+/// The segment that names it is the first, so `minimax-m2.5` is what the tree header, the recents list
+/// and the compare columns say. The rule reads the same way for a Hub repo — `hf://Qwen/Qwen3-Coder-30B`
+/// is `Qwen3-Coder-30B`, the part after the owner.
+///
+/// Contracted with the browser's `lib/format.ts: checkpointLabel` through `shared/parity/format.json`:
+/// two surfaces that shortened the same address differently would have the tree header and the
+/// dropdown naming one checkpoint two ways.
+#[must_use]
+pub fn checkpoint_label(spec: &str) -> String {
+    let spec = spec.trim().trim_end_matches('/');
+    if let Some((_scheme, rest)) = spec.split_once("://") {
+        let mut parts = rest.split('/').filter(|p| !p.is_empty());
+        let bucket = parts.next().unwrap_or_default();
+        // The bucket itself when there is nothing under it — an address with no path has no better name.
+        return parts.next().unwrap_or(bucket).to_string();
+    }
+    spec.rsplit('/')
+        .find(|p| !p.is_empty())
+        .unwrap_or(spec)
+        .to_string()
 }
 
 impl Checkpoint {

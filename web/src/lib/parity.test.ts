@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { expandedIds, flatten, nodeId, type Row } from './flatten';
 import { sortRows } from './rows';
-import { humanCount, humanSize, percent, shardNote, totalsLine } from './format';
+import { checkpointLabel, humanCount, humanSize, percent, shardNote, totalsLine } from './format';
 import { searchTree } from './search';
 import type { TreeNode } from './types';
 
@@ -37,6 +37,8 @@ interface SortFixtureTensor {
 
 interface Fixture {
   size: [number, string][];
+  /** `[spec, short display name]` — what a checkpoint is called on either surface. */
+  label: [string, string][];
   count: [number, string][];
   percent: [number, number, string][];
   shard: [number, number, number, string][];
@@ -57,6 +59,14 @@ const HINT = 'regenerate with `UPDATE_PARITY=1 cargo test --test parity` after a
 describe('byte sizes match the Rust format_size', () => {
   it.each(fixture.size)('%i → %s', (bytes, expected) => {
     expect(humanSize(bytes), HINT).toBe(expected);
+  });
+});
+
+// What a checkpoint is *called*. The reported case: an `s3://` cstorch checkpoint was shortened to
+// `checkpoint`, the fixed last segment, rather than to the model name above the run number.
+describe('checkpoint labels match the Rust checkpoint_label', () => {
+  it.each(fixture.label)('%s → %s', (spec, expected) => {
+    expect(checkpointLabel(spec), HINT).toBe(expected);
   });
 });
 

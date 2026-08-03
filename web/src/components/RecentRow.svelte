@@ -5,6 +5,7 @@
   // because both need the same two-step confirmation, and two copies of a confirmation flow is two
   // places for "does this delete immediately?" to diverge.
   import { forgetRecent } from '../stores/server';
+  import { checkpointLabel } from '../lib/format';
 
   export let spec: string;
   /** Marked as the one being served. */
@@ -19,7 +20,9 @@
   let confirming = false;
   let error = '';
 
-  const short = (s: string) => s.replace(/\/+$/, '').split('/').pop() || s;
+  // The shared rule, not a local `split('/').pop()`: that called every `s3://…/checkpoint`
+  // "checkpoint" — see `checkpointLabel`, which Rust's `model::checkpoint_label` is contracted with.
+  const short = checkpointLabel;
 
   async function forget() {
     confirming = false;

@@ -301,6 +301,25 @@ fn sort_section() -> Value {
     json!({ "tensors": tensors, "orders": orders })
 }
 
+/// Addresses whose short display name both surfaces have to agree on.
+///
+/// The `s3://` case is the reported one: a cstorch checkpoint's last segment is the fixed word
+/// `checkpoint` and the one above it is a run number, so the name is the *first* segment after the
+/// bucket. The scp and local forms are here because the rule must not disturb them.
+const LABELS: &[&str] = &[
+    "s3://inference-opensource/minimax-m2.5/4bit/260402/checkpoint",
+    "s3://inference-opensource/minimax-m2.5",
+    "s3://inference-opensource",
+    "s3://inference-opensource/",
+    "hf://Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "lab@net004.example.com:/opt/cerebras/inference/models/minimax-m2.5-4bit-12-boxes",
+    "/models/Qwen3-Coder-30B-A3B-lut-3bit",
+    "/models/Qwen3-Coder-30B-A3B-lut-3bit/",
+    "/models/model.safetensors",
+    ":/opt/models/ckpt-1000",
+    "model.safetensors",
+];
+
 fn build() -> Value {
     let matcher = SkimMatcherV2::default();
     json!({
@@ -308,6 +327,11 @@ fn build() -> Value {
                   Verified against Rust there and against TypeScript in web/src/lib/parity.test.ts. \
                   See shared/parity/README.md.",
         "size": SIZES.iter().map(|&b| json!([b, format_size(b)])).collect::<Vec<_>>(),
+        // What a checkpoint is *called* — the tree header, the recents rows, a compare column.
+        "label": LABELS
+            .iter()
+            .map(|&spec| json!([spec, checkpoint_studio_core::model::checkpoint_label(spec)]))
+            .collect::<Vec<_>>(),
         "count": COUNTS.iter().map(|&n| json!([n, format_parameters(n)])).collect::<Vec<_>>(),
         "percent": ZEROS
             .iter()

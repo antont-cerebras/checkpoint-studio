@@ -90,6 +90,52 @@
       "2.0 PiB"
     ]
   ],
+  "label": [
+    [
+      "s3://inference-opensource/minimax-m2.5/4bit/260402/checkpoint",
+      "minimax-m2.5"
+    ],
+    [
+      "s3://inference-opensource/minimax-m2.5",
+      "minimax-m2.5"
+    ],
+    [
+      "s3://inference-opensource",
+      "inference-opensource"
+    ],
+    [
+      "s3://inference-opensource/",
+      "inference-opensource"
+    ],
+    [
+      "hf://Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "Qwen3-Coder-30B-A3B-Instruct"
+    ],
+    [
+      "lab@net004.example.com:/opt/cerebras/inference/models/minimax-m2.5-4bit-12-boxes",
+      "minimax-m2.5-4bit-12-boxes"
+    ],
+    [
+      "/models/Qwen3-Coder-30B-A3B-lut-3bit",
+      "Qwen3-Coder-30B-A3B-lut-3bit"
+    ],
+    [
+      "/models/Qwen3-Coder-30B-A3B-lut-3bit/",
+      "Qwen3-Coder-30B-A3B-lut-3bit"
+    ],
+    [
+      "/models/model.safetensors",
+      "model.safetensors"
+    ],
+    [
+      ":/opt/models/ckpt-1000",
+      "ckpt-1000"
+    ],
+    [
+      "model.safetensors",
+      "model.safetensors"
+    ]
+  ],
   "count": [
     [
       0,
