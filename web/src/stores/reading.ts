@@ -13,11 +13,10 @@
 import { writable } from 'svelte/store';
 import { api } from '../lib/api';
 
-/** What `GET /api/reading` reports. Mirrors `web::current::ReadingProgress`. */
-export interface ReadingProgress {
-  /** What is being read — for a comparison, whichever side the server is on now. */
+/** One checkpoint's share of a read. Mirrors `web::current::SideProgress`. */
+export interface SideProgress {
+  /** Which checkpoint this row is about. */
   spec: string;
-  seconds: number;
   done: number;
   /** 0 until the reader knows a denominator: a spinner, not a bar at zero. */
   total: number;
@@ -25,6 +24,17 @@ export interface ReadingProgress {
   unit: string;
   /** `reading S3 storage metadata` — which step is running, or null before the reader says. */
   stage: string | null;
+  /** This one has landed while the other is still going — which the counters cannot say, since a
+   * reader that never learned a total finishes at `0/0` like one that has not started. */
+  finished: boolean;
+}
+
+/** What `GET /api/reading` reports. Mirrors `web::current::ReadingProgress`. */
+export interface ReadingProgress {
+  seconds: number;
+  /** One entry per checkpoint being read: one for an open, **two** while a comparison sets up, since
+   * both of its sides are read at the same time. Baseline first. */
+  sides: SideProgress[];
 }
 
 /** The read in flight, or null when the server is idle. */

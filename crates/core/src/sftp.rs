@@ -154,6 +154,9 @@ pub struct RemoteSession {
     session: Session,
 }
 
+/// Serialises the *authentication* half of opening an ssh session — see `connect_with`.
+static AUTH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl RemoteSession {
     /// Connect to `[user@]host[:port]`, verify the host key against
     /// `~/.ssh/known_hosts`, and authenticate (SSH agent → default identity files
@@ -163,6 +166,14 @@ impl RemoteSession {
     /// Agent/key auth needs no prompt regardless. Silent — the caller announces the
     /// connection once, so opening a pool of sessions doesn't spam the terminal.
     pub fn connect_with(target: &str, password: &mut Option<String>) -> Result<Self> {
+        // **One authentication at a time.** Two checkpoints of a comparison are read in parallel, each
+        // on its own session (ssh2 sessions are not `Sync`), and a host that asks for a password would
+        // otherwise prompt twice at once — two prompts and two half-typed passwords on one terminal.
+        // Key and agent auth never prompt, so the wait here is microseconds in the ordinary case; the
+        // lock is released before the read itself starts.
+        let _one_at_a_time = AUTH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (user, host, port) = parse_target(target);
         // A rejected password leaves the ssh2 session unusable for anything else, so
         // each attempt authenticates on a *fresh* connection (rather than retrying

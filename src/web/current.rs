@@ -191,20 +191,29 @@ impl Current {
     /// `None` when another read holds it; the caller turns that into the 409 with
     /// [`Self::busy_message`]. `try_lock`, not `lock`: a caller told "something else is reading" can
     /// decide to retry, where one silently queued behind a 30 s remote read cannot tell why it hangs.
-    fn begin_read(&self, spec: &str) -> Option<Reading<'_>> {
+    ///
+    /// **One slot, one *or two* checkpoints.** A comparison reads both of its sides under this one
+    /// slot, at the same time, so each side gets its own counters and its own cancel handle here.
+    fn begin_read(&self, specs: &[String]) -> Option<Reading<'_>> {
         let guard = self.opening.try_lock().ok()?;
-        let progress = Arc::new(crate::hf::ReadProgress::default());
+        let sides: Vec<SideRead> = specs
+            .iter()
+            .map(|spec| SideRead {
+                spec: spec.clone(),
+                progress: Arc::new(crate::hf::ReadProgress::default()),
+                finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            })
+            .collect();
         *self
             .in_flight
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(InFlight {
-            spec: spec.to_string(),
             since: std::time::Instant::now(),
-            progress: Arc::clone(&progress),
+            sides: sides.clone(),
         });
         Some(Reading {
             current: self,
-            progress,
+            sides,
             _guard: guard,
         })
     }
@@ -216,23 +225,27 @@ impl Current {
     /// read nobody is waiting for any more — unavailable. Cancelling is cooperative, so this then waits
     /// for the slot rather than assuming it is free; if the loser does not let go it is reported rather
     /// than waited on forever.
-    fn begin_read_taking_over(&self, spec: &str) -> Result<Reading<'_>> {
+    fn begin_read_taking_over(&self, specs: &[String]) -> Result<Reading<'_>> {
         let stopped = {
             let held = self
                 .in_flight
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Nothing to stop leaves the name empty and falls through to taking the slot normally.
+            // Every side of whatever is running is asked to stop, not just the first: a comparison
+            // reads two at once, and cancelling one of them would leave the other holding the slot.
             held.as_ref().map_or_else(String::new, |f| {
-                f.progress.cancel();
-                f.spec.clone()
+                for side in &f.sides {
+                    side.progress.cancel();
+                }
+                f.name()
             })
         };
         // Poll rather than `lock()`: a read that ignores the flag would otherwise hang this request
         // (and its worker) indefinitely, which is the failure mode `try_lock` exists to avoid.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
-            if let Some(reading) = self.begin_read(spec) {
+            if let Some(reading) = self.begin_read(specs) {
                 return Ok(reading);
             }
             if std::time::Instant::now() >= deadline {
@@ -253,10 +266,10 @@ impl Current {
     /// Take the read slot the way `busy` asks for.
     // `pub(super)` — with `Reading` — only so `current_tests`, a sibling module rather than a child,
     // can hold the slot and watch what gets announced under it. Nothing outside `web` can reach either.
-    pub(super) fn take_slot(&self, spec: &str, busy: WhenBusy) -> Result<Reading<'_>> {
+    pub(super) fn take_slot(&self, specs: &[String], busy: WhenBusy) -> Result<Reading<'_>> {
         match busy {
-            WhenBusy::StopTheOther => self.begin_read_taking_over(spec),
-            WhenBusy::Refuse => self.begin_read(spec).ok_or_else(|| {
+            WhenBusy::StopTheOther => self.begin_read_taking_over(specs),
+            WhenBusy::Refuse => self.begin_read(specs).ok_or_else(|| {
                 let (held, secs) = self
                     .busy_with()
                     .unwrap_or_else(|| ("another checkpoint".to_string(), 0.0));
@@ -276,22 +289,7 @@ impl Current {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .map(|f| (f.spec.clone(), f.since.elapsed().as_secs_f64()))
-    }
-
-    /// Move the in-flight record onto the next checkpoint of a comparison.
-    ///
-    /// The slot is taken once for the pair — one cancel handle, one elapsed clock — but *what is being
-    /// read* changes halfway through, and that is the part a progress line has to be honest about.
-    pub(super) fn now_reading(&self, spec: &str) {
-        if let Some(f) = self
-            .in_flight
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-        {
-            f.spec = spec.to_string();
-        }
+            .map(|f| (f.name(), f.since.elapsed().as_secs_f64()))
     }
 
     /// The read in flight, in as much detail as it reports: what it is reading, for how long, how far
@@ -302,7 +300,7 @@ impl Current {
     /// whole time — they were being animated onto the log of a process nobody was watching. This is the
     /// channel that gets them to whoever is actually waiting (`GET /api/reading`).
     pub(crate) fn reading(&self) -> Option<ReadingProgress> {
-        // The counters are `Arc`-shared with the read itself, so taking a handle is all this needs the
+        // The counters are `Arc`-shared with the read itself, so taking handles is all this needs the
         // lock for — and it releases it before reading them. Polled several times a second while a read
         // is running, and the read takes the same lock when it finishes.
         let held = self
@@ -310,18 +308,26 @@ impl Current {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let f = held.as_ref()?;
-        let (spec, since, progress) = (f.spec.clone(), f.since, Arc::clone(&f.progress));
+        let (since, sides) = (f.since, f.sides.clone());
         drop(held);
 
-        let load = progress.load();
-        let (done, total) = load.snapshot();
         Some(ReadingProgress {
-            spec,
             seconds: since.elapsed().as_secs_f64(),
-            done,
-            total,
-            unit: load.unit_label().trim().to_string(),
-            stage: load.stage().map(|s| s.note().to_string()),
+            sides: sides
+                .iter()
+                .map(|side| {
+                    let load = side.progress.load();
+                    let (done, total) = load.snapshot();
+                    SideProgress {
+                        spec: side.spec.clone(),
+                        done,
+                        total,
+                        unit: load.unit_label().trim().to_string(),
+                        stage: load.stage().map(|s| s.note().to_string()),
+                        finished: side.finished.load(std::sync::atomic::Ordering::Relaxed),
+                    }
+                })
+                .collect(),
         })
     }
 
@@ -336,10 +342,10 @@ impl Current {
                   releasing it as soon as `progress` has been taken would let a second read start"
     )]
     pub(crate) fn open(&self, spec: &str, busy: WhenBusy) -> Result<Arc<WebState>> {
-        let reading = self.take_slot(spec, busy)?;
+        let reading = self.take_slot(std::slice::from_ref(&spec.to_string()), busy)?;
         let opened = opening::resolve(spec, &self.opts)?
             // The slot's own handle, so a later "stop it" reaches this read rather than a throwaway.
-            .read(opening::Want::Model, &reading.progress)?;
+            .read(opening::Want::Model, reading.progress(0))?;
         // Record the durable spelling of what opened, not the string typed: a relative path
         // becomes absolute and a proxied path becomes `host:/path`, so the entry still names
         // this checkpoint from another directory or another config (see `recorded_spec`).
@@ -395,42 +401,72 @@ impl Current {
     /// the served one is used — the common case, and the one that costs nothing.
     ///
     /// Shares the open lock with [`Self::open`]: these are multi-second reads that install a
-    /// checkpoint, and letting them run at once would have reads competing for the same disk while
-    /// the caller cannot tell which one it is waiting for.
-    // The read slot below is held for the whole read on purpose — that is what serialises them.
-    // Releasing it as soon as `progress` has been taken would let a second read start.
+    /// checkpoint, and letting an *unrelated* one start under them would have reads competing for the
+    /// same disk while the caller cannot tell which one it is waiting for.
+    ///
+    /// **The pair's own two reads run at once.** They were sequential, which cost the sum of two waits
+    /// for no reason: the sides are independent, they are usually on different machines entirely — an
+    /// `s3://` prefix read through a proxy and a directory over SFTP — and neither depends on anything
+    /// the other produces. A comparison now takes as long as its slower side rather than as long as
+    /// both, which on the pair this was reported over is the difference between about 40 seconds and
+    /// about 20. The `diff` subcommand has read its two sides in parallel from the start (`main.rs`,
+    /// two ssh sessions); this is the browser catching up.
+    // The read slot below is held for the whole read on purpose — that is what serialises them
+    // against other requests. Releasing it as soon as the handles have been taken would let an
+    // unrelated read start.
     pub(crate) fn set_comparison(
         &self,
         left: &str,
         right: &str,
         busy: WhenBusy,
     ) -> Result<ComparisonSet> {
-        let reading = self.take_slot(left, busy)?;
         let served = self.snapshot();
         let served_spec = served.spec.clone();
+        // Only read the right side when it is genuinely a third checkpoint. Comparing against what
+        // is already loaded should not cost a second copy of it.
+        let right_to_read = match right.trim() {
+            "" => None,
+            r if r == served_spec => None,
+            r => Some(r.to_string()),
+        };
+        // One slot, a row per checkpoint it covers — so the screen can draw a live line for each.
+        let mut specs = vec![left.to_string()];
+        specs.extend(right_to_read.clone());
+        let reading = self.take_slot(&specs, busy)?;
         // Drop whatever was set up before reading anything. A failed set-up used to leave the
         // *previous* comparison in the slot, so `/api/difftree` kept answering 200 with a pair
         // nobody asked for — a stale comparison served as if it were the requested one, which is
         // worse than the 409 that says there is none.
         self.clear_comparison();
-        let (left_state, left_spec) = self.read_side(left, &reading.progress)?;
-        // Only read the right side when it is genuinely a third checkpoint. Comparing against what
-        // is already loaded should not cost a second copy of it.
-        let right_read = match right.trim() {
-            "" => None,
-            r if r == served_spec => None,
-            r => {
-                // Say which checkpoint is being read *now*. A comparison reads two, one after the
-                // other, at speeds that can differ by a factor of twenty — a local directory in a
-                // second, an `s3://` prefix in twenty — and the screen draws a row for each. The
-                // in-flight record kept naming the *first* one throughout, so the second row never
-                // lit up: both bars belonged to the baseline and the candidate looked like it was
-                // never read at all.
-                self.now_reading(r);
-                Some(self.read_side(r, &reading.progress)?)
+        // Both sides at once, each with its own counters and its own cancel handle.
+        //
+        // `thread::scope` rather than detached threads: the reads borrow `self` and the slot, and
+        // both are guaranteed to have finished by the time this returns — including when one fails,
+        // which asks the other to stop rather than leaving it running for a comparison that will
+        // not happen.
+        let (left_read, right_read) = std::thread::scope(|scope| {
+            let left_job = scope.spawn(|| {
+                let out = self.read_side(left, reading.progress(0));
+                reading.done(0);
+                out
+            });
+            // Not a `move` closure: that would take the slot guard — which is not `Send` — into the
+            // thread with it. Both reads borrow it, and the scope is what makes that sound.
+            let right_job = right_to_read.as_deref().map(|r| {
+                scope.spawn(|| {
+                    let out = self.read_side(r, reading.progress(1));
+                    reading.done(1);
+                    out
+                })
+            });
+            let left_out = join_read(left_job.join());
+            if left_out.is_err() {
+                reading.cancel_all();
             }
-        };
-        let (right_state, right_spec) = match right_read {
+            (left_out, right_job.map(|h| join_read(h.join())))
+        });
+        let (left_state, left_spec) = left_read?;
+        let (right_state, right_spec) = match right_read.transpose()? {
             Some((state, spec)) => (Some(state), spec),
             // The newer side is the served checkpoint, so *its* address is what resolved — the client
             // needs the effective spec, not the empty string it sent.
@@ -547,23 +583,53 @@ pub(crate) enum WhenBusy {
 /// the spec, because only the reader knows whether it is listing files or `HEAD`ing objects.
 #[derive(serde::Serialize)]
 pub(crate) struct ReadingProgress {
-    pub spec: String,
     pub seconds: f64,
+    /// One entry per checkpoint being read — two while a comparison sets up, since both of its sides
+    /// are read at once. In the order they were asked for: baseline first.
+    pub sides: Vec<SideProgress>,
+}
+
+/// One checkpoint's share of a read.
+#[derive(serde::Serialize, Clone)]
+pub(crate) struct SideProgress {
+    pub spec: String,
     pub done: usize,
     pub total: usize,
     /// `shards`, `S3 objects`, `tensors` — what the count counts.
     pub unit: String,
     /// `reading S3 storage metadata`, `listing the checkpoint files` — which step is running.
     pub stage: Option<String>,
+    /// This side has landed while the other is still going — which the counters cannot say, since a
+    /// reader that never learned a total finishes with `0/0` like one that has not started.
+    pub finished: bool,
 }
 
-/// A read in progress: what it is reading, since when, and how to ask it to stop.
-struct InFlight {
+/// One checkpoint being read: what it is, how far it has got, and how to ask it to stop.
+#[derive(Clone)]
+struct SideRead {
     spec: String,
-    since: std::time::Instant,
     /// The read's own progress-and-control handle. Cancelling through it tears down the remote
     /// command, so a `Stop it` really stops rather than merely stopping the *waiting*.
     progress: Arc<crate::hf::ReadProgress>,
+    finished: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A read in progress: which checkpoints, since when.
+struct InFlight {
+    since: std::time::Instant,
+    /// One or two: an open reads one checkpoint, a comparison reads both of its sides together.
+    sides: Vec<SideRead>,
+}
+
+impl InFlight {
+    /// What to call this read in a sentence — `A ↔ B` while a comparison is setting up.
+    fn name(&self) -> String {
+        self.sides
+            .iter()
+            .map(|s| s.spec.as_str())
+            .collect::<Vec<_>>()
+            .join(" ↔ ")
+    }
 }
 
 /// The single read slot, held.
@@ -574,10 +640,46 @@ struct InFlight {
 /// to be busy with a read that had already failed.
 pub(super) struct Reading<'a> {
     current: &'a Current,
-    /// This read's progress-and-control handle, shared with `in_flight` so a later request can cancel
-    /// it. The read itself is handed this, not a throwaway.
-    progress: Arc<crate::hf::ReadProgress>,
+    /// One per checkpoint, shared with `in_flight` so a later request can cancel them. Each read is
+    /// handed its own, not a throwaway.
+    sides: Vec<SideRead>,
     _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+impl Reading<'_> {
+    /// Side `i`'s progress handle — the one to hand the reader.
+    fn progress(&self, i: usize) -> &crate::hf::ReadProgress {
+        // Every caller indexes a side it asked the slot for, so this cannot be out of range; a
+        // throwaway rather than a panic if it ever were, since a wrong bar beats a dead worker.
+        self.sides.get(i).map_or_else(
+            || {
+                static SPARE: std::sync::OnceLock<crate::hf::ReadProgress> =
+                    std::sync::OnceLock::new();
+                SPARE.get_or_init(crate::hf::ReadProgress::default)
+            },
+            |s| s.progress.as_ref(),
+        )
+    }
+
+    /// Mark side `i` landed, so the screen can say `read` beside it while the other still runs.
+    fn done(&self, i: usize) {
+        if let Some(s) = self.sides.get(i) {
+            s.finished.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Ask every side to stop — one has failed, and the comparison cannot proceed without it.
+    fn cancel_all(&self) {
+        for s in &self.sides {
+            s.progress.cancel();
+        }
+    }
+
+    /// Whether every side has been asked to stop — for the test that a takeover reaches both.
+    #[cfg(test)]
+    pub(super) fn every_side_cancelled(&self) -> bool {
+        self.sides.iter().all(|s| s.progress.cancelled())
+    }
 }
 
 impl Drop for Reading<'_> {
@@ -588,6 +690,18 @@ impl Drop for Reading<'_> {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
+}
+
+/// A read thread's result, with a panic reported rather than propagated.
+///
+/// A panicking worker would otherwise take the whole `thread::scope` down and, with it, a request
+/// that could have said what went wrong.
+fn join_read(
+    joined: std::thread::Result<Result<(Arc<WebState>, String)>>,
+) -> Result<(Arc<WebState>, String)> {
+    joined.unwrap_or_else(|_| {
+        bail!("the thread reading this checkpoint panicked — see the server log")
+    })
 }
 
 /// Build the served state from a read, insisting on the model the API serves.

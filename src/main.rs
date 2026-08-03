@@ -1791,20 +1791,29 @@ fn run_diff(
         eprintln!("checkpoint-studio diff: {e:#}");
         return 2;
     }
-    // Remote: read both checkpoints in parallel, one over each of two SSH sessions
-    // (ssh2 sessions aren't Sync, so a session per thread). The password is entered
-    // once and reused for the second session, so it's still one prompt; agent/key
-    // auth needs none. A spinner line animates for each read. Local: sequential.
+    // Both checkpoints are read **in parallel**, remote or local: the two sides are independent, and
+    // a comparison should cost the slower of them rather than their sum. Remote gets a session each
+    // (ssh2 sessions aren't Sync) and a spinner line each; the password is entered once and reused,
+    // so it is still one prompt, and agent/key auth needs none. Local reads print nothing, so two at
+    // once need no coordination — a directory of shards is a rayon fan-out either way, and on a
+    // network filesystem two of them overlap rather than queue.
     // The SSH password is entered once (on the first session) and reused for every
     // later session — the two parallel structure reads and, for an s3-vs-s3 value
     // diff, the comparison session opened afterwards — so the whole run is one prompt.
     let mut password: Option<String> = None;
     let loaded: Result<(SideLoad, SideLoad)> = remote.map_or_else(
         || {
-            Ok((
-                load_local(old).with_context(|| format!("reading {}", old.display()))?,
-                load_local(new).with_context(|| format!("reading {}", new.display()))?,
-            ))
+            let (a, b) = std::thread::scope(|scope| {
+                let ta = scope.spawn(|| {
+                    load_local(old).with_context(|| format!("reading {}", old.display()))
+                });
+                let tb = scope.spawn(|| {
+                    load_local(new).with_context(|| format!("reading {}", new.display()))
+                });
+                (ta.join(), tb.join())
+            });
+            let panicked = || anyhow::anyhow!("the thread reading a checkpoint panicked");
+            Ok((a.map_err(|_| panicked())??, b.map_err(|_| panicked())??))
         },
         |r| {
             (|| -> Result<(SideLoad, SideLoad)> {

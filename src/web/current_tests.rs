@@ -598,33 +598,42 @@ fn a_job_can_be_started_polled_and_stopped() {
     assert_eq!(crate::web::handlers::cancel_job(&current, 99_999).0, 404);
 }
 
-/// A comparison announces the checkpoint it is reading *now*, not the one it started with.
+/// A comparison reports **both** of its checkpoints, because it reads both at once.
 ///
-/// The pair takes the read slot once — one cancel handle, one elapsed clock — and both sides are read
-/// under it. The announcement used to be written when the slot was taken and never again, so the
-/// browser's second progress row, the one for the candidate, never lit up: while an `s3://` prefix
-/// took twenty seconds, the screen said it was still reading the local baseline it had finished with.
+/// The pair takes the read slot once — one elapsed clock — and each side gets its own counters and
+/// its own cancel handle under it. The slot used to carry a single spec, so the browser's second
+/// progress row never lit up: while an `s3://` prefix was being read, the screen still named the
+/// local baseline that had finished. (And before that the two reads were sequential, which is what
+/// made "which one is it on" a question at all.)
 #[test]
-fn the_announcement_follows_the_side_being_read() {
+fn a_read_reports_every_checkpoint_it_covers() {
     let current = serving("tiny.safetensors");
+    let pair = ["the-baseline".to_string(), "the-candidate".to_string()];
     let held = current
-        .take_slot("the-baseline", WhenBusy::Refuse)
+        .take_slot(&pair, WhenBusy::Refuse)
         .expect("nothing else is reading");
-    assert_eq!(
-        current.busy_with().expect("a read is in flight").0,
-        "the-baseline"
-    );
 
-    current.now_reading("the-candidate");
+    let progress = current.reading().expect("a read is in flight");
+    let specs: Vec<&str> = progress.sides.iter().map(|s| s.spec.as_str()).collect();
     assert_eq!(
-        current.busy_with().expect("still the same read").0,
-        "the-candidate",
-        "the second side of a pair is what the progress line names once it starts"
+        specs,
+        ["the-baseline", "the-candidate"],
+        "one row per checkpoint, baseline first"
+    );
+    assert!(
+        progress.sides.iter().all(|s| !s.finished),
+        "neither side has landed yet"
+    );
+    // A refusal names the pair, not half of it.
+    let busy = current.busy_with().expect("a read is in flight").0;
+    assert!(
+        busy.contains("the-baseline") && busy.contains("the-candidate"),
+        "{busy}"
     );
 
     drop(held);
     assert!(
-        current.busy_with().is_none(),
+        current.reading().is_none(),
         "and the slot still frees on drop"
     );
 }

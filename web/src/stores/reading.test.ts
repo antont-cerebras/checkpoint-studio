@@ -9,12 +9,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
 
 const PROGRESS = {
-  spec: 's3://bucket/ckpt',
   seconds: 3.2,
-  done: 44,
-  total: 66,
-  unit: 'shards',
-  stage: 'reading shard headers',
+  // Two rows: a comparison reads both of its checkpoints at once, and each reports for itself.
+  sides: [
+    {
+      spec: 's3://bucket/ckpt',
+      done: 44,
+      total: 66,
+      unit: 'S3 objects',
+      stage: 'reading S3 storage metadata',
+      finished: false,
+    },
+    {
+      spec: 'lab@host:/opt/models/ckpt',
+      done: 12,
+      total: 30,
+      unit: 'shards',
+      stage: 'reading shard headers',
+      finished: false,
+    },
+  ],
 };
 
 describe('the read-progress poll', () => {
