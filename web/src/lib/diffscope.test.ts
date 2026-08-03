@@ -119,6 +119,16 @@ describe("saying the scope in one line", () => {
     ).toBe("name model.layers.1.* !*.bias · dtype F* · tensors only");
   });
 
+  // The alignment is the one control whose effect a reader cannot see in the row count alone — a fused
+  // pair with it off reads as "nothing lines up" — so the line has to say it is on.
+  it("says when the two layouts are being aligned, and from which subtrees", () => {
+    expect(
+      scopeSummary(
+        scope({ alignFused: true, subtree: "language_model", subtreeNew: "model" }),
+      ),
+    ).toBe("unfused ↔ fused aligned · baseline from #language_model · candidate from #model");
+  });
+
   it("counts exact names rather than listing them", () => {
     expect(scopeSummary(scope({ names: "a.w,b.w,c.w" }))).toBe("3 exact names");
     expect(scopeSummary(scope({ names: "a.w" }))).toBe("1 exact name");

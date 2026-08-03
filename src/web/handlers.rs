@@ -840,6 +840,45 @@ pub(crate) fn diff_names(current: &super::Current, q: &Query) -> Reply {
     }))
 }
 
+/// **The terminal invocation for a set of parameters** — the one place a command string is produced.
+///
+/// `GET /api/command?left=SPEC&right=SPEC&<scope>&<check>`, answering `{"command": "…"}`.
+///
+/// Every surface that offers "run this in a terminal" asks here with the parameters it holds, so there
+/// is one renderer of `diff` arguments (the table in [`super::params`]) and one assembler of the line
+/// (`compare::cli_diff_command`, which quotes and carries `#subtree` on the operands). The browser used
+/// to build the Data view's command itself out of the two addresses — and so offered
+/// `diff --values OLD NEW` for a comparison scoped to a single tensor with a fused alignment: a command
+/// that compares every tensor of both checkpoints, unaligned. A string assembled beside the state it is
+/// supposed to describe will always be one control behind it.
+///
+/// `null` when a side cannot be named in one word (see `compare::side_operand`) — better nothing than a
+/// command that means something else.
+pub(crate) fn command(q: &Query) -> Reply {
+    let Some(left) = q.get("left").map(String::as_str).filter(|s| !s.is_empty()) else {
+        return err(400, "command needs ?left=SPEC&right=SPEC");
+    };
+    let right = q.get("right").map_or("", String::as_str);
+    if right.is_empty() {
+        return err(400, "command needs ?right=SPEC as well as ?left=SPEC");
+    }
+    // Parsed, though only the render uses the query: a scope that cannot compile is a client mistake
+    // worth naming here rather than a command built from an invalid glob.
+    if let Err(e) = super::diffscope::DiffScope::from_query(q) {
+        return err(400, format!("{e:#}"));
+    }
+    let args = super::params::render(q, &[super::params::SCOPE, super::params::CHECK]);
+    ok(json!({
+        "command": crate::compare::cli_diff_command(
+            left,
+            right,
+            &args,
+            crate::compare::Sides::BaselineFirst,
+            super::params::subtrees(q),
+        ),
+    }))
+}
+
 /// One side's **namespaces**, for the subtree pickers: `?id=N&side=old|new`, with an optional `?q=`.
 ///
 /// A subtree is a wrapper to drop — `language_model`, `model`, `vision_tower` — and typing one is a
@@ -1090,13 +1129,9 @@ pub(crate) fn diff(current: &super::Current, q: &Query) -> Reply {
             &candidate_operand,
             // `--full` when the reader has expanded the families, so the command reproduces the screen
             // rather than the default the screen is not showing.
-            &{
-                let mut args = scope.cli_args();
-                if switch(q, "full").unwrap_or(false) {
-                    args.push("--full".to_string());
-                }
-                args
-            },
+            // The scope *and* the check, from the one table — `--full` included, which is why this no
+            // longer appends it by hand.
+            &super::params::render(q, &[super::params::SCOPE, super::params::CHECK]),
             sides,
             scope.subtrees(),
         ),

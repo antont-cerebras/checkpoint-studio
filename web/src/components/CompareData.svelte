@@ -19,6 +19,7 @@
   import { cancelJob, clearJob, job, jobError, startJob, type JobKind } from '../stores/jobs';
   import { diffTree } from '../stores/compare';
   import { diffReport } from '../stores/report';
+  import { api } from '../lib/api';
   import type { DiffScopeParams } from '../lib/diffscope';
   import { copyText } from '../lib/clipboard';
 
@@ -84,10 +85,30 @@
   /** A number the way the CLI prints it. */
   const n = (v: number | undefined) => (v === undefined ? '—' : v.toLocaleString());
 
-  /** The equivalent command, for a terminal — an alternative, not the only way. */
-  $: command = `checkpoint-studio diff --values ${shell(left)} ${shell(right)}`;
-  function shell(s: string): string {
-    return /^[\w./:@=-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
+  /**
+   * The equivalent command, for a terminal — an alternative, not the only way.
+   *
+   * **Asked for, not assembled.** This line used to be built here out of the two addresses, which meant
+   * it silently dropped the entire selection: a comparison scoped to one tensor with a fused alignment
+   * offered `diff --values OLD NEW`, a command that compares every tensor of both checkpoints,
+   * unaligned. A string built beside the state it describes is always one control behind it, so the
+   * server renders it from the same parameter table that decides which parameters exist
+   * (`GET /api/command`, `src/web/params.rs`).
+   */
+  let command = '';
+  $: void loadCommand(left, right, scope);
+  async function loadCommand(l: string, r: string, s: DiffScopeParams | undefined) {
+    if (!l || !r) {
+      command = '';
+      return;
+    }
+    try {
+      command = (await api.command(l, r, s, 'values')).command ?? '';
+    } catch {
+      // The command is an alternative, not the answer: if it cannot be rendered, the panel simply does
+      // not offer one, and the run itself reports its own failures.
+      command = '';
+    }
   }
   let copied = false;
   function copy() {
@@ -248,7 +269,7 @@
     {/if}
   {/if}
 
-  {#if left && right}
+  {#if left && right && command}
     <!-- The same run, for a terminal — for a pipeline, or for somewhere this tab is not. -->
     <p class="alt dim">Or run it in a terminal:</p>
     <div class="cmd">

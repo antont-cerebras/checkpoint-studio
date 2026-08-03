@@ -1,3 +1,5 @@
+import { SCOPE_PARAMS } from './params.generated';
+
 // How a diff is narrowed, as the browser holds it — the CLI's selection flags, in a URL.
 //
 // `checkpoint-studio diff --name 'model.layers.1.*'` scopes a comparison to nineteen tensors of
@@ -8,95 +10,66 @@
 // a scoped comparison is a thing you send someone, and a reload should land on the same nineteen
 // tensors rather than on all 117,664.
 
-/** The selection, exactly the parameters the two diff routes accept. */
-export interface DiffScopeParams {
-  /** `--name`: one glob per line, `!` to exclude. Newlines because a repeated query key would
-   * collapse to its last value in the server's `HashMap` query. */
-  name: string;
-  /** `--names`: exact names, comma-separated. */
-  names: string;
-  /** `--dtype-is`: a glob against the dtype, case-insensitive. */
-  dtypeIs: string;
-  /** `--shape-is`: a glob over comma- or `x`-separated dims. */
-  shapeIs: string;
-  /** `--map`: `PATTERN=>REPLACEMENT` rename rules, one per line, applied to the baseline's names
-   * *before* comparing — so two naming schemes line up instead of reading as added+removed.
-   *
-   * Both views apply them. The side-by-side rebuilds the baseline's tree from the renamed names, since
-   * groups are named from name segments and rewriting a leaf alone leaves the path above it describing
-   * the name it used to have. */
-  map: string;
-  /** `--only-tensors`: skip the metadata comparison. Note that *any* filter also suppresses it — the
-   * CLI's rule, since no glob can select a metadata entry. */
-  onlyTensors: boolean;
-  /**
-   * `--align-fused`: line an **unfused** checkpoint up with its **fused** counterpart.
-   *
-   * Two layouts of one model share no tensor name, so a plain comparison reports every tensor of both
-   * sides as one-sided — 80,107 against 933, "nothing lines up", which answers nothing. This drops the
-   * per-expert index (256 tensors fold onto the one fused tensor that holds them, shown as `×256`) and
-   * applies the standard layout synonyms. Applied to both sides; each rule is a no-op on a side that is
-   * already fused.
-   */
-  alignFused: boolean;
-  /**
-   * `SOURCE#subtree`: compare *from inside* a subtree, per side.
-   *
-   * A Hugging Face multimodal checkpoint keeps its language model under `language_model.…`; the
-   * converted one has it at the root. Without this the two share no tensor name and the comparison
-   * reports every tensor of both sides as one-sided. Re-rooting a side keys its tensors by their
-   * sub-path — so `language_model.model.layers.0.w` lines up with `model.layers.0.w` — and leaves the
-   * siblings (`vision_tower.…`) out of scope rather than calling them removed.
-   *
-   * The CLI spells this on the operand (`diff 'hf#language_model' converted`), which is what the
-   * offered command shows; here it is a field per side, because the address boxes are already full of
-   * path.
-   */
-  subtree: string;
-  subtreeNew: string;
-}
+/**
+ * The selection, exactly the parameters the two diff routes accept.
+ *
+ * **Derived from the generated table** (`params.generated.ts`, written from `src/web/params.rs`), so a
+ * parameter renamed on the server renames the field here and TypeScript fails to compile wherever the
+ * old name is used. This was a hand-written interface beside a hand-written list of query keys; the
+ * *keys* were contract-tested against the server's allowlist, which catches a key the server would
+ * refuse and not one this client reads back under the wrong name.
+ *
+ * The doc comments for what each parameter *means* stay here — the generated file carries names, not
+ * explanations:
+ *
+ * - `name` — `--name`: one glob per line, `!` to exclude. Newlines because a repeated query key would
+ *   collapse to its last value in the server's `HashMap` query.
+ * - `names` — `--names`: exact names, one per line or comma-separated.
+ * - `dtypeIs` / `shapeIs` — `--dtype-is` / `--shape-is`: globs over the dtype and the dimensions.
+ * - `map` — `--map`: `PATTERN=>REPLACEMENT` rename rules, one per line, applied to the baseline's names
+ *   *before* comparing, so two naming schemes line up instead of reading as added+removed.
+ * - `onlyTensors` — `--only-tensors`: skip the metadata comparison. *Any* filter also suppresses it,
+ *   which is the CLI's rule, since no glob can select a metadata entry.
+ * - `alignFused` — `--align-fused`: line an **unfused** checkpoint up with its **fused** counterpart.
+ *   Two layouts of one model share no tensor name, so a plain comparison reports every tensor of both
+ *   sides as one-sided; this drops the per-expert index (256 tensors fold onto the one fused tensor,
+ *   shown as `×256`) and applies the standard layout synonyms, to both sides.
+ * - `subtree` / `subtreeNew` — `SOURCE#subtree`, per side: compare *from inside* a subtree, so a
+ *   multimodal checkpoint's `language_model.model.…` lines up with a converted `model.…` and the
+ *   siblings (`vision_tower.…`) are out of scope rather than removed. The CLI spells this on the
+ *   operand, which is what the offered command shows.
+ */
+export type DiffScopeParams = {
+  [P in TextParam as P['field']]: string;
+} & {
+  [P in SwitchParam as P['field']]: boolean;
+};
+
+/** One row of the generated table, by kind. */
+type ScopeParam = (typeof SCOPE_PARAMS)[number];
+type TextParam = Extract<ScopeParam, { kind: 'text' }>;
+type SwitchParam = Extract<ScopeParam, { kind: 'switch' }>;
+
+/** The text fields and the switches, as lists to walk. Narrowed from the generated rows, so a new row
+ * joins the right list by its `kind` and nothing here changes. */
+const TEXTS = SCOPE_PARAMS.filter((p): p is TextParam => p.kind === 'text');
+const SWITCHES = SCOPE_PARAMS.filter((p): p is SwitchParam => p.kind === 'switch');
 
 /** No narrowing — the whole comparison. */
 export function emptyScope(): DiffScopeParams {
-  return {
-    name: '',
-    names: '',
-    dtypeIs: '',
-    shapeIs: '',
-    map: '',
-    onlyTensors: false,
-    alignFused: false,
-    subtree: '',
-    subtreeNew: '',
-  };
+  const s = {} as Record<string, string | boolean>;
+  for (const p of TEXTS) s[p.field] = '';
+  for (const p of SWITCHES) s[p.field] = false;
+  return s as DiffScopeParams;
 }
 
 /** Whether anything narrows the comparison. Drives whether the bar shows a "clear" and whether the
  * request carries any scope at all. */
 export function isScopeActive(s: DiffScopeParams): boolean {
   return (
-    s.name.trim() !== '' ||
-    s.names.trim() !== '' ||
-    s.dtypeIs.trim() !== '' ||
-    s.shapeIs.trim() !== '' ||
-    s.map.trim() !== '' ||
-    s.onlyTensors ||
-    s.alignFused ||
-    s.subtree.trim() !== '' ||
-    s.subtreeNew.trim() !== ''
+    TEXTS.some((p) => s[p.field].trim() !== '') || SWITCHES.some((p) => s[p.field])
   );
 }
-
-/** The fields, paired with their URL and API key — one list, so encoding and decoding cannot drift. */
-const TEXT_FIELDS = [
-  ['name', 'name'],
-  ['names', 'names'],
-  ['dtypeIs', 'dtype_is'],
-  ['shapeIs', 'shape_is'],
-  ['map', 'map'],
-  ['subtree', 'subtree'],
-  ['subtreeNew', 'subtree_new'],
-] as const;
 
 /**
  * The scope as query parameters, for both the API and the URL hash.
@@ -106,32 +79,29 @@ const TEXT_FIELDS = [
  */
 export function scopeToQuery(s: DiffScopeParams): [string, string][] {
   const out: [string, string][] = [];
-  for (const [field, key] of TEXT_FIELDS) {
-    const v = s[field].trim();
-    if (v !== '') out.push([key, v]);
+  for (const p of TEXTS) {
+    const v = s[p.field].trim();
+    if (v !== '') out.push([p.key, v]);
   }
-  if (s.onlyTensors) out.push(['only_tensors', '1']);
-  if (s.alignFused) out.push(['align_fused', '1']);
+  for (const p of SWITCHES) {
+    if (s[p.field]) out.push([p.key, '1']);
+  }
   return out;
 }
 
 /** Read a scope back out of a `URLSearchParams` — the inverse of [[scopeToQuery]]. */
 export function scopeFromQuery(q: URLSearchParams): DiffScopeParams {
   const s = emptyScope();
-  for (const [field, key] of TEXT_FIELDS) {
-    s[field] = q.get(key) ?? '';
-  }
-  s.onlyTensors = q.get('only_tensors') === '1';
-  s.alignFused = q.get('align_fused') === '1';
+  for (const p of TEXTS) s[p.field] = q.get(p.key) ?? '';
+  for (const p of SWITCHES) s[p.field] = q.get(p.key) === '1';
   return s;
 }
 
 /** Whether two scopes describe the same selection — so a re-render can skip a refetch. */
 export function sameScope(a: DiffScopeParams, b: DiffScopeParams): boolean {
   return (
-    TEXT_FIELDS.every(([field]) => a[field].trim() === b[field].trim()) &&
-    a.onlyTensors === b.onlyTensors &&
-    a.alignFused === b.alignFused
+    TEXTS.every((p) => a[p.field].trim() === b[p.field].trim()) &&
+    SWITCHES.every((p) => a[p.field] === b[p.field])
   );
 }
 

@@ -40,20 +40,12 @@ pub(crate) struct DiffScope {
     /// folding, so 256 per-expert tensors read as `×256 → ×1` against the one fused tensor that holds
     /// them rather than as 255 removals.
     align_fused: Option<NameMap>,
-    // The inputs, kept so the scope can render itself back as CLI flags. Compiled globs cannot: a
-    // `glob::Pattern` does not give its source string back.
     /// `SOURCE#subtree`, per side: compare *from inside* a subtree. The tensors outside it are out of
     /// scope, and the ones inside are keyed by their sub-path — so a Hugging Face model's
     /// `language_model.model.layers.0.w` lines up with a converted checkpoint's `model.layers.0.w`.
     /// A scope change, not a rename (see [`crate::diff::CheckpointSummary::reroot`]).
     subtree: Option<String>,
     subtree_new: Option<String>,
-    name_globs: Vec<String>,
-    names_csv: Option<String>,
-    names_lines: Option<String>,
-    dtype_is: Option<String>,
-    shape_is: Option<String>,
-    map_rules: Vec<String>,
 }
 
 /// What applying a scope did, for the line the CLI prints as
@@ -119,55 +111,6 @@ fn flag(q: &Query, key: &str) -> Result<bool> {
 }
 
 impl DiffScope {
-    /// The scope rendered back as `diff` flags, for the copyable command the report offers.
-    ///
-    /// Without this the handover was a lie: the browser showed nineteen tensors and the command it
-    /// gave you compared all 117,664. Rendering from the compiled scope's *inputs* rather than
-    /// re-reading the query keeps the two in step.
-    pub(crate) fn cli_args(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for g in &self.name_globs {
-            out.push("--name".to_string());
-            out.push(g.clone());
-        }
-        if let Some(csv) = &self.names_csv {
-            out.push("--names".to_string());
-            out.push(csv.clone());
-        }
-        if let Some(d) = &self.dtype_is {
-            out.push("--dtype-is".to_string());
-            out.push(d.clone());
-        }
-        if let Some(s) = &self.shape_is {
-            out.push("--shape-is".to_string());
-            out.push(s.clone());
-        }
-        for rule in &self.map_rules {
-            out.push("--map".to_string());
-            out.push(rule.clone());
-        }
-        if self.only_tensors {
-            out.push("--only-tensors".to_string());
-        }
-        if self.align_fused.is_some() {
-            out.push("--align-fused".to_string());
-        }
-        // `names_list` has no single-flag equivalent — `--names-from` takes a path, and the pasted
-        // content is not one. Folded into `--names` so the command still reproduces the selection.
-        if let Some(lines) = &self.names_lines {
-            let joined: Vec<&str> = lines
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .collect();
-            if !joined.is_empty() {
-                out.push("--names".to_string());
-                out.push(joined.join(","));
-            }
-        }
-        out
-    }
-
     /// Read a scope from a request's query. An invalid glob or rename rule is an error, so the UI can
     /// say which pattern was rejected instead of showing an empty diff.
     pub(crate) fn from_query(q: &Query) -> Result<Self> {
@@ -193,12 +136,6 @@ impl DiffScope {
             align_fused,
             subtree: text(q, "subtree").map(str::to_string),
             subtree_new: text(q, "subtree_new").map(str::to_string),
-            name_globs: name,
-            names_csv: text(q, "names").map(str::to_string),
-            names_lines: text(q, "names_list").map(str::to_string),
-            dtype_is: text(q, "dtype_is").map(str::to_string),
-            shape_is: text(q, "shape_is").map(str::to_string),
-            map_rules,
         })
     }
 
@@ -720,16 +657,16 @@ mod tests {
     /// The copyable command must reproduce what is on screen, scope included.
     #[test]
     fn the_scope_renders_back_as_the_flags_that_produced_it() {
-        let scope = DiffScope::from_query(&q(&[
+        let scope_query = q(&[
             ("name", "model.layers.1.*\n!*.bias"),
             ("dtype_is", "F*"),
             ("shape_is", "768,**"),
             ("map", r"^blocks\.=>model.layers."),
             ("only_tensors", "1"),
-        ]))
-        .expect("valid");
+        ]);
+        DiffScope::from_query(&scope_query).expect("valid");
         assert_eq!(
-            scope.cli_args(),
+            super::super::params::render(&scope_query, &[super::super::params::SCOPE]),
             [
                 "--name",
                 "model.layers.1.*",
@@ -745,21 +682,19 @@ mod tests {
             ]
         );
         // An unscoped comparison adds nothing, so the command stays the short form.
-        assert!(
-            DiffScope::from_query(&q(&[]))
-                .expect("valid")
-                .cli_args()
-                .is_empty()
-        );
+        assert!(super::super::params::render(&q(&[]), &[super::super::params::SCOPE]).is_empty());
     }
 
     /// A pasted name list has no `--names-from` equivalent (that flag takes a path), so it folds into
     /// `--names` — otherwise the command silently drops the selection.
     #[test]
     fn a_pasted_name_list_becomes_an_explicit_names_flag() {
-        let scope =
-            DiffScope::from_query(&q(&[("names_list", "# pick\na.w\n\nb.w\n")])).expect("valid");
-        assert_eq!(scope.cli_args(), ["--names", "a.w,b.w"]);
+        let query = q(&[("names_list", "# pick\na.w\n\nb.w\n")]);
+        DiffScope::from_query(&query).expect("valid");
+        assert_eq!(
+            super::super::params::render(&query, &[super::super::params::SCOPE]),
+            ["--names", "a.w,b.w"]
+        );
     }
 
     /// An empty parameter means "unset", not "a pattern that matches nothing" — a UI that always sends
@@ -786,7 +721,10 @@ mod tests {
         let q: Query = std::iter::once(("align_fused".to_string(), "1".to_string())).collect();
         let scope = DiffScope::from_query(&q).expect("the canonical rules compile");
         assert!(scope.aligns_fused());
-        assert!(scope.cli_args().contains(&"--align-fused".to_string()));
+        assert!(
+            super::super::params::render(&q, &[super::super::params::SCOPE])
+                .contains(&"--align-fused".to_string())
+        );
 
         let unfused = summary(
             &[

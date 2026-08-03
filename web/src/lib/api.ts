@@ -2,6 +2,7 @@
 // these just fetch it. Errors surface the server's `{error}` envelope.
 
 import { noteServedBuild } from './build';
+import { CHECK_PARAMS } from './params.generated';
 import { totalBytes } from './progress';
 import { scopeToQuery, type DiffScopeParams } from './diffscope';
 import type { JobStatus } from '../stores/jobs';
@@ -156,6 +157,33 @@ async function getJson<T>(url: string): Promise<T> {
 const BUILD_HEADER = 'X-App-Build';
 
 const enc = encodeURIComponent;
+
+/**
+ * Which comparison to render a command for, named as the generated table names it
+ * (`params.generated.ts`, from `src/web/params.rs`).
+ */
+export type CheckKind = 'values' | 'histogram' | 'verifyRepack';
+
+/**
+ * The check as a query tail: `&values=1`, plus `&full=1` for the structural report's row fold.
+ *
+ * Keyed through the generated table rather than by writing the wire names here — the parameter is
+ * `verify_repack` and the field is `verifyRepack`, and that pairing is what the table exists to hold in
+ * one place.
+ */
+function checkTail(check: CheckKind | undefined, full: boolean): string {
+  const parts: string[] = [];
+  if (check) parts.push(`&${WIRE[check]}=1`);
+  if (full) parts.push(`&${WIRE.full}=1`);
+  return parts.join('');
+}
+
+/** Every check field's wire key, from the generated table — typed as total, so there is no
+ * "unknown field" branch to fall back through: the fields *are* the table's. */
+const WIRE = Object.fromEntries(CHECK_PARAMS.map((p) => [p.field, p.key])) as Record<
+  (typeof CHECK_PARAMS)[number]['field'],
+  string
+>;
 
 /** A scope as a query tail, or nothing. One place, so the two diff routes cannot encode it differently. */
 function scopeTail(scope: DiffScopeParams | undefined): string {
@@ -357,6 +385,24 @@ export const api = {
   subtrees: (id: number, side: 'old' | 'new', q = '', limit = 100) =>
     getJson<{ total: number; subtrees: { prefix: string; tensors: number }[] }>(
       `/api/subtrees?id=${id}&side=${side}&limit=${limit}${q ? `&q=${enc(q)}` : ''}`,
+    ),
+  /**
+   * The terminal invocation for a set of parameters — **the only way this client obtains one**.
+   *
+   * `check` says which comparison (`values`, `histogram`, `verify-repack`, or the structural default),
+   * and the scope goes with it. Rendered server-side from the same table that decides which parameters
+   * are accepted at all, so a control the panel sets cannot be one the command drops. The Data view used
+   * to build its line here from the two addresses and silently dropped the whole selection.
+   */
+  command: (
+    left: string,
+    right: string,
+    scope?: DiffScopeParams,
+    check?: CheckKind,
+    full = false,
+  ) =>
+    getJson<{ command: string | null }>(
+      `/api/command?left=${enc(left)}&right=${enc(right)}${checkTail(check, full)}${scopeTail(scope)}`,
     ),
   /** Forget one checkpoint. Returns the list without it; rejects with a 404 if it wasn't there. */
   forgetRecent: (spec: string) =>

@@ -6,6 +6,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BusyError, api } from "./api";
+import { emptyScope } from "./diffscope";
 
 /**
  * A stand-in `Response` that answers what the real one does: status, `headers` (so
@@ -222,6 +223,25 @@ describe("urls", () => {
     await expect(api.diff(7)).rejects.toThrow(
       "no checkpoint files found at /tmp/x",
     );
+  });
+
+  // **The one place a terminal invocation comes from.** The Data view used to assemble its own out of the
+  // two addresses, which dropped the whole selection; every surface asks for one now, so the request has
+  // to carry the check *and* the scope.
+  it("asks the server for a command, with the check and the scope", async () => {
+    const urls = stubFetch({ body: { command: "checkpoint-studio diff /a /b" } });
+    await api.command("/a", "/b");
+    await api.command("/a", "/b", { ...emptyScope(), names: "lm_head.weight" }, "values");
+    await api.command("/a", "/b", undefined, "histogram");
+    await api.command("/a", "/b", undefined, "verifyRepack");
+    await api.command("/a", "/b", undefined, undefined, true);
+    expect(urls).toEqual([
+      "/api/command?left=%2Fa&right=%2Fb",
+      "/api/command?left=%2Fa&right=%2Fb&values=1&names=lm_head.weight",
+      "/api/command?left=%2Fa&right=%2Fb&histogram=1",
+      "/api/command?left=%2Fa&right=%2Fb&verify_repack=1",
+      "/api/command?left=%2Fa&right=%2Fb&full=1",
+    ]);
   });
 
   it("encodes a shard path for the layout and file endpoints", async () => {
