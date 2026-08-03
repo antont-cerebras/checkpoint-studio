@@ -72,6 +72,12 @@ pub(crate) struct Job {
     findings: Mutex<Vec<Value>>,
     error: Mutex<Option<String>>,
     started: std::time::Instant,
+    /// How long the run took, once it is over.
+    ///
+    /// Written when the job finishes, because a finished run's duration is a fact and not a clock: a
+    /// poll of a job that failed after fourteen seconds used to report it as having taken seventy, and
+    /// climbing, which reads as work still going on.
+    took: Mutex<Option<std::time::Duration>>,
     /// The handle the work was given, so a stop request reaches it.
     progress: Arc<crate::hf::ReadProgress>,
 }
@@ -127,6 +133,12 @@ impl Job {
     }
 
     fn finish(&self, outcome: State, error: Option<String>) {
+        // Stop the clock first: a poll racing this must not see a finished state with a still-growing
+        // elapsed time.
+        *self
+            .took
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(self.started.elapsed());
         *self
             .state
             .write()
@@ -155,7 +167,13 @@ impl Job {
             "total": self.total.load(Ordering::Relaxed),
             "bytes": self.bytes.load(Ordering::Relaxed),
             "current": *self.current.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-            "elapsed_s": self.started.elapsed().as_secs_f64(),
+            // Wall-clock while it runs; the run's own duration once it is over.
+            "elapsed_s": self
+                .took
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(|| self.started.elapsed())
+                .as_secs_f64(),
             "findings": *self.findings.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
             "error": *self.error.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
         })
@@ -199,6 +217,7 @@ impl Jobs {
             findings: Mutex::new(Vec::new()),
             error: Mutex::new(None),
             started: std::time::Instant::now(),
+            took: Mutex::new(None),
             progress: Arc::new(crate::hf::ReadProgress::default()),
         });
         self.register(Arc::clone(&job));
@@ -292,6 +311,27 @@ mod tests {
         Jobs::finish(&job, Ok(()));
         let held = jobs.get(job.id).expect("a finished job is still there");
         assert_eq!(held.snapshot()["state"], "done");
+    }
+
+    /// **A finished run's duration stops being a clock.** A job that failed at fourteen seconds kept
+    /// reporting a larger elapsed time on every poll — seventy seconds and climbing next to the word
+    /// *failed*, which reads as work still going on.
+    #[test]
+    fn a_finished_job_reports_how_long_it_took_not_how_long_ago_it_started() {
+        let jobs = Jobs::default();
+        let job = jobs.start("verify-repack");
+        Jobs::finish(&job, Err(anyhow::anyhow!("nothing matched")));
+        let first = job.snapshot()["elapsed_s"]
+            .as_f64()
+            .expect("an elapsed time");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let later = job.snapshot()["elapsed_s"]
+            .as_f64()
+            .expect("an elapsed time");
+        assert!(
+            (later - first).abs() < f64::EPSILON,
+            "a finished job's elapsed time must not move: {first} then {later}"
+        );
     }
 
     /// A cancelled job is not a failed one — it says what happened, so a UI does not show an error for
