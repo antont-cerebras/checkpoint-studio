@@ -274,7 +274,17 @@ def work(idx: int) -> int:
                 lo_c = min(b[0] for b in bounds); hi_c = max(b[1] for b in bounds)
             if hi_c <= lo_c: n = 1
             oc = np.zeros(n, dtype=np.int64); nc = np.zeros(n, dtype=np.int64)
-        for (i, j) in spans:
+        # A big tensor is compared span by span, and that loop is the slow part: for a safetensors side
+        # there is no download to animate, and even for s3 the read finishes long before the compare
+        # does. Reporting the span keeps the bar honest — it used to stop while the work continued.
+        nspans = len(spans)
+        last_note = [0.0]
+        for (si, (i, j)) in enumerate(spans):
+            now = time.time()
+            # Throttled: a span can be milliseconds, and a line per span would flood the ssh channel.
+            if nspans > 1 and (si == 0 or now - last_note[0] >= 1.0):
+                last_note[0] = now
+                stat("phase\t%s\tcomparing\t%d\t%d" % (nname, si + 1, nspans))
             av = to_f64(ra, i, j); bv = to_f64(rb, i, j)
             if WANT_VALUES:
                 both_nan = np.isnan(av) & np.isnan(bv)

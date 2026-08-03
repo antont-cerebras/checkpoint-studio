@@ -379,9 +379,18 @@ fn compare_on_proxy(
         .open_with(&mut password)
         .with_context(|| format!("opening an ssh session to {}", proxy.host))?;
     let mut counted = ProxyBytes::default();
-    let (map, _stats) = proxy.value_diff(&session, old_side, new_side, &pairs, &vopts, |ev| {
-        proxy_event(job, &ev, &mut counted);
-    })?;
+    let (map, _stats) = proxy.value_diff(
+        &session,
+        old_side,
+        new_side,
+        &pairs,
+        &vopts,
+        // The job's own flag: *Stop* tears the ssh channel down, which ends the remote python with it.
+        // Without it a stop stopped only the *waiting* — the proxy went on comparing every tensor of a
+        // checkpoint nobody was watching, and the only way to end it was to log in and kill it.
+        Some(job.read_progress().abort_flag()),
+        |ev| proxy_event(job, &ev, &mut counted),
+    )?;
     let mut out: HashMap<String, crate::diff::TensorExtras> = HashMap::new();
     for (name, diff) in map {
         if let Some(e) = &diff.error {
@@ -450,8 +459,16 @@ fn proxy_event(job: &Job, ev: &crate::remote::RepackEvent<'_>, counted: &mut Pro
             old_done,
             new_done,
         } => job.set_bytes(counted.observe(name, old_done + new_done)),
-        crate::remote::RepackEvent::Size { .. }
-        | crate::remote::RepackEvent::Comparing(_)
-        | crate::remote::RepackEvent::Done { .. } => {}
+        // The comparison of one tensor, span by span: for a safetensors side there is no download to
+        // animate, and even for s3 the read finishes long before the compare does — so this is what the
+        // reader watches while a gigabyte-scale weight is worked through.
+        crate::remote::RepackEvent::Comparing { name, spans } => {
+            let label = match spans {
+                Some((done, total)) => format!("{name} · comparing {done}/{total}"),
+                None => format!("{name} · comparing"),
+            };
+            job.set_current(&label);
+        }
+        crate::remote::RepackEvent::Size { .. } | crate::remote::RepackEvent::Done { .. } => {}
     }
 }

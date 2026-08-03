@@ -83,6 +83,17 @@ impl Job {
     }
 
     /// Move on to `name`, having finished `done` items.
+    /// Relabel what is being worked on without moving the count.
+    ///
+    /// For a phase *within* one item — the comparison of a gigabyte-scale tensor, which is minutes of
+    /// work under one unchanged `done`. Without it the whole line sat still while the work went on.
+    pub(crate) fn set_current(&self, name: &str) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = name.to_string();
+    }
+
     pub(crate) fn progress_to(&self, done: usize, name: &str) {
         self.done.store(done, Ordering::Relaxed);
         *self

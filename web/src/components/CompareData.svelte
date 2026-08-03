@@ -19,6 +19,7 @@
   import { cancelJob, clearJob, job, jobError, startJob, type JobKind } from '../stores/jobs';
   import { diffTree } from '../stores/compare';
   import { diffReport } from '../stores/report';
+  import { onMount } from 'svelte';
   import { api } from '../lib/api';
   import type { DiffScopeParams } from '../lib/diffscope';
   import { copyText } from '../lib/clipboard';
@@ -84,6 +85,35 @@
 
   /** A number the way the CLI prints it. */
   const n = (v: number | undefined) => (v === undefined ? '—' : v.toLocaleString());
+
+  /**
+   * The elapsed time, on its own clock.
+   *
+   * The server measures it and every poll carries a fresh figure — but a poll is twice a second, so the
+   * timer moved in half-second steps *with* the counters and read as frozen whenever they were: exactly
+   * when a reader is asking whether anything is still happening. So the server's figure is a baseline
+   * and this adds the wall-clock time since that answer arrived. It stays the server's measure — the
+   * clock only fills the gaps between its updates — and it stops when the job does.
+   */
+  let ticking = 0;
+  // Fields of an object, so the reactive block below can *read the previous run's* baseline without
+  // Svelte treating it as a dependency — and without an assignment that would re-trigger the block.
+  const seen = { at: 0, elapsed: 0 };
+  $: if ($job && $job.elapsed_s !== seen.elapsed) {
+    // A new answer: re-baseline. This is also what lands the timer exactly on the server's final figure
+    // when the run ends, since the last poll carries it and the clock below has stopped by then.
+    seen.elapsed = $job.elapsed_s;
+    seen.at = performance.now();
+    ticking = $job.elapsed_s;
+  }
+  // One interval for the component's life rather than one started and stopped by a reactive statement —
+  // which would assign the handle it reads, and is the shape `svelte/infinite-reactive-loop` warns about.
+  onMount(() => {
+    const id = setInterval(() => {
+      if (running) ticking = seen.elapsed + (performance.now() - seen.at) / 1000;
+    }, 100);
+    return () => clearInterval(id);
+  });
 
   /**
    * The equivalent command, for a terminal — an alternative, not the only way.
@@ -197,7 +227,7 @@
       <span class="dim tick">
         {n($job.done)}{$job.total > 0 ? ` / ${n($job.total)}` : ''}
         {#if $job.bytes > 0}· {humanSize($job.bytes)} read{/if}
-        · {$job.elapsed_s.toFixed(1)}s
+        · {ticking.toFixed(1)}s
       </span>
     </div>
     {#if running}

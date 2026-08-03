@@ -180,6 +180,9 @@ fn verify_on_proxy(
         &plan.pairs,
         plan.bits,
         false,
+        // The job's own flag, so *Stop* tears the channel down and the remote verification ends with
+        // it — rather than stopping the waiting while the proxy carries on alone.
+        Some(job.read_progress().abort_flag()),
         |ev| on_event(job, &ev, &mut counted),
     )?;
     record(job, plan, &map);
@@ -228,7 +231,7 @@ fn on_event(job: &Job, ev: &crate::remote::RepackEvent<'_>, counted: &mut ByteTa
         // `Start`/`Bytes` already, or in the findings. Listed rather than wildcarded so a new event
         // variant is a compile error here and gets a decision.
         crate::remote::RepackEvent::Size { .. }
-        | crate::remote::RepackEvent::Comparing(_)
+        | crate::remote::RepackEvent::Comparing { .. }
         | crate::remote::RepackEvent::Done { .. } => {}
     }
 }

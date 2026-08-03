@@ -398,8 +398,13 @@ pub enum RepackEvent<'a> {
         old_done: u64,
         new_done: u64,
     },
-    /// Download done; now decoding + comparing the indices.
-    Comparing(&'a str),
+    /// Download done; now decoding + comparing. `spans` is how far *that* has got, when the tensor is
+    /// big enough to be compared in pieces — the phase where a gigabyte-scale weight spends its time,
+    /// and where the bar used to stop while the work went on.
+    Comparing {
+        name: &'a str,
+        spans: Option<(usize, usize)>,
+    },
     /// The tensor finished, with its verification outcome.
     Done {
         name: &'a str,
@@ -990,6 +995,10 @@ impl RemoteRead {
     ///
     /// **Read-only:** loads (lazily) and reads tensor data to compare; it never
     /// writes, saves, or otherwise mutates either checkpoint.
+    // Positional, like its sibling `verify_repack`: the arguments are the two sides, what to compare,
+    // how, and the stop flag — each named at every call site, and grouping them into a struct would put
+    // one more indirection between the caller and a signature it already reads once.
+    #[allow(clippy::too_many_arguments)]
     pub fn value_diff(
         &self,
         session: &RemoteSession,
@@ -997,11 +1006,15 @@ impl RemoteRead {
         new: &RemoteSide,
         pairs: &[(String, String)],
         opts: &RemoteValueOpts,
+        // Set to stop: the channel is torn down, which ends the remote python with it. Without this a
+        // *Stop* stopped only the waiting — the proxy went on comparing every tensor of a checkpoint
+        // nobody was watching, holding gigabytes, and the only way to end it was to log in and kill it.
+        abort: Option<&std::sync::atomic::AtomicBool>,
         mut on_event: impl FnMut(RepackEvent<'_>),
     ) -> Result<(HashMap<String, RemoteTensorDiff>, Option<RemoteValueStats>)> {
         let script = value_diff_script(old, new, pairs, opts);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
-        let out = session.exec_capture(&command, &script, |line| {
+        let out = session.exec_capture_abortable(&command, &script, abort, |line| {
             dispatch_stream_line(line, &compare_status, &mut on_event);
         })?;
         record_transcript("value_diff", &out);
@@ -1025,11 +1038,13 @@ impl RemoteRead {
         pairs: &[(String, String)],
         bits: usize,
         auto_sparse: bool,
+        // Set to stop — see `value_diff`'s note; the same reasoning, the same fix.
+        abort: Option<&std::sync::atomic::AtomicBool>,
         mut on_event: impl FnMut(RepackEvent<'_>),
     ) -> Result<(HashMap<String, RepackResult>, Option<RemoteValueStats>)> {
         let script = repack_verify_script(old_uri, new_uri, pairs, bits, auto_sparse);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
-        let out = session.exec_capture(&command, &script, |line| {
+        let out = session.exec_capture_abortable(&command, &script, abort, |line| {
             dispatch_stream_line(line, &repack_status, &mut on_event);
         })?;
         record_transcript("repack_verify", &out);
@@ -1085,7 +1100,14 @@ fn dispatch_stream_line(
             }
             Some("phase") => {
                 if let Some(name) = f.next() {
-                    on_event(RepackEvent::Comparing(name));
+                    // `comparing` may carry how far it has got: `phase<TAB>name<TAB>comparing<TAB>3<TAB>12`.
+                    let spans = match (f.next(), f.next(), f.next()) {
+                        (Some(_), Some(done), Some(total)) => {
+                            done.parse().ok().zip(total.parse().ok())
+                        }
+                        _ => None,
+                    };
+                    on_event(RepackEvent::Comparing { name, spans });
                 }
             }
             // A sibling tensor's own bar finished downloading (codebook / qscale) —

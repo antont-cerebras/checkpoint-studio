@@ -1564,8 +1564,16 @@ impl ValueBar {
             }
             // The whole run is never "done reading" until the end, so a per-tensor
             // compare phase would flicker the note on and off; name the tensor instead.
-            E::Comparing(name) => {
-                p.set_item(&format!("{} · comparing", self.item_label(name)));
+            E::Comparing { name, spans } => {
+                // How far *that* has got, when the tensor is compared in pieces: a gigabyte-scale
+                // weight spends its time here, and the bar's counters do not move until it is done.
+                let label = match spans {
+                    Some((done, total)) => {
+                        format!("{} · comparing {done}/{total}", self.item_label(name))
+                    }
+                    None => format!("{} · comparing", self.item_label(name)),
+                };
+                p.set_item(&label);
             }
             E::Done { name, status } => {
                 self.done += 1;
@@ -2689,9 +2697,18 @@ fn fetch_remote_repack(
         0,
         bar_labels.len(),
     ));
-    let out = r.verify_repack(&session, old_uri, new_uri, pairs, bits, auto_sparse, |ev| {
-        bar.borrow_mut().on(ev);
-    });
+    // Ctrl-C sets the same flag every remote read watches, so a stop reaches the proxy rather than only
+    // the waiting here.
+    let out = r.verify_repack(
+        &session,
+        old_uri,
+        new_uri,
+        pairs,
+        bits,
+        auto_sparse,
+        None,
+        |ev| bar.borrow_mut().on(ev),
+    );
     // Settle the bar (even on a fatal mid-run error) so the animation thread sees it
     // finished and `join` returns.
     bar.into_inner().finish();
@@ -3128,7 +3145,7 @@ fn fetch_remote_value_diff(
         total_bytes,
         pairs.len(),
     ));
-    let out = r.value_diff(&session, old_side, new_side, pairs, vopts, |ev| {
+    let out = r.value_diff(&session, old_side, new_side, pairs, vopts, None, |ev| {
         bar.borrow_mut().on(ev);
     });
     bar.into_inner().finish();
@@ -4238,7 +4255,10 @@ mod tests {
         #[test]
         fn comparing_says_so_without_losing_the_tensor_name() {
             let mut b = bar(10, 1);
-            b.on(E::Comparing("w"));
+            b.on(E::Comparing {
+                name: "w",
+                spans: None,
+            });
             let p = b.bars.progress(0).expect("one bar");
             let item = p.item().unwrap_or_default();
             assert!(item.contains('w'), "keeps the name: {item}");
