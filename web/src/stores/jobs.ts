@@ -52,6 +52,15 @@ export interface JobFinding {
   /** `--values` / `--histogram`, per tensor. */
   values?: ValueFinding | null;
   histogram?: HistFinding | null;
+  /**
+   * Why this tensor could **not** be compared — a shape the two sides do not share, a name one side
+   * lacks, a fold the alignment made.
+   *
+   * Rendered, unlike when it was only in the payload: a run that compared nothing showed a list of bare
+   * names under `0 of 0 compared tensor(s) differ`, which reads as "nothing differs" rather than as
+   * "nothing happened".
+   */
+  error?: string;
   /** `--verify-repack`, per tensor: decoded indices rather than element values. */
   elements?: number;
   differing?: number;

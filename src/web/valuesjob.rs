@@ -177,7 +177,13 @@ pub(crate) fn run(
     // The renamed names are used for *pairing*; the reads use the original `TensorInfo`, whose name also
     // keys the packing schemas. So `renamed_to_original` maps one to the other rather than rewriting the
     // tensor and losing its schema.
-    let renamed_old = scope.rename_tensors(&old.tensors).tensors;
+    let renamed = scope.rename_tensors(&old.tensors);
+    // Which names the alignment *folded*: 256 per-expert tensors onto the one fused tensor that holds
+    // them. Kept because a folded name cannot have its values compared element by element — the two
+    // sides are not the same array — and saying which names those are is the difference between a
+    // result a reader can act on and a silent `0 of 0 compared`.
+    let folded = renamed.folds.clone();
+    let renamed_old = renamed.tensors;
     let renamed_to_original: HashMap<String, crate::tree::TensorInfo> = renamed_old
         .iter()
         .zip(old.tensors.iter())
@@ -250,7 +256,7 @@ pub(crate) fn run(
         new_side,
     } = &mode
     {
-        let extras = compare_on_proxy(job, proxy, old_side, new_side, &common, what)?;
+        let extras = compare_on_proxy(job, proxy, old_side, new_side, &common, what, &folded)?;
         return finish(job, old_sum, new_sum, extras);
     }
 
@@ -349,6 +355,8 @@ fn compare_on_proxy(
     new_side: &crate::remote::RemoteSide,
     names: &[String],
     what: &What,
+    // Names the alignment folded, and into how many parts — see `run`.
+    folded: &std::collections::BTreeMap<String, usize>,
 ) -> Result<HashMap<String, crate::diff::TensorExtras>> {
     // The proxy pairs by name: the selection is already keyed by the *renamed* old name, which is the
     // new side's name — the same key the report is built from.
@@ -394,7 +402,21 @@ fn compare_on_proxy(
     let mut out: HashMap<String, crate::diff::TensorExtras> = HashMap::new();
     for (name, diff) in map {
         if let Some(e) = &diff.error {
-            job.add_finding(json!({ "kind": "tensor", "name": name, "error": e }));
+            // A folded name's sides are not the same array: `×256 → ×1` means 256 per-expert tensors
+            // against the one fused tensor holding them, in a packed layout whose inner dimension is
+            // padded. There is no element-by-element comparison to run, and the check that *does*
+            // answer "are these the same weights" for such a pair is the repack verification.
+            let why = folded.get(&name).map_or_else(
+                || e.clone(),
+                |parts| {
+                    format!(
+                        "{e} — the alignment folded {parts} tensors onto this one (×{parts} → ×1), so \
+                         the two sides are not the same array. Use verify-repack, which decodes the \
+                         packing."
+                    )
+                },
+            );
+            job.add_finding(json!({ "kind": "tensor", "name": name, "error": why }));
             continue;
         }
         let extras = crate::diff::TensorExtras {

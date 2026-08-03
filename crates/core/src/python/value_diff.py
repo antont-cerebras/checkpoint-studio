@@ -7,6 +7,13 @@ both, which is what makes comparing them possible without moving tensor data
 anywhere. Only the per-tensor verdicts cross the ssh link. Emits progress lines plus
 one sentinel-tagged JSON result per pair.
 
+**What is compared is what each side stores.** No decode is applied here: no qscale, no codebook, no
+bit-unpacking. For unquantized tensors that is the value comparison; for a quantized one it is a
+comparison of the *stored* representation, which only means something if both sides store it the same
+way — and two differently-quantized checkpoints do not. The local path can decode (packing schemas from
+the checkpoint's metadata) and `--verify-repack` compares decoded indices on the proxy; a dequantizing
+comparison over here does not exist yet.
+
 Read-only: loads and compares; never writes to either checkpoint.
 """
 # Annotations are lazy (PEP 563) so they never execute at import time on the
@@ -208,7 +215,10 @@ def work(idx: int) -> int:
         ashape = old_sd.shape(oname) if a is None else [int(d) for d in a.shape]
         bshape = new_sd.shape(nname) if b is None else [int(d) for d in b.shape]
         if ashape != bshape:
-            res["error"] = "shapes differ"; emit(res); return 0
+            # Both shapes, not just the fact: a comparison of *values* needs the same layout on both
+            # sides, and the reader's next question is always which side is which.
+            res["error"] = "shapes differ: %s vs %s" % (tuple(ashape), tuple(bshape))
+            emit(res); return 0
         # Stream each side's S3 object on the proxy (chunked, with byte progress); the
         # per-chunk float64 conversions below work off the in-memory copy. Values are
         # compared here — only progress + the small result cross ssh. Fall back to

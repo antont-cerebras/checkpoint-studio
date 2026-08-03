@@ -34,6 +34,8 @@
   $: fraction = $job && $job.total > 0 ? Math.min(1, $job.done / $job.total) : null;
   $: verdict = $job?.findings.find((f) => f.kind === 'verdict');
   $: tensors = $job?.findings.filter((f) => f.kind === 'tensor') ?? [];
+  /** Tensors the run could not compare at all — a shape it cannot pair, a name one side lacks. */
+  $: skipped = tensors.filter((f) => f.error).length;
 
   /**
    * What this run would read, from the comparison already on screen.
@@ -270,6 +272,13 @@
           <span class="dim"
             >{n(verdict.differ)} of {n(verdict.compared)} compared tensor(s) differ</span
           >
+          <!-- What could *not* be compared. `0 of 0 compared` on its own read as "nothing differs",
+               which is the opposite of what a run that compared nothing means. -->
+          {#if skipped > 0}
+            <span class="why"
+              >{n(skipped)} could not be compared — see below</span
+            >
+          {/if}
         {/if}
       </p>
     {/if}
@@ -293,6 +302,12 @@
               <span class="dim">{n(f.differing)} of {n(f.elements)} indices differ</span>
               <span class="dim">max Δ {n(f.max_delta)}</span>
             {/if}
+            {#if f.error}
+              <!-- A tensor that could *not* be compared, and why. Rendering only the successes left a
+                   list of bare names under `0 of 0 compared` — the reader could see that nothing had
+                   happened and not what had stopped it. -->
+              <span class="why">{f.error}</span>
+            {/if}
           </li>
         {/each}
       </ul>
@@ -310,6 +325,12 @@
 </div>
 
 <style>
+  /* Why a tensor could not be compared — a fact about the run, not a value. Coloured like a warning
+     rather than an error: the run itself succeeded, and this is what it could not answer. */
+  .why {
+    color: var(--warn, var(--danger));
+    font-size: 11.5px;
+  }
   /* A note about what can be done, not a result — the shape the report gives its own method notes. */
   .method {
     margin: 0 0 8px;

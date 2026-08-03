@@ -1991,12 +1991,15 @@ fn run_diff(
     });
     let remote_values = match (remote, compares_data) {
         (Some(_), true) => {
-            // A cstorch tensor is already the logical values, so the local decode views
-            // (`--dtype u4/unpacked/…`) do not apply to that side.
-            if !matches!(view, sample::ViewDtype::Stored) && s3_pair {
+            // **The proxy compares what is stored, and applies no decode.** `--dtype u4/unpacked/…`
+            // are local decodes, and a remote comparison has no access to them; saying the remote's
+            // tensors "are already the logical values" was a claim about *unquantized* checkpoints that
+            // does not hold for a quantized one — where the stored array is indices or scaled integers
+            // and the logical value needs a qscale (or a codebook) applied.
+            if !matches!(view, sample::ViewDtype::Stored) {
                 eprintln!(
-                    "checkpoint-studio diff: --dtype is ignored for s3:// cstorch checkpoints \
-                     (their tensors are already the logical values)"
+                    "checkpoint-studio diff: --dtype is ignored on the proxy — a remote comparison \
+                     reads what each side stores, with no decode applied"
                 );
             }
             true
