@@ -376,54 +376,99 @@ pub(crate) fn repack_supported(proxied: bool, s3_pair: bool) -> Result<()> {
     Ok(())
 }
 
-/// Whether the two sides' **values** can be compared at all, from their addresses alone.
+/// Whether the two sides' **values** can be compared at all, and where — from their addresses alone.
 ///
 /// Asked before either side is read. The job used to read both checkpoints first — minutes over an ssh
 /// proxy — and only then discover it had no way to the bytes, so the answer arrived after the wait it
 /// should have prevented. Nothing about it depends on the read: the specs say where each side lives, and
-/// `proxied` says whether there is a proxy to compare on.
+/// `proxy` says which host can be compared *on*.
 ///
-/// Three answers, not two: both local (read here), two `s3://` with a proxy (compared *there*), and
-/// everything else — a remote safetensors directory has no reader on either side of the wire.
-///
-/// The message names what to do about each case, which is why this is one sentence in one place rather
-/// than a guess at each call site.
-pub(crate) fn values_supported(left: &str, right: &str, proxied: bool) -> Result<()> {
-    let remote: Vec<&str> = [left, right]
-        .into_iter()
-        .filter(|spec| !crate::capability::Location::of_source_path(spec).is_local())
-        .collect();
-    if remote.is_empty() {
-        return Ok(());
+/// Three answers, and the middle one is the point: a comparison does not need the data *here*, it needs
+/// both sides readable **in one place**. The proxy holds the S3 credentials and the filesystem an
+/// `ssh` path names, so a pair that is entirely over there is compared over there
+/// ([`crate::remote::RemoteRead::value_diff`]) with only the results coming back.
+pub(crate) fn values_where(left: &str, right: &str, proxy: Option<&str>) -> Result<ValuesAt> {
+    use crate::capability::Location;
+    // `of_spec`, not `of_source_path`: these are addresses as typed, and `:PATH` means the proxy.
+    let where_ = |spec: &str| Location::of_spec(spec);
+    if where_(left).is_local() && where_(right).is_local() {
+        return Ok(ValuesAt::Here);
     }
-    let s3 = |spec: &str| {
-        matches!(
-            crate::capability::Location::of_source_path(spec),
-            crate::capability::Location::S3
-        )
+    // Readable by the proxy: an `s3://` URI (it has the credentials), or a path on the proxy itself —
+    // `:/path`, or `host:/path` where the host *is* the proxy. A path on some other host is not.
+    let on_proxy = |spec: &str| match where_(spec) {
+        Location::S3 => proxy.is_some(),
+        Location::Sftp => proxy.is_some_and(|p| {
+            spec.starts_with(':') || spec.split_once(':').is_some_and(|(host, _)| host == p)
+        }),
+        Location::Local | Location::Hf => false,
     };
-    let both_s3 = s3(left) && s3(right);
-    // **Two `s3://` cstorch checkpoints are supported** — on the proxy, which holds the credentials and
-    // the data, so the comparison runs where the bytes already are and only the results come back
-    // (`remote::RemoteRead::value_diff`). It needs a proxy to run on, which is the one thing about it
-    // this cannot infer from the addresses.
-    if both_s3 && proxied {
-        return Ok(());
+    if on_proxy(left) && on_proxy(right) {
+        return Ok(ValuesAt::OnProxy);
     }
+    // Two different refusals, because they are two different problems. A *mixed* pair has two readable
+    // sides and no single place holding both; the other case has a side nothing can read.
+    let local: Vec<&str> = [left, right]
+        .into_iter()
+        .filter(|spec| where_(spec).is_local())
+        .collect();
+    if !local.is_empty() {
+        let elsewhere: Vec<&str> = [left, right]
+            .into_iter()
+            .filter(|spec| !where_(spec).is_local())
+            .collect();
+        anyhow::bail!(
+            "comparing values needs both checkpoints in one place: {} {} here and {} {} not. Copy one \
+             down, or put both on the proxy.",
+            local.join(" and "),
+            if local.len() == 1 { "is" } else { "are" },
+            elsewhere.join(" and "),
+            if elsewhere.len() == 1 { "is" } else { "are" },
+        );
+    }
+    let unreachable: Vec<&str> = [left, right]
+        .into_iter()
+        .filter(|spec| !on_proxy(spec))
+        .collect();
     anyhow::bail!(
-        "this build compares values by reading the tensors here, and {} {} read remotely — only the \
-         structure comes from there.{}",
-        remote.join(" and "),
-        if remote.len() == 1 { "is" } else { "are" },
-        if both_s3 {
-            // Supported, but not from here: the comparison needs the proxy that holds the data.
-            " Both sides are s3:// cstorch checkpoints, which can be compared on the proxy — but no \
-             ssh proxy is configured: start with --ssh-proxy, or set ssh_proxy in the config."
+        "comparing values needs both checkpoints readable in one place, and {} {} not readable on the \
+         proxy.{}",
+        unreachable.join(" and "),
+        if unreachable.len() == 1 { "is" } else { "are" },
+        if proxy.is_none() {
+            " No ssh proxy is configured — start with --ssh-proxy, or set ssh_proxy in the config."
         } else {
-            " Copy a checkpoint down to compare its values here. Two s3:// cstorch checkpoints are \
-             compared on the proxy instead; a remote safetensors directory cannot be yet."
+            " A Hugging Face repo has no reader for its bytes, and a path on another host is not one \
+             the proxy can open."
         }
     );
+}
+
+/// How the proxy reads a side whose address is **already proxy-relative**.
+///
+/// The `diff` subcommand splits the host off both operands before it reads them (that is how one
+/// `--ssh-proxy` serves an scp-style pair), so by the time it needs this, a side is either an `s3://`
+/// URI or a path *on* the proxy — there is nothing left to decide about reachability, only which library
+/// opens it. The web's job builds the same two variants from what its read resolved
+/// (`web::valuesjob::Side::as_remote`), having asked [`values_where`] about the specs first.
+pub(crate) fn proxy_side_of(spec: &str) -> crate::remote::RemoteSide {
+    if spec.starts_with("s3://") {
+        crate::remote::RemoteSide::S3(spec.to_string())
+    } else {
+        crate::remote::RemoteSide::Safetensors(spec.to_string())
+    }
+}
+
+/// Where a value comparison can happen for a given pair.
+///
+/// An enum rather than a `bool`, because the two arms read *different data in different places* and the
+/// caller has to pick a code path, not a flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValuesAt {
+    /// Both sides are on this machine: read and compare here.
+    Here,
+    /// Both sides are readable by the proxy: compare there, and only results come back.
+    OnProxy,
 }
 
 /// Plan a repack verification over two **already-scoped** summaries.
@@ -763,61 +808,79 @@ mod tests {
         );
     }
 
-    /// Whether a value comparison can happen at all — asked of the two addresses, before any read.
+    /// **Where** a value comparison can happen — asked of the two addresses, before any read.
     ///
     /// The reported bug: a remote pair was accepted, both checkpoints were read (minutes over an ssh
-    /// proxy), and *then* the job said a remote source serves no tensor data. The question never
-    /// needed the read.
+    /// proxy), and *then* the job said it had no tensor data. The question never needed the read.
+    ///
+    /// The three answers matter as much as the refusal. A comparison does not need the bytes *here*; it
+    /// needs both sides readable in one place, and the proxy is such a place for anything it can open.
     #[test]
-    fn comparing_values_says_where_it_can_happen_before_reading_anything() {
-        // Both local: read here, proxy or not.
-        assert!(values_supported("/models/a", "/models/b", false).is_ok());
-        assert!(values_supported("/models/a", "/models/b", true).is_ok());
+    fn a_value_comparison_happens_wherever_both_sides_are_readable() {
+        use super::ValuesAt::{Here, OnProxy};
 
-        // **Two s3:// cstorch checkpoints are supported** — on the proxy that holds the data.
-        assert!(
-            values_supported("s3://bucket/old", "s3://bucket/new", true).is_ok(),
-            "the proxy compares them where the bytes already are"
+        // Both local: here, proxy or not.
+        assert_eq!(
+            values_where("/models/a", "/models/b", None).ok(),
+            Some(Here)
+        );
+        assert_eq!(
+            values_where("/models/a", "/models/b", Some("lab@host")).ok(),
+            Some(Here)
         );
 
-        // One remote side: named, so the reader knows which one to copy down.
-        let one = values_supported("/models/a", "lab@host:/opt/models/b", true)
-            .expect_err("a remote side has no bytes to compare");
-        let msg = format!("{one:#}");
-        assert!(msg.contains("lab@host:/opt/models/b"), "{msg}");
-        assert!(
-            !msg.contains("/models/a"),
-            "the local side is not the problem: {msg}"
-        );
-        assert!(msg.contains("is read remotely"), "{msg}");
+        // Both readable by the proxy — every mixture of the two remote kinds, which is the point of
+        // this pass: an `s3://` cstorch checkpoint and a safetensors directory on that same host.
+        for (l, r) in [
+            ("s3://bucket/old", "s3://bucket/new"),
+            ("lab@host:/opt/models/a", "s3://bucket/new"),
+            ("s3://bucket/old", ":/opt/models/b"),
+            (":/opt/models/a", "lab@host:/opt/models/b"),
+        ] {
+            assert_eq!(
+                values_where(l, r, Some("lab@host")).ok(),
+                Some(OnProxy),
+                "{l} vs {r} is a pair the proxy can read"
+            );
+        }
 
-        // Two `s3://` sides: the one remote pair that *has* an answer, so the refusal names it.
-        // The same pair with no proxy to run on: refused, and the refusal says what is missing rather
-        // than implying the pair itself cannot be compared.
-        let pair = values_supported("s3://bucket/old", "s3://bucket/new", false)
+        // A path on *another* host is not something this proxy can open.
+        let elsewhere = values_where("other@host2:/opt/a", "s3://bucket/new", Some("lab@host"))
+            .expect_err("the proxy cannot read another host's filesystem");
+        let msg = format!("{elsewhere:#}");
+        assert!(msg.contains("other@host2:/opt/a"), "{msg}");
+        assert!(msg.contains("another host"), "{msg}");
+
+        // No proxy: a remote pair has nowhere to be compared, and the message says which piece is
+        // missing rather than implying the pair cannot be compared at all.
+        let none = values_where("s3://bucket/old", "s3://bucket/new", None)
             .expect_err("there is nowhere to compare them");
-        let msg = format!("{pair:#}");
         assert!(
-            msg.contains("are read remotely"),
-            "both sides, plural: {msg}"
-        );
-        assert!(
-            msg.contains("no ssh proxy is configured"),
-            "the missing piece is the proxy, not the capability: {msg}"
+            format!("{none:#}").contains("No ssh proxy is configured"),
+            "{none:#}"
         );
 
-        // A mixed remote pair cannot use verify-repack either, and must not be told it can.
-        let mixed =
-            values_supported("lab@host:/opt/a", "s3://bucket/new", true).expect_err("no bytes");
+        // Mixed local and remote: two readable sides and no single place holding both. The refusal names
+        // *both*, since which one to move is the reader's choice.
+        let mixed = values_where("/models/a", "lab@host:/opt/b", Some("lab@host"))
+            .expect_err("no one place holds both");
         let msg = format!("{mixed:#}");
-        assert!(msg.contains("Copy a checkpoint down"), "{msg}");
         assert!(
-            msg.contains("a remote safetensors directory cannot be yet"),
-            "and says which case is genuinely unsupported anywhere: {msg}"
+            msg.contains("/models/a") && msg.contains("lab@host:/opt/b"),
+            "{msg}"
         );
+        assert!(
+            msg.contains("Copy one down, or put both on the proxy"),
+            "{msg}"
+        );
+
+        // A Hub repo serves no bytes anywhere.
+        let hub = values_where("hf://owner/name", "s3://bucket/new", Some("lab@host"))
+            .expect_err("the Hub is structure only");
+        assert!(format!("{hub:#}").contains("hf://owner/name"), "{hub:#}");
     }
 
-    /// Which pairs `--verify-repack` can run over, in the one place both surfaces ask.
+    /// Which pairs `--verify-repack` can run over, in the one place both surfaces ask.    /// Which pairs `--verify-repack` can run over, in the one place both surfaces ask.
     ///
     /// The middle case is the reported bug: a `:PATH` (remote safetensors directory) against an
     /// `s3://` checkpoint. The web refused it; the CLI checked the same condition only after two

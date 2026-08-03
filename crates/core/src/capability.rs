@@ -101,6 +101,21 @@ impl Location {
         }
     }
 
+    /// The location an address **as typed** implies.
+    ///
+    /// Differs from [`Self::of_source_path`] in one case that matters: the `:PATH` shorthand, which
+    /// means "on the configured ssh proxy". A *tensor's* path never has that form — it is resolved to
+    /// `host:/path` when the checkpoint is read — but a spec a person typed does, and a caller asking
+    /// "where does this live" about a spec would otherwise be told "here".
+    #[must_use]
+    pub fn of_spec(spec: &str) -> Self {
+        let spec = spec.trim();
+        if spec.starts_with(':') {
+            return Self::Sftp;
+        }
+        Self::of_source_path(spec)
+    }
+
     /// The location a tensor's `source_path` implies — `hf://…`, `s3://…`, an scp-style
     /// `host:/path`, or a local path.
     ///

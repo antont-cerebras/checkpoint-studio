@@ -518,7 +518,7 @@ pub(crate) fn start_values(current: &Arc<super::Current>, q: &Query) -> Reply {
     // source hands over no tensor data, and the job used to discover that having already spent the
     // minutes the answer would have saved. `--verify-repack` has always checked its own support up
     // front, for the same reason.
-    if let Err(e) = crate::compare::values_supported(left, right, current.is_proxied()) {
+    if let Err(e) = crate::compare::values_where(left, right, current.proxy_host()) {
         return err(400, format!("{e:#}"));
     }
     let scope = match super::diffscope::DiffScope::from_query(q) {
@@ -1109,10 +1109,10 @@ pub(crate) fn diff(current: &super::Current, q: &Query) -> Reply {
         // Asked of the two addresses, so the Data view can say it *before* a reader spends minutes on
         // a job that ends in a refusal — which is exactly how this was reported. One answer from the
         // one function both surfaces use (`compare::values_supported`).
-        "values_note": crate::compare::values_supported(
+        "values_note": crate::compare::values_where(
             &baseline_operand,
             &candidate_operand,
-            current.is_proxied(),
+            current.proxy_host(),
         )
             .err()
             .map(|e| format!("{e:#}")),

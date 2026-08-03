@@ -1969,18 +1969,23 @@ fn run_diff(
     }
     let compares_data = compares_data && !compares_data_unavailable;
 
-    let remote_values = match remote {
-        Some(_) if compares_data && !s3_pair => {
-            eprintln!(
-                "checkpoint-studio diff: value/distribution comparison over --ssh-proxy needs \
-                 both sides to be s3:// cstorch checkpoints — comparing structure only"
-            );
-            false
-        }
-        Some(_) if compares_data => {
-            // cstorch tensors are already the logical values, so the local decode
-            // views (`--dtype u4/unpacked/…`) don't apply on the remote.
-            if !matches!(view, sample::ViewDtype::Stored) {
+    // **How the proxy reads each side.** Under `--ssh-proxy` both operands are already proxy-relative —
+    // the host was split off before either was read — so each is either an `s3://` URI (cstorch) or a
+    // path on that host (safetensors), and the proxy can open both. That is what makes a value
+    // comparison possible for a pair that is *entirely* over there, which used to be refused unless
+    // both sides were `s3://`. The browser asks the same question of specs that still carry their host
+    // (`compare::values_where`), so the two surfaces compare the same pairs.
+    let remote_sides = remote.map(|_| {
+        (
+            compare::proxy_side_of(&old_str),
+            compare::proxy_side_of(&new_str),
+        )
+    });
+    let remote_values = match (remote, compares_data) {
+        (Some(_), true) => {
+            // A cstorch tensor is already the logical values, so the local decode views
+            // (`--dtype u4/unpacked/…`) do not apply to that side.
+            if !matches!(view, sample::ViewDtype::Stored) && s3_pair {
                 eprintln!(
                     "checkpoint-studio diff: --dtype is ignored for s3:// cstorch checkpoints \
                      (their tensors are already the logical values)"
@@ -2050,14 +2055,18 @@ fn run_diff(
                         full_hist: true,
                         jobs: jobs.clamp(1, 32),
                     };
+                    #[allow(clippy::expect_used)]
+                    let (old_side, new_side) = remote_sides
+                        .as_ref()
+                        .expect("remote_values implies two proxy-readable sides");
                     match fetch_remote_value_diff(
                         // `remote_values` is only set on the branch that has a remote (the
                         // `--ssh-proxy` path); the two travel together.
                         #[allow(clippy::expect_used)]
                         remote.expect("remote_values implies a remote"),
                         &mut password,
-                        &old_str,
-                        &new_str,
+                        old_side,
+                        new_side,
                         &[(name.to_string(), name.to_string())],
                         &vopts,
                         (a.size_bytes + b.size_bytes) as u64,
@@ -2257,14 +2266,18 @@ fn run_diff(
                 // below) — don't load the checkpoints again for a no-op float pass.
                 HashMap::new()
             } else {
+                #[allow(clippy::expect_used)]
+                let (old_side, new_side) = remote_sides
+                    .as_ref()
+                    .expect("remote_values implies two proxy-readable sides");
                 match fetch_remote_value_diff(
                     // `remote_values` is only set on the branch that has a remote (the
                     // `--ssh-proxy` path); the two travel together.
                     #[allow(clippy::expect_used)]
                     remote.expect("remote_values implies a remote"),
                     &mut password,
-                    &old_str,
-                    &new_str,
+                    old_side,
+                    new_side,
                     &pairs,
                     &vopts,
                     total_bytes,
@@ -3087,8 +3100,8 @@ fn detect_fold(old: &[usize], new: &[usize]) -> Option<usize> {
 fn fetch_remote_value_diff(
     r: &remote::RemoteRead,
     password: &mut Option<String>,
-    old_uri: &str,
-    new_uri: &str,
+    old_side: &remote::RemoteSide,
+    new_side: &remote::RemoteSide,
     pairs: &[(String, String)],
     vopts: &remote::RemoteValueOpts,
     total_bytes: u64,
@@ -3115,7 +3128,7 @@ fn fetch_remote_value_diff(
         total_bytes,
         pairs.len(),
     ));
-    let out = r.value_diff(&session, old_uri, new_uri, pairs, vopts, |ev| {
+    let out = r.value_diff(&session, old_side, new_side, pairs, vopts, |ev| {
         bar.borrow_mut().on(ev);
     });
     bar.into_inner().finish();

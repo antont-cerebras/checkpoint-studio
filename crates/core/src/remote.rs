@@ -144,6 +144,40 @@ impl ObjectMeta {
     }
 }
 
+/// One side of a comparison **as the proxy can read it**.
+///
+/// The proxy holds the S3 credentials *and* the filesystem the ssh path names, so both kinds are
+/// readable there — which is what makes a value comparison possible without moving tensor data. Named
+/// rather than passed as a bare string, because the two are loaded by entirely different libraries on
+/// the far end (`cstorch.load` against `safetensors.safe_open`) and a string cannot say which.
+#[derive(Clone, Debug)]
+pub enum RemoteSide {
+    /// An `s3://…` cstorch checkpoint, loaded through `cstorch`. Its tensors are already logical
+    /// values.
+    S3(String),
+    /// A safetensors file or directory of shards **on the proxy**, read with `safetensors`. The path is
+    /// the remote one, without any `host:` prefix — the session is already on that host.
+    Safetensors(String),
+}
+
+impl RemoteSide {
+    /// The address as the script needs it, with the kind that says how to open it.
+    fn as_json(&self) -> serde_json::Value {
+        match self {
+            Self::S3(uri) => serde_json::json!({ "kind": "s3", "path": uri }),
+            Self::Safetensors(path) => serde_json::json!({ "kind": "safetensors", "path": path }),
+        }
+    }
+
+    /// What to call this side in a message.
+    #[must_use]
+    pub fn address(&self) -> &str {
+        match self {
+            Self::S3(p) | Self::Safetensors(p) => p,
+        }
+    }
+}
+
 /// What a remote value comparison ([`RemoteRead::value_diff`]) computes per tensor.
 #[derive(Clone, Debug)]
 pub struct RemoteValueOpts {
@@ -959,13 +993,13 @@ impl RemoteRead {
     pub fn value_diff(
         &self,
         session: &RemoteSession,
-        old_uri: &str,
-        new_uri: &str,
+        old: &RemoteSide,
+        new: &RemoteSide,
         pairs: &[(String, String)],
         opts: &RemoteValueOpts,
         mut on_event: impl FnMut(RepackEvent<'_>),
     ) -> Result<(HashMap<String, RemoteTensorDiff>, Option<RemoteValueStats>)> {
-        let script = value_diff_script(old_uri, new_uri, pairs, opts);
+        let script = value_diff_script(old, new, pairs, opts);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
         let out = session.exec_capture(&command, &script, |line| {
             dispatch_stream_line(line, &compare_status, &mut on_event);
@@ -1222,16 +1256,16 @@ fn dump_script(src: &str, want_s3: bool) -> String {
 /// compare — it never opens anything for writing, never `save`s, and touches no S3
 /// write API. Neither checkpoint is modified.
 fn value_diff_script(
-    old_uri: &str,
-    new_uri: &str,
+    old: &RemoteSide,
+    new: &RemoteSide,
     pairs: &[(String, String)],
     opts: &RemoteValueOpts,
 ) -> String {
     with_params(
         &cstorch_prelude(include_str!("python/value_diff.py")),
         &serde_json::json!({
-            "old": old_uri,
-            "new": new_uri,
+            "old": old.as_json(),
+            "new": new.as_json(),
             "pairs": pairs,
             "want_values": opts.values,
             "want_hist": opts.histogram,
@@ -1973,6 +2007,11 @@ fn merge_shards(shards: &[ShardParse]) -> (Vec<TensorInfo>, Vec<MetadataInfo>) {
 
 #[cfg(test)]
 mod tests {
+    /// The commonest side in these tests, said once.
+    fn s3(uri: &str) -> RemoteSide {
+        RemoteSide::S3(uri.to_string())
+    }
+
     use super::*;
 
     /// Read a generated script's parameters back out — the exact values the remote
@@ -2009,8 +2048,8 @@ mod tests {
             (
                 "value_diff",
                 value_diff_script(
-                    "s3://b/o",
-                    "s3://b/n",
+                    &RemoteSide::S3("s3://b/o".to_string()),
+                    &RemoteSide::S3("s3://b/n".to_string()),
                     &[],
                     &RemoteValueOpts {
                         values: true,
@@ -2120,7 +2159,12 @@ mod tests {
             (
                 "value_diff.py",
                 include_str!("python/value_diff.py"),
-                value_diff_script("s3://b/o", "s3://b/n", &pairs, &opts),
+                value_diff_script(
+                    &RemoteSide::S3("s3://b/o".to_string()),
+                    &RemoteSide::S3("s3://b/n".to_string()),
+                    &pairs,
+                    &opts,
+                ),
             ),
             (
                 "repack_verify.py",
@@ -2244,6 +2288,43 @@ mod tests {
         }
     }
 
+    /// **A safetensors side is read where it lives.**
+    ///
+    /// The pair this exists for: a checkpoint directory on the proxy against an `s3://` cstorch one.
+    /// Both are readable *there*, which is what makes comparing them possible at all — the browser and
+    /// the CLI used to refuse the pair outright. The script must then import both readers and open the
+    /// directory with `safetensors`, not with cstorch.
+    #[test]
+    fn value_diff_script_reads_a_safetensors_side_on_the_proxy() {
+        let opts = RemoteValueOpts {
+            values: true,
+            histogram: false,
+            bins: None,
+            full_hist: false,
+            jobs: 4,
+        };
+        let s = value_diff_script(
+            &RemoteSide::Safetensors("/opt/models/boxes".to_string()),
+            &s3("s3://bucket/ckpt"),
+            &[("w".to_string(), "w".to_string())],
+            &opts,
+        );
+        let p = script_params(&s);
+        assert_eq!(
+            p["old"],
+            serde_json::json!({"kind": "safetensors", "path": "/opt/models/boxes"})
+        );
+        assert_eq!(
+            p["new"],
+            serde_json::json!({"kind": "s3", "path": "s3://bucket/ckpt"})
+        );
+        // Both readers are in the script; which one runs is decided from the side's kind.
+        assert!(s.contains("from safetensors import safe_open"), "{s}");
+        assert!(s.contains("import cerebras.pytorch"), "{s}");
+        // The header gives the shape without reading data, so a mismatch costs nothing.
+        assert!(s.contains("get_slice(name).get_shape()"), "{s}");
+    }
+
     #[test]
     fn value_diff_script_embeds_inputs_and_is_read_only() {
         let pairs = vec![
@@ -2257,10 +2338,16 @@ mod tests {
             full_hist: false,
             jobs: 8,
         };
-        let s = value_diff_script("s3://b/old", "s3://b/new", &pairs, &opts);
+        let s = value_diff_script(&s3("s3://b/old"), &s3("s3://b/new"), &pairs, &opts);
         let p = script_params(&s);
-        assert_eq!(p["old"], "s3://b/old");
-        assert_eq!(p["new"], "s3://b/new");
+        assert_eq!(
+            p["old"],
+            serde_json::json!({"kind": "s3", "path": "s3://b/old"})
+        );
+        assert_eq!(
+            p["new"],
+            serde_json::json!({"kind": "s3", "path": "s3://b/new"})
+        );
         assert_eq!(
             p["pairs"],
             serde_json::json!([["old.w", "new.w"], ["x", "x"]])
@@ -2274,7 +2361,7 @@ mod tests {
         assert!(s.contains(SENTINEL));
         // Streams live status events (load phase + per-tensor start) for the view.
         assert!(s.contains(STATUS_TAG), "{s}");
-        assert!(s.contains("stat(\"load\\told\")"), "{s}");
+        assert!(s.contains("stat(\"load\\t%s\" % (which,))"), "{s}");
         assert!(s.contains("stat(\"start\\t"), "{s}");
         assert!(s.contains("res[\"bytes\"]"), "{s}");
         // Parallel reads driven by JOBS via a thread pool.
@@ -2289,17 +2376,26 @@ mod tests {
             "upload",
             "delete_object",
             "copy_object",
-            "open(",
         ] {
             assert!(
                 !s.contains(forbidden),
                 "value-diff script must stay read-only: {forbidden}"
             );
         }
+        // `open(` as a **word**, not as a substring: `safe_open(…)` is safetensors' reader — read-only
+        // by construction, and the only way to open a shard at all — so banning the substring would ban
+        // the feature. A bare `open(` is what could write.
+        let bare_open = s.match_indices("open(").any(|(i, _)| {
+            s[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        });
+        assert!(!bare_open, "value-diff script must stay read-only: open(");
         // No histogram wanted → the branch and its bins are dropped from the script.
         let vonly = value_diff_script(
-            "s3://b/o",
-            "s3://b/n",
+            &s3("s3://b/o"),
+            &s3("s3://b/n"),
             &pairs,
             &RemoteValueOpts {
                 values: true,

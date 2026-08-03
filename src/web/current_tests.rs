@@ -688,10 +688,10 @@ fn stopping_a_comparison_stops_both_of_its_reads() {
 /// proxy — and then said it had no tensor data to compare. The addresses answer that, so the refusal
 /// belongs at the door.
 ///
-/// A *mixed* pair is the case that is refused wherever this runs: a remote safetensors directory has no
-/// reader on either side of the wire, whatever proxy is configured. The pair a proxy *can* compare (two
-/// `s3://` cstorch checkpoints) is covered where the rule lives — `compare::values_supported` takes the
-/// proxy as an argument, which is the only way to test both answers without one.
+/// A *mixed* pair is the case refused wherever this runs: one side here and one over there means no
+/// single place holds both, whatever proxy is configured. The pairs a proxy *can* compare are covered
+/// where the rule lives — `compare::values_where` takes the proxy as an argument, which is the only way
+/// to test every answer without one.
 #[test]
 fn a_pair_with_no_readable_data_is_refused_a_value_comparison_at_the_door() {
     let current = std::sync::Arc::new(serving("tiny.safetensors"));
@@ -711,12 +711,12 @@ fn a_pair_with_no_readable_data_is_refused_a_value_comparison_at_the_door() {
     let (status, msg) = ask("lab@host:/opt/models/a", "/tmp/local");
     assert_eq!(status, 400, "refused, and immediately: {msg}");
     assert!(
-        msg.contains("lab@host:/opt/models/a") && !msg.contains("/tmp/local"),
-        "the refusal names the side without readable data, not the one with it: {msg}"
+        msg.contains("lab@host:/opt/models/a") && msg.contains("/tmp/local"),
+        "the refusal names both sides — which one to move is the reader's choice: {msg}"
     );
     assert!(
-        msg.contains("a remote safetensors directory cannot be yet"),
-        "and says which case is unsupported anywhere: {msg}"
+        msg.contains("Copy one down, or put both on the proxy"),
+        "and says what would make this pair comparable: {msg}"
     );
 
     // Two local paths are accepted here — they do not resolve, so the *job* fails, which is the

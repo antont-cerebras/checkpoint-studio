@@ -1,9 +1,11 @@
-"""Compare two `s3://` cstorch checkpoints' tensor VALUES on the proxy.
+"""Compare two checkpoints' tensor VALUES on the proxy.
 
-Driven by `remote.rs::value_diff_script`. Both checkpoints are read on the remote
-(which holds the S3 access) and only the per-tensor verdicts cross the ssh link —
-never tensor data. Emits progress lines plus one sentinel-tagged JSON result per
-pair.
+Driven by `remote.rs::value_diff_script`. Each side is either an `s3://` cstorch
+checkpoint (loaded with cstorch, which holds the S3 access) or a safetensors file /
+directory of shards **on this host** (read with `safetensors`) — the proxy can reach
+both, which is what makes comparing them possible without moving tensor data
+anywhere. Only the per-tensor verdicts cross the ssh link. Emits progress lines plus
+one sentinel-tagged JSON result per pair.
 
 Read-only: loads and compares; never writes to either checkpoint.
 """
@@ -22,7 +24,7 @@ from typing import Any, Callable, NamedTuple
 # JSON object (see `remote.rs::with_params`). One substitution point keeps the rest
 # of this file ordinary Python that ruff and pyright can check.
 PARAMS = json.loads("__PARAMS__")
-OLD = PARAMS["old"]
+OLD = PARAMS["old"]      # {"kind": "s3"|"safetensors", "path": …}
 NEW = PARAMS["new"]
 PAIRS = PARAMS["pairs"]
 WANT_VALUES = PARAMS["want_values"]
@@ -43,22 +45,75 @@ def stat(s: str) -> None:
     with _lock:
         sys.stdout.write(ST + s + "\n"); sys.stdout.flush()
 try:
-    import cerebras.pytorch as cstorch
-except Exception as e:
-    emit({"error": "import cerebras.pytorch failed: %r" % (e,)}); sys.exit(0)
-try:
     import numpy as np
     import torch
-    import zstandard
 except Exception as e:
-    emit({"error": "import numpy/torch/zstandard failed (needed to compare values): %r" % (e,)}); sys.exit(0)
+    emit({"error": "import numpy/torch failed (needed to compare values): %r" % (e,)}); sys.exit(0)
+KINDS = {OLD["kind"], NEW["kind"]}
+cstorch = None
+if "s3" in KINDS:
+    try:
+        import cerebras.pytorch as cstorch
+        import zstandard
+    except Exception as e:
+        emit({"error": "import cerebras.pytorch/zstandard failed (needed for an s3:// side): %r" % (e,)}); sys.exit(0)
+safe_open = None
+if "safetensors" in KINDS:
+    try:
+        from safetensors import safe_open
+    except Exception as e:
+        emit({"error": "import safetensors failed (needed for a safetensors side): %r" % (e,)}); sys.exit(0)
+
+
+class SafeSide:
+    """A safetensors file or directory of shards on this host, keyed by tensor name.
+
+    Reads a whole tensor at a time, like the s3 path's in-memory copy: the comparison
+    below streams *within* the tensor, so peak memory is one tensor per side per
+    worker either way. The header scan that builds the map is a few kilobytes per
+    shard.
+    """
+
+    def __init__(self, path: str) -> None:
+        from pathlib import Path
+
+        p = Path(path)
+        files = sorted(p.glob("*.safetensors")) if p.is_dir() else [p]
+        if not files:
+            raise FileNotFoundError("no .safetensors files under %s" % (path,))
+        # Which shard holds each tensor. Header reads only — a few kilobytes per shard — and the first
+        # shard to claim a name wins, matching how the rest of the app resolves a duplicate.
+        self.where: dict[str, str] = {}
+        for f in files:
+            with safe_open(str(f), framework="pt") as h:
+                for k in h.keys():  # noqa: SIM118  (safe_open is not a dict; `in` is not `keys()`)
+                    self.where.setdefault(k, str(f))
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.where
+
+    def shape(self, name: str) -> list[int]:
+        """From the header alone — `get_slice` reads no data, so a shape mismatch is free."""
+        with safe_open(self.where[name], framework="pt") as h:
+            return [int(d) for d in h.get_slice(name).get_shape()]
+
+    def read(self, name: str) -> torch.Tensor:
+        with safe_open(self.where[name], framework="pt") as h:
+            return h.get_tensor(name)
+
+
+def open_side(side: dict[str, Any], which: str) -> Any:
+    stat("load\t%s" % (which,))
+    if side["kind"] == "s3":
+        return cstorch.load(side["path"], map_location=None)
+    return SafeSide(side["path"])
+
+
 try:
-    stat("load\told")
-    old_sd = cstorch.load(OLD, map_location=None)
-    stat("load\tnew")
-    new_sd = cstorch.load(NEW, map_location=None)
+    old_sd = open_side(OLD, "old")
+    new_sd = open_side(NEW, "new")
 except Exception as e:
-    emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
+    emit({"error": "opening a checkpoint failed: %r" % (e,)}); sys.exit(0)
 def to_f64(rt: torch.Tensor, i: int | None, j: int | None) -> np.ndarray[Any, Any]:
     sl = rt if i is None else rt[i:j]
     return sl.to(torch.float64).numpy().reshape(-1)
@@ -126,6 +181,13 @@ def stream_raw(p: Obj, on: Callable[[int], object]) -> bytearray:
 def decode_tensor(buf: bytearray, p: Obj) -> torch.Tensor:
     raw = zstandard.decompress(bytes(buf)) if p.compressed else buf
     return torch.frombuffer(bytearray(raw), dtype=p.dtype).reshape(p.shape)
+def read_whole(sd: Any, side: dict[str, Any], name: str, handle: Any) -> torch.Tensor:
+    """One tensor as a CPU torch tensor, whichever kind of side it came from."""
+    if side["kind"] == "safetensors":
+        return sd.read(name)
+    return handle.to("cpu")
+
+
 total = len(PAIRS)
 t0 = time.time()
 read_bytes = 0
@@ -136,8 +198,15 @@ def work(idx: int) -> int:
     res: dict[str, Any] = {"name": nname}
     tb = 0
     try:
-        a = old_sd[oname]; b = new_sd[nname]
-        ashape = [int(d) for d in a.shape]; bshape = [int(d) for d in b.shape]
+        if oname not in old_sd:
+            res["error"] = "not in the baseline"; emit(res); return 0
+        if nname not in new_sd:
+            res["error"] = "not in the candidate"; emit(res); return 0
+        # Shapes from the header / the lazy handle — no tensor data read, so a mismatch costs nothing.
+        a = None if OLD["kind"] == "safetensors" else old_sd[oname]
+        b = None if NEW["kind"] == "safetensors" else new_sd[nname]
+        ashape = old_sd.shape(oname) if a is None else [int(d) for d in a.shape]
+        bshape = new_sd.shape(nname) if b is None else [int(d) for d in b.shape]
         if ashape != bshape:
             res["error"] = "shapes differ"; emit(res); return 0
         # Stream each side's S3 object on the proxy (chunked, with byte progress); the
@@ -148,9 +217,21 @@ def work(idx: int) -> int:
             # Bytes are all read (bar at 100%); decompress + decode is the slow part, so
             # flag the phase BEFORE it, not after.
             stat("phase\t%s\tcomparing" % (nname,))
-        pa = prep(a); pb = prep(b)
+        pa = prep(a) if a is not None else None
+        pb = prep(b) if b is not None else None
         # Each branch decodes its own tensors, so `ra`/`rb` are bound on every path.
-        if pa is not None and pb is not None:
+        if a is None or b is None:
+            # At least one side is safetensors on this host: read each side whole (the s3 path does the
+            # same — it downloads the whole object), then the span loop below streams within them. A
+            # local read needs no byte bar of its own, so the sizes are announced once and completed.
+            ra = read_whole(old_sd, OLD, oname, a)
+            rb = read_whole(new_sd, NEW, nname, b)
+            osz = int(ra.element_size() * ra.nelement()); nsz = int(rb.element_size() * rb.nelement())
+            tb = osz + nsz
+            stat("size\t%s\t%d\t%d" % (nname, osz, nsz))
+            stat("bytes\t%s\t%d\t%d" % (nname, osz, nsz))
+            comparing()
+        elif pa is not None and pb is not None:
             osz = pa.size; nsz = pb.size
             stat("size\t%s\t%d\t%d" % (nname, osz, nsz))
             od = [0]; nd = [0]; last = [0]

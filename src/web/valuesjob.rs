@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use super::diffscope::DiffScope;
@@ -48,8 +48,8 @@ enum Mode {
     /// (`remote::RemoteRead::value_diff`), so a browser run and a terminal run answer alike.
     Proxy {
         proxy: crate::remote::RemoteRead,
-        old_uri: String,
-        new_uri: String,
+        old_side: crate::remote::RemoteSide,
+        new_side: crate::remote::RemoteSide,
     },
 }
 
@@ -59,6 +59,9 @@ struct Side {
     metadata: Vec<crate::tree::MetadataInfo>,
     /// The `s3://` URI, when this side is one — the proxy's comparison addresses objects by URI.
     s3_uri: Option<String>,
+    /// The path on the proxy, when this side is a remote safetensors file or directory. Without any
+    /// `host:` prefix: the session is already on that host.
+    remote_path: Option<String>,
     /// The proxy this side is read through, when it is remote.
     remote: Option<crate::remote::RemoteRead>,
     schemas: HashMap<String, crate::sample::PackingSchema>,
@@ -78,6 +81,16 @@ fn read_side(spec: &str, opts: &crate::opening::Options, job: &Job) -> Result<Si
         .map(|p| p.to_string_lossy().into_owned())
         .filter(|s| s.starts_with("s3://"));
     let remote = target.remote.clone();
+    // The path as the proxy sees it — what `safetensors` opens over there. `requested` is already the
+    // remote path: the host was split off when the spec was resolved.
+    let remote_path = (remote.is_some() && s3_uri.is_none())
+        .then(|| {
+            target
+                .requested
+                .first()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .flatten();
     let opened = target
         .read(crate::opening::Want::Model, job.read_progress())
         .with_context(|| format!("reading {spec}"))?;
@@ -88,10 +101,23 @@ fn read_side(spec: &str, opts: &crate::opening::Options, job: &Job) -> Result<Si
         tensors,
         metadata,
         s3_uri,
+        remote_path,
         remote,
         schemas,
         local,
     })
+}
+
+impl Side {
+    /// How the proxy reads this side, or `None` when it cannot.
+    fn as_remote(&self) -> Option<crate::remote::RemoteSide> {
+        if let Some(uri) = &self.s3_uri {
+            return Some(crate::remote::RemoteSide::S3(uri.clone()));
+        }
+        self.remote_path
+            .as_ref()
+            .map(|p| crate::remote::RemoteSide::Safetensors(p.clone()))
+    }
 }
 
 /// Compare two checkpoints' values, recording each tensor's findings as they land.
@@ -107,7 +133,7 @@ pub(crate) fn run(
     // Before either read: a remote side serves no tensor data, and finding that out after two
     // multi-minute reads is the failure this check exists to prevent. The start handler asks the same
     // question, so this is the second line of defence rather than the only one.
-    crate::compare::values_supported(left, right, current.is_proxied())?;
+    let at = crate::compare::values_where(left, right, current.proxy_host())?;
     job.progress_to(0, left);
     let old = read_side(left, opts, job)?;
     if job.cancelled() {
@@ -118,33 +144,31 @@ pub(crate) fn run(
     if job.cancelled() {
         return Ok(());
     }
-    // **Where the comparison happens**, decided from what the two sides turned out to be.
-    //
-    // Two local checkpoints are read here. Two `s3://` cstorch checkpoints are compared **on the ssh
-    // proxy**, which holds the credentials and the data: only the per-tensor results cross the wire.
-    // Anything else has no path to the bytes, and `values_supported` says so in the words both surfaces
-    // use — checked at the door as well (the route refuses before this job starts), so reaching it here
-    // means a spec resolved to something its address did not promise.
-    let mode = match (
-        old.local && new.local,
-        old.s3_uri.as_deref().zip(new.s3_uri.as_deref()),
-        old.remote.as_ref().or(new.remote.as_ref()),
-    ) {
-        (true, _, _) => Mode::Local,
-        (false, Some((old_uri, new_uri)), Some(proxy)) => Mode::Proxy {
-            proxy: proxy.clone(),
-            old_uri: old_uri.to_string(),
-            new_uri: new_uri.to_string(),
-        },
-        _ => {
-            return Err(
-                crate::compare::values_supported(left, right, current.is_proxied())
-                    .err()
-                    .unwrap_or_else(|| {
-                        anyhow::anyhow!("one side turned out to have no readable tensor data")
-                    }),
-            );
+    // **Where the comparison happens**, from the answer the addresses already gave — confirmed against
+    // what the two sides turned out to be, so a spec that resolved to something its address did not
+    // promise is caught before a byte is compared.
+    let mode = match at {
+        crate::compare::ValuesAt::Here if old.local && new.local => Mode::Local,
+        crate::compare::ValuesAt::OnProxy => {
+            let (Some(proxy), Some(old_side), Some(new_side)) = (
+                old.remote.as_ref().or(new.remote.as_ref()),
+                old.as_remote(),
+                new.as_remote(),
+            ) else {
+                bail!(
+                    "comparing these on the proxy needs both sides addressed as the proxy reads them — \
+                     an s3:// URI or a path on that host"
+                );
+            };
+            Mode::Proxy {
+                proxy: proxy.clone(),
+                old_side,
+                new_side,
+            }
         }
+        crate::compare::ValuesAt::Here => bail!(
+            "one side turned out not to be readable here after all — its address said it was local"
+        ),
     };
 
     // Rename rules first, as the CLI does — otherwise two lined-up schemes read as every tensor added
@@ -222,11 +246,11 @@ pub(crate) fn run(
     // walks the pairs itself, so asking per tensor would pay for that load per tensor.
     if let Mode::Proxy {
         proxy,
-        old_uri,
-        new_uri,
+        old_side,
+        new_side,
     } = &mode
     {
-        let extras = compare_on_proxy(job, proxy, old_uri, new_uri, &common, what)?;
+        let extras = compare_on_proxy(job, proxy, old_side, new_side, &common, what)?;
         return finish(job, old_sum, new_sum, extras);
     }
 
@@ -321,8 +345,8 @@ fn finish(
 fn compare_on_proxy(
     job: &Job,
     proxy: &crate::remote::RemoteRead,
-    old_uri: &str,
-    new_uri: &str,
+    old_side: &crate::remote::RemoteSide,
+    new_side: &crate::remote::RemoteSide,
     names: &[String],
     what: &What,
 ) -> Result<HashMap<String, crate::diff::TensorExtras>> {
@@ -335,14 +359,27 @@ fn compare_on_proxy(
         bins: what.bins,
         // The per-bin table is for a single tensor's detail view; a run over many wants the summary.
         full_hist: what.tensor.is_some(),
-        jobs: what.jobs.clamp(1, 32),
+        // A safetensors side is read whole into the proxy's memory, and an embedding weight is over a
+        // gigabyte — so fewer at once when one is involved. The s3 path streams its objects in chunks
+        // and can afford the wider fan-out that hides their latency.
+        jobs: if matches!(
+            (old_side, new_side),
+            (
+                crate::remote::RemoteSide::S3(_),
+                crate::remote::RemoteSide::S3(_)
+            )
+        ) {
+            what.jobs.clamp(1, 32)
+        } else {
+            what.jobs.clamp(1, 4)
+        },
     };
     let mut password = None;
     let session = proxy
         .open_with(&mut password)
         .with_context(|| format!("opening an ssh session to {}", proxy.host))?;
     let mut counted = ProxyBytes::default();
-    let (map, _stats) = proxy.value_diff(&session, old_uri, new_uri, &pairs, &vopts, |ev| {
+    let (map, _stats) = proxy.value_diff(&session, old_side, new_side, &pairs, &vopts, |ev| {
         proxy_event(job, &ev, &mut counted);
     })?;
     let mut out: HashMap<String, crate::diff::TensorExtras> = HashMap::new();
