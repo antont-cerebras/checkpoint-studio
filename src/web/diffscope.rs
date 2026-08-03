@@ -403,6 +403,34 @@ impl DiffScope {
     ///
     /// Renaming first, then filtering: the rules exist to make two naming schemes line up, so the
     /// filter's globs are written against the *renamed* names, as they are on the command line.
+    /// The tensor names that **line up on both sides** once the alignment is applied.
+    ///
+    /// What the browser's exact-name picker offers. It is the alignment's answer, not the filter's:
+    /// the point of the list is to choose names *from* it, so the name globs and the dtype/shape
+    /// selectors are deliberately not applied — narrowing the list by the very thing being edited
+    /// would make it impossible to widen a selection.
+    ///
+    /// The intersection rather than the union, for the same reason: a name that exists on one side
+    /// only is not a comparison of anything, and 79,732 one-sided names would bury the ones that are.
+    /// Re-rooting happens in the handler, before this, exactly as it does for the report.
+    pub(crate) fn aligned_names(
+        &self,
+        mut old: CheckpointSummary,
+        mut new: CheckpointSummary,
+    ) -> Vec<String> {
+        self.align(&mut old);
+        self.align(&mut new);
+        self.map.remap_summary(&mut old);
+        let mut names: Vec<String> = old
+            .tensors
+            .keys()
+            .filter(|n| new.tensors.contains_key(*n))
+            .cloned()
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
     pub(crate) fn compare(&self, mut old: CheckpointSummary, mut new: CheckpointSummary) -> Scoped {
         // No `#subtree` re-rooting here: the handlers do it first, because a prefix that matches nothing
         // has to be a 400 rather than an empty comparison — and because doing it twice would empty

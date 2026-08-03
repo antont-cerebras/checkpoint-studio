@@ -39,6 +39,22 @@
       "subtree_new",
       "swap"
     ],
+    "diffnames": [
+      "align_fused",
+      "dtype_is",
+      "id",
+      "limit",
+      "map",
+      "map_json",
+      "name",
+      "names",
+      "names_list",
+      "only_tensors",
+      "q",
+      "shape_is",
+      "subtree",
+      "subtree_new"
+    ],
     "difftree": [
       "align_fused",
       "dtype_is",
@@ -115,6 +131,12 @@
       "q"
     ],
     "stats": [],
+    "subtrees": [
+      "id",
+      "limit",
+      "q",
+      "side"
+    ],
     "tensor": [
       "name"
     ],

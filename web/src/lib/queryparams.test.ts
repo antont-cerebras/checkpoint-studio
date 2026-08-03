@@ -89,6 +89,8 @@ describe('every parameter the browser sends', () => {
     await api.setComparison('/a', '/b', true);
     await api.difftree(1, FULL_SCOPE, undefined, undefined, undefined, true);
     await api.diff(1, FULL_SCOPE, true, true);
+    await api.diffNames(1, FULL_SCOPE, 'down_proj', 25);
+    await api.subtrees(1, 'old', 'language', 25);
     await api.tensor('model.w');
     await api.layout('shard.safetensors');
     await api.file('config.json');

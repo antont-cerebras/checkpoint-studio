@@ -317,32 +317,9 @@ pub(crate) fn difftree(current: &super::Current, _s: &WebState, q: &Query) -> Re
         Ok(v) => v,
         Err(e) => return e,
     };
-    let Some(id) = q.get("id").and_then(|v| v.parse::<u64>().ok()) else {
-        return err(
-            400,
-            "difftree needs ?id=N, the id returned by POST /api/compare — \
-             without it this could answer about a comparison you did not ask for",
-        );
-    };
-    let (base, right) = match current.comparison_for(id) {
-        // 409, not 404: the endpoint exists and the request is well-formed — there is simply no
-        // comparison set up yet, which the client fixes by POSTing a baseline.
-        ComparisonLookup::None => {
-            return err(
-                409,
-                "no comparison set up — POST /api/compare?left=SPEC first",
-            );
-        }
-        ComparisonLookup::Replaced { current: now } => {
-            return err(
-                409,
-                format!(
-                    "comparison {id} was replaced by another request (now {now}) — \
-                     POST /api/compare again to set up yours"
-                ),
-            );
-        }
-        ComparisonLookup::Found { base, right } => (base, right),
+    let (base, right) = match comparison_sides(current, q, "difftree") {
+        Ok(pair) => pair,
+        Err(e) => return e,
     };
     let served = current.snapshot();
     // Identity, not string equality: whether a side *is* the served state is a fact about the
@@ -536,6 +513,13 @@ pub(crate) fn start_values(current: &Arc<super::Current>, q: &Query) -> Reply {
     let right = q.get("right").map_or("", String::as_str);
     if right.is_empty() {
         return err(400, "values needs ?right=SPEC as well as ?left=SPEC");
+    }
+    // Refused **now**, from the two addresses, rather than after reading both checkpoints: a remote
+    // source hands over no tensor data, and the job used to discover that having already spent the
+    // minutes the answer would have saved. `--verify-repack` has always checked its own support up
+    // front, for the same reason.
+    if let Err(e) = crate::compare::values_supported(left, right) {
+        return err(400, format!("{e:#}"));
     }
     let scope = match super::diffscope::DiffScope::from_query(q) {
         Ok(scope) => scope,
@@ -763,6 +747,190 @@ pub(crate) fn check(s: &WebState) -> Reply {
         .map_or_else(|| ok(Value::Null), |report| ok(report.to_json(false)))
 }
 
+/// The two sides of the comparison a request quotes, or the refusal to answer without one.
+///
+/// Shared by the three routes that read a comparison by id — the aligned tree, the report and the name
+/// picker. All take `?id=N` from `POST /api/compare`, and all have to distinguish *no comparison* from
+/// *someone else's*: answering from "whatever is in the slot" once handed one client another's pair.
+fn comparison_sides(
+    current: &super::Current,
+    q: &Query,
+    route: &str,
+) -> Result<(Arc<WebState>, Arc<WebState>), Reply> {
+    let Some(id) = q.get("id").and_then(|v| v.parse::<u64>().ok()) else {
+        return Err(err(
+            400,
+            format!(
+                "{route} needs ?id=N, the id returned by POST /api/compare — \
+                 without it this could answer about a comparison you did not ask for"
+            ),
+        ));
+    };
+    match current.comparison_for(id) {
+        ComparisonLookup::None => Err(err(
+            409,
+            "no comparison set up — POST /api/compare?left=SPEC first",
+        )),
+        ComparisonLookup::Replaced { current: now } => Err(err(
+            409,
+            format!(
+                "comparison {id} was replaced by another request (now {now}) — \
+                 POST /api/compare again to set up yours"
+            ),
+        )),
+        ComparisonLookup::Found { base, right } => Ok((base, right)),
+    }
+}
+
+/// The names a comparison's two sides **share**, for the exact-name picker: `?id=N`, the alignment
+/// parameters, and an optional `?q=` to search with.
+///
+/// Why a route rather than reading the aligned tree the browser can already ask for: that body is the
+/// largest this API serves (91 MB on a real pair), and this is a list of strings behind a search box.
+/// It answers with at most `limit` of them (100 by default, 500 at most), so a keystroke costs a few
+/// kilobytes.
+///
+/// The alignment matters and the filter does not — see [`super::diffscope::DiffScope::aligned_names`].
+/// `q` is the same fuzzy match the tensor tree's search uses, ranked best-first; without it the list is
+/// alphabetical, which is what a reader scrolling for a prefix wants.
+pub(crate) fn diff_names(current: &super::Current, q: &Query) -> Reply {
+    let scope = match super::diffscope::DiffScope::from_query(q) {
+        Ok(scope) => scope,
+        Err(e) => return err(400, format!("{e:#}")),
+    };
+    let limit = match whole(q, "limit", 100, 1) {
+        Ok(n) => n.min(500),
+        Err(e) => return e,
+    };
+    let (base, candidate) = match comparison_sides(current, q, "diffnames") {
+        Ok(pair) => pair,
+        Err(e) => return e,
+    };
+    let mut old =
+        crate::diff::CheckpointSummary::from_loaded(&base.tensors, &base.checkpoint.metadata_vec());
+    let mut new = crate::diff::CheckpointSummary::from_loaded(
+        &candidate.tensors,
+        &candidate.checkpoint.metadata_vec(),
+    );
+    if let Err(e) = scope.reroot_sides(&mut old, &mut new) {
+        return err(400, format!("{e:#}"));
+    }
+    let names = scope.aligned_names(old, new);
+    let query = q.get("q").map_or("", String::as_str).trim();
+    let matched: Vec<&String> = if query.is_empty() {
+        names.iter().collect()
+    } else {
+        // The tree screen's matcher, so a query that finds a tensor there finds it here.
+        use fuzzy_matcher::FuzzyMatcher as _;
+        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+        let mut scored: Vec<(i64, &String)> = names
+            .iter()
+            .filter_map(|n| matcher.fuzzy_match(n, query).map(|score| (score, n)))
+            .collect();
+        // Best first, then alphabetical, so equal scores do not shuffle between keystrokes.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        scored.into_iter().map(|(_, n)| n).collect()
+    };
+    ok(json!({
+        // How many line up in all, so the picker can say "100 of 1,254" rather than implying that the
+        // hundred it drew is everything.
+        "total": names.len(),
+        "matched": matched.len(),
+        "names": matched.iter().take(limit).collect::<Vec<_>>(),
+    }))
+}
+
+/// One side's **namespaces**, for the subtree pickers: `?id=N&side=old|new`, with an optional `?q=`.
+///
+/// A subtree is a wrapper to drop — `language_model`, `model`, `vision_tower` — and typing one is a
+/// guess at a name the reader has not seen yet: a prefix that selects nothing is a 400, and one that
+/// selects the wrong thing is an empty comparison. So the panel offers what is there, with the number of
+/// tensors under each, which is what tells `language_model` (312) from a typo (0).
+///
+/// **Namespaces, not paths.** Prefixes whose last segment is an index are left out: 62 entries reading
+/// `model.layers.0`, `model.layers.1`, … are not alignment targets, they are the thing an alignment
+/// looks *through*. Depth is capped for the same reason — a wrapper is one or two segments in practice,
+/// four is already generous — and each is offered with its count, biggest first.
+///
+/// Before any alignment, deliberately: re-rooting is what the answer feeds, so applying it here would
+/// offer prefixes of prefixes.
+pub(crate) fn subtrees(current: &super::Current, q: &Query) -> Reply {
+    /// A wrapper deeper than this is not what this control is for.
+    const MAX_DEPTH: usize = 4;
+    let side = match q.get("side").map(String::as_str) {
+        Some("old") => Side::Old,
+        Some("new") => Side::New,
+        _ => {
+            return err(
+                400,
+                "subtrees needs ?side=old or ?side=new — the two checkpoints have different namespaces",
+            );
+        }
+    };
+    let limit = match whole(q, "limit", 100, 1) {
+        Ok(n) => n.min(500),
+        Err(e) => return e,
+    };
+    let (base, candidate) = match comparison_sides(current, q, "subtrees") {
+        Ok(pair) => pair,
+        Err(e) => return e,
+    };
+    let state = match side {
+        Side::Old => &base,
+        Side::New => &candidate,
+    };
+    // Count the tensors under every namespace prefix, in one pass over the names.
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for tensor in &state.tensors {
+        let name = tensor.name.as_str();
+        let mut at = 0;
+        for depth in 0..MAX_DEPTH {
+            match name[at..].find('.') {
+                None => break,
+                Some(dot) => {
+                    at += dot;
+                    let prefix = &name[..at];
+                    at += 1;
+                    let _ = depth;
+                    // A namespace has no *index* in it. `model.layers.0` is a layer and
+                    // `model.layers.0.mlp` is one layer's block — the things an alignment looks
+                    // *through*, not targets for it, and there are as many of them as there are layers.
+                    if prefix
+                        .split('.')
+                        .any(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
+                    {
+                        continue;
+                    }
+                    *counts.entry(prefix).or_default() += 1;
+                }
+            }
+        }
+    }
+    let query = q.get("q").map_or("", String::as_str).trim().to_lowercase();
+    let mut found: Vec<(&str, usize)> = counts
+        .into_iter()
+        .filter(|(prefix, _)| query.is_empty() || prefix.to_lowercase().contains(&query))
+        .collect();
+    // The biggest namespace first — that is the one a wrapper usually is — then alphabetically, so the
+    // list does not shuffle between keystrokes.
+    found.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    ok(json!({
+        "total": found.len(),
+        "subtrees": found
+            .iter()
+            .take(limit)
+            .map(|(prefix, count)| json!({ "prefix": prefix, "tensors": count }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// Which side of a comparison a request is about.
+#[derive(Clone, Copy)]
+enum Side {
+    Old,
+    New,
+}
+
 /// The structural report for a comparison the server holds: `?id=N`, from `POST /api/compare`.
 ///
 /// Both checkpoints were read when the pair was set up, so this route reads nothing — it categorises
@@ -794,28 +962,9 @@ pub(crate) fn diff(current: &super::Current, q: &Query) -> Reply {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let Some(id) = q.get("id").and_then(|v| v.parse::<u64>().ok()) else {
-        return err(
-            400,
-            "diff needs ?id=N, the id returned by POST /api/compare —              without it this could answer about a comparison you did not ask for",
-        );
-    };
-    let (base, candidate) = match current.comparison_for(id) {
-        ComparisonLookup::None => {
-            return err(
-                409,
-                "no comparison set up — POST /api/compare?left=SPEC first",
-            );
-        }
-        ComparisonLookup::Replaced { current: now } => {
-            return err(
-                409,
-                format!(
-                    "comparison {id} was replaced by another request (now {now}) —                      POST /api/compare again to set up yours"
-                ),
-            );
-        }
-        ComparisonLookup::Found { base, right } => (base, right),
+    let (base, candidate) = match comparison_sides(current, q, "diff") {
+        Ok(pair) => pair,
+        Err(e) => return e,
     };
     let against = base.spec.as_str();
     // What each side is called on a command line, for the invocation offered at the bottom of the
@@ -916,6 +1065,14 @@ pub(crate) fn diff(current: &super::Current, q: &Query) -> Reply {
             "size": crate::diff::totals_labels(scope.is_filtered()).0,
             "params": crate::diff::totals_labels(scope.is_filtered()).1,
         },
+        // **Whether the numbers can be compared at all**, and why not when they cannot.
+        //
+        // Asked of the two addresses, so the Data view can say it *before* a reader spends minutes on
+        // a job that ends in a refusal — which is exactly how this was reported. One answer from the
+        // one function both surfaces use (`compare::values_supported`).
+        "values_note": crate::compare::values_supported(&baseline_operand, &candidate_operand)
+            .err()
+            .map(|e| format!("{e:#}")),
         // What the S3 object comparison did, or why it did not happen. `null` when neither side is
         // `s3://`, which is the ordinary local case.
         "s3_note": s3_note,

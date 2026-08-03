@@ -613,6 +613,12 @@ fn accepted_params(path: &str) -> Option<(&'static [&'static str], Scoped)> {
         // the other way round, and `full` says the reader expanded the families, which the offered
         // command has to carry.
         "diff" => (&["id", "swap", "full"], Scoped::Yes),
+        // Only the *alignment* half of the scope changes this answer, but the client sends the scope
+        // it holds and a stricter list here would refuse a request that means the same thing.
+        "diffnames" => (&["id", "q", "limit"], Scoped::Yes),
+        // No scope: the answer is what a re-root would be applied *to*, so applying one here would
+        // offer prefixes of prefixes.
+        "subtrees" => (&["id", "side", "q", "limit"], Scoped::No),
         "jobs/verify-repack" => (&["left", "right", "repack_bits"], Scoped::Yes),
         "jobs/values" => (
             &[
@@ -772,6 +778,10 @@ fn route_api(
         "version" => handlers::version(s),
         // The two checkpoints aligned into one tree — the whole side-by-side in one response.
         "difftree" => handlers::difftree(current, s, q),
+        // The names both sides share, for the exact-name picker in the comparison settings.
+        "diffnames" => handlers::diff_names(current, q),
+        // One side's namespaces, for the subtree pickers.
+        "subtrees" => handlers::subtrees(current, q),
         "files" => handlers::files(s),
         "filter" => handlers::filter(s, q),
         "compact" => handlers::compact(s, q),
@@ -1167,6 +1177,8 @@ mod tests {
         "compact",
         "diff",
         "difftree",
+        "diffnames",
+        "subtrees",
         "file",
         "tensor/stats",
         "tensor/sample",

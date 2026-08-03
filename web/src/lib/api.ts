@@ -335,6 +335,29 @@ export const api = {
       onDecoding,
       signal,
     ),
+  /**
+   * The names a comparison's two sides **share**, for the exact-name picker.
+   *
+   * Only the *alignment* half of the scope changes the answer, but the whole scope goes on the wire:
+   * the caller holds one object, and a client that sent half of it would be one refactor away from
+   * sending the wrong half. `q` is a fuzzy search, ranked by the same matcher the tree screen uses;
+   * `limit` caps the rows so a keystroke costs kilobytes rather than the 91 MB the aligned tree does.
+   */
+  diffNames: (id: number, scope?: DiffScopeParams, q = '', limit = 100) =>
+    getJson<{ total: number; matched: number; names: string[] }>(
+      `/api/diffnames?id=${id}&limit=${limit}${q ? `&q=${enc(q)}` : ''}${scopeTail(scope)}`,
+    ),
+  /**
+   * One side's namespaces, with the number of tensors under each — for the subtree pickers.
+   *
+   * No scope: a re-root is applied *to* this answer, so applying one here would offer prefixes of
+   * prefixes. `side` is which checkpoint, since the two have different namespaces — that is the whole
+   * reason the field exists.
+   */
+  subtrees: (id: number, side: 'old' | 'new', q = '', limit = 100) =>
+    getJson<{ total: number; subtrees: { prefix: string; tensors: number }[] }>(
+      `/api/subtrees?id=${id}&side=${side}&limit=${limit}${q ? `&q=${enc(q)}` : ''}`,
+    ),
   /** Forget one checkpoint. Returns the list without it; rejects with a 404 if it wasn't there. */
   forgetRecent: (spec: string) =>
     deleteJson<{ forgot: string; recents: string[] }>(`/api/recents?path=${enc(spec)}`),

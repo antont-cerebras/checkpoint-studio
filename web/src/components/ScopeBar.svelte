@@ -17,6 +17,9 @@
   import { emptyScope, isScopeActive, scopeSummary, type DiffScopeParams } from '../lib/diffscope';
   import { parseMappingRules, serializeMappingRules, type MappingRule } from '../lib/mapbuilder';
   import TextField from './TextField.svelte';
+  import { api } from '../lib/api';
+  import { comparison } from '../stores/compare';
+  import PickList from './PickList.svelte';
 
   /** The scope in force. Changing a box does not apply it — [`apply`] does, so a half-typed glob
    * never triggers a comparison. */
@@ -73,7 +76,7 @@
       flag: '--name',
       rows: 2,
       placeholder: 'model.layers.1.*\n!*.bias',
-      hint: 'One glob per line; a tensor is kept if it matches any of them. A line starting with ! excludes instead. {a,b} tries each alternative.',
+      hint: 'One glob per line — not comma-separated, because the comma belongs to {a,b}. A tensor is kept if it matches any line; a line starting with ! excludes instead.',
       examples: ['model.layers.1.*', '*.mlp.down_proj.weight', 'model.layers.{0,31,60}.*', '!*.bias'],
     },
     {
@@ -81,8 +84,8 @@
       label: 'Exact names',
       flag: '--names',
       rows: 2,
-      placeholder: 'lm_head.weight, model.norm.weight',
-      hint: 'A comma-separated literal list. When name patterns are also set, tensors must pass both.',
+      placeholder: 'lm_head.weight\nmodel.norm.weight',
+      hint: 'One name per line, or comma-separated — whichever you have. When name globs are also set, a tensor must pass both.',
       examples: ['lm_head.weight, model.norm.weight'],
     },
     {
@@ -300,6 +303,92 @@
     }
   }
 
+  /**
+   * Picking values from the lists the two checkpoints actually contain.
+   *
+   * Typing into these fields is a guess. A tensor name is one of tens of thousands, and a subtree prefix
+   * that selects nothing is a refusal rather than a comparison — so each field offers what is there:
+   * the names both sides share once the alignment is applied (`/api/diffnames`), and each side's
+   * namespaces with the number of tensors under them (`/api/subtrees`).
+   *
+   * The names list carries the **draft** alignment, not the applied one: a reader writes a rename rule
+   * and picks from what it produces, without applying anything first. The subtree lists carry no
+   * alignment at all — re-rooting is applied *to* them.
+   */
+  let picking: '' | 'names' | 'subtree' | 'subtreeNew' = '';
+  /**
+   * A handle for the *names* list alone: it is the one that has to re-ask when something else on the
+   * panel changes (the alignment). The subtree lists depend on nothing but their side.
+   *
+   * Typed structurally rather than as the component: a Svelte 4 component's exported functions are not
+   * part of the type its class carries, so `PickList` here would be an `any` call at the one site that
+   * matters.
+   */
+  let namesList: { refresh: (delay?: number) => void } | undefined;
+
+  /** The names already in the field, in the CLI's own separated form. */
+  $: chosenNames = draft.names
+    .split(/[,\n]/)
+    .map((n) => n.trim())
+    .filter(Boolean);
+
+  /** No pair, no lists: the options are facts about two checkpoints the server has read. */
+  $: pairId = $comparison?.id;
+
+  /** The names both sides share under the alignment being edited. */
+  async function loadNames(query: string) {
+    if (pairId === undefined) throw new Error('Compare a pair first — the list is what its two sides share.');
+    const r = await api.diffNames(pairId, { ...draft }, query, 200);
+    return { options: r.names.map((value) => ({ value })), total: r.matched };
+  }
+
+  /** One side's namespaces, with what is under each — the count is what tells a wrapper from a typo. */
+  function loadSubtrees(side: 'old' | 'new') {
+    return async (query: string) => {
+      if (pairId === undefined) throw new Error('Compare a pair first — these are the namespaces it found.');
+      const r = await api.subtrees(pairId, side, query, 200);
+      return {
+        options: r.subtrees.map((o) => ({
+          value: o.prefix,
+          detail: `${o.tensors.toLocaleString()} ${o.tensors === 1 ? 'tensor' : 'tensors'}`,
+        })),
+        total: r.total,
+      };
+    };
+  }
+
+  /** Open one list at a time: three open at once is a panel of scrolling boxes.
+   *
+   * No fetch here — each list asks on mount, since it is *created* by this flag and cannot be called
+   * before it exists. */
+  function togglePicker(which: 'names' | 'subtree' | 'subtreeNew') {
+    picking = picking === which ? '' : which;
+  }
+
+  /** A name adds to (or comes out of) the list; a subtree is one value, so it replaces. */
+  function pickName(name: string) {
+    const next = chosenNames.includes(name)
+      ? chosenNames.filter((n) => n !== name)
+      : [...chosenNames, name];
+    // The separator already in the box, so a pasted column stays a column and a typed list stays a list.
+    setText('names', next.join(draft.names.includes('\n') ? '\n' : ', '));
+  }
+
+  function pickSubtree(key: 'subtree' | 'subtreeNew', prefix: string) {
+    setText(key, draft[key] === prefix ? '' : prefix);
+  }
+  // Named, because a template expression cannot carry the annotation that would type its parameter —
+  // and an untyped one is an `any` flowing into a typed prop.
+  const pickBaselineSubtree = (prefix: string) => pickSubtree('subtree', prefix);
+  const pickCandidateSubtree = (prefix: string) => pickSubtree('subtreeNew', prefix);
+  /** The two loaders, made once rather than per render. */
+  const loadBaselineSubtrees = loadSubtrees('old');
+  const loadCandidateSubtrees = loadSubtrees('new');
+
+  /** The alignment decides what lines up, so an edit to it re-asks — while the list is open. */
+  $: alignmentKey = `${draft.map}\u0000${draft.subtree}\u0000${draft.subtreeNew}\u0000${draft.alignFused}`;
+  $: if (picking === 'names' && alignmentKey) namesList?.refresh();
+
   function clear() {
     draft = emptyScope();
     mappings = [];
@@ -329,54 +418,16 @@
 
   {#if open}
     <div class="body">
+      <!-- **Alignment first, selection last.** The names you can select *are* the names the alignment
+           produces: with two naming schemes and no rules, the two sides share nothing and there is
+           nothing to pick. So the panel reads in the order the work happens — drop a wrapper
+           namespace, line the names up, then choose among what lines up (and the picker in step 3
+           lists exactly that). It used to open with the selection, which is the step that depends on
+           the other two. -->
       <div class="cards">
-        <section class="card selection">
-          <header class="card-head">
-            <span class="step">Select</span>
-            <div>
-              <h3>Choose tensors</h3>
-              <p>Limit which tensors enter the comparison.</p>
-            </div>
-          </header>
-          <div class="fields">
-          {#each SELECTION as f (f.key)}
-            <label for="scope-{f.key}" class:narrow={f.narrow}>
-              <span class="what"
-                >{f.label} <code>{f.flag}</code></span
-              >
-              <TextField
-                variant="dense"
-                rows={f.rows}
-                id="scope-{f.key}"
-                value={draft[f.key]}
-                on:input={(e) => setText(f.key, eventValue(e))}
-                placeholder={f.placeholder}
-                spellcheck="false"
-                readonly={busy}
-              />
-              <small class="dim">{f.hint}</small>
-              <small class="eg">
-                <span class="dim">e.g.</span>
-                {#each f.examples as e (e)}<code>{e}</code>{/each}
-              </small>
-            </label>
-          {/each}
-          </div>
-          <label class="check">
-            <input
-              type="checkbox"
-              checked={draft.onlyTensors}
-              disabled={busy}
-              on:change={(e) => setFlag('onlyTensors', eventChecked(e))}
-            />
-            <span><strong>Tensors only</strong> <code>--only-tensors</code></span>
-            <small class="dim">Skip checkpoint metadata. Applying any tensor filter also leaves metadata out.</small>
-          </label>
-        </section>
-
         <section class="card roots" bind:this={rootsCard}>
           <header class="card-head">
-            <span class="step">Re-root</span>
+            <span class="step">1 · Re-root</span>
             <div>
               <h3>Line up submodels</h3>
               <p>Remove an extra wrapper namespace from either checkpoint.</p>
@@ -403,6 +454,40 @@
                 <span class="dim">e.g.</span>
                 {#each f.examples as e (e)}<code>{e}</code>{/each}
               </small>
+              <!-- Each side's own namespaces: the two checkpoints have different ones, which is the
+                   whole reason there are two fields. A prefix that selects nothing is a refusal, so the
+                   list carries the tensor count that tells `language_model` from a typo. -->
+              <button
+                type="button"
+                class="picklink"
+                disabled={busy}
+                on:click={() => togglePicker(f.key === 'subtree' ? 'subtree' : 'subtreeNew')}
+              >
+                {picking === f.key ? 'Hide the list' : 'Pick a namespace…'}
+              </button>
+              {#if picking === 'subtree' && f.key === 'subtree'}
+                <PickList
+                  id="scope-subtree-search"
+                  chosen={draft.subtree ? [draft.subtree] : []}
+                  load={loadBaselineSubtrees}
+                  onPick={pickBaselineSubtree}
+                  disabled={busy}
+                  placeholder="search the baseline's namespaces…"
+                  noun="namespaces in the baseline"
+                  emptyNote="No namespace to drop — the baseline's tensors sit at the root."
+                />
+              {:else if picking === 'subtreeNew' && f.key === 'subtreeNew'}
+                <PickList
+                  id="scope-subtree-new-search"
+                  chosen={draft.subtreeNew ? [draft.subtreeNew] : []}
+                  load={loadCandidateSubtrees}
+                  onPick={pickCandidateSubtree}
+                  disabled={busy}
+                  placeholder="search the candidate's namespaces…"
+                  noun="namespaces in the candidate"
+                  emptyNote="No namespace to drop — the candidate's tensors sit at the root."
+                />
+              {/if}
             </label>
           {/each}
           </div>
@@ -411,7 +496,7 @@
 
         <section class="card matching">
           <header class="card-head">
-            <span class="step">Match</span>
+            <span class="step">2 · Match</span>
             <div>
               <h3>Match different names</h3>
               <p>Describe tensors that correspond but use different naming or packing layouts.</p>
@@ -504,6 +589,77 @@
           {/if}
           {#if mappingIssue}<p class="mapping-issue" role="alert">{mappingIssue}</p>{/if}
         </section>
+        <section class="card selection">
+          <header class="card-head">
+            <span class="step">3 · Select</span>
+            <div>
+              <h3>Choose tensors</h3>
+              <p>Limit which tensors enter the comparison.</p>
+            </div>
+          </header>
+          <div class="fields">
+          {#each SELECTION as f (f.key)}
+            <label for="scope-{f.key}" class:narrow={f.narrow}>
+              <span class="what"
+                >{f.label} <code>{f.flag}</code></span
+              >
+              <TextField
+                variant="dense"
+                rows={f.rows}
+                id="scope-{f.key}"
+                value={draft[f.key]}
+                on:input={(e) => setText(f.key, eventValue(e))}
+                placeholder={f.placeholder}
+                spellcheck="false"
+                readonly={busy}
+              />
+              <small class="dim">{f.hint}</small>
+              <small class="eg">
+                <span class="dim">e.g.</span>
+                {#each f.examples as e (e)}<code>{e}</code>{/each}
+              </small>
+              {#if f.key === 'names'}
+                <!-- The list rather than the guess. Typing an exact name is a guess among tens of
+                     thousands, and a name neither side has after the alignment scopes the comparison to
+                     nothing — so what is on offer is exactly what the two sides share, under the rules
+                     in the two steps above. -->
+                <button
+                  type="button"
+                  class="picklink"
+                  disabled={busy}
+                  on:click={() => togglePicker('names')}
+                >
+                  {picking === 'names' ? 'Hide the list' : 'Pick from both checkpoints…'}
+                </button>
+                {#if picking === 'names'}
+                  <PickList
+                    bind:this={namesList}
+                    id="scope-names-search"
+                    chosen={chosenNames}
+                    load={loadNames}
+                    onPick={pickName}
+                    disabled={busy}
+                    placeholder="search the names that line up…"
+                    noun="that line up on both sides"
+                    emptyNote="Nothing lines up yet — the two sides share no tensor name. Try the steps above."
+                  />
+                {/if}
+              {/if}
+            </label>
+          {/each}
+          </div>
+          <label class="check">
+            <input
+              type="checkbox"
+              checked={draft.onlyTensors}
+              disabled={busy}
+              on:change={(e) => setFlag('onlyTensors', eventChecked(e))}
+            />
+            <span><strong>Tensors only</strong> <code>--only-tensors</code></span>
+            <small class="dim">Skip checkpoint metadata. Applying any tensor filter also leaves metadata out.</small>
+          </label>
+        </section>
+
       </div>
 
       <!-- Every action on this panel, in one place. *Clear* used to sit at the top-right of the
@@ -581,9 +737,13 @@
   }
   /* Selection is the broad job and gets the tall left rail. Re-rooting and name correspondence are
      independent, shorter jobs on the right. At narrow widths they become an ordinary reading order. */
+  /* Two rows, not two columns of unequal height: the two *alignment* steps sit side by side at the top
+     and the selection spans the width below them, so the panel reads in the order the work happens.
+     Laid out as columns, the tallest card (the selection, four fields and a name picker) took the whole
+     left side and read as step one whatever its number said. */
   .cards {
     display: grid;
-    grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 10px;
     align-items: start;
   }
@@ -594,8 +754,16 @@
     border-radius: 6px;
     background: var(--bg-panel);
   }
+  /* The width, under the two steps it depends on. */
   .selection {
-    grid-row: 1 / span 2;
+    grid-column: 1 / -1;
+  }
+  /* Its four fields laid out along that width rather than stacked in a column. */
+  .selection .fields {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 10px;
+    align-items: start;
   }
   .card-head {
     display: flex;
@@ -801,6 +969,18 @@
   code {
     font-size: 11px;
   }
+  /* The link that opens a picker under a field. */
+  .picklink {
+    align-self: start;
+    font: inherit;
+    font-size: 11.5px;
+    color: var(--accent);
+    background: none;
+    border: none;
+    padding: 2px 0;
+    cursor: pointer;
+    text-decoration: underline;
+  }
   /* All three together, at the end of the panel: close, reset, apply. */
   .acts {
     position: sticky;
@@ -832,7 +1012,7 @@
       grid-template-columns: minmax(0, 1fr);
     }
     .selection {
-      grid-row: auto;
+      grid-column: auto;
     }
   }
   @media (max-width: 620px) {

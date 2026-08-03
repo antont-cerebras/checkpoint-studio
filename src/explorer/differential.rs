@@ -1311,3 +1311,134 @@ fn a_value_comparison_agrees_between_the_cli_and_the_web() {
         "with values compared it must read as changed"
     );
 }
+
+/// The exact-name picker's list: what the two sides share **once the alignment is applied**.
+///
+/// The order the panel puts its steps in is the point. Two checkpoints under different naming schemes
+/// share nothing, so an unaligned list is empty and there is nothing to pick; the same pair under the
+/// rename rule that lines them up shares everything. The list has to follow the rules being edited, or
+/// picking a name from it would scope the comparison to a name neither side has.
+#[test]
+fn the_name_picker_lists_what_the_alignment_lines_up() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let old = dir.join("diff_map_old.safetensors");
+    let new = dir.join("diff_map_new.safetensors");
+    let (current, id) = comparing(std::slice::from_ref(&new), &old.to_string_lossy());
+
+    let bare = body(handlers::diff_names(
+        &current,
+        &query("id", &id.to_string()),
+    ));
+    assert_eq!(
+        bare["names"].as_array().map(Vec::len),
+        Some(0),
+        "two naming schemes share no name until something lines them up: {bare}"
+    );
+
+    // The rule the panel's *Match different names* step writes, applied to the baseline.
+    let mut q = std::collections::HashMap::new();
+    q.insert("id".to_string(), id.to_string());
+    q.insert(
+        "map".to_string(),
+        r"\.mlp\.experts\.(\w+)$=>.block_sparse_moe.experts.$1.weight".to_string(),
+    );
+    let mapped = body(handlers::diff_names(&current, &q));
+    let names: Vec<&str> = mapped["names"]
+        .as_array()
+        .expect("a list of names")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        names.contains(&"model.layers.0.block_sparse_moe.experts.down_proj.weight"),
+        "the aligned names are the candidate's, which is what a picked name must match: {names:?}"
+    );
+    assert_eq!(
+        mapped["total"].as_u64(),
+        Some(names.len() as u64),
+        "everything lines up under the rule, so nothing is held back: {mapped}"
+    );
+
+    // And the search is the tree screen's: a fuzzy query narrows the list without changing the total.
+    q.insert("q".to_string(), "l0down".to_string());
+    let searched = body(handlers::diff_names(&current, &q));
+    assert_eq!(
+        searched["total"], mapped["total"],
+        "the total is of the list, not of the search"
+    );
+    let hits = searched["names"].as_array().expect("a list").len();
+    assert!(
+        hits > 0 && hits < names.len(),
+        "a query narrows: {searched}"
+    );
+
+    // A cap the client can rely on: never more rows than it asked for.
+    q.remove("q");
+    q.insert("limit".to_string(), "2".to_string());
+    let capped = body(handlers::diff_names(&current, &q));
+    assert_eq!(capped["names"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        capped["matched"], mapped["matched"],
+        "matched counts them all"
+    );
+}
+
+/// The subtree pickers' lists: one side's **namespaces**, with what each holds.
+///
+/// A `#subtree` prefix that selects nothing is a refusal, and one that selects the wrong thing is an
+/// empty comparison — so the panel offers what is there rather than asking the reader to remember it.
+/// Two properties matter: the two sides are asked separately (they have *different* namespaces, which
+/// is why there are two fields), and per-layer paths are left out (`model.layers.0.mlp` is what an
+/// alignment looks through, and there is one per layer).
+#[test]
+fn the_subtree_pickers_offer_each_side_its_own_namespaces() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let old = dir.join("diff_old.safetensors");
+    let new = dir.join("diff_new.safetensors");
+    let (current, id) = comparing(std::slice::from_ref(&new), &old.to_string_lossy());
+
+    let ask = |side: &str| -> Vec<(String, u64)> {
+        let q: handlers::Query = [("id", id.to_string()), ("side", side.to_string())]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        body(handlers::subtrees(&current, &q))["subtrees"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|o| {
+                (
+                    o["prefix"].as_str().unwrap_or_default().to_string(),
+                    o["tensors"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect()
+    };
+
+    for side in ["old", "new"] {
+        let offered = ask(side);
+        assert!(!offered.is_empty(), "{side} has namespaces: {offered:?}");
+        assert!(
+            offered.iter().all(|(p, _)| !p
+                .split('.')
+                .any(|seg| seg.chars().all(|c| c.is_ascii_digit()) && !seg.is_empty())),
+            "a per-layer path is not a namespace: {offered:?}"
+        );
+        // Biggest first: a wrapper is the namespace with the most under it.
+        assert!(
+            offered.windows(2).all(|w| w[0].1 >= w[1].1),
+            "ordered by what each holds: {offered:?}"
+        );
+    }
+    // Each side is asked about *itself*: the baseline here keeps an `lm_head` at the root that the
+    // candidate does not have, so the two lists are not the same list.
+    let (old_side, new_side) = (ask("old"), ask("new"));
+    assert!(
+        old_side.iter().any(|(p, _)| p == "model") && new_side.iter().any(|(p, _)| p == "model"),
+        "both hold a `model` namespace: {old_side:?} vs {new_side:?}"
+    );
+
+    // A side must be named: the two answers are different, so guessing one would be a coin toss.
+    let (status, _) = handlers::subtrees(&current, &query("id", &id.to_string()));
+    assert_eq!(status, 400, "?side=old|new is required");
+}
